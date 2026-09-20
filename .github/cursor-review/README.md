@@ -56,6 +56,27 @@ diff-size cap](#over-the-diff-size-cap). With `blocking: true` a final
 thread is unresolved — see
 [Optional: make the review blocking](#optional-make-the-review-blocking).
 
+A **Panel integrity** job follows Post review on every run, with no input to
+turn it on, and is the check-run an automated merge gate should read for *"was
+the panel whole?"* — it reports on every run where a panel was meant to happen,
+including the ones where deciding that failed, and stays skipped (so, for a
+required check, green) on the ones that deliberately review nothing. See
+[Panel integrity](#panel-integrity).
+
+The jobs, in the order they report:
+
+| Job / check run | Runs when | Red means |
+|---|---|---|
+| `Gate` | always | The trigger decision itself failed (a label read or the dedupe API call), so whether the PR should be reviewed is unknown. |
+| `Prior-review ledger` | reviewing | Designed never to fail the run: the review matrix `needs:` it, so it degrades to an empty ledger rather than erroring. Rare is not never — if it does go red (job timeout, cancellation, a lost runner), the matrix skips and `Panel integrity` reports that rather than passing. |
+| `Diff size check` | reviewing | The `BASE...HEAD` diff could not be built at all. An over-cap PR is not a failure — it is a skip plus a PR comment. |
+| `Preflight — validate model catalog` | reviewing | A pinned panel model is delisted. The panel is skipped rather than quietly running a lab short. |
+| `<review type> (<model>)` — one per cell | reviewing | **That cell did not submit a review.** Its artifact is still uploaded and the panel still consolidates; the leg is red so the gap reaches `statusCheckRollup`. Never require one of these: the context name carries the model id and changes whenever the panel list does. |
+| `Consolidate panel` | reviewing | The judge job failed outright (a hung judge is absorbed and falls back to the panel union instead). |
+| `Post review` | Consolidate panel succeeded | The POST failed, or succeeded without the run being able to confirm it. The findings are written to the job summary in that case — see [Delivery, the body-only fallback, and a throttled POST](#delivery-the-body-only-fallback-and-a-throttled-post). |
+| `Panel integrity` | reviewing, **or** the decision to review failed | The panel was short, findings went unanchored, nothing was delivered, the judge never adjudicated — or `Gate`/`Diff size check`/`Preflight`/`Prior-review ledger` failed, leaving whether the PR was reviewed unknown. Skipped, not green-by-verdict, when no review was warranted. Advisory unless a caller marks it required. |
+| `Blocking gate` | `blocking: true` | Unresolved, non-outdated finding threads — or a round that should have produced them and did not. Opt-in. |
+
 **Post review is its own job, and that is a security boundary.** No job both
 checks out PR code and holds a write-scoped credential. Every job that checks out
 PR code and runs `cursor-agent` over it — every panel cell and the judge's
@@ -70,6 +91,57 @@ could rewrite the assets checkout or a downloaded action *inside its own job*. O
 a fresh runner with a fresh pinned checkout there is nothing tampered left for the
 minted token to meet. `tests/test_workflow_job_isolation.py` pins the property, and
 [`pr-size.yml`](../workflows/pr-size.yml) uses the identical split for its comment job.
+
+### Panel integrity
+
+`Panel integrity` exists because none of the facts above used to reach a
+check-run *conclusion*, which is the only surface an automated merge gate reads.
+A cell that never submitted left the pre-seeded `status=error` artifact and
+exited green; `Aggregate panel findings` reported `Panel: 2/6 cells contributed
+findings.` into a log; [`post-review.py`](post-review.py) emitted
+`ungated_findings=<n>` as a job output nothing consumed. Measured on one consumer
+repo over 92 panel runs, 38 runs had at least one errored leg and 52 of 552 cells
+errored — and every leg check in every one of those runs reported `success`
+(BE-15554).
+
+Two changes answer that. Each panel cell now **fails its own leg** when its
+artifact does not come back `status=ok`, in a step deliberately placed *after*
+the artifact upload so the panel keeps consolidating and the review still posts.
+And one `Panel integrity` job reads the panel-level facts back off
+`consolidate`'s and `post-review`'s job outputs and goes red on any of: fewer
+cells submitted than ran; findings demoted to the review body with no thread;
+no review delivered; the judge never adjudicated; `consolidate` or `post-review`
+did not succeed at all. It also goes red — rather than skipping — when any job
+the panel's decision rests on *failed*, because three of those gate conditions
+read a job output (empty when the job producing it failed) and the fourth reads
+the matrix result, which is `skipped` whenever ANY job the matrix `needs:`
+(`gate`, `diff-size`, `preflight`, `ledger`) did not succeed, while a skipped
+required check passes: the same fail-closed guard the Blocking gate carries.
+The invariant is *every* job the matrix depends on, not the four that happen to
+be on that list today — it was re-opened twice by a dependency being added to
+the matrix and not here, so the test suite now pins the two lists against each
+other.
+
+What it is **not** is an attestation that six independent reviews happened. A
+leg's "did it submit" verdict is the `status` its own `--trust` agent wrote into
+`findings.json`, so a prompt-injected cell can green itself; this is an
+availability signal against stalls, crashes and step caps — which is what every
+observed failure has been — and a forgery-resistant count would need the
+submission recorded outside the cell's own writable job. Otherwise it prints one
+`::notice::Panel integrity: <ok>/<total> cells, <n> anchored finding(s), 0
+unanchored.` It gates no other job — a short panel must not also cost the PR the
+findings it did produce — so blocking on it is the caller's call, exactly like
+the Blocking gate.
+
+Nor is a red verdict durable yet. The job is gated on a panel being warranted,
+so a later run on the **same head SHA** that takes a deliberate no-panel branch
+— a toggled label, or the already-reviewed re-trigger — skips it, and that
+newer skipped check run supersedes the red for branch protection, which counts
+a skip as a pass. Closing it means reading prior state from outside the run
+(the previous conclusion, or the landed review's cell count), which this job
+deliberately holds no credential for; tracked as BE-15604, and documented as a
+caveat in [the setup
+guide](../../docs/callers/cursor-review.md#panel-integrity).
 
 ### Delivery, the body-only fallback, and a throttled POST
 
@@ -124,7 +196,9 @@ MCP server. Model prose is never parsed for results: tool schemas validate the
 records before writing them, which removes formatting drift, markdown fences,
 truncated JSON, and reformat retries from the result path. If a cell fails
 (checkout, agent, or tool submission), it still shows up in the panel summary
-tagged `error` rather than silently vanishing.
+tagged `error` rather than silently vanishing — and, since BE-15554, its own leg
+check goes red so the gap is visible in the PR's status rollup and not only in
+the consolidated review's panel table. See [Panel integrity](#panel-integrity).
 
 ## What's in this directory
 

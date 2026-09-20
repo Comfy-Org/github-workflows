@@ -38,6 +38,12 @@ failure cases besides. The Blocking gate does not have this hole: with
 `blocking: true` it runs on every event the caller delivers, so its verdict is
 always a live query of the PR's thread state, never a skip.
 
+**Panel integrity is its own check, and it is always on.** A reviewer cell that
+never submits no longer exits green, and a run whose panel came up short, whose
+findings could not be anchored, or whose review never landed publishes a red
+`Panel integrity` context. It needs no input and blocks nothing by itself — see
+[Panel integrity](#panel-integrity).
+
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
 
@@ -222,6 +228,137 @@ What it does **not** do is make your own group redundant. Keep the caller group 
 
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.
+
+## Panel integrity
+
+`<caller job id> / Panel integrity` (with the caller above, `review / Panel
+integrity`) is the context that answers **"was the panel that reviewed this PR a
+whole panel?"** — it is the one an automated merge gate should read for that
+question, and it runs on every review, with no input to turn on. Read the
+**"red, not skipped, when the decision itself failed"** and **"still skips when
+no review was warranted"** bullets below before you require it: it is red when
+the review ran and came up short *and* when the decision that selects a review
+failed, but it is **skipped — and therefore green — on the runs that
+deliberately review nothing**.
+
+It is **advisory**: red here fails no other job, and the consolidated review
+still posts. Marking it a required status check in your branch-protection /
+ruleset settings is what makes red block a merge — the same two-switch shape as
+the Blocking gate, and independent of it. The two answer different questions:
+Panel integrity asks whether the review was *complete*, the Blocking gate asks
+whether its findings were *addressed*.
+
+Red means at least one of these, each named on its own `::error::` annotation in
+the job log:
+
+| Cause | What it means |
+|---|---|
+| Panel incomplete | Fewer cells submitted findings than ran. The consolidated review was adjudicated over a short panel. The individual leg checks (`adversarial (<model>)` / `edge-case (<model>)`) are red for exactly the cells that did not submit — almost always the 15-minute agent cap. |
+| Unanchored findings | Findings the review could not anchor to a line of the reviewed diff, so they were demoted to the review **body** and have no thread. The Blocking gate cannot see them; read the body. |
+| Nothing delivered | No review carrying resolvable finding threads reached the PR — a read-only token, a rejected inline payload, or a post that could not be confirmed. The findings are in the `Post review` job summary. |
+| Judge degraded | The judge model never adjudicated; the review is the raw union of the cells' findings, so duplicates and false positives were not filtered out. |
+| Panel never adjudicated / Post review failed | `Consolidate panel` or `Post review` did not succeed, so the values the causes above are read from are absent. Reported as its own cause rather than inferred from the empty outputs, because an absent output is not a clean one — and because `delivered=true` is written the moment the POST returns, so it can survive a `Post review` job that dies in a later step. |
+| Cell counts missing | `ok_count`/`total` came back empty. Counted as an incomplete panel: unset-vs-unset compares equal, so without this the check would print "whole panel" having counted nothing. |
+
+**Your caller job goes red with a failing leg, and that is the point.** A
+reusable workflow's caller job takes the aggregate conclusion of the jobs inside
+it, so a cell that did not submit now turns `review` red as well as its own leg
+— on a measured ~40% of runs, because a stalled `cursor-agent` is common. That
+red is the signal: it is what makes an incomplete panel visible to anything
+reading `statusCheckRollup`, which is exactly what used to be impossible. Read
+it as "this review is partial", not as "the review failed": the consolidated
+review still posts, the Blocking gate is unaffected, and re-running the failed
+legs or re-triggering the review is what clears it. If you want a *merge* gate,
+require `Panel integrity` — do **not** require the caller job itself, which is
+red for every unrelated infrastructure failure too.
+
+**"Re-run failed jobs" posts a second review.** GitHub's re-run-failed-jobs
+re-runs every job that *depends* on a failed one, so re-running a red leg also
+re-runs `Consolidate panel` and `Post review` — while the green `Gate` is not
+re-run and its cached `already_reviewed=false` is reused. `post-review.py`'s
+landed-review check only fires when the POST itself *errors*, so a clean re-run
+POSTs, and the PR ends up with two consolidated reviews. Prefer **re-running the
+whole workflow** (which re-runs `Gate`, whose dup-check sees the review that
+already landed) or re-triggering by label. Use re-run-failed-jobs when you
+actually want a second, fuller review on the same commit. Both of those
+alternatives, though, supersede a red `Panel integrity` with a skip — see the
+supersession shape below before you reach for either to clear one.
+
+The remaining shapes to expect before you require it:
+
+* **A cancelled run reports red.** GitHub counts a *skipped* required check as
+  passing, so this job runs on cancellation rather than handing a superseded run
+  a free green — the same reasoning the Blocking gate documents. Under the
+  `cancel-in-progress` caller above that red lands on the head SHA that was
+  superseded, not on the new one.
+* **Do not require a leg check instead.** A panel cell's context name carries
+  the model id (`edge-case (kimi-k3-high)`), so it changes whenever the panel
+  list does — and a required check whose name no longer exists blocks every PR
+  in the repo. `Panel integrity` is stable by design.
+* **It is red, not skipped, when the decision itself failed.** Panel integrity
+  is gated on the same four conditions the panel is. Three of them read `Gate`'s
+  and `Diff size check`'s job *outputs*, which are empty when those jobs
+  **failed**; the fourth reads the review matrix's *result*, which is `skipped`
+  whenever **any** job the matrix `needs:` did not succeed — `Preflight —
+  validate model catalog` or `Prior-review ledger`. Gating on those alone would
+  skip this check exactly when a dup-check API call errored, the diff could not
+  be built, or a delisted model stopped the panel before a single cell started —
+  and GitHub counts a skipped required check as **passing**. So a failed `Gate`,
+  `Diff size check`, `Preflight` **or `Prior-review ledger`** runs this job and
+  fails it: an undecided run is not a clean run. (`Prior-review ledger` is built
+  never to fail — every step in it is `continue-on-error` — but a job timeout,
+  a cancellation or a lost runner is not a step outcome, and "rare" is the wrong
+  bar for something that would otherwise hand you a green merge gate.)
+* **It still skips when no review was warranted, and a skip is green.** The
+  deliberate no-panel branches — no trigger label, an already-reviewed commit, a
+  PR over the diff-size cap, a fork the panel cannot run on — are the ones where
+  `Gate` and `Diff size check` both *succeeded* and said no panel should run.
+  This check stays skipped there, and a required skipped check passes. That is
+  the intended shape: it answers **"was the panel that ran whole?"**, not "was
+  this PR reviewed at all?" If you need the second question gated too — most
+  relevantly, if you do not want an over-cap PR merging unreviewed — require the
+  Blocking gate, which fails closed on over-cap fresh reviews, and keep your own
+  label policy. Do not read a skipped Panel integrity as "the panel was fine".
+* **A later no-panel run on the same commit supersedes a red with a skip.**
+  That is the previous bullet's sharp edge, and reaching it needs no failure at
+  all. Once `Panel integrity` is red on a head SHA, **any** subsequent run on
+  that same SHA which takes a deliberate no-panel branch publishes a *newer*
+  `Panel integrity` check run in the `skipped` state — and branch protection
+  reads the latest check run of a given name, counting a skipped one as
+  passing. An unrelated label toggled, `skip-cursor-review` applied, the trigger
+  label removed, or the already-reviewed re-trigger all do it — and so does
+  **re-running the whole workflow**, the remediation recommended above, whose
+  fresh `Gate` dup-check finds the review that already landed and reports
+  `already_reviewed=true`. The panel is still short, nothing was re-reviewed,
+  and the required check is green. Until this is closed (BE-15604), clear a red
+  `Panel integrity` by pushing a **new commit** — a fresh SHA gets its own
+  verdict — rather than by re-triggering on the reviewed one, and for a commit
+  whose review came up short read the check's *run history* rather than only its
+  latest conclusion.
+* **It detects a cell that went missing, not a cell that lied.** "Did this cell
+  submit" is the `status` field of the artifact the cell itself wrote, and that
+  cell's agent runs `--trust` with shell access over attacker-authored diff
+  text. A prompt-injected cell can write `{"status": "ok"}` with zero findings
+  and green both its own leg and the panel count. That is a real limit, not a
+  quibble: this check is an availability signal — it catches the stalls, crashes
+  and caps that make up essentially all of the observed failures — and is **not**
+  an attestation that six independent reviews happened. Making the count
+  forgery-resistant needs the submission recorded outside the cell's own
+  writable job; until then, do not treat a green `Panel integrity` as proof
+  against an adversarial PR.
+* **A discarded incremental block warns, it does not fail the check.** The job
+  also reads `diff-size`'s `incremental_subset`, which is `false` when the
+  incremental "new since the last reviewed round" block was built and then
+  failed its byte-for-byte subset check against the reviewed diff. That reads
+  like a scope failure and is not one: the block is **discarded whole**, so the
+  panel reviews the **full reviewed diff alone** — the same input it gets on
+  round 1, and on every run where no block could be built at all. Nothing is
+  skipped and no finding is suppressed, so the panel is exactly as whole as any
+  other run's. `Panel integrity` therefore emits a `::warning::` here and stays
+  green on this signal alone; the counts are in the `Incremental diff
+  discarded` warning on the *Diff size check* job. It is called out because the
+  annotation is easy to misread as "the panel reviewed the wrong hunks" when it
+  means "the panel lost its budget hint".
 
 ## Blocking-gate gotchas
 
