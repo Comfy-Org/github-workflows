@@ -28,7 +28,7 @@ a schema library calls "invalid":
 | Class | Severity | Because |
 |---|---|---|
 | YAML parse error | error | CodeRabbit cannot read the file at all. |
-| `maxLength` violation | error | File-rejecting. The schema carries **14** per-field caps, 50 → 20,000 chars. |
+| `maxLength` violation | error | File-rejecting. The schema carries **15** per-field caps, 50 → 20,000 chars. |
 | type / enum error | error | File-rejecting. |
 | unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. Reported wherever the schema object accepts only the names it lists — see below. |
 | config path that is not a regular file, or > 512 KiB | exit 2 | "I could not check" must never look like a pass. A path resolving outside the repo root (symlinks resolved) is refused the same way. |
@@ -95,7 +95,7 @@ carried exactly that shape when this landed.
 ## Why file size is the wrong invariant
 
 The obvious cheap check — "fail if `.coderabbit.yaml` gets too big" — would gate
-nothing. There is no whole-document size cap in the schema, only the 14 per-field
+nothing. There is no whole-document size cap in the schema, only the 15 per-field
 ones, and size is uncorrelated with validity: the invalid config that started this
 was 2,198 bytes while a valid one next to it was 4,826. Across the org sweep there
 were **zero** `maxLength` violations and three misplaced-key repos, so a size check

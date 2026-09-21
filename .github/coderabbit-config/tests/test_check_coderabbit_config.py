@@ -1056,8 +1056,13 @@ class OpennessTest(unittest.TestCase):
             else:
                 omitted.append(node)
         # Not an arbitrary snapshot: this is the size of the gap being closed.
+        # `omitted` grows by one per object the upstream schema adds without an
+        # opener -- 103 at #179, 104 at #215, 105 once #250 vendored the `vale`
+        # tool. `explicit` holding at 5 is the load-bearing half: it says the
+        # refresh introduced no NEW opener keyword, so the walk still means what
+        # the docstring above claims. Bump these deliberately, never to go green.
         self.assertEqual(len(explicit), 5)
-        self.assertEqual(len(omitted), 104)
+        self.assertEqual(len(omitted), 105)
 
     def test_every_explicitly_open_object_uses_additional_properties(self):
         # The audit behind `_OPENER_KEYWORDS`: the schema uses one opener today,

@@ -210,7 +210,13 @@ class VendoredSchemaTest(unittest.TestCase):
         caps = schema_drift.length_caps(schema_drift.load(VENDORED, "vendored"))
         self.assertEqual(caps["tone_instructions"], 250)
         self.assertEqual(caps["reviews.path_instructions[].instructions"], 20000)
-        self.assertEqual(len(caps), 14)
+        # The two above are the caps the checker's own messages quote; this one
+        # arrived with #288's refresh and is pinned so the 15th cap is checked
+        # rather than merely counted.
+        self.assertEqual(caps["chat.integrations.jira.issue_template"], 3000)
+        # README.md documents this count and the 50 -> 20,000 span; both move together.
+        self.assertEqual(len(caps), 15)
+        self.assertEqual((min(caps.values()), max(caps.values())), (50, 20000))
 
 
 if __name__ == "__main__":
