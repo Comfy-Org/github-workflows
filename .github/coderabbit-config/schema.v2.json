@@ -688,7 +688,7 @@
 					"properties": {
 						"override_requested_reviewers_only": {
 							"default": false,
-							"description": "Override Requested Reviewers Only | When enabled, only requested reviewers (and not the pull request author) can override/ignore failing pre-merge checks.",
+							"description": "Override Requested Reviewers Only | When enabled, the pull request author cannot override/ignore failing pre-merge checks. Eligible actors are individually requested reviewers and, on GitHub, members of requested reviewer teams or submitted reviewers whose author association is OWNER, MEMBER, or COLLABORATOR.",
 							"type": "boolean"
 						},
 						"docstrings": {
@@ -828,6 +828,11 @@
 							"default": {},
 							"type": "object",
 							"properties": {
+								"enabled": {
+									"default": true,
+									"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.3",
+									"type": "boolean"
+								},
 								"rule_dirs": {
 									"default": [],
 									"description": "List of rules directories.",
@@ -878,7 +883,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.4",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.5",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -973,7 +978,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.10",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.11",
 									"type": "boolean"
 								}
 							}
@@ -1013,7 +1018,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.9",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.12",
 									"type": "boolean"
 								},
 								"level": {
@@ -1120,7 +1125,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.13",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.16",
 									"type": "boolean"
 								}
 							}
@@ -1277,7 +1282,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable zizmor | zizmor is a static security analyzer for GitHub Actions workflow files. | v1.29.0",
+									"description": "Enable zizmor | zizmor is a static security analyzer for GitHub Actions workflow files. | v1.30.0",
 									"type": "boolean"
 								}
 							}
@@ -1289,7 +1294,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.26.0",
+									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.27.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1329,7 +1334,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.18.0",
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.19.0",
 									"type": "boolean"
 								}
 							}
@@ -1353,7 +1358,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.28.0",
+									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.29.0",
 									"type": "boolean"
 								}
 							}
@@ -1365,7 +1370,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.174.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.176.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1381,7 +1386,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.48692",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.49221",
 									"type": "boolean"
 								}
 							}
@@ -1421,7 +1426,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.63.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.64.0",
 									"type": "boolean"
 								}
 							}
@@ -1457,7 +1462,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.7",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.8",
 									"type": "boolean"
 								}
 							}
@@ -1469,7 +1474,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.80.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.81.0",
 									"type": "boolean"
 								}
 							}
@@ -1481,7 +1486,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.7.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.7.1 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1579,7 +1584,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.29.1",
+									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.30.0",
 									"type": "boolean"
 								}
 							}
@@ -1615,7 +1620,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.17",
+									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.21",
 									"type": "boolean"
 								}
 							}
@@ -1651,7 +1656,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.9.6",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.11.0",
 									"type": "boolean"
 								}
 							}
