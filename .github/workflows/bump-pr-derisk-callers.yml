@@ -92,7 +92,7 @@ on:
       # change, or pinned callers silently drift onto stale tool behavior.
       - scripts/pr-derisk/**
       # A pr-derisk caller runs the pr-risk GRADER as well as the planner — every floor in a
-      # plan is computed by grade-pr-risk.sh, and the base-ref override read is grade-targets.sh
+      # plan is computed by grade-pr-risk.sh, and the base-ref override read is lib.sh's
       # — both loaded from the same pinned ref. So a change to either is consumer-visible here
       # and needs this fleet bumped, independently of the pr-risk fleet's own bump.
       - scripts/pr-risk/**
@@ -110,6 +110,11 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and read by the PREFLIGHT step alone (BE-10008): before it
+  # honors a `Skip-caller-bump: true` trailer, the guard reads this fleet's own
+  # Actions run history to check no earlier watched change is still owed a bump.
+  # It stays well ahead of the org-wide write token minted further down.
+  actions: read
 
 # Serialize runs of this fleet. The bumper now pushes to a STABLE branch
 # (ci/bump-pr-derisk) shared across runs, so two overlapping runs (a rapid second
@@ -192,20 +197,23 @@ jobs:
           # Every file whose ABSENCE breaks a pinned caller at run time — not just the
           # entry points, and NOT confined to this rung's own directory. A `/derisk`
           # run loads BOTH trees from the pinned ref:
-          #   * collect-pr-inputs.sh SOURCES grade-targets.sh (for the base-ref
-          #     override read) and EXECS grade-pr-risk.sh; either missing is a hard
-          #     failure before any plan exists;
+          #   * collect-pr-inputs.sh SOURCES scripts/pr-risk/lib.sh (for the base-ref
+          #     and override resolvers) and EXECS grade-pr-risk.sh; either missing is
+          #     a hard failure before any plan exists;
           #   * plan-derisk.sh execs grade-pr-risk.sh again for the split floors, and
           #     that grader falls back to risk-map.v0.json / runbook-registry.v0.json
           #     beside itself whenever the consumer ships no override — which is the
           #     default enrolment;
-          # DELIBERATELY ABSENT: apply-risk-label.sh and publish-risk-surfaces.sh.
-          # grade-targets.sh does check for them — but inside `main()`, which its
-          # `BASH_SOURCE == $0` footer runs only on a DIRECT invocation, and
-          # collect-pr-inputs.sh only SOURCES it for two helpers. Listing them would
-          # make a pr-risk-side decommission of a file no `/derisk` run ever touches
-          # freeze THIS fleet behind a `::warning::` — a false decommission, which is
-          # the same freeze the over-wide-list note above warns about, one list down.
+          # DELIBERATELY ABSENT: grade-targets.sh, apply-risk-label.sh and
+          # publish-risk-surfaces.sh — the whole pr-risk ENTRYPOINT and the two tools
+          # it alone reaches. A `/derisk` run never invokes grade-targets.sh and, since
+          # the sourceable helpers moved into lib.sh, no longer loads it at all: it
+          # sources the library directly and execs the grader. Listing any of the three
+          # would make a pr-risk-side decommission of a file no `/derisk` run ever
+          # touches freeze THIS fleet behind a `::warning::` — a false decommission,
+          # which is the same freeze the over-wide-list note above warns about, one
+          # list down. bump-pr-risk-callers.yml is the fleet that watches them, because
+          # it is the fleet whose callers run them.
           # NOTE these are literal paths: a VERSIONED rename (risk-map.v0 → v1) reads
           # here as a decommission and no-ops the fleet behind a ::warning::, so rename
           # them in this list in the same commit.
@@ -216,10 +224,15 @@ jobs:
             scripts/pr-derisk/collect-pr-inputs.sh
             scripts/pr-derisk/resolve-enabled.sh
             scripts/pr-risk/grade-pr-risk.sh
-            scripts/pr-risk/grade-targets.sh
+            scripts/pr-risk/lib.sh
             scripts/pr-risk/risk-map.v0.json
             scripts/pr-risk/runbook-registry.v0.json
           NEW_SHA: ${{ github.sha }}
+          # Read-only ambient token, for the owed-bump probe's `actions: read`
+          # history lookup only (BE-10008). Never a write credential: the
+          # Cloud Code Bot token is minted after — and only if — this step says
+          # proceed. Absent, the probe reads as "cannot determine" and bumps.
+          GH_TOKEN: ${{ github.token }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

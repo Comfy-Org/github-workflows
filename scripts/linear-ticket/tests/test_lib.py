@@ -87,6 +87,118 @@ def _issue(identifier, key, state):
     return {"issue": {"identifier": identifier, "team": {"key": key}, "state": {"type": state}}}
 
 
+class ParsePathList(unittest.TestCase):
+    def test_empty_disables_the_exemption(self):
+        self.assertEqual(lib.parse_path_list(""), [])
+        self.assertEqual(lib.parse_path_list("   "), [])
+        self.assertEqual(lib.parse_path_list(None), [])
+
+    def test_trims_and_preserves_order_and_case(self):
+        # Paths are case-SENSITIVE on GitHub, unlike the logins parse_actor_list lowercases.
+        self.assertEqual(
+            lib.parse_path_list(" infrastructure/dynamicConfig/** , docs/*.md "),
+            ["infrastructure/dynamicConfig/**", "docs/*.md"],
+        )
+
+    def test_empty_entry_rejected(self):
+        # Stricter than normalize_team_keys, which tolerates "BE,,ENG": this input is a
+        # merge-gate waiver, so a stray/trailing comma fails the run rather than running under
+        # a list the caller did not quite write.
+        for raw in ("a/**,,b/**", "a/**,", ",a/**", "a/**, ,b/**"):
+            with self.assertRaises(ValueError, msg=raw):
+                lib.parse_path_list(raw)
+
+    def test_duplicate_rejected(self):
+        with self.assertRaises(ValueError):
+            lib.parse_path_list("a/**,a/**")
+
+    def test_negation_rejected(self):
+        # Matching `!foo` literally would invert the author's intent in silence.
+        with self.assertRaises(ValueError):
+            lib.parse_path_list("!secret/**")
+
+    def test_absolute_rejected(self):
+        with self.assertRaises(ValueError):
+            lib.parse_path_list("/infrastructure/**")
+
+    def test_parent_segment_rejected(self):
+        with self.assertRaises(ValueError):
+            lib.parse_path_list("a/../../etc/**")
+
+    def test_dotdot_inside_a_filename_is_fine(self):
+        # Only a whole `..` SEGMENT is rejected; "a..b" is a legal file name.
+        self.assertEqual(lib.parse_path_list("a..b/**"), ["a..b/**"])
+
+
+class PathMatching(unittest.TestCase):
+    def test_double_star_crosses_slashes(self):
+        patterns = ["infrastructure/dynamicconfig/**"]
+        self.assertTrue(lib.path_matches_any("infrastructure/dynamicconfig/prod.yaml", patterns))
+        self.assertTrue(
+            lib.path_matches_any("infrastructure/dynamicconfig/env/prod/a.yaml", patterns))
+        self.assertFalse(lib.path_matches_any("infrastructure/other/prod.yaml", patterns))
+
+    def test_double_star_does_not_match_a_sibling_prefix(self):
+        # The `/` before `**` is literal, so the pattern cannot leak into `...config-backup/`.
+        patterns = ["infrastructure/dynamicconfig/**"]
+        self.assertFalse(
+            lib.path_matches_any("infrastructure/dynamicconfig-backup/prod.yaml", patterns))
+        self.assertFalse(lib.path_matches_any("infrastructure/dynamicconfig", patterns))
+
+    def test_single_star_does_not_cross_slashes(self):
+        self.assertTrue(lib.path_matches_any("docs/readme.md", ["docs/*.md"]))
+        self.assertFalse(lib.path_matches_any("docs/nested/readme.md", ["docs/*.md"]))
+
+    def test_whole_string_match_not_substring(self):
+        self.assertFalse(lib.path_matches_any("vendor/docs/readme.md", ["docs/*.md"]))
+        self.assertFalse(lib.path_matches_any("docs/readme.md.bak", ["docs/*.md"]))
+
+    def test_dot_is_literal_not_a_regex_wildcard(self):
+        self.assertFalse(lib.path_matches_any("docs/readmeXmd", ["docs/*.md"]))
+
+    def test_question_mark_and_brackets_are_literal(self):
+        # A deliberate subset of GitHub's grammar: unsupported metacharacters match literally,
+        # which under-matches — and under-matching leaves the ticket requirement in force.
+        self.assertTrue(lib.path_matches_any("a?b.yaml", ["a?b.yaml"]))
+        self.assertFalse(lib.path_matches_any("axb.yaml", ["a?b.yaml"]))
+        self.assertTrue(lib.path_matches_any("a[1].yaml", ["a[1].yaml"]))
+        self.assertFalse(lib.path_matches_any("a1.yaml", ["a[1].yaml"]))
+
+    def test_any_pattern_may_match(self):
+        patterns = ["config/**", "docs/*.md"]
+        self.assertTrue(lib.path_matches_any("config/a/b.yaml", patterns))
+        self.assertTrue(lib.path_matches_any("docs/x.md", patterns))
+
+    def test_no_patterns_and_empty_path_never_match(self):
+        self.assertFalse(lib.path_matches_any("config/a.yaml", []))
+        self.assertFalse(lib.path_matches_any("", ["**"]))
+
+
+class AllPathsExempt(unittest.TestCase):
+    PATTERNS = ["infrastructure/dynamicconfig/**"]
+
+    def test_all_matching_is_exempt(self):
+        self.assertTrue(lib.all_paths_exempt(
+            ["infrastructure/dynamicconfig/prod.yaml",
+             "infrastructure/dynamicconfig/staging.yaml"],
+            self.PATTERNS))
+
+    def test_one_unmatched_file_is_not_exempt(self):
+        # The headline case: a config flip that also carries a Go file still needs a ticket.
+        self.assertFalse(lib.all_paths_exempt(
+            ["infrastructure/dynamicconfig/prod.yaml", "services/api/handler.go"],
+            self.PATTERNS))
+
+    def test_zero_files_is_not_exempt(self):
+        # "Every path matches" is VACUOUSLY true over an empty list; waiving a merge gate on a
+        # vacuous truth is not a waiver anyone asked for.
+        self.assertFalse(lib.all_paths_exempt([], self.PATTERNS))
+
+    def test_no_patterns_is_not_exempt(self):
+        self.assertFalse(lib.all_paths_exempt(["infrastructure/dynamicconfig/prod.yaml"], []))
+        self.assertFalse(lib.all_paths_exempt([], []))
+
+
 class FilterIssues(unittest.TestCase):
     LINKED_OPEN_BE = [_issue("BE-1", "BE", "started")]
     LINKED_DONE_BE = [_issue("BE-1", "BE", "completed")]
@@ -164,17 +276,18 @@ class SelectFailureCategory(unittest.TestCase):
         self.assertEqual(lib.select_failure_category(False, 0, 0), "no_candidate")
 
 
+ALL_CATEGORIES = ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error",
+                  "changed_files_unavailable")
+
+
 class FailureGuidance(unittest.TestCase):
     def test_every_category_non_empty(self):
-        for category in ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error"):
+        for category in ALL_CATEGORIES:
             self.assertTrue(lib.failure_guidance(category).strip())
 
     def test_unknown_category_raises(self):
         with self.assertRaises(KeyError):
             lib.failure_guidance("bogus")
-
-
-ALL_CATEGORIES = ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error")
 
 
 class StatusContext(unittest.TestCase):
@@ -334,6 +447,14 @@ class AdvisoryNote(unittest.TestCase):
         note = lib.advisory_note("infra_error")
         self.assertNotIn("Linking the ticket", note)
         self.assertIn("could not reach Linear", note)
+
+    def test_changed_files_unavailable_does_not_tell_the_author_to_link_a_ticket(self):
+        # An unreadable changed-file list is repository infrastructure, and the one case the
+        # author CAN act on (a PR past the 3000-file ceiling) is fixed by splitting the PR,
+        # not by linking a ticket.
+        note = lib.advisory_note("changed_files_unavailable")
+        self.assertNotIn("Linking the ticket", note)
+        self.assertIn("changed-file list", note)
 
     def test_ticket_categories_do_tell_the_author_to_link(self):
         for category in ("no_candidate", "exists_not_linked", "policy_mismatch"):

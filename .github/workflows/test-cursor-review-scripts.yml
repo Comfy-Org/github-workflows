@@ -13,14 +13,14 @@ name: Test cursor-review scripts
 # out PR code and holds the bot key / pull-requests: write). Both assertions are
 # only worth anything if they run when the file they parse changes.
 #
-# docs/callers/cursor-review.md is here for the same reason and, specifically,
-# for the drift direction test_workflow_inputs_docs.py was written to catch:
-# that suite pins set-equality between the workflow's declared inputs and the
-# tables in BOTH .github/cursor-review/README.md (already covered by the
-# .github/cursor-review/** entry) and the setup guide. Without this line a
-# docs-only PR that deletes the `blocking` row — the #31 scenario exactly —
-# matches no filter and runs no job, so the alarm cannot fire on the very edit
-# it exists for.
+# The declared-vs-documented input drift check no longer lives here: it folded
+# into the table-driven harness at
+# .github/workflow-pins/tests/test_inputs_docs_drift.py, which reads BOTH
+# docs/callers/cursor-review.md and .github/cursor-review/README.md. Both paths
+# are in test-workflow-pins.yml's filters, so docs/callers/cursor-review.md is
+# deliberately NOT listed below — no suite this workflow runs reads it, and a
+# docs-only PR that deletes the `blocking` row (the #31 scenario) still fires
+# the alarm, over there.
 
 on:
   pull_request:
@@ -29,7 +29,6 @@ on:
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
-      - 'docs/callers/cursor-review.md'
   push:
     branches: [main]
     paths:
@@ -37,7 +36,6 @@ on:
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
-      - 'docs/callers/cursor-review.md'
 
 permissions:
   contents: read

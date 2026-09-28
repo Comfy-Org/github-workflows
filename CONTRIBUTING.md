@@ -29,6 +29,10 @@ python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py'
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
 
+# org repo literal allowlist lint (runs on EVERY change — no path filter)
+shellcheck -x .github/lint/check-org-repo-literals.sh
+bash .github/lint/check-org-repo-literals.sh
+
 # PR-size classifier
 cd scripts/check-pr-size && go vet ./... && go test ./...
 ```

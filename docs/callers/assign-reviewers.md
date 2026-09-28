@@ -4,16 +4,14 @@ Read [the shared caller contract](README.md) first.
 
 ## What it does
 
-Matches a PR's changed paths against a **caller-repo** `.github/reviewers.yml`
-(path-glob → reviewers, plus a `default_pool`), drops the author and anyone in
-`vars.REVIEWER_EXCLUDE`, ranks the remaining candidates by current open load
-(steering off anyone at or over `vars.REVIEWER_LOAD_CAP`), may swap one slot for a
-`vars.REVIEWER_GROWTH_POOL` member for new-folk randomization, and assigns the top
-`num_reviewers`.
+Routes a PR using configured path expertise and recent human approvals on the
+same code. Each chosen owner must add coverage of the changed files. Workload
+breaks relevance ties; a one-subsystem PR normally gets one owner even with the
+default maximum of two. There are no random substitutions.
 
-Routing runs for every eligible author by default. Set
-`vars.REVIEWER_AUTHOR_ALLOWLIST` to scope it to an opt-in set of PR authors
-instead — the middle ground between "on for everyone" and off.
+Each run logs its evidence and writes an Actions summary: additional files
+covered, configured rules, supporting historical PR numbers, and known/unknown
+open review load. It does not post a PR comment.
 
 > **Despite the name, it writes the ASSIGNEE field, not reviewer requests.**
 > Comfy-Org routes and alerts people via assignees, so an entry under
@@ -29,11 +27,42 @@ buy fork support** — see the fork gotcha below.
 |---|---|
 | `vars.APP_ID` | **Required.** CLOUD_CODE_BOT app id. |
 | `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required.** |
-| `.github/reviewers.yml` in **your** repo | **Required.** The expertise map. |
-| `vars.REVIEWER_GROWTH_POOL` | Optional. Logins for new-folk randomization. |
-| `vars.REVIEWER_LOAD_CAP` | Optional. Max open reviews before steering off. |
+| `.github/reviewers.yml` in **your** repo | **Required for assignment.** The expertise map. |
+| App permission `Actions: read` | Required for cached-history downloads; otherwise assignment uses live history. |
+| `vars.REVIEWER_GROWTH_POOL` | Deprecated and ignored. No random assignments. |
+| `vars.REVIEWER_LOAD_CAP` | Optional. Prefer below-cap owners among equally relevant candidates. |
 | `vars.REVIEWER_EXCLUDE` | Optional. Logins to hard-exclude. |
 | `vars.REVIEWER_AUTHOR_ALLOWLIST` | Optional. Whitespace-separated logins. When non-empty, only these **authors'** PRs are routed; everyone else's is skipped. Unset ⇒ every eligible author is routed. |
+| `vars.REVIEWER_SKIP_BASE_BRANCHES` | Optional. Whitespace-separated globs. A PR whose **base** ref matches any of them is skipped. Unset ⇒ every base is routed. |
+
+### Turning routing off for a stacked-PR lane
+
+Set `REVIEWER_SKIP_BASE_BRANCHES` to `stack/**` and PRs that target a `stack/…`
+integration branch get no assignee, while PRs to the default branch route as
+before. This is for the lane where many small child PRs land on one long-lived
+branch and review is deferred to the single promotion PR at the end — assigning
+an owner to each child pages a human per commit for a review nobody intends to
+do there, and that noise is what gets the whole automation muted.
+
+Glob semantics match the path rules: `**` spans segments (`stack/**` covers
+`stack/a` and `stack/a/b`), `*` stays within one (`stack/*` covers `stack/a` but
+not `stack/a/b`), and a pattern with no wildcard is an **exact** match — so
+`release` skips `release` and leaves `release/1.2` and `releases` alone. `?` is
+one Unicode character other than `/` — one code POINT, so an emoji counts as a
+single `?` rather than as the bytes or UTF-16 units it is stored as. An accented
+letter counts once only when **precomposed** (NFC): a decomposed `é` (`e` +
+U+0301, and NFD is the normal form paths originating on macOS arrive in) is two
+code points and needs two `?`. `*` spans either form, so prefer it over `?` when
+a segment may carry combining marks. Several patterns are whitespace-separated: `stack/** wip/**`.
+
+Two related knobs, so pick the right one. This var is **per-lane and automatic**.
+The `skip_label` input (default `skip-auto-assign`) is **per-PR and manual**. Use
+the label for a one-off; use this for a lane that should never route.
+
+Unlike `REVIEWER_AUTHOR_ALLOWLIST`, this gate fails **open**: a pattern that
+matches nothing simply routes as usual, so a typo costs you the exemption rather
+than silently disabling routing repo-wide. Confirm it took effect in the run log,
+which prints `Base branch <ref> matches REVIEWER_SKIP_BASE_BRANCHES — skipping.`
 
 ## Caller
 
@@ -45,6 +74,9 @@ name: Assign Reviewers
 on:
   pull_request:
     types: [opened, ready_for_review]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
 
 jobs:
   assign:
@@ -53,16 +85,34 @@ jobs:
     # arrives empty, so the App-token step hard-fails and the PR carries a red X
     # for a routing decision that could never have been made. See the gotcha.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
       && github.actor != 'dependabot[bot]'
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
     with:
       num_reviewers: 2
+      history_workflow: assign-reviewers.yml
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+  refresh-history:
+    if: >-
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
+    with:
+      generate_history: true
     secrets:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
+
+Pin both jobs to the same reviewed SHA. The shared caller bumper updates both
+references in this file. To keep live-only routing, omit `history_workflow`, the
+refresh job, and the schedule/manual triggers.
 
 Then ask a maintainer to add your repo to the `ASSIGN_REVIEWERS_CALLERS` roster secret.
 
@@ -78,9 +128,50 @@ The assignee write goes through the App token.
 
 | Input | Default | Notes |
 |---|---|---|
+| `generate_history` | `false` | Generate a manifest instead of assigning; only schedule/manual dispatch on the default branch is accepted. |
+| `history_workflow` | `''` | Caller workflow filename that publishes the manifest, e.g. `assign-reviewers.yml`. Empty uses live history. |
 | `reviewer_config_path` | `.github/reviewers.yml` | Where your expertise map lives. |
-| `num_reviewers` | `2` | How many people to assign. |
+| `num_reviewers` | `2` | Maximum owners (clamped to 1–10). Extra owners must add file coverage. |
 | `skip_label` | `skip-auto-assign` | Present on a PR ⇒ skip routing. |
+
+## Shared history manifest
+
+Generation is a second **job calling this same reusable workflow**, not a second
+implementation. It uses the same collector as live routing, independent of the PR
+author, author allowlist, exclusions, or reviewer map. It gathers up to 50 recent
+merged PRs on the default branch and publishes `reviewer-history-v1`, a ZIP with
+one `manifest.json` member. The JSON contains schema version, repository, base
+branch, producing run ID, refresh timestamp, and records of PR number, changed
+paths and final human approvers. Review bodies and credentials are never stored.
+
+On a cache hit, the PR job reads the manifest instead of repeating the history
+search and review/file lookups. Current changed files, ownership config, author
+and exclusions, workload, assignability, and manual assignments are still live.
+History can be up to **12 hours old**; cached evidence can include an approval
+withdrawn since refresh. This is advisory owner routing, not approval enforcement.
+The six-hour schedule tolerates a missed refresh. Artifacts expire after two days,
+so four runs daily retain about eight small snapshots, with a 2 MiB payload limit.
+
+Only successful, completed **schedule or workflow_dispatch** runs of the configured
+caller on the same repository's default branch can supply a snapshot. PR and
+workflow_run artifacts are never accepted. The reader checks repository, base,
+run identity, schema, record structure and freshness, and reads exactly one bounded
+JSON member in memory, without extracting or executing archive contents. Historical
+file lists stop at three pages; 300+ file sweeps provide no routing evidence.
+
+Absent, expired, malformed, incompatible, or inaccessible snapshots fall back to
+the live collector. Failed refreshes publish nothing; partial history is never
+saved. The run log reports cache hit/run ID/age or why live lookup was needed.
+Non-default-base PRs use live history because the shared snapshot covers only the
+default branch. Change the schema version when changing the evidence contract.
+
+After merging the caller, open its Actions page and choose **Run workflow** on the
+default branch to seed the snapshot immediately. Subsequent refreshes run on the
+schedule. Check the `Refresh reviewer history` job for the record/byte count and
+its `reviewer-history-v1` artifact, then verify that a qualifying PR reports
+`History cache hit`. Before the first refresh, assignments still work via live
+lookup. The App needs Actions read permission to download artifacts; the caller's
+ambient token remains `contents: read` and is not widened.
 
 ## Your `reviewers.yml`
 
@@ -103,6 +194,65 @@ rules:
 [This repo's own `reviewers.yml`](../../.github/reviewers.yml) is a worked example
 with commentary on how the buckets were seeded.
 
+Four dialect rules the focused parser follows, shared with the `refresh-reviewers`
+generator that writes this file: a **duplicate top-level `default_pool:` is last-wins**
+— a second one replaces the first rather than adding to it, and the run logs a warning
+rather than failing (a repeated `rules:` block is *not* covered: it still appends to the
+earlier one, with no warning, so replace a rules block in place rather than restating it);
+a **`#` starts a comment only at the start of a line or after a
+space or a tab**, so `[x#c]` is the literal login `x#c` and only `[x #c]` is a trailing
+comment; a **single leading byte-order mark is tolerated**, so a `reviewers.yml`
+saved as UTF-8-with-BOM still routes; and **a login is trimmed of spaces and tabs only**,
+so one padded by any other invisible character — a non-breaking space, a NEL, a *second*
+byte-order mark — is taken literally as part of the login by both the runtime and the
+drift generator, matches no collaborator, and will not route. Strip those characters from
+the file rather than expecting either side to absorb them.
+
+Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
+is not a valid GitHub login and will never be assigned`) whenever a login configured in
+`reviewers.yml` cannot be a GitHub login at all, rendering the offending token
+codepoint-escaped so the character is findable. Every rule's reviewers and the whole
+`default_pool` are checked on every run, including rules whose paths this PR did not
+touch — the warning reports the state of the *file*, so a rotted owner does not stay
+hidden until some later PR happens to change that area. Being warned about is not being
+routed to: an unmatched rule's owners are still never assigned. It is deliberately silent about a
+configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
+since that is normal and would otherwise fire on nearly every run.
+
+One consequence of trimming spaces and tabs only: a line whose sole content is some
+*other* invisible character is no longer a blank line, and indentation counts spaces, so
+at column 0 it ends the block above it — inside `rules:` that discards every rule after
+it. Both ports behave identically here and the corpus pins it. The run no longer leaves
+you to guess, though: it **warns**, naming the file and the line number and rendering the
+line's content codepoint-escaped so the character is findable —
+
+```
+::warning::reviewers.yml: line 3 is not a recognised top-level key (\u00a0) — it ends the `default_pool:` block above it, and every list item or rule indented below it is dropped; only `default_pool:` and `rules:` are read, and at column 0 one invisible character (e.g. U+00A0) ends a block exactly like a misspelled key does
+```
+
+A misspelled or unsupported top-level key truncates the block identically and gets the
+same warning. A **near miss** — a line that names a supported key without opening one —
+gets its own:
+
+```
+::warning::reviewers.yml: line 1 is not a recognised top-level key (\u0085default_pool: [alice]) — it is not the supported `default_pool:` key, so the whole block it opens is ignored; that key is read only at column 0 with nothing but spaces before it and a space, a tab or the end of the line after its colon
+```
+
+That covers a stray character before the key (which is not indentation, so the key reads
+as column 0 and falls through) as well as `rules:v2:` — valid YAML for a key *named*
+`rules:v2` — and `default_pool:[alice]`, which YAML reads as a plain scalar rather than a
+mapping. Both of the latter used to be silently accepted **as** the supported key.
+
+What does *not* warn is as deliberate. A column-0 line that breaks nothing is silent: a
+`---` or `...` document marker (yamllint's default `document-start` rule requires the
+former, so a conformant config has one), a `version:`-style key before the first block,
+and a stray key between two complete blocks all leave every later `default_pool:`/`rules:`
+parsing. So are the orphaned items *below* a stray line, and every indented fallthrough
+line. One annotation per thing actually broken is the signal — otherwise a tab-indented
+config (indentation counts spaces, so every item reads as column 0) or a zero-indented
+block sequence would spend GitHub's ~10-annotation-per-step budget on the symptoms and
+bury the cause.
+
 ## Gotchas
 
 **Dependabot PRs need the same skip as forks, for a different reason.** They are
@@ -117,10 +267,8 @@ Hence `&& github.actor != 'dependabot[bot]'` in the guard above.
 `pull_request` event withholds repository secrets from fork-originated runs, so
 `CLOUD_CODE_BOT_PRIVATE_KEY` arrives empty and the App-token mint hard-fails — a
 red check and no routing either way. Hence the `if:` guard in the caller above; a
-skipped job reports as neutral instead. Routing forks would mean
-`pull_request_target`, which runs privileged against untrusted head code while
-this workflow reads `.github/reviewers.yml` from the head SHA — that combination
-turns the expertise map into a real escalation path, so it is not offered.
+skipped job reports as neutral instead. The base-SHA configuration read does not
+change this caller contract; fork routing through `pull_request_target` is not offered.
 [`ci-assign-reviewers.yml`](../../.github/workflows/ci-assign-reviewers.yml) in
 this repo is the worked example.
 
@@ -134,17 +282,50 @@ guessed at. After setting it, confirm on a real PR that the run logs
 variable rather than emptying it to whitespace — both work, but an unset variable
 is the unambiguous "no scoping" state.
 
-**A matched bucket does not fall back to `default_pool`.** `default_pool` is
-consulted only when *no* rule matched the changed paths. The author is dropped
-**after** that choice, so a rule whose reviewer list is just the PR author matches,
-yields a one-person candidate set, loses that person to the author-drop, and ends
-at `No eligible candidates after exclusions — nothing to assign`. It never reaches
-`default_pool`. Write each bucket with at least one member who is not the usual
-author of changes in those paths.
+## How selection works
 
-**`default_pool` must never be one person** — and must not be whoever opens most
-PRs in the repo. When it *is* used (no rule matched), the same author-drop applies,
-so a single-member pool that happens to be the author assigns nobody.
+1. Read the expertise map at the PR's **base SHA**. Routing changes in a PR apply
+   only after merge. Match current paths and original paths of renamed files.
+   A matching rule defines the eligible roster for that file.
+2. Look at up to **50 recently updated merged PRs in the last 90 days**, targeting
+   the same base branch. Only human approvals from members, owners, or
+   collaborators count. The last decisive review state must be APPROVED;
+   dismissed approvals and later change requests do not count. One approval of
+   the exact file is evidence; directory-only inference needs two separate PRs
+   and a shared directory at least two levels deep. History refines the roster
+   for mapped files and discovers eligible owners for unmapped files.
+3. Rank by newly covered files. Each file has equal weight except recognizable
+   generated files, vendored/build output, and lockfiles, which count one tenth.
+   Among equal coverage, prefer owners below the optional load cap, then stronger
+   approval evidence, then lower load, then login for a stable tie. Load counts
+   open PRs assigned to the person in **this repository**, excluding their own
+   PRs. The repository-scoped app cannot reliably measure the whole organization.
+4. Confirm the chosen user can be assigned, then repeat only for uncovered files
+   up to `num_reviewers`. A second person must cover something new.
+
+If no rule and no credible historical evidence match, assign **one** member of
+`default_pool`, clearly identified as a low-confidence fallback. A matched rule
+whose entire roster is excluded does **not** fall back to unrelated people.
+Keep at least two people in each rule and fallback pool so authorship/exclusions
+leave an eligible owner. The PR author and `REVIEWER_EXCLUDE` are always removed,
+case-insensitively, tolerating a leading `@`.
+
+History is a bounded sample, not a complete ownership database. Huge historical
+PRs (300+ files) are ignored as weak routing evidence. Directory proximity is a
+heuristic, not proof of semantic expertise; maintain explicit rules for areas
+where that distinction matters. Older or less frequently reviewed areas may
+still use the configured fallback. Use the summary to improve those rules.
+
+If history fails, discard partial history and use the configured map. Failed or
+incomplete load queries remain **unknown**, never zero. An incomplete current
+file list skips routing. An unavailable assignability check skips that candidate.
+
+Existing non-author assignees or requested reviewers/teams suppress routing.
+The reusable serializes assignment per PR and rechecks live assignments, draft,
+closed/skip-label state, head SHA and base target immediately before writing. Manual changes
+made during the analysis are respected; a push during analysis skips the stale
+selection. There is still a small race with unrelated external writers after the
+last read because GitHub's assignment API has no conditional-write operation.
 
 **Globs are the durable part; names are not.** People change teams. Write bucket
 globs deliberately and expect the roster inside them to churn.

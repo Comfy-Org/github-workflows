@@ -20,6 +20,7 @@ Standard library only (no third-party deps), matching this repo's Python convent
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import NamedTuple
 
@@ -97,6 +98,101 @@ def parse_actor_list(raw: str) -> list[str]:
     return [part.strip().lower() for part in (raw or "").split(",") if part.strip()]
 
 
+# ── path exemption (`exempt-paths`) ─────────────────────────────────────────────────────
+# A DELIBERATE SUBSET of GitHub's filter-pattern grammar. Only `*` and `**` are wildcards:
+#
+#   **   zero or more of any character, INCLUDING `/`
+#   *    zero or more characters, EXCLUDING `/`
+#
+# Everything else — `?`, `[]`, `+`, `.` — is matched LITERALLY. GitHub's own `paths` grammar
+# additionally reads `?` and `+` as postfix quantifiers on the preceding character, which is
+# the opposite of what a reader who knows shell globbing expects; supporting a half-remembered
+# quantifier in a MERGE-GATE WAIVER is how a pattern silently matches more than its author
+# meant. So the grammar here is small enough to hold in your head, and every limitation in it
+# fails toward NOT exempt — an under-matching pattern leaves the ticket requirement in force,
+# which is the safe direction. `!` negation is rejected outright rather than matched literally,
+# because treating `!foo` as a literal path would invert the author's intent in silence.
+#
+# Consequence worth knowing: `**` is translated positionally, so `a/**/b.yaml` requires both
+# slashes literally and does NOT match `a/b.yaml`. Prefer the `a/**` form, which is what a
+# directory exemption actually wants.
+_PATH_PATTERN_TOKEN_RE = re.compile(r"\*\*|\*|[^*]+")
+
+
+def parse_path_list(raw: str) -> list[str]:
+    """Parse the caller's comma-separated ``exempt-paths`` input into path patterns.
+
+    Empty/whitespace-only input -> ``[]``, which DISABLES the path exemption entirely (the
+    default: every existing caller behaves exactly as it did before this input existed).
+
+    Raises ValueError — rejecting the whole run as a caller misconfiguration — on an empty
+    entry, a duplicate, an absolute pattern, a `..` segment, or a leading `!`. Note this is
+    STRICTER than ``normalize_team_keys``, which tolerates a stray ``BE,,ENG`` empty field:
+    an empty entry there narrows nothing, whereas this input is a merge-gate WAIVER and a
+    stray comma is the shape of a half-finished edit. A waiver list runs under exactly what
+    the caller wrote or it does not run at all.
+    """
+    if not (raw or "").strip():
+        return []
+    patterns: list[str] = []
+    for part in raw.split(","):
+        pattern = part.strip()
+        if not pattern:
+            raise ValueError("empty path pattern (a stray or trailing comma)")
+        if pattern.startswith("!"):
+            raise ValueError(
+                f"negated path pattern is not supported: {pattern!r}")
+        if pattern.startswith("/"):
+            raise ValueError(
+                f"path pattern must be repo-relative, not absolute: {pattern!r}")
+        if ".." in pattern.split("/"):
+            raise ValueError(f"path pattern must not contain a '..' segment: {pattern!r}")
+        if pattern in patterns:
+            raise ValueError(f"duplicate path pattern: {pattern!r}")
+        patterns.append(pattern)
+    return patterns
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_path_pattern(pattern: str) -> re.Pattern:
+    """Translate one pattern into an anchored regex. Cached: a PR can carry 1000s of files."""
+    parts = []
+    for token in _PATH_PATTERN_TOKEN_RE.findall(pattern):
+        if token == "**":
+            parts.append(".*")
+        elif token == "*":
+            parts.append("[^/]*")
+        else:
+            parts.append(re.escape(token))
+    return re.compile("".join(parts))
+
+
+def path_matches_any(path: str, patterns: list[str]) -> bool:
+    """True iff ``path`` matches at least one pattern, whole-string."""
+    if not path:
+        return False
+    return any(_compile_path_pattern(p).fullmatch(path) for p in (patterns or []))
+
+
+def all_paths_exempt(paths: list[str], patterns: list[str]) -> bool:
+    """THE PATH EXEMPTION. True iff EVERY changed path matches at least one pattern.
+
+    Mirrors `paths-ignore` semantics: a PR touching one config file and one Go file is NOT
+    exempt, because the Go file alone is the kind of change the ticket gate exists for.
+
+    Two ways this deliberately returns False:
+
+    * no patterns  — the exemption is disabled (the empty default), so nothing is exempt.
+    * no paths     — "every path matches" is VACUOUSLY true over an empty list, and an empty
+                     list is reachable (an empty branch, a fully-reverted PR, and, if a caller
+                     ever loses the over-cap guard in validate.py, a truncated read). Waiving a
+                     merge gate on a vacuous truth is not a waiver anyone asked for.
+    """
+    if not patterns or not paths:
+        return False
+    return all(path_matches_any(path, patterns) for path in paths)
+
+
 def filter_issues(nodes: list[dict], team_keys: list[str], require_open: bool) -> list[str]:
     """THE GATE. Identifiers of the linked issues that satisfy policy, sorted unique.
 
@@ -166,6 +262,11 @@ def select_failure_category(infra_error: bool, linked: int, referenced: int) -> 
     * exists_not_linked — no link, but an identifier was REFERENCED in branch/title/body.
     * no_candidate      — no link and no identifier referenced anywhere.
 
+    NOT every category lives here: ``changed_files_unavailable`` is decided by validate.py
+    before Linear is queried at all (the path exemption could not be evaluated), so it is
+    passed straight to ``finish_fail`` and never flows through this selector. It still needs
+    copy in every table below, which is what the surface-coverage test pins.
+
     The boundary between the last two is whether an identifier was referenced at all; the
     batched diagnostic lookup (count_resolved_candidates) only enriches the DETAIL line, it
     does not move the category — so the copy can never say "no identifier detected" while the
@@ -199,6 +300,15 @@ _GUIDANCE = {
         "policy — every linked issue is either in a completed/canceled state or belongs to a "
         "team this check does not accept. Link an issue from an accepted team that is not "
         "closed, or move the existing issue back to an open state."
+    ),
+    "changed_files_unavailable": (
+        "This check could not be completed because the PR's changed-file list could not be "
+        "read completely, and this repository configures a path-based exemption "
+        "(`exempt-paths`) that is decided from that list. A partial list could waive the "
+        "ticket requirement for a PR that actually carries code, so it fails closed instead. "
+        "This is an infrastructure error, not a verdict on your ticket. Re-run the check; a "
+        "PR whose changed-file count is past GitHub's 3000-file API ceiling will keep failing "
+        "until it is split, so contact the repository owners if that is what you are seeing."
     ),
     "infra_error": (
         "This check could not be completed because Linear could not be queried "
@@ -256,6 +366,7 @@ _STATUS_HEADLINE = {
     "exists_not_linked": "Referenced Linear issue is not linked yet",
     "policy_mismatch": "Linked Linear issue fails this repo's policy",
     "infra_error": "Could not verify — Linear could not be queried",
+    "changed_files_unavailable": "Could not verify — the PR's changed-file list is unreadable",
 }
 
 # Appended to the marker comment whenever the check is red but warn-only, so nobody reads the
@@ -282,6 +393,14 @@ _ADVISORY_TAIL = {
     "infra_error": (
         " This run could not reach Linear, so there is nothing to fix on the PR itself: re-run "
         "the check, and if it keeps failing contact the repository owners."
+    ),
+    # Same shape: the changed-file read is repository infrastructure, and the one case the
+    # author CAN act on (a PR past the 3000-file ceiling) is not fixed by linking a ticket
+    # either — it is fixed by splitting the PR.
+    "changed_files_unavailable": (
+        " This run could not read the PR's changed-file list, so there is nothing to fix by "
+        "linking a ticket: re-run the check, and if it keeps failing contact the repository "
+        "owners (a PR past GitHub's 3000-file API ceiling has to be split)."
     ),
 }
 _ADVISORY_TAIL_DEFAULT = (

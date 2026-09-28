@@ -65,8 +65,9 @@ on:
     types: [labeled, unlabeled]
 
 concurrency:
-  # cursor-review declares no group of its own, so a caller-level group is safe
-  # and worth having — it stops label-toggling from stacking panels.
+  # KEEP THIS. The reusable owns a group of its own (see "The reusable owns a
+  # group of its own" below), but it refines yours rather than replacing it.
+  # Never name a caller group `cursor-review-reusable-*`.
   # NOTE: label.name is part of the key only because this caller is label-only.
   # Drop it if you widen `types:` — see the run_without_label gotcha.
   group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
@@ -112,7 +113,7 @@ pull-requests: write   # posting the consolidated review
 | `extra_generated_globs` | `**/node_modules/**`<br>`**/dist/**`<br>`**/vendor/**`<br>`**/*.generated.*`<br>`**/*.min.js`<br>`**/*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — kept out of **both** the size-budget count and the reviewed diff. Passing your own value **replaces** the default list, so re-state the entries you still want — **copy them verbatim**, `**/…/**` and all: a pattern with no `/` matches only the *base name*, so a bare `node_modules` matches a file literally named `node_modules` and excludes nothing under the directory; and conversely a pattern that *does* contain a `/` is anchored to the whole repo-relative path unless it opens with `**/`, so `data/gen.json` matches only the root-level file and misses `packages/x/data/gen.json`. These are plain globs, **not** git pathspecs — never carry a `:!` prefix over from `diff_excludes` (see that row). `.claude` is deliberately **not** in the default: hand-authored agent instructions are prose worth reviewing. A repo whose `.claude/` tree is vendored/tool-installed output (a BMAD-method install, say) should pass the defaults above plus `**/.claude/**` — otherwise that tree now counts toward `diff_size_cap`, and a PR over the cap is skipped silently (no review comment, no Slack notice). |
 | `extra_lockfiles` | `''` | Extra dependency-lockfile base names, on top of the classifier's built-ins. |
 | `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff **only** (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. Each entry must carry git pathspec-magic (`:!**/foo/**` or `:(exclude)**/foo/**`); the value is word-split into `git diff … -- . <entries>`, so a plain path is OR'd with `.` and excludes nothing. **Migrating:** this input used to exclude from *both* the count and the diff. If your caller lists generated paths here, move them to `extra_generated_globs` — left here they still leave the reviewed diff but are now counted, which can push the PR over `diff_size_cap`. **Strip the `:!` / `:(exclude)` prefix on the way over:** `extra_generated_globs` takes plain globs, not pathspecs, and the classifier compiles each token literally — a verbatim `:!**/vendor/**` becomes the anchored regexp `^:!(?:.*/)?vendor/.*$`, which matches no repo-relative path, so the exclusion silently vanishes from both the count and the diff (only `extra_lockfiles` validates its entries). Write `**/vendor/**`. |
-| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose. The review prompts and scripts load from this ref at run time. Each job that checks them out carries its own `Require a pinned workflows_ref` step and fails fast on an empty or omitted value — but treat that as a backstop, not a guarantee: a job the label gate skips never evaluates it, and the `Prior-review ledger` job is deliberately exempt (it must never fail the run, since the review matrix `needs:` it) and falls back instead of erroring. |
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose. The review prompts and scripts load from this ref at run time. Each job that checks them out carries its own `Require a pinned workflows_ref` step and fails fast on an empty value **and on a value that differs from the commit `uses:` resolved to** (`job.workflow_sha`, which the runner computes from the `uses:` pin, so a caller cannot set it); a runner too old to supply `job.workflow_sha` warns and skips that comparison rather than failing. But treat the whole step as a backstop, not a guarantee: a job the label gate skips never evaluates it, and the `Prior-review ledger` job is deliberately exempt (it must never fail the run, since the review matrix `needs:` it) — it falls back instead of erroring, and downgrades the same mismatch to a `::warning::`. |
 | `bot_app_id` | `''` | Post as your App. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
@@ -142,6 +143,12 @@ the label. Add `synchronize` to `types:` if you want every push re-reviewed (and
 see the spend warning below).
 
 **An over-cap PR gets no review, and now says so.** When the counted diff exceeds `diff_size_cap` the panel is skipped and the run still goes green — nothing about it is a failure. So the skip announces itself in three places instead: a `::warning::` annotation and a step-summary block on the *Diff size check* job (both credential-free, so they still show on Dependabot PRs, whose runs can't read Actions secrets), plus a sticky PR comment naming the counted total and the cap. Get the PR under the cap and **re-apply the label** — with the label-gated caller above a push alone starts no run — and that comment flips to ✅. The comment posts as your bot app when `bot_app_id` + `BOT_APP_PRIVATE_KEY` are set and as `github-actions[bot]` otherwise, so it works out of the box; if the write fails it degrades to the annotation and the summary and the job log says why. The comment path is best-effort throughout — it never reddens the run. Note that **fork PRs get neither half**: the gate skips a cross-repo head before the size check runs, so a fork PR is skipped for being a fork, whatever its size. **Under `blocking: true` an over-cap PR does not go green** — the Blocking gate holds it red, because diff size is author-controlled and "too big to review" is not evidence a PR is clean; see [the blocking-gate gotchas](#blocking-gate-gotchas).
+
+**The "hunks new since round N" block is always a subset of the diff being reviewed.** From round 2 onward the panel prompt carries a second block — the hunks new since the last reviewed commit — introduced as "the subset of the diff above". It is derived from two PR patches — the diff the previous round actually reviewed, taken against the merge base *that* round recorded (see the next note), versus the reviewed diff this round is running on — each of which is a diff against a merge base and so contains only your branch's own changes, and every section it shows is copied verbatim out of the reviewed diff. It can therefore never contain a hunk your PR does not carry — in particular, merging the base branch into your branch no longer drags that branch's commits into the block (BE-15558; the old `git diff LAST_REVIEWED...HEAD` formulation did, because with a merge commit at HEAD the merge base of those two commits *is* `LAST_REVIEWED`). A pure rebase, which shifts line numbers without changing a hunk, produces no block at all rather than re-flagging the whole PR.
+
+**A retargeted PR gets one round with no block, on purpose.** Each consolidated review that actually reviewed something now carries a hidden *round sentinel* recording the commit it reviewed and the merge base it was diffed against (a round that failed outright, or in which every reviewer errored, records none — so the round after it takes the fail-closed path below), and the next round rebuilds the "already reviewed" side against **that recorded merge base** rather than recomputing one from your PR's current base (BE-15598). It has to: change the PR's base branch — or rewrite that branch — and the recomputed merge base moves, so everything your branch inherited from the old base appears on both sides and hunks the panel has never seen are quietly subtracted as already reviewed. That loss is invisible to the subset check below, since a block that is merely too small is still a subset. So the step **fails closed** instead: when there is no usable recorded merge base — the previous round predates this change, its sentinel did not parse, or the recorded commit is unreachable or no longer an ancestor of the reviewed commit — the *Diff size check* job logs which case it hit (`No recorded merge base for round N …` / `Recorded merge base … is unreachable or not an ancestor …`) and the panel simply reviews the full diff with no prioritization block. Nothing is skipped and no finding is suppressed. Every open PR sees exactly one such round after this rolls out, because the round it is comparing against was posted before the sentinel existed; the block comes back on the round after that.
+
+The block is verified after it is built, and **discarded whole if the check fails**. If you see `::warning::Incremental diff discarded: it was not a subset of the reviewed diff (<n> foreign file(s), <a> vs <b> lines).` on the *Diff size check* job, it means some section of the block was not carried **byte for byte** by the reviewed diff — a file it does not have, or a hunk that did not match verbatim — or the block came out longer than it, and the whole thing was thrown away: the panel reviewed the **full diff alone**, which is always correct — it just lost the hint about where to spend budget first. Nothing was skipped and no finding was suppressed. The job also reports this as its `incremental_subset` output, which is `false` only in that discard case.
 
 **Dependabot PRs are not covered by the fork skip.** Dependabot's branches live in
 the base repo, so the gate's cross-repo check treats them as ordinary PRs — but
@@ -175,7 +182,9 @@ on:
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
 
 concurrency:
-  # Drop `label.name` from the key — see below.
+  # KEEP THIS — it is what supersedes a running panel on push; the reusable's
+  # own group only does that under `run_without_label: true` (see below). Drop
+  # `label.name` from the key, and never name it `cursor-review-reusable-*`.
   group: cursor-review-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 # ...
@@ -195,12 +204,44 @@ Keep `labeled`/`unlabeled` in the list even in label-free mode: the label path
 stays live alongside it, which is how you force a re-review on an unchanged commit
 (dismiss the existing review, then apply the label — see the dedupe gotcha below).
 
+**The reusable owns a group of its own — it ADDS to your caller group, it does not replace it.** `cursor-review.yml` declares a workflow-level `concurrency: cursor-review-reusable-<pr>-<slot>` with `cancel-in-progress: true`, which reaches you at your next pin bump with no caller edit and no permission change. Its slot rule: the trigger label and `skip-cursor-review` share one `trigger` slot, so **applying `skip-cursor-review` mid-panel cancels the running panel**; every other label gets its own `label-<name>` slot, so an unrelated label add never kills a running review; `pull_request_review_thread` events stay out of `trigger`, so resolving a finding thread on a blocking caller cannot cancel a panel; and under `run_without_label: true` the four plain PR actions the gate accepts (`opened` / `reopened` / `ready_for_review` / `synchronize`) join `trigger` as well, so a push supersedes a running panel and the veto label can still reach it.
+
+What it does **not** do is make your own group redundant. Keep the caller group in every shape above, and know what each side costs:
+
+- **Under the default `run_without_label: false`, the reusable's group does not supersede on push.** That arm of the `trigger` slot is gated on the input, so a `synchronize` event lands in `label-` while the label-triggered panel sits in `trigger`, and the push cancels nothing. `post-review`'s `!cancelled()` guard exists to stop a review pinned to a superseded head SHA and depends on that cancellation — so a widened or blocking caller that drops its PR-number-only group posts reviews against stale diffs, and under `blocking: true` gates red on threads for code that no longer exists.
+- **A PR-number-only caller group is coarser than the reusable's, and that is the price of the line above.** It puts *every* event for the PR in one slot, so an unrelated label add — or, on the blocking caller, a `pull_request_review_thread: resolved` — cancels the caller run, and with it the `uses:` panel job, before the reusable's per-slot group can isolate anything. The reusable's slots only refine what your own group has not already cancelled.
+
+**Two hard rules, both of them the ones [`pr-size`](pr-size.md) carries:**
+
+- **Never name a caller group `cursor-review-reusable-*`.** A caller that declares the reusable's own group deadlocks its own run — the caller holds the group while its `uses:` job waits to acquire it.
+- **Call cursor-review from a dedicated workflow file, not as one job of a larger `ci.yml`.** Cancellation is run-scoped, so the reusable's group cancels the whole caller *run* — including builds, tests and deploys that have nothing to do with the review. Unlike the deadlock rule this one arrives silently at your next pin bump, with no caller edit to warn you, so check it before you bump.
+
+**`review_label` must match your label's case exactly.** The slot expression compares it with a GitHub expression `==`, which is case-**in**sensitive, while the gate's own decision is a case-**sensitive** shell comparison. A label differing from `review_label` only in case therefore reaches the shared `trigger` slot and cancels a running panel, then no-ops in the gate — a review destroyed with nothing replacing it. GitHub expressions have no case-sensitive string compare, so the caller has to get this right.
+
+**Veto mid-flight: on a pin BELOW that change, `skip-cursor-review` does not stop a running panel.** With only a caller-level group, `labeled: skip-cursor-review` and `labeled: cursor-review` land in *different* groups (the group key carries `label.name`), so the veto starts a run that no-ops in the gate while the panel it was meant to stop keeps going — and still posts its review. Do not try to fix it caller-side by collapsing to a PR-number-only group: that does cancel on the veto, but it also puts *every* label event in one group, so adding an unrelated label kills a running review. Bump your pin past the reusable's own group instead — there is nothing to change in the caller.
+
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.
 
 ## Blocking-gate gotchas
 
 Everything in this section applies only once you pass `blocking: true`.
+
+**A mid-panel veto leaves the check's verdict racy.** Applying `skip-cursor-review`
+while a panel is running cancels that run and starts a second one, both on the
+same head SHA, and both publish a `Blocking gate` check. The cancelled run trips
+the "a fresh review was triggered but did not land" guard (`post-review` is
+`cancelled`) and reports **red**; the veto run has `should_run=false`, skips that
+guard, falls through to the live thread query and reports **green** unless an
+earlier round left unresolved threads. Which one sticks is whichever job finishes
+last, and nothing orders them. Treat a red gate straight after a veto as "re-run
+it", not as a finding: re-applying the trigger label, resolving the threads, or
+re-running the gate job settles it. The `always()` on that job is deliberate and
+is not the bug — a cancelled run that *skipped* the gate would mint a green
+required check, which is the exact fail-open BE-4691 added the job to close. Which
+verdict a vetoed PR *should* get is a policy question and is tracked separately;
+until it is settled, do not require the check on a repo where mid-panel vetoes are
+routine.
 
 **Widen your triggers before you require the check, or pushes brick the PR.**
 A required check that never *reports* on the head SHA blocks merge as
@@ -216,8 +257,12 @@ on:
     types: [resolved, unresolved]
 
 concurrency:
-  # PR number only — label.name is empty on the widened events, and split
-  # groups can't cancel each other (see the run_without_label gotcha).
+  # KEEP THIS — with `run_without_label: false` the reusable's own group does
+  # not cancel a panel on push, and this gate reports on the head SHA (see
+  # "The reusable owns a group of its own"); never name it
+  # `cursor-review-reusable-*`. PR number only — label.name is empty on the
+  # widened events, and split groups can't cancel each other (see the
+  # run_without_label gotcha).
   group: cursor-review-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 ```
@@ -238,7 +283,7 @@ are the same story: they can't run the panel (see above), so they never gate
 red.
 
 **Neither the skip label nor removing the trigger label waives the gate.**
-`skip-cursor-review` stops new panels from running; it does not resolve the
+`skip-cursor-review` stops new panels from running and cancels a running one; it does not resolve the
 threads an earlier panel already posted, and neither does taking the trigger
 label off. Once findings exist, the ways out are resolving each thread, pushing
 a fix that outdates them, or a ruleset bypass. Dismissing the review does not

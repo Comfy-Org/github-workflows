@@ -14,8 +14,11 @@ name: Linear Ticket (reusable)
 #   * the signal workflow checks out nothing, runs no PR content, emits no artifact/cache;
 #   * this validator never downloads that run's artifacts/caches and never checks out the PR
 #     branch or merge commit — it reads only GitHub-owned data and Linear's API;
-#   * every PR-derived value (branch, title, body, labels, URL) is untrusted DATA, passed
-#     through env / GraphQL variables, never shell-interpolated.
+#   * every PR-derived value (branch, title, body, labels, URL, changed-file paths) is
+#     untrusted DATA, passed through env / GraphQL variables, never shell-interpolated.
+# The `exempt-paths` changed-file lookup reads GitHub-owned metadata (the pulls/{n}/files
+# endpoint), NOT the PR branch, so it stays inside those constraints; the filenames it returns
+# are still author-controlled strings and are only ever pattern-MATCHED.
 # The job runs on the DEFAULT branch, so its job-level check must NOT be the required merge
 # check. Instead validate.sh publishes the `Linear ticket` commit status on the refetched PR
 # head SHA; branch protection requires THAT context. See docs/callers/linear-ticket.md.
@@ -80,6 +83,22 @@ on:
           carry a ticket. Opt-in and EMPTY by default — there is no built-in bot bypass; a
           repo that lists an actor here accepts that all of that account's PRs merge without a
           Linear ticket.
+        type: string
+        required: false
+        default: ''
+      exempt-paths:
+        description: >-
+          Optional comma-separated path patterns; a PR is exempt when EVERY changed file
+          matches at least one of them (mirroring `paths-ignore` semantics: one config file
+          plus one code file is NOT exempt). The hatch for config-only chores — dynamic-config
+          flips, version syncs — that come from many different authors, so neither
+          `exempt-label` (manual, per PR) nor `exempt-actors` (waives that account's real work
+          too) fits. Empty (default) disables it, leaving every existing caller byte-identical.
+          Only `*` (not across `/`) and `**` (across `/`) are wildcards; everything else is
+          literal, `!` negation is rejected, and empty/duplicate/absolute/`..` entries fail the
+          run. This is an IN-VALIDATOR exemption, deliberately not a `paths-ignore:` on the
+          signal workflow: a filtered-out signal publishes no `Linear ticket` status at all, and
+          a required context that is never published leaves the PR pending forever.
         type: string
         required: false
         default: ''
@@ -240,6 +259,7 @@ jobs:
           TEAM_KEYS: ${{ inputs.team-keys }}
           EXEMPT_LABEL: ${{ inputs.exempt-label }}
           EXEMPT_ACTORS: ${{ inputs.exempt-actors }}
+          EXEMPT_PATHS: ${{ inputs.exempt-paths }}
           REQUIRE_OPEN_ISSUE: ${{ inputs.require-open-issue }}
           ENFORCE: ${{ inputs.enforce }}
           SOFT_FAIL: ${{ inputs.soft-fail }}

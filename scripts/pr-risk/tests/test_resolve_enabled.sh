@@ -104,10 +104,27 @@ case "$SUMMARY" in
   *"This MANUAL run grades anyway"*) ok "it says the manual run will grade" ;;
   *) bad "it says the manual run will grade" "$SUMMARY" ;;
 esac
+# ...and that the OPT-IN surfaces ride along with it. `publish-check` follows the grade job rather
+# than `enabled` (see its `if:` in pr-risk.yml) and the sticky comment is posted from inside grade
+# itself, so a disabled dispatch on an opted-in caller leaves a comment and a Check Run too. A
+# summary naming only the label would understate what the run is about to write to the PR.
+case "$SUMMARY" in
+  *"post the sticky comment and the Check Run"*) ok "and that the opted-in surfaces ride along" ;;
+  *) bad "and that the opted-in surfaces ride along" "$SUMMARY" ;;
+esac
 # And it must warn that the label it leaves goes stale, since pushes will not re-grade it.
 case "$SUMMARY" in
   *"every later commit will go ungraded"*) ok "and that the label will not stay current" ;;
   *) bad "and that the label will not stay current" "$SUMMARY" ;;
+esac
+# The STICKY COMMENT goes stale the same way and must be named in that warning too. It is only
+# refreshed by a later re-grade, which a disabled repo never performs, so it keeps displaying this
+# moment's tier while every subsequent commit goes ungraded underneath it. A warning naming only
+# the label reads as though the comment were still live. (The Check Run needs no such caveat: it
+# is pinned to the commit it graded, so it never becomes untrue of that commit.)
+case "$SUMMARY" in
+  *"and the sticky comment"*) ok "and that the sticky comment goes stale with it" ;;
+  *) bad "and that the sticky comment goes stale with it" "$SUMMARY" ;;
 esac
 # The non-dispatch summary keeps its own claim, and points at the dispatch escape hatch.
 run false "" pull_request

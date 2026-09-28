@@ -1,0 +1,33 @@
+name: Test owner assignment
+
+# `.github/assign-reviewers/**` below covers parser-corpus.json, the fixture the
+# Python port in .github/refresh-reviewers/generate.py is ALSO driven from
+# (test-refresh-reviewers.yml names that file explicitly in its own filters).
+# Keep the glob: an edit to the corpus has to run both suites, or a case retuned
+# to satisfy one of the two hand-ported parsers lands green against the other.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/assign-reviewers.yml'
+      - '.github/workflows/test-assign-reviewers.yml'
+      - '.github/assign-reviewers/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/assign-reviewers.yml'
+      - '.github/workflows/test-assign-reviewers.yml'
+      - '.github/assign-reviewers/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the shipped github-script with API fixtures
+        run: node --test .github/assign-reviewers/tests/*.test.cjs
