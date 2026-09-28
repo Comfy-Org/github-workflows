@@ -12,11 +12,11 @@ class TestBuilderBounds(unittest.TestCase):
     @staticmethod
     def builder_step():
         match = re.search(
-            r"(?ms)^      - name: Run builder\n(?P<body>.*?)^      - name: Unlock the clone's \.git\n",
+            r"(?ms)^      - name: Run builder\n(?P<body>.*?)^      - name: Upload agent execution log\n",
             WORKFLOW,
         )
         if match is None:
-            raise AssertionError("groom.yml has no Run builder step followed by Unlock the clone's .git")
+            raise AssertionError("groom.yml has no Run builder step followed by Upload agent execution log")
         return match.group("body")
 
     def test_brief_requires_a_bounded_feasibility_decision_before_edits(self):

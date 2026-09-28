@@ -12,11 +12,11 @@ class TestFinderBounds(unittest.TestCase):
     @staticmethod
     def finder_step():
         match = re.search(
-            r"(?ms)^      - name: Run finder\n(?P<body>.*?)^      - name: Unlock the clone\n",
+            r"(?ms)^      - name: Run finder\n(?P<body>.*?)^      - name: Upload agent execution log\n",
             WORKFLOW,
         )
         if match is None:
-            raise AssertionError("groom.yml has no Run finder step followed by Unlock the clone")
+            raise AssertionError("groom.yml has no Run finder step followed by Upload agent execution log")
         return match.group("body")
 
     def test_finder_cli_has_turn_and_dollar_caps(self):
