@@ -97,6 +97,84 @@ echo "— is_known_area —"
 DESC="known area passes"; pass_rc is_known_area "area:gcp" "$(taxonomy_names "$GOOD")"
 DESC="unknown area fails"; fail_rc is_known_area "area:nope" "$(taxonomy_names "$GOOD")"
 
+# ── deterministic path sub-labels ─────────────────────────────────────────────
+# A taxonomy carrying both the classified labels[] and a sub_labels[] block, shaped like the
+# motivating case: a subsystem (router) that lives INSIDE another area's own service.
+SUBS_YML="$SANDBOX/subs.yml"
+cat > "$SUBS_YML" <<'YAML'
+labels:
+  - name: "area:api"
+    color: "1d76db"
+    description: "The API service"
+  - name: "area:ci"
+    color: "5319e7"
+    description: "CI workflows"
+sub_labels:
+  - name: "area:router"
+    color: "7057ff"
+    description: "Router: the model-routing layer inside the API service"
+    paths:
+      - "services/api/router*/**"
+      - "testing/e2e/router/**"
+      - "**/*router*"
+YAML
+
+echo "— taxonomy_sub_labels —"
+eq "sub_labels parse to {name, paths}" '[{"name":"area:router","paths":["services/api/router*/**","testing/e2e/router/**","**/*router*"]}]' \
+  "$(taxonomy_sub_labels "$SUBS_YML")"
+eq "absent sub_labels is an empty set, not an error" '[]' "$(taxonomy_sub_labels "$GOOD")"
+
+echo "— validate_sub_labels —"
+CLASSIFIED='["area:api","area:ci"]'
+DESC="well-formed sub_labels pass"; pass_rc validate_sub_labels "$(taxonomy_sub_labels "$SUBS_YML")" "$CLASSIFIED"
+DESC="empty set passes (no sub_labels is valid)"; pass_rc validate_sub_labels '[]' "$CLASSIFIED"
+DESC="non-area slug fails"; fail_rc validate_sub_labels '[{"name":"router","paths":["a/**"]}]' "$CLASSIFIED"
+DESC="uppercase slug fails"; fail_rc validate_sub_labels '[{"name":"area:Router","paths":["a/**"]}]' "$CLASSIFIED"
+DESC="duplicate sub-label name fails"; fail_rc validate_sub_labels '[{"name":"area:r","paths":["a"]},{"name":"area:r","paths":["b"]}]' "$CLASSIFIED"
+# The disjointness gate: a name in BOTH lists would make cleanup ambiguous (is it the
+# classified area, or an exempt sub-label?) — reject the taxonomy instead of guessing.
+DESC="name colliding with a classified label fails"; fail_rc validate_sub_labels '[{"name":"area:ci","paths":["a/**"]}]' "$CLASSIFIED"
+DESC="missing paths fails"; fail_rc validate_sub_labels '[{"name":"area:router","paths":[]}]' "$CLASSIFIED"
+DESC="blank path fails"; fail_rc validate_sub_labels '[{"name":"area:router","paths":["  "]}]' "$CLASSIFIED"
+DESC="non-string path fails"; fail_rc validate_sub_labels '[{"name":"area:router","paths":[7]}]' "$CLASSIFIED"
+
+echo "— glob_to_regex —"
+eq "* stays within one segment" '^services/[^/]*/main\.go$' "$(glob_to_regex 'services/*/main.go')"
+eq "trailing ** crosses segments" '^services/api/router[^/]*/.*$' "$(glob_to_regex 'services/api/router*/**')"
+eq "leading **/ is optional" '^(.*/)?[^/]*router[^/]*$' "$(glob_to_regex '**/*router*')"
+eq "? is one non-separator char" '^v[^/]\.go$' "$(glob_to_regex 'v?.go')"
+# shellcheck disable=SC2016  # the single quotes are the point: these are regex literals.
+eq "regex metacharacters are escaped" '^a\+b\(c\)\[d\]\{e\}\^f\$g\|h$' "$(glob_to_regex 'a+b(c)[d]{e}^f$g|h')"
+eq "a literal backslash is escaped, not dropped" '^a\\b$' "$(glob_to_regex "a\\b")"
+
+echo "— matched_sub_labels —"
+SUBS="$(taxonomy_sub_labels "$SUBS_YML")"
+eq "a router package matches" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["services/api/routerqueue/queue.go"]')"
+eq "a nested file under a router package matches" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["services/api/routerpollstate/testdata/x/y.json"]')"
+eq "**/ matches a router-named file at the repo root" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["router_notes.md"]')"
+eq "**/ matches a router-named file deep in another tree" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["services/api/server/middleware/router_auth.go"]')"
+eq "a non-router change in the same service matches nothing" "" \
+  "$(matched_sub_labels "$SUBS" '["services/api/db/schema.go","README.md"]')"
+eq "one file out of many is enough" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["README.md","testing/e2e/router/cases.d/a.json"]')"
+eq "a name is emitted once even when several paths match" "area:router" \
+  "$(matched_sub_labels "$SUBS" '["services/api/routerqueue/a.go","testing/e2e/router/b.json"]')"
+eq "an empty sub_labels set matches nothing" "" "$(matched_sub_labels '[]' '["anything.go"]')"
+# Two sub-labels, so the taxonomy-order + multi-match behavior is pinned, not implied.
+TWO='[{"name":"area:router","paths":["services/*/router*/**"]},{"name":"area:sdk","paths":["sdk/**"]}]'
+eq "several matches come back in taxonomy order" "area:router
+area:sdk" "$(matched_sub_labels "$TWO" '["sdk/go/client.go","services/api/routerqueue/a.go"]')"
+
+echo "— sub_labels_json / desired_suffix —"
+eq "matched names become a JSON array" '["area:router"]' "$(sub_labels_json "area:router")"
+eq "no match is an empty array, not [\"\"]" '[]' "$(sub_labels_json "")"
+eq "suffix renders the full end state" " + area:router" "$(desired_suffix '["area:router"]')"
+eq "suffix is empty when nothing matched" "" "$(desired_suffix '[]')"
+
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

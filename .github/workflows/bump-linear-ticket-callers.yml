@@ -43,6 +43,11 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and read by the PREFLIGHT step alone (BE-10008): before it
+  # honors a `Skip-caller-bump: true` trailer, the guard reads this fleet's own
+  # Actions run history to check no earlier watched change is still owed a bump.
+  # It stays well ahead of the org-wide write token minted further down.
+  actions: read
 
 concurrency:
   group: bump-linear-ticket-callers
@@ -79,6 +84,11 @@ jobs:
             scripts/linear-ticket/lib.py
             scripts/linear-ticket/validate.py
           NEW_SHA: ${{ github.sha }}
+          # Read-only ambient token, for the owed-bump probe's `actions: read`
+          # history lookup only (BE-10008). Never a write credential: the
+          # Cloud Code Bot token is minted after — and only if — this step says
+          # proceed. Absent, the probe reads as "cannot determine" and bumps.
+          GH_TOKEN: ${{ github.token }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

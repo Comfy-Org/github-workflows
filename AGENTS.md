@@ -33,8 +33,10 @@ for t in <dir>/tests/*.sh; do bash "$t" || { echo "FAILED: $t"; break; }; done
 (cd scripts/check-pr-size && [ -z "$(gofmt -l .)" ] && go vet ./... && go test ./...)
 
 # Repo-wide lints that take a target rather than a suite:
-python3 .github/workflow-pins/check_workflow_pins.py   # no reusable may default `workflows_ref`
+python3 .github/workflow-pins/check_workflow_pins.py   # `workflows_ref` + every `uses:` SHA
 python3 .github/agents-md-integrity/check_agents_md.py --root .
+# org repo literal allowlist lint (whole tree, not path-filtered) + its shellcheck
+shellcheck -x .github/lint/check-org-repo-literals.sh && bash .github/lint/check-org-repo-literals.sh
 ```
 
 ## Layout
@@ -48,11 +50,15 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   multi-model panel + judge). `catalog-drift.py` reads the model pins *out of*
   `cursor-review.yml` — never duplicate that model list.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
-  this AGENTS.md standard, and the lint forbidding a `default:` on
-  `workflows_ref` / requiring the empty-ref guard at every checkout.
+  this AGENTS.md standard, and the lint forbidding a `default:` on `workflows_ref`,
+  requiring the empty-ref guard at every checkout, and SHA-pinning every `uses:`.
 - `.github/public-repo-hygiene/` — the leak checker + the org-wide known-public
   allowlist it default-denies against. Never make that allowlist a workflow input:
   one a caller can pass is one a PR in that repo can widen.
+- `.github/lint/` — `check-org-repo-literals.sh` + `org-repo-allowlist.txt`, the
+  repo-LOCAL lint behind `test-org-repo-literals.yml` (BE-8192): the repo-name
+  subset of `public-repo-hygiene`, which this repo cannot adopt as a caller
+  because it is that checker's HOME (its fake-private fixtures live here).
 - `.github/groom/` — the finder/verifier/builder briefs behind `groom.yml`, plus
   `ledger.py` (dedup), `interval.py` (cadence), `scope.py` (path containment) and
   `agent-sandbox.sh` (the credential boundary). `package.json` installs nothing: it
@@ -93,9 +99,15 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   not variables (BE-6472): a variable passed via a step's `env:` prints unmasked in
   the env dump Actions emits *before* the step, too early for the bumper's masking.
   Keep private repo paths and detail out of workflow files, commits, and PR text.
-- **Pin everything by full commit SHA**, with a trailing `# v1` comment — both the
-  `uses:` in callers and every third-party action here. Bare `@v1` fails the
-  pin-validation (`pinact`, `zizmor`) that consumer CI runs.
+  **CI-enforced (BE-8192) for tracked file contents only**:
+  `test-org-repo-literals.yml` fails any org-prefixed repo literal in the tracked
+  tree whose name is not on `.github/lint/org-repo-allowlist.txt`, so publishing
+  a name is an allowlist edit review sees. Commit messages, PR text and BARE
+  names stay with review (a denylist would leak).
+- **Pin everything by full commit SHA**, with a trailing `# v1` comment — callers'
+  `uses:` and every third-party action here. Bare `@v1` fails the pin-validation
+  (`pinact`, `zizmor`) consumers run and `check_workflow_pins.py` here (BE-15255);
+  Dependabot only ever narrows a tag to a tag, so it never fixes one for you.
 - **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
   lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
   unenforced for `workflow_call` (omitted → `''` → checkout takes the default
@@ -153,3 +165,4 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
 - [`.github/groom/README.md`](.github/groom/README.md) — briefs, ledger, cadence, the CLI pin.
 - [`.github/public-repo-hygiene/README.md`](.github/public-repo-hygiene/README.md) — the leak guard + its limits.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
+- [`.github/lint/README.md`](.github/lint/README.md) — the org-repo-literal allowlist lint + how to add a name.

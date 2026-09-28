@@ -178,7 +178,7 @@ if [ "$NFILES" -lt 2 ]; then
   emit fallback "this pull request changes $NFILES file(s) — there is nothing to partition"
 fi
 # `-s`, not `-f`: a zero-byte diff file is a read that failed quietly (a followed redirect returns
-# 200 with an empty body — grade-targets.sh's `fetch_override` documents the same trap), and asking
+# 200 with an empty body — `../pr-risk/lib.sh`'s `fetch_override` documents the same trap), and asking
 # the model to partition a diff it never saw returns a confident, evidence-free plan.
 if [ "$OVERSIZED" = 1 ] || [ -z "$DIFF_FILE" ] || [ ! -s "$DIFF_FILE" ]; then
   emit fallback "the diff is too large to plan against (or could not be read), so no partition was proposed. The v0 reducibility readout on the risk grade still names which files hold the tier up and what the remainder would floor at."

@@ -357,6 +357,22 @@ class PreAgentFailureTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([finder_job("failure")]))
         self.assertFalse(interval.run_audited([finder_job("failure", [])]))
 
+    def test_failed_sandbox_preflight_before_the_agent_is_not_a_spent_audit(self):
+        # BE-14756: the sandbox bring-up is its OWN step ("Preflight the sandbox"),
+        # placed BEFORE "Run finder". A no-agent-budget bring-up failure fails that
+        # step, so "Run finder" is never reached and the API reports it
+        # queued/skipped — which must NOT count as a spent audit. The preflight
+        # step is named DISTINCTLY from the billed step, so the exact-name matcher
+        # ignores it and only the (unstarted) agent step decides the verdict.
+        preflight_failed = {"name": "Preflight the sandbox", "status": "completed",
+                            "conclusion": "failure"}
+        queued = finder_job("failure", [pre_agent_step(conclusion="success"), preflight_failed,
+                                        agent_step(status="queued", conclusion=None)])
+        self.assertFalse(interval.run_audited([queued]))
+        skipped = finder_job("failure", [pre_agent_step(conclusion="success"), preflight_failed,
+                                         agent_step(conclusion="skipped")])
+        self.assertFalse(interval.run_audited([skipped]))
+
     def test_failure_after_the_agent_step_completed_IS_a_spent_audit(self):
         # The half that must NOT regress: a run that paid for the agent and then
         # died at a later step (the JSON assert, the artifact upload) still counts,
@@ -471,6 +487,15 @@ class PreAgentFailureTest(unittest.TestCase):
         step = finder_block[0].split(f"- name: {interval.agent_step_name()}\n", 1)[1]
         step = step.split("\n      - name:", 1)[0]
         self.assertNotRegex(step, r"(?m)^\s+if:\s", "the pinned agent step must not be conditional")
+
+        # BE-14756 + BE-14771: the sandbox bring-up (`--preflight-only`) and the
+        # pre-exec guard wall (`--validate-only`) are both no-spend, and both run in
+        # a SEPARATE, distinctly-named step that PRECEDES this one — so a failure in
+        # either never stamps "Run finder" failed, and `agent_step_started` reads it
+        # as unstarted rather than as a spent audit. Nothing in THIS module changes
+        # (the exact-name match is what keeps that step uncounted), and the structure
+        # is not audit_find-specific, so it is pinned once for all three agent jobs
+        # in SandboxPreflightHoistTest below rather than a second time here.
 
     def test_the_gate_job_is_time_bounded(self):
         # The gate walks run history (and, for re-run entries, per-attempt job
@@ -867,6 +892,127 @@ class FetchValidationTest(unittest.TestCase):
     def test_bad_workflow_file_rejected(self):
         with self.assertRaises(ValueError):
             interval.fetch_workflow_runs("o/r", "ci-groom", run=make_gh_stub([], {}))
+
+
+
+# Every groom job that runs an agent inside the jail: (job key, billed step name).
+# `audit_find`'s is the one `interval.py` matches by name; the other two are
+# structurally identical and hoist the same guards for the same reason.
+_AGENT_JOBS = (
+    ("audit_find", "Run finder"),
+    ("audit_verify", "Run verifier"),
+    ("build", "Run builder"),
+)
+
+_PREFLIGHT_STEP = "Preflight the sandbox"
+
+# The mount-shaping arguments of an `agent-sandbox.sh` invocation. `--env` and the
+# `-- <command>` are deliberately excluded — validate-only refuses a command, and
+# every --env key in groom.yml is a literal, so the KEY=VALUE guard cannot fire
+# from this caller.
+_MOUNT_ARGS = r"--(?:clone|clone-mode|out-dir|uds|ro-file)\s+\S+"
+
+
+def _job_block(text, job):
+    """The `job:` block of groom.yml, as text.
+
+    Matched as text rather than parsed — PyYAML is not stdlib and this repo is
+    stdlib-only, so a parse would add a CI dependency for a structural pin.
+    """
+    blocks = re.split(r"(?m)^  (?=[A-Za-z_][A-Za-z0-9_-]*:\s*$)", text)
+    blocks = [b for b in blocks if b.startswith(f"{job}:")]
+    assert len(blocks) == 1, f"could not isolate the {job} job in groom.yml"
+    return blocks[0]
+
+
+def _step_body(block, name):
+    """The body of the `- name: <name>` step inside a job block."""
+    body = block.split(f"- name: {name}\n", 1)[1]
+    return body.split("\n      - name:", 1)[0]
+
+
+def _invocation(block, start):
+    """The mount arguments of ONE `bash ... agent-sandbox.sh ...` call at `start`.
+
+    Continuation lines until the first that does not end in a backslash.
+    """
+    lines = []
+    for line in block[start:].split("\n"):
+        lines.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    return re.findall(_MOUNT_ARGS, "\n".join(lines))
+
+
+class SandboxPreflightHoistTest(unittest.TestCase):
+    """BE-14756 + BE-14771, pinned for EVERY agent job, not just the billed one.
+
+    `agent-sandbox.sh`'s pre-exec work — the mutating bring-up (`--preflight-only`)
+    and the wall of fail-loud guards (`--validate-only`) — is no-spend. Run from
+    inside a billed `Run <agent>` step, a failure there stamps that step failed
+    having billed nothing, which `interval.py` reads as a STARTED (spent) audit.
+    Both phases therefore live in a separate, distinctly-named step that precedes
+    it. `interval.py` only matches `audit_find`'s step by name, but the verifier
+    and builder hoist the same guards for the same reason and are equally able to
+    drift — and they carry the longer `--ro-file` lists and the only
+    `--clone-mode rw-git-ro`, whose `.git`-pointer guard is the one most likely
+    to kill those jobs no-spend.
+    """
+
+    def setUp(self):
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            self.text = f.read()
+
+    def test_the_preflight_step_precedes_every_billed_agent_step(self):
+        self.assertNotEqual(_PREFLIGHT_STEP, interval.agent_step_name())
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                self.assertEqual(block.count(f"- name: {agent_step}\n"), 1)
+                self.assertEqual(block.count(f"- name: {_PREFLIGHT_STEP}\n"), 1)
+                self.assertLess(
+                    block.index(f"- name: {_PREFLIGHT_STEP}\n"),
+                    block.index(f"- name: {agent_step}\n"),
+                    f"{job}: the sandbox preflight step must come BEFORE the billed agent step",
+                )
+
+    def test_both_no_spend_phases_run_off_the_billed_step(self):
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                preflight = _step_body(block, _PREFLIGHT_STEP)
+                billed = _step_body(block, agent_step)
+                # Match the INVOCATION, not the flag name: both flags are discussed
+                # in the steps' own comments, so a bare substring check would pass
+                # on the prose alone and keep passing after the command was deleted.
+                self.assertIn('agent-sandbox.sh" --preflight-only', preflight, job)
+                self.assertIn('agent-sandbox.sh" --validate-only', preflight, job)
+                # And neither phase may run inside the billed step: the whole point
+                # is that they fail somewhere interval.py does not count.
+                self.assertNotIn('agent-sandbox.sh" --validate-only', billed, job)
+                self.assertNotIn('agent-sandbox.sh" --preflight-only', billed, job)
+
+    def test_validate_only_mirrors_the_invocation_its_job_actually_runs(self):
+        # A `--ro-file` (or a `--clone-mode`) added to `Run <agent>` but not to the
+        # preflight call leaves that path unvalidated until the BILLED step dies on
+        # it — precisely the miscount the hoist exists to prevent. The step comments
+        # say "KEEP THE TWO LISTS IN SYNC"; a comment is not a guard.
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                preflight = _step_body(block, _PREFLIGHT_STEP)
+                billed = _step_body(block, agent_step)
+                validated = _invocation(
+                    preflight, preflight.index('agent-sandbox.sh" --validate-only')
+                )
+                executed = _invocation(billed, billed.index('agent-sandbox.sh"'))
+                self.assertTrue(validated, f"{job}: no mount arguments found on the --validate-only call")
+                self.assertEqual(
+                    validated,
+                    executed,
+                    f"{job}: the --validate-only arguments must mirror the billed agent step's",
+                )
 
 
 if __name__ == "__main__":

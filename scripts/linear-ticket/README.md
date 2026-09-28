@@ -30,6 +30,36 @@ author types is not a link. So:
 - "Any issue remains" is the pass rule: a PR linked to several tickets passes when at least
   one linked issue satisfies policy.
 
+The three **exemptions** (`exempt-label`, `exempt-actors`, `exempt-paths`, all opt-in and all
+empty by default) are the only other way to a green check. They short-circuit *before* the
+Linear query — so an exempt PR spends no token budget and does not depend on Linear being
+reachable — and every one of them exits through the shared `finish_exempt()`, which PUBLISHES a
+green `Linear ticket` status rather than skipping it. That is the whole point of doing the path
+exemption here instead of as a `paths-ignore:` on the consumer's signal workflow: a filtered-out
+signal publishes no status at all, and a required context that is never published leaves the PR
+pending forever.
+
+`exempt-paths` specifically (`lib.parse_path_list` / `lib.all_paths_exempt`):
+
+- Exempt only when **every** changed path matches at least one pattern — `paths-ignore`
+  semantics. One config file plus one Go file is not exempt.
+- **Zero** changed paths is NOT exempt: "every path matches" is vacuously true over an empty
+  list, and that list is reachable (an empty or fully-reverted branch).
+- The pattern grammar is a deliberate SUBSET of GitHub's: `**` crosses `/`, `*` does not,
+  everything else is literal. `!` negation and empty/duplicate/absolute/`..` entries fail the
+  run. Every limitation under-matches, and under-matching leaves the requirement in force.
+- The changed-file list comes from `GET /repos/{owner}/{repo}/pulls/{number}/files`
+  (GitHub-owned metadata, paginated at 100/page; no PR branch is checked out). Filenames are
+  author-controlled strings and are only ever pattern-matched. A **rename** contributes both
+  its new path and its `previous_filename`, so code cannot be moved into an exempt directory to
+  buy the exemption.
+- That endpoint caps at **3000 files and truncates silently**, so a read at or past the cap —
+  or a failed/malformed one — raises `ChangedFilesUnavailable` and fails the check closed as
+  `changed_files_unavailable`, never as a partial list declared fully matched. "Malformed"
+  includes a length that **disagrees with the PR payload's own `changed_files` count** (a list
+  that is merely short reads exactly like a complete one once the dropped entry is the
+  non-exempt path) and any entry that is not an object carrying string paths.
+
 ## Security & failure model
 
 - Runs in the **privileged `workflow_run` job**; every PR-derived value is untrusted DATA

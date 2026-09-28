@@ -65,6 +65,11 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and read by the PREFLIGHT step alone (BE-10008): before it
+  # honors a `Skip-caller-bump: true` trailer, the guard reads this fleet's own
+  # Actions run history to check no earlier watched change is still owed a bump.
+  # It stays well ahead of the org-wide write token minted further down.
+  actions: read
 
 # Serialize runs of this fleet. The bumper now pushes to a STABLE branch
 # (ci/bump-pr-size) shared across runs, so two overlapping runs (a rapid second
@@ -130,6 +135,43 @@ jobs:
             .github/workflows/pr-size.yml
             scripts/check-pr-size
             :(exclude)scripts/check-pr-size/*_test.go
+          # Every file whose ABSENCE breaks a pinned caller at run time. The
+          # directory above can never be the decommission probe on its own, and this
+          # tree survives differently from the rest of the fleet's: it holds no
+          # README.md and no `tests/`, so what keeps it resolving after main.go,
+          # size.go and go.mod are deleted is precisely the `*_test.go` pair the
+          # filter above deliberately excludes. Name the Go build inputs the
+          # "Build check-pr-size" step compiles instead — `go build .` needs every
+          # non-test source in the package, and go.mod is read twice (setup-go's
+          # go-version-file, then the build). The tests are NOT listed, and the
+          # reason is the FIRST rule, not the exclusion above: no pinned caller ever
+          # runs `go test`, so a missing `*_test.go` breaks nothing at run time.
+          # Listing one would not re-import that churn — WATCHED_EXEC is a
+          # presence-only decommission probe and takes no part in the staleness
+          # comparison (that is WATCHED_PATHSPECS), so an entry here can only ever
+          # read as `tip_gone`, never turn a skip into a bump. What it WOULD buy is
+          # a false-decommission freeze the day a test is deleted. Do not prune the
+          # `:(exclude)` line above on the belief this input covers churn: it does
+          # not.
+          # NOTE these are literal paths: a rename that is not mirrored here reads as
+          # a decommission and no-ops the fleet behind a `::warning::`, so rename them
+          # in this list in the same commit. test_paths_contract.sh asserts every
+          # entry is a tracked file, so forgetting turns that silent freeze into a red
+          # PR — including the case where only ONE of the two byte-identical
+          # scripts/check-pr-size blocks is updated.
+          # Those lines are byte-identical to the ones in
+          # bump-cursor-review-callers.yml, which builds the same tool from the same
+          # pin — keep the two in step.
+          WATCHED_EXEC: |
+            .github/workflows/pr-size.yml
+            scripts/check-pr-size/go.mod
+            scripts/check-pr-size/main.go
+            scripts/check-pr-size/size.go
+          # Read-only ambient token, for the owed-bump probe's `actions: read`
+          # history lookup only (BE-10008). Never a write credential: the
+          # Cloud Code Bot token is minted after — and only if — this step says
+          # proceed. Absent, the probe reads as "cannot determine" and bumps.
+          GH_TOKEN: ${{ github.token }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

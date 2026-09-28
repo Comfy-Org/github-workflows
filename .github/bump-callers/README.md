@@ -27,14 +27,14 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
-| [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/`, `README.md` and `catalog-drift.py`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` (minus its `tests/` and `README.md`, which no caller executes) | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` (minus its `tests/`, `README.md` and `schema_drift.py`, which no caller executes) | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-pr-derisk-callers.yml`](../workflows/bump-pr-derisk-callers.yml) | `pr-derisk.yml`, `scripts/pr-derisk/**` **or `scripts/pr-risk/**`** (minus both `tests/` and `README.md`) — a `/derisk` run executes the pr-risk grader as well as the planner, so a grader change is consumer-visible on this fleet too | `PR_RISK_CALLERS` **(shared — filtered to `ci-pr-derisk.yml`)** | **may select nothing** (no callers enrolled yet — flip `ALLOW_EMPTY` to `false` with the first enrolment) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` (minus its `tests/` and `README.md`, which no caller executes) | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-area-label-callers.yml`](../workflows/bump-area-label-callers.yml) | `pr-area-label.yml` or `scripts/area-label/**` (minus its `tests/` and `README.md`, which no caller executes) | `AREA_LABEL_CALLERS` | empty `[]` (grows as callers land) |
@@ -88,6 +88,7 @@ the filenames literally) and `cursor-review` does not.
 |---|---|---|
 | `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
 | `assign-prs-to-author.yml` | 0 | Same. |
+| `refresh-reviewers.yml` | 0 | Ships a consumer caller guide but no external caller has enrolled yet. Add a fleet + `REFRESH_REVIEWERS_CALLERS` roster once the first one lands; until then a consumer's `uses:`/`workflows_ref` pin is bumped by hand. |
 
 A reusable that has callers but no fleet is the trap this whole directory exists
 to prevent: the pins simply never move, so consumers drift behind indefinitely
@@ -185,10 +186,12 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
-| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-derisk`, `pr-size` and `cursor-review` |
-| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` and `pr-derisk` need this today** |
+| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by every fleet whose `paths:` filter carries a `!` exclusion (see the table above) |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Every fleet whose `WATCHED_ASSETS` entry is a DIRECTORY needs it** — that is all ten of the asset-watching fleets today; only the three that watch nothing beyond `WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it unset |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
+| `GITHUB_EVENT_NAME`, `GITHUB_EVENT_PATH`, `GITHUB_REPOSITORY`, `GITHUB_WORKFLOW_REF` | also provided by Actions to every step, no wiring needed — read only by the `Skip-caller-bump` gate and the owed-bump check below. Absent or unparseable is never an error; both fail open toward bumping |
+| `GH_TOKEN` | the ambient, read-only `${{ github.token }}`, wired into the preflight step's `env:` alongside an `actions: read` permission. The **only** credential this script uses, and it is minted long before the org-wide write token the bump step needs. Read only by the owed-bump check; unset means that check reads "cannot determine" and bumps |
 
 `WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
 repo-relative paths, not the globs from the `paths:` filter** —
@@ -280,10 +283,12 @@ trigger is covered by the comparison — for `agents-md-integrity`
 (`.github/agents-md-integrity/**`), `cursor-review` (`.github/cursor-review/**`),
 `groom` (`.github/groom/**`) and `pr-size` (`scripts/check-pr-size/**`) that
 includes the asset directory the reusable loads its prompts/scripts/briefs from at
-run time. (`pr-risk` is multi-path too, but its filter also carries `:(exclude)`
-entries that `WATCHED_ASSETS` cannot express, so its comparison is
-`WATCHED_PATHSPECS` — it still *sets* `WATCHED_ASSETS`, for a different reason;
-see the note below.) Compare `WATCHED` alone on one of those and a commit touching
+run time. (Every fleet whose `paths:` filter *also* carries a `!` exclusion — read
+the "Triggers on" column of the table above rather than a list here, which is what
+went stale last time — has a comparison that `WATCHED_ASSETS` cannot express, so
+its comparison is `WATCHED_PATHSPECS`; it still *sets* `WATCHED_ASSETS`, for a
+different reason; see the note below.)
+Compare `WATCHED` alone on one of those and a commit touching
 only the assets reads as "unchanged", so callers get pinned to a tip whose other
 relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
@@ -393,14 +398,41 @@ Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
 `test_paths_contract.sh` measures the tree for exactly this and fails the build
-the day it becomes true, so it cannot happen quietly.
+the day it becomes true, so it cannot happen quietly. What makes that the day is
+the trigger: `test-bump-callers.yml` runs on any change under `.github/**` or
+`scripts/**` (#302), so the measurement fails the PR that CREATES the divergence
+rather than some unrelated later one — and the contract test asserts that filter
+covers every fleet's positive `paths:` entry, so a fleet that ever watches a tree
+outside those two fails there instead of quietly losing its trigger.
+
+Three things to know about the scope of the glob-flatness measurement itself:
+
+* It applies to **glob exclusions only.** A `/**` *directory* exclusion
+  (`!scripts/pr-risk/tests/**`) selects the whole subtree in both syntaxes at
+  every depth, so it cannot diverge this way and is deliberately not measured,
+  subdirectories and all. `?` and `[…]` **are** globs on both sides and are
+  measured like `*` — git's `?` crosses `/` too.
+* It measures the whole **path**, not the basename, because that is what git
+  does: `:(exclude)x/test_*.sh` drops `x/test_dir/b.sh` (its `*` spans `dir/b`)
+  and keeps `x/sub/test_a.sh` (no literal `x/test_` prefix). So a prefix-anchored
+  exclusion is held to git's rule, not to a basename's.
+* A shape it cannot decide is reported **unmeasured**, not clean — a glob in the
+  directory half (`!x/*/tests/**` genuinely can diverge), a directory absent from
+  the tree, or a literal *directory* (`!x/tests` matches only a file named that,
+  while `:(exclude)x/tests` drops the subtree — write `!x/tests/**`). A failed
+  walk is a hard failure, never a pass.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
 excludes `scripts/check-pr-size/*_test.go`, since a pinned caller builds and runs
 that tool and never runs `go test`, so a test-only commit would otherwise mint a
-token and fan a pure-churn bump PR to every consumer. `pr-risk` needs both — and
-they are what let it move onto this script instead of keeping its own guard:
+token and fan a pure-churn bump PR to every consumer. The second is **not** a
+pr-risk speciality: *every* fleet whose `WATCHED_ASSETS` entry is a directory
+needs it, because a directory outlives the files inside it — all ten of the
+asset-watching fleets set it today, and only the three that watch nothing beyond
+`WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it
+unset. `pr-risk` needs both — and they are what let it move onto this script
+instead of keeping its own guard:
 
 - Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
   no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
@@ -411,17 +443,67 @@ they are what let it move onto this script instead of keeping its own guard:
   nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
   the input rules above). It compares two trees and walks no history, so it
   composes with the deepening but does not need it.
-- Its decommission surface is the three grader scripts a caller executes, not the
-  directory holding them: a commit deleting the graders while leaving `tests/` and
-  the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
-  caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
-  they are probed at the tip (before the staleness test, so a deletion warns rather
-  than reading as "a newer commit has its own run") and again in this run's tree —
-  the latter only when the run was *not* re-pointed, since a re-point makes that
-  same tip the SHA callers are pinned to and this checkout no longer the thing
-  worth probing.
+- Its decommission surface is the grader scripts and data files a caller executes,
+  not the directory holding them: a commit deleting the graders while leaving
+  `tests/` and the README behind satisfies a `-d scripts/pr-risk` probe and would
+  bump every caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those
+  files, and they are probed at the tip (before the staleness test, so a deletion
+  warns rather than reading as "a newer commit has its own run") and again in this
+  run's tree — the latter only when the run was *not* re-pointed, since a re-point
+  makes that same tip the SHA callers are pinned to and this checkout no longer the
+  thing worth probing.
 
-Every other fleet leaves both unset and behaves exactly as before.
+That second half generalises, and every asset-watching fleet now applies it. The
+survivors differ per tree but the hole is identical: `.github/groom`,
+`.github/cursor-review`, `.github/agents-md-integrity`, `.github/coderabbit-config`
+and `.github/public-repo-hygiene` are each kept alive by `tests/` and `README.md`,
+while `scripts/check-pr-size` has neither and is kept alive by the very
+`*_test.go` files the `pr-size` / `cursor-review` filters exclude. Three rules
+when you write one of these lists:
+
+- **The test is "absence breaks a pinned caller at run time", not "is it an
+  executable".** A prompt or brief a consumer loads from the pinned ref qualifies
+  (`prompt-judge.md`, `finder.md`), and so does a data file resolved beside the
+  script (`risk-map.v0.json`, `schema.v2.json`) or a manifest a step fails closed
+  on (`.github/groom/package.json`). A `README.md` and anything under `tests/` does
+  not.
+- **Do not list a file no pinned caller loads**, even one that lives in the watched
+  directory and is genuinely executed *here* — `catalog-drift.py`,
+  `schema_drift.py` and `wire-bot-identity.py` all run out of this repo's own
+  checkout. Listing one turns its retirement into a `::warning::` that freezes the
+  whole fleet: a false decommission, the mirror of the false-healthy bump the input
+  exists to stop. `bump-pr-derisk-callers.yml` records the same call for
+  `apply-risk-label.sh`. `catalog-drift.py` and `schema_drift.py` are now also
+  negated out of their fleets' `paths:` filters (and mirrored into
+  `WATCHED_PATHSPECS`), so a commit touching only one of them does not fan a
+  no-op bump either, while `wire-bot-identity.py` stays *watched* — the bumper
+  itself executes it and rewrites `wire_bot`-flagged callers with its output, so
+  a wiring-logic change really does change caller files.
+- **A path that stops resolving is a silent freeze, so it is machine-checked.**
+  These are ~50 hand-written literal paths and preflight.sh probes each one for
+  deletion, so a typo — or a rename applied to the tree but not to this list, or
+  to only one of the two byte-identical `scripts/check-pr-size` blocks — makes the
+  fleet take the decommission branch on every future run: one `::warning::`,
+  `proceed=false`, a green run, and no caller bumped again. `test_paths_contract.sh`
+  asserts every entry is a tracked file at that commit, sits under a watched
+  surface, and that no fleet watching a DIRECTORY leaves the input unset — so all
+  three now fail the PR instead of the fleet. Rename or retire a listed file in the
+  SAME commit as the list edit, and the check will tell you when you have not.
+- **An exclusion that stops resolving is the opposite failure, and is checked in
+  the same place.** git ignores a `:(exclude)` matching nothing without a word, so
+  a rename applied to the tree but to neither list leaves the `paths:` negation and
+  its `WATCHED_PATHSPECS` mirror carrying the same stale path and agreeing
+  perfectly about it — the renamed file falls back into the watched surface and the
+  fleet quietly resumes the no-op bumps the exclusion was added to stop. That one
+  over-watches rather than under-verifying, so it can never produce an *unsafe*
+  bump and preflight.sh does NOT error on it at run time (that would trade churn
+  for a full fleet outage); `test_paths_contract.sh` resolves every exclusion
+  against the tree instead, failing the PR that does the renaming.
+
+The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
+exactly as before — `test_paths_contract.sh` grants them exactly that exemption,
+since preflight.sh probes `WATCHED` unconditionally and a `.yml` file is its own
+probe.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 
@@ -619,14 +701,49 @@ to widen it — but logs a **distinct** line first saying the hand-off is
 *unverified*, so a fleet that quietly stopped bumping leaves a trace of which of
 the two happened.
 
-**Known limit.** A bump run is also the *catch-up* for an earlier watched change
-whose own run never bumped — one that failed at the token mint or inside
+**The owed-bump check.** A bump run is also the *catch-up* for an earlier watched
+change whose own run never bumped — one that failed at the token mint or inside
 `bump-callers.sh`, was cancelled, or never started because a `paths:` filter is
-evaluated against only the first 300 changed files of a push. Declining here
-declines that catch-up too, and nothing in the push payload can see it; the
-hand-off guard covers only the concurrent-run case, which is the one the
-preflight *can* observe. Until that is closed, keep trailered pushes small and
-reach for `workflow_dispatch` if a fleet looks behind.
+evaluated against only the first 300 changed files of a push. Declining on a
+trailer used to decline that catch-up too, and nothing in the push *payload* can
+see it (the hand-off guard covers only the concurrent-run case). So before the
+trailer is honored, `fleet_owes_bump` looks somewhere the payload cannot: this
+fleet's own **Actions run history** — the same `actions: read`, no-new-secret,
+fail-open pattern `.github/groom/interval.py` uses for its cadence gate.
+
+1. **Find the left endpoint.** From `GITHUB_WORKFLOW_REF` and
+   `GITHUB_REPOSITORY`, list this workflow's successful runs on `main`, newest
+   first, one bounded page, and take the first whose job carries a step named
+   exactly **`Bump SHA in caller repos`** with conclusion `success`. That step is
+   `skipped` on a declined run and `success` on a real bump, which is the entire
+   discriminator; every entrypoint spells it identically and
+   `test_paths_contract.sh` fails the build if one stops. `push` and
+   `workflow_dispatch` runs both count — a dispatch recovery bump is as much of a
+   catch-up as a push one. The endpoint is that run's `head_sha`, not the SHA it
+   pinned: a re-pointed run had already proved its surface unchanged up to its
+   pin target, so the difference can only *add* commits to the range below.
+2. **Walk that range to `HEAD`**, restricted to the watched surface (the same
+   pathspecs the staleness comparison uses, so an excluding fleet keeps its
+   exclusions), and check each commit's message with the one shared trailer
+   definition. **Per commit, not as a content diff** — that is what lets an
+   earlier, legitimately-skipped trailered push keep being excused by its own
+   trailer instead of poisoning every later skip.
+3. **Any untrailered watched commit refuses the skip**, with a `::notice::`
+   naming the oldest one: *catch-up owed for `<sha>`, whose own run never
+   bumped.*
+
+The check can only ever **narrow** a skip. Every indeterminate answer — no `gh`
+or `jq`, an Actions API error, no qualifying run inside the scan bound, a failed
+deepening fetch, a left endpoint that is not an ancestor of `HEAD`, a range past
+the sanity bound — bumps, and none of them fails the run.
+
+**Residual, deliberately.** The scan reads one bounded page of recent runs, so a
+fleet whose last real bump has aged out of that page — or out of the Actions
+run-retention window entirely — reads as "cannot determine" and bumps. That is
+status-quo churn (the behavior before the trailer existed), never pin drift. The
+same is true of a fleet whose preflight step loses `actions: read` or its
+`GH_TOKEN`: the trailer quietly stops being honored, which is why the contract
+test asserts all three.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
