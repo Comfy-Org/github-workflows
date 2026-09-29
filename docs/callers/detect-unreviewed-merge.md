@@ -66,6 +66,7 @@ Read-only on your repo. The issue write happens on the tracking repo via the PAT
 | Input | Default | Notes |
 |---|---|---|
 | `approval-mode` | `latest-per-reviewer` | Which historical approvals count. Pick deliberately — see below. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ### Choosing `approval-mode`
 

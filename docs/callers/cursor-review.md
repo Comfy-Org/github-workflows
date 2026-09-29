@@ -118,6 +118,7 @@ pull-requests: write   # posting the consolidated review
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ## Gotchas
 

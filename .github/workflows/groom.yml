@@ -653,6 +653,19 @@ on:
         type: string
         required: false
         default: ''
+      runs_on:
+        description: >-
+          JSON-encoded runs-on value for every job in this workflow. The
+          default '"ubuntu-latest"' (a JSON string) keeps every caller on
+          GitHub-hosted runners, so nothing moves unless a caller opts in. A
+          private repository can pass a self-hosted label, e.g.
+          '"my-runner-label"' or '["self-hosted", "linux"]'. A public
+          repository should keep the default, because its pull requests run
+          code from anyone. Parsed with fromJSON, so the value MUST be valid
+          JSON. Same contract as the input on cursor-review-auto-label.yml.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -708,7 +721,7 @@ env:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # The one job here that had no bound. It is meant to be cheap — a handful of
     # `gh api` reads — but its cost is data-dependent: the interval gate walks up
     # to `_MAX_RUNS_SCANNED` runs and, for any that were re-run by hand, up to
@@ -761,9 +774,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -1131,8 +1144,9 @@ jobs:
         # pin from the default branch, i.e. exactly the bug this step exists to
         # fix. The populated accessor is the `job` context one added in runner
         # v2.334.0 (Apr 2026): "the commit SHA of the workflow file that defines
-        # the current job". Every job here is `ubuntu-latest`, which is always on
-        # a current runner; only a stale self-hosted runner would see it empty, so
+        # the current job". Every job here defaults to `ubuntu-latest`, which is
+        # always a current runner; only a stale self-hosted runner (a `runs_on`
+        # override) would see it empty, so
         # the resolve step below re-checks and WARNS rather than assuming.
         #
         # Sparse and gated on `should_run` for the same reason the resolve step is —
@@ -1282,7 +1296,7 @@ jobs:
     name: "Audit — finder${{ needs.gate.outputs.path != '' && format(' (scoped: {0})', needs.gate.outputs.path) || '' }}"
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1304,9 +1318,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -1836,7 +1850,7 @@ jobs:
     name: Audit — verifier
     needs: [gate, audit_find]
     if: needs.gate.outputs.should_run == 'true' && needs.audit_find.outputs.have_candidates == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1858,9 +1872,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -2307,7 +2321,7 @@ jobs:
     name: Select + dedup
     needs: [gate, audit_verify]
     if: needs.gate.outputs.should_run == 'true' && needs.audit_verify.outputs.have_findings == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # Optional caller-side gate on the bot App key: '' (the default) binds no
     # environment, so existing callers are unaffected. Bound ONLY by the jobs
     # that mint the bot token — never by the agent jobs, which run a model over
@@ -2358,9 +2372,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -2537,7 +2551,7 @@ jobs:
     name: File findings
     needs: [gate, build_select]
     if: needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_file == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # Optional caller-side gate on the bot App key: '' (the default) binds no
     # environment, so existing callers are unaffected. Bound ONLY by the jobs
     # that mint the bot token — never by the agent jobs, which run a model over
@@ -2571,9 +2585,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -2791,7 +2805,7 @@ jobs:
     name: Build patch
     needs: [gate, build_select]
     if: needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -2815,9 +2829,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
@@ -3371,7 +3385,7 @@ jobs:
     # index. Each successfully-built finding still opens its PR; a build cell that
     # never uploaded its result simply fails its own build_pr cell (fail-fast off).
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_build == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # Optional caller-side gate on the bot App key: '' (the default) binds no
     # environment, so existing callers are unaffected. Bound ONLY by the jobs
     # that mint the bot token — never by the agent jobs, which run a model over
@@ -3417,9 +3431,9 @@ jobs:
         # Actions expands an unknown context property to '' rather than erroring,
         # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
         # loading mutable briefs and scripts into a job that holds the caller's
-        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
-        # `ubuntu-latest`, which is always current, so only a stale self-hosted
-        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here
+        # defaults to `ubuntu-latest`, which is always current, so only a stale
+        # self-hosted runner (a `runs_on` override) can trip this. (BE-8077, the same shape as cursor-review.yml's
         # BE-5546 guard for the required-input case.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}

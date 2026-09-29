@@ -160,6 +160,7 @@ job-level detail.
 | `require-open-issue` | `true` | Reject a linked issue whose Linear `state.type` is `completed`/`canceled`. `backlog`/`unstarted`/`started`/`triage` pass. |
 | `enforce` | `true` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported; the diagnosis is identical either way. Warn-only is not a promise the job always exits `0` — a broken *run* still does (a failed terminal status write, a missing token/repo, malformed `team-keys`, a non-`pull_request` trigger). |
 | `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `Linear ticket` is not a required status in your ruleset. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `Linear ticket` context while `enforce: false` — required + soft-fail would block merges. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ## Why `exempt-paths` is an in-validator exemption and not a `paths-ignore` filter
 

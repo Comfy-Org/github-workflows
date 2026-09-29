@@ -40,6 +40,19 @@ on:
         type: string
         required: false
         default: latest-per-reviewer
+      runs_on:
+        description: >-
+          JSON-encoded runs-on value for every job in this workflow. The
+          default '"ubuntu-latest"' (a JSON string) keeps every caller on
+          GitHub-hosted runners, so nothing moves unless a caller opts in. A
+          private repository can pass a self-hosted label, e.g.
+          '"my-runner-label"' or '["self-hosted", "linux"]'. A public
+          repository should keep the default, because its pull requests run
+          code from anyone. Parsed with fromJSON, so the value MUST be valid
+          JSON. Same contract as the input on cursor-review-auto-label.yml.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
     secrets:
       UNREVIEWED_MERGES_TOKEN:
         description: Fine-grained PAT with issues:write on Comfy-Org/unreviewed-merges
@@ -51,7 +64,7 @@ permissions:
 
 jobs:
   detect:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     steps:
       - name: Check for unreviewed merge
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

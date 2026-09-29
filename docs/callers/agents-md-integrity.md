@@ -68,6 +68,7 @@ contents: read
 | `require_codeowners` | `false` | Require a CODEOWNERS DRI for `AGENTS.md`. |
 | `agents_file` | `AGENTS.md` | Override the filename. |
 | `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose; the run fails fast (`Require a pinned workflows_ref` step) if omitted or empty. The checker script loads from this ref. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ## The `CLAUDE.md` shim
 

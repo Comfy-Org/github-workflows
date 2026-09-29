@@ -562,6 +562,19 @@ on:
         type: boolean
         required: false
         default: false
+      runs_on:
+        description: >-
+          JSON-encoded runs-on value for every job in this workflow. The
+          default '"ubuntu-latest"' (a JSON string) keeps every caller on
+          GitHub-hosted runners, so nothing moves unless a caller opts in. A
+          private repository can pass a self-hosted label, e.g.
+          '"my-runner-label"' or '["self-hosted", "linux"]'. A public
+          repository should keep the default, because its pull requests run
+          code from anyone. Parsed with fromJSON, so the value MUST be valid
+          JSON. Same contract as the input on cursor-review-auto-label.yml.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
 
 permissions:
   contents: read
@@ -574,7 +587,7 @@ jobs:
   # variable, and must never be the thing that touches a PR.
   gate:
     name: Resolve enablement
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # 10, not 5: the ancestry guard below makes two unauthenticated fetches, each up to 3
     # attempts at a 40s wall-clock cap plus 15s of backoff (~135s), sequentially — ~270s worst
     # case before the tool checkout even starts. 5 minutes left no margin for that plus runner
@@ -785,7 +798,7 @@ jobs:
       needs.gate.outputs.enabled == 'true' ||
       github.event_name == 'workflow_dispatch'
     name: Grade PR risk
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 30
     outputs:
       # The RENDERED Check Run payloads, one per target. Rendering happens HERE — in the job with
@@ -1148,7 +1161,7 @@ jobs:
       inputs.check_run &&
       !cancelled()
     name: Publish the risk Check Run
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       checks: write         # the ONLY new grant this workflow can ask for, and only when opted in

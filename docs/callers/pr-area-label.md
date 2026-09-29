@@ -95,6 +95,7 @@ declares `pull-requests: write`, so a short grant fails the whole run with an op
 | `model` | `claude-opus-4-8` | Classifier model. |
 | `pr_number` | `''` | For a manual dispatch: the PR to classify. Empty on push/PR runs; a dispatch with no number runs a full label sync. |
 | `dry_run` | `false` | Classify and log the decision without applying. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ## Taxonomy shape
 
