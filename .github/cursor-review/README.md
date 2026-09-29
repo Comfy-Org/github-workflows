@@ -285,6 +285,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
+| `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for every job. A private repo can pass a self-hosted runner label; a public repo should keep the default. |
 
 ### `workflows_ref` must equal the `uses:` pin
 

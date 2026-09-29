@@ -133,6 +133,7 @@ The assignee write goes through the App token.
 | `reviewer_config_path` | `.github/reviewers.yml` | Where your expertise map lives. |
 | `num_reviewers` | `2` | Maximum owners (clamped to 1–10). Extra owners must add file coverage. |
 | `skip_label` | `skip-auto-assign` | Present on a PR ⇒ skip routing. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. A private repo can pass a self-hosted runner label for every job; a public repo should keep the default. |
 
 ## Shared history manifest
 
