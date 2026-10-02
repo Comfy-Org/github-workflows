@@ -9,6 +9,9 @@ Detects a PR merged **without prior approval** and opens a tracking issue in
 This is SOC 2 compliance evidence: the control is "changes are reviewed", and this
 is the detective control that catches exceptions.
 
+Only approvals submitted by GitHub users whose account type is not `Bot` satisfy
+the control. Bot reviews still run normally, but cannot mask a missing human review.
+
 It reports; it does not block. Blocking is branch protection's job.
 
 ## Prerequisites
