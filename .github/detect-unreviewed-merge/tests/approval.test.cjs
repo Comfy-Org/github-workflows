@@ -11,15 +11,22 @@ const workflowPath = path.resolve(
 function workflowScript() {
   const workflow = fs.readFileSync(workflowPath, 'utf8')
   const marker = '          script: |\n'
-  const start = workflow.indexOf(marker)
-  assert.notEqual(start, -1, 'workflow github-script block must exist')
+  const starts = []
+  for (
+    let start = workflow.indexOf(marker);
+    start !== -1;
+    start = workflow.indexOf(marker, start + marker.length)
+  ) {
+    starts.push(start)
+  }
+  assert.equal(starts.length, 1, 'workflow must contain exactly one github-script block')
 
-  return workflow
-    .slice(start + marker.length)
-    .split('\n')
-    .filter((line) => line === '' || line.startsWith('            '))
-    .map((line) => line.slice(12))
-    .join('\n')
+  const lines = []
+  for (const line of workflow.slice(starts[0] + marker.length).split('\n')) {
+    if (line.trim() !== '' && !line.startsWith('            ')) break
+    lines.push(line.slice(12))
+  }
+  return lines.join('\n')
 }
 
 async function runDetector({ approvalMode, reviews, justification = null }) {
@@ -117,6 +124,18 @@ const botApproval = {
   submitted_at: '2026-10-02T11:45:10Z',
   user: { login: 'coderabbitai[bot]', type: 'Bot' },
 }
+const unattributedApproval = {
+  id: 3,
+  state: 'APPROVED',
+  submitted_at: '2026-10-02T11:45:20Z',
+  user: null,
+}
+const humanChangesRequested = {
+  id: 4,
+  state: 'CHANGES_REQUESTED',
+  submitted_at: '2026-10-02T11:45:30Z',
+  user: { login: 'human-reviewer', type: 'User' },
+}
 
 for (const approvalMode of ['latest-per-reviewer', 'any-approval']) {
   test(`${approvalMode}: a human approval satisfies the control`, async () => {
@@ -138,5 +157,21 @@ for (const approvalMode of ['latest-per-reviewer', 'any-approval']) {
       'needs-review',
       'repo:comfyui_frontend',
     ])
+  })
+
+  test(`${approvalMode}: an unattributed approval creates a tracker issue`, async () => {
+    const result = await runDetector({
+      approvalMode,
+      reviews: [unattributedApproval],
+    })
+    assert.equal(result.createdIssues.length, 1)
+  })
+
+  test(`${approvalMode}: a bot approval cannot override a human rejection`, async () => {
+    const result = await runDetector({
+      approvalMode,
+      reviews: [botApproval, humanChangesRequested],
+    })
+    assert.equal(result.createdIssues.length, 1)
   })
 }

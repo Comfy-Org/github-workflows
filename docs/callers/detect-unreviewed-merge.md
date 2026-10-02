@@ -9,8 +9,10 @@ Detects a PR merged **without prior approval** and opens a tracking issue in
 This is SOC 2 compliance evidence: the control is "changes are reviewed", and this
 is the detective control that catches exceptions.
 
-Only approvals submitted by GitHub users whose account type is not `Bot` satisfy
-the control. Bot reviews still run normally, but cannot mask a missing human review.
+Only approvals submitted by accounts GitHub classifies as `User` satisfy the control.
+Bot, app, organization, mannequin, and unattributed reviews still run normally, but
+cannot mask a missing human review. Automation using a human-classified machine user
+is indistinguishable from a person through this API and must be governed separately.
 
 It reports; it does not block. Blocking is branch protection's job.
 
@@ -76,7 +78,7 @@ Read-only on your repo. The issue write happens on the tracking repo via the PAT
   new commits"* enabled. A dismissed approval does **not** count, matching what
   branch protection actually enforced.
 - **`any-approval`** — for private repos **without** stale-dismissal. Any
-  historical `APPROVED` counts.
+  historical `APPROVED` review from a GitHub `User` account counts.
 
 Getting this backwards produces audit noise in one direction or false confidence
 in the other. Check the repo's branch-protection settings, then pick.
