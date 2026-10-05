@@ -305,6 +305,24 @@ on:
         type: boolean
         required: false
         default: false
+      approve_max_severity:
+        description: >-
+          Opt-in auto-approve. '' (default) → off: the bot never approves or
+          requests changes. `medium`, `low` or `nit` → after a round, the bot
+          APPROVES (pinned to the reviewed commit) when every finding is at or
+          below that severity, and REQUESTS CHANGES when any finding is above
+          it. Any other value fails the run. No approval when the judge did not
+          adjudicate, a panel reviewer did not complete, the review did not land
+          as threads, the head moved mid-run, or an earlier critical/high thread
+          is still open. A caller that sets this must also deliver
+          `synchronize`, so a push dismisses the bot's earlier review. Pass a
+          repo variable (e.g. `vars.CURSOR_APPROVE_MAX_SEVERITY`) to flip it
+          without a PR. The approval only counts where the approving identity
+          can satisfy the ruleset — see APPROVER_TOKEN and
+          docs/callers/cursor-review.md.
+        type: string
+        required: false
+        default: ''
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -314,6 +332,13 @@ on:
         required: false
       BOT_APP_PRIVATE_KEY:
         description: PEM private key matching the bot_app_id input. Required only when bot_app_id is set.
+        required: false
+      APPROVER_TOKEN:
+        description: >-
+          Optional token for approve_max_severity's reviews (approve, request
+          changes, dismiss). Use a user account's token where the ruleset needs a
+          CODE OWNER approval — a GitHub App cannot be a code owner. Absent → the
+          bot_app_id identity, else github-actions[bot].
         required: false
 
 concurrency:
@@ -2969,6 +2994,149 @@ jobs:
               --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
+
+      - name: Auto-approve decision
+        # Opt-in (inputs.approve_max_severity). Runs only after `Post review`
+        # succeeded, so the decision is about a review that is on the PR. All of
+        # the fail-closed rules live in auto-approve.py (see its docstring); this
+        # job checks out no PR code, so the PR cannot rewrite the logic judging it.
+        if: ${{ inputs.approve_max_severity != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN || steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
+          DELIVERED: ${{ steps.post.outputs.delivered }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" decide \
+            --threshold "$THRESHOLD" \
+            --findings /tmp/consolidated/consolidated.json \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --commit-sha "$HEAD_SHA" \
+            --judge-status "$JUDGE_STATUS" \
+            --delivered "$DELIVERED"
+
+  dismiss-stale-approval:
+    # Opt-in companion to `Auto-approve decision`. A ruleset with
+    # `dismiss_stale_reviews_on_push: false` keeps an approval valid for every
+    # later commit, so on a push the bot withdraws its own auto-approve reviews
+    # (approve AND request-changes — the next round replaces either) that are
+    # not on the new head. Only reviews carrying the auto-approve marker and
+    # authored by the approver identity are touched. Independent of `gate`: it
+    # must run on a push whether or not a panel runs. Checks out no PR code.
+    name: Dismiss stale auto-approval
+    if: >-
+      ${{ inputs.approve_max_severity != '' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here — every job here is `runs-on: ubuntu-latest`, so that
+            # means a runner group shadowing the label. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ inputs.bot_app_id != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: Dismiss stale auto-approve reviews
+        env:
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Same identity precedence as `Auto-approve decision`, so the login
+          # whose reviews are dismissed is the login that posted them.
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+            LOGIN="$(gh api user --jq .login)"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+            LOGIN="${APP_SLUG}[bot]"
+          else
+            export GH_TOKEN="$FALLBACK_TOKEN"
+            LOGIN="github-actions[bot]"
+          fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --approver-login "$LOGIN"
 
   blocking-gate:
     # Opt-in merge gate (inputs.blocking), restored by BE-4691 after #31

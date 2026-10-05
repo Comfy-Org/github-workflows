@@ -118,6 +118,7 @@ pull-requests: write   # posting the consolidated review
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
+| `approve_max_severity` | `''` (off) | `medium`, `low` or `nit`: after each round the bot **approves** (pinned to the reviewed commit) when every finding is at or below that severity, and **requests changes** when any is above it. See [auto-approve](#auto-approve). |
 
 ## Gotchas
 
@@ -341,3 +342,47 @@ the check:
   nothing could ever clear. Read the review body, not just the threads. The
   fully-demoted case, where *no* finding got a thread, is caught by the
   fail-closed list above.
+
+## Auto-approve
+
+Opt in with `approve_max_severity` (`medium`, `low` or `nit`; anything else fails
+the run). Off by default. Pass a repo variable so an admin can flip or kill it
+without a PR:
+
+```yaml
+on:
+  pull_request:
+    # `synchronize` is REQUIRED with auto-approve: it is what dismisses the bot's
+    # earlier review when new commits land.
+    types: [labeled, unlabeled, synchronize]
+jobs:
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with:
+      workflows_ref: <same-sha-as-uses>
+      approve_max_severity: ${{ vars.CURSOR_APPROVE_MAX_SEVERITY }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      # Optional: approve as a user account (see below).
+      APPROVER_TOKEN: ${{ secrets.CURSOR_APPROVER_TOKEN }}
+```
+
+After `Post review` lands, `auto-approve.py decide` submits one of:
+
+- **APPROVE**, pinned to the reviewed commit, when every finding is at or below
+  the threshold;
+- **REQUEST_CHANGES** when any finding is above it, or has an unrecognised
+  severity;
+- **nothing** when the round can't be trusted: the judge did not adjudicate, a
+  panel reviewer did not complete, the review did not land as threads, the head
+  moved mid-run, or an earlier round's critical/high thread is still open.
+
+On `synchronize` the **Dismiss stale auto-approval** job withdraws the bot's own
+marked reviews that are not on the new head. A push does not start a new panel
+under the label-triggered caller — re-apply the label for the next round.
+
+**Who approves.** `APPROVER_TOKEN` if set, else the `bot_app_id` App, else
+`github-actions[bot]`. A GitHub App cannot be a CODE OWNER, so on a ruleset with
+`require_code_owner_review` an App's approval is posted but does not count — use
+`APPROVER_TOKEN` from a user account that is a code owner there. GitHub refuses
+an approval of the approver's own PR; that is logged and skipped, not failed.

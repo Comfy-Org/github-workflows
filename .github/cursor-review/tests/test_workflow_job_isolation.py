@@ -298,7 +298,7 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         holders = {
             name for name, body in self.jobs.items() if references_bot_key(body)
         }
-        self.assertEqual(holders, {"over-cap-comment", "post-review"})
+        self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval"})
 
     def test_consolidate_runs_the_judge_over_a_pr_checkout(self):
         # The premise of the whole split. If the judge ever stops running here
