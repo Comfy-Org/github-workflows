@@ -331,6 +331,29 @@ class DismissJobTriggerTest(unittest.TestCase):
         self.assertIn('--base-ref "$BASE_REF"', text)
 
 
+class AnnotationCauseTest(unittest.TestCase):
+    """One line, whatever the error carries — see `annotation_cause`."""
+
+    def test_no_error_uses_the_fallback(self):
+        self.assertEqual(AA.annotation_cause(None, "nothing came back"), "nothing came back")
+
+    def test_the_type_is_named_when_the_message_is_empty(self):
+        # str(RuntimeError()) is "", which would render a bare "()".
+        self.assertEqual(AA.annotation_cause(RuntimeError(), "x"), "RuntimeError")
+
+    def test_multiline_stderr_collapses_to_one_line(self):
+        got = AA.annotation_cause(RuntimeError("gh: HTTP 403\n::error::injected\nsee docs"), "x")
+        self.assertEqual(got, "RuntimeError: gh: HTTP 403 ::error::injected see docs")
+
+    def test_percent_is_escaped_so_the_runner_cannot_decode_a_newline_back_in(self):
+        # The runner percent-decodes %0A/%0D when it renders an annotation, so an
+        # encoded sequence would undo the collapsing. Escape `%` first.
+        got = AA.annotation_cause(RuntimeError("bad url http://x/a%0Ab%0D%0Ac"), "x")
+        self.assertNotIn("%0A", got)
+        self.assertNotIn("%0D", got)
+        self.assertIn("%250A", got)
+
+
 class DismissStaleHeadTest(unittest.TestCase):
     """`dismiss-stale` judges against the LIVE head, not the delivered event's.
 
@@ -340,7 +363,7 @@ class DismissStaleHeadTest(unittest.TestCase):
     approval. An unreadable head degrades to the event's, never to "".
     """
 
-    def run_dismiss(self, live, event_head, reviews, live_base="main", all_approvals=False):
+    def run_dismiss(self, live, event_head, reviews, live_base="main", all_approvals=False, raw=None):
         dismissed = []
 
         def fake_gh(args, payload=None):
@@ -349,6 +372,8 @@ class DismissStaleHeadTest(unittest.TestCase):
                 return "{}"
             if args[:2] == ["api", "--paginate"]:
                 return json.dumps([list(reviews)])
+            if raw is not None:
+                return raw  # valid JSON of the wrong shape
             if isinstance(live, Exception):
                 raise live
             # A real payload carries a base alongside the head, so the fixture does
@@ -446,13 +471,50 @@ class DismissStaleHeadTest(unittest.TestCase):
 
     def test_the_degraded_warning_does_not_name_a_head_when_all_approvals_is_set(self):
         # `--all-approvals` ignores the head, so naming a SHA as the comparison
-        # basis would misdirect whoever investigates the mass withdrawal.
+        # basis would misdirect whoever investigates the mass withdrawal. The TAIL
+        # matters as much as the basis: withdrawing a head-valid approval is the
+        # deliberate purpose of a retarget, not a degradation to apologise for.
         rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, NEW)],
                                          all_approvals=True)
         self.assertEqual((rc, len(dismissed)), (0, 1))
         warned = " ".join(self.warnings())
         self.assertIn("--all-approvals", warned)
         self.assertNotIn(NEW, warned)
+        self.assertNotIn("valid for the head as it stands now", warned)
+        self.assertNotIn("without the base check, for this run", warned)
+
+    def test_a_retarget_still_withdraws_everything_with_no_event_head(self):
+        # `--all-approvals` needs no head to do its job, so the empty-head red gate
+        # must not block the one event where every approval MUST be withdrawn.
+        rc, dismissed = self.run_dismiss(RuntimeError("x"), "", [self.approval(1, NEW)], all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_a_missing_base_under_all_approvals_does_not_claim_a_head_comparison(self):
+        # "comparing on head alone" is false here: the head is discarded and every
+        # marked approval goes, so the base check was moot rather than skipped.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")],
+                                         live_base="", all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("--all-approvals", warned)
+        self.assertNotIn("comparing on head alone", warned)
+
+    def test_the_missing_base_warning_names_what_skipping_the_check_costs(self):
+        # The guard fails OPEN — an off-base approval survives — so the annotation
+        # has to say so rather than imply the run was complete.
+        self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")], live_base="")
+        self.assertTrue(any("SURVIVES" in line for line in self.warnings()), self.printed)
+
+    def test_json_that_is_not_an_object_degrades_instead_of_tracebacking(self):
+        # `null`, or the ARRAY the collection endpoint returns for an empty number:
+        # `.get` on either raises AttributeError, which nothing catches, so it
+        # would escape as a traceback and bypass the whole announced-degradation
+        # path — including the shapeless fallback that exists for exactly this.
+        for body in ("null", "[]", '"a string"'):
+            with self.subTest(body=body):
+                rc, dismissed = self.run_dismiss(None, NEW, [self.approval(1, NEW)], raw=body)
+                self.assertEqual((rc, dismissed), (0, []))
+                self.assertTrue(any("live PR head" in line for line in self.warnings()), self.printed)
 
     def test_a_shapeless_head_read_never_dismisses_everything(self):
         # read_head returning "" must not reach the filter: "" is not None, so it

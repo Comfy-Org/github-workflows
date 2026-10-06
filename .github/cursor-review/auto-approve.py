@@ -454,6 +454,14 @@ DISMISS_PERMISSION_HINT = (
 def read_pr(repo: str, pr_number) -> tuple:
     """(head sha, base ref) of the PR as it is now."""
     pr = json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
+    if not isinstance(pr, dict):
+        # Valid JSON that is not an object: `null`, or the ARRAY the collection
+        # endpoint returns when the number is empty (argparse's `required=True`
+        # accepts `--pr-number ""`). `.get` on either raises AttributeError, which
+        # no caller catches — it would escape as a traceback and bypass every
+        # announced degradation below, including the shapeless-payload fallback
+        # that exists for exactly this. Make it the shapeless read they handle.
+        raise ValueError(f"expected a PR object, got {type(pr).__name__}")
     return (pr.get("head") or {}).get("sha", ""), (pr.get("base") or {}).get("ref", "")
 
 
@@ -467,14 +475,16 @@ def withdraw_own_approvals(args) -> int:
     try:
         ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, None)
     except (RuntimeError, ValueError) as e:
-        print(f"::error::Could not list reviews to withdraw an earlier auto-approval: {e}")
+        print(f"::error::Could not list reviews to withdraw an earlier auto-approval: {annotation_cause(e, 'unknown error')}")
         return 1
     failed = []
     for rid in ids:
         try:
             dismiss(args.repo, args.pr_number, rid, UNTRUSTED_MESSAGE)
         except RuntimeError as e:
-            failed.append(f"{rid}: {e}")
+            # Collapsed per id: these are joined into an ::error:: annotation, and
+            # each carries `gh`'s multi-line stderr.
+            failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
     if ids:
         emit(f"Auto-approve: withdrew {len(ids) - len(failed)}/{len(ids)} earlier approval(s) by {args.approver_login}.")
     if failed:
@@ -507,7 +517,13 @@ def annotation_cause(error, fallback: str) -> str:
     """
     if not error:
         return fallback
-    return " ".join(f"{type(error).__name__}: {error}".split()).rstrip(":")
+    # Escape `%` FIRST — the standard `escapeData` ordering. The runner
+    # percent-decodes `%0A`/`%0D` when it RENDERS an annotation, so an encoded
+    # sequence in captured stderr (common in URLs echoed by API errors) would
+    # reintroduce the very line break collapsing just removed. Display-only:
+    # command parsing is per-line and happens before decoding.
+    text = f"{type(error).__name__}: {error}".replace("%", "%25")
+    return " ".join(text.split()).rstrip(":")
 
 
 def cmd_dismiss_stale(args) -> int:
@@ -540,32 +556,44 @@ def cmd_dismiss_stale(args) -> int:
         live_head, live_base, read_error = "", None, e
     else:
         read_error = None
+    # Every branch below states the consequence for the mode it is actually in:
+    # `--all-approvals` ignores the head and withdraws everything (see `head`
+    # below), so the non-retarget wording — a named SHA, a skipped base check, a
+    # wrongly withdrawn head-valid approval — is false on exactly that path, and
+    # a reader investigating a mass withdrawal is the one it would misdirect.
     if not live_head:
         cause = annotation_cause(read_error, "no head in the response")
         live_head, live_base = args.head_sha, None
-        if not live_head:
+        if not live_head and not args.all_approvals:
+            # A retarget needs no head to do its job, so it is not blocked by the
+            # absence of one; every other mode compares against it and cannot run.
             print(f"::error::Could not read the PR head to dismiss stale auto-approvals: {cause}")
             return 1
-        # `--all-approvals` ignores the head entirely (see `head` below), so naming
-        # a SHA as the basis would misdirect whoever investigates the withdrawal.
-        basis = ("selecting every marked approval regardless of head, because --all-approvals is set"
+        print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — "
+              + ("withdrawing every marked approval regardless of head, because --all-approvals is set. The "
+                 "base check is moot on a retarget, which withdraws them all anyway."
                  if args.all_approvals else
-                 f"judging staleness against the event's head {args.head_sha!r}")
-        print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — {basis}, "
-              "without the base check, for this run. A queued or redelivered event can therefore withdraw an "
-              "approval that is valid for the head as it stands now.")
+                 f"judging staleness against the event's head {args.head_sha!r}, without the base check, for "
+                 "this run. A queued or redelivered event can therefore withdraw an approval that is valid for "
+                 "the head as it stands now."))
     elif not live_base:
         # The same guard as the head, on the other axis. An empty live base is NOT
         # None, and `_stale_approvals` treats "" as a real base that no recorded
         # base equals — so letting it through withdraws every approval that
-        # recorded one, green and unannounced. Skip the base check instead.
+        # recorded one, green and unannounced. Skip the base check instead, and say
+        # what skipping it costs rather than implying the run was complete.
         live_base = None
-        print(f"::warning::Read the live head of {args.repo}#{args.pr_number} but no base ref — comparing on head "
-              "alone, without the base check, for this run. The next event redoes it from live state.")
+        print(f"::warning::Read the live head of {args.repo}#{args.pr_number} but no base ref — "
+              + ("withdrawing every marked approval, because --all-approvals is set; the base check is moot on "
+                 "a retarget."
+                 if args.all_approvals else
+                 "comparing on head alone for this run. An approval recorded against a DIFFERENT base "
+                 "therefore SURVIVES this run and keeps counting; the next event redoes the base check from "
+                 "live state."))
     try:
         reviews = list_reviews(args.repo, args.pr_number)
     except (RuntimeError, ValueError) as e:
-        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {e}")
+        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {annotation_cause(e, 'unknown error')}")
         return 1
     head = None if args.all_approvals else live_head
     ids = stale_reviews_to_dismiss(reviews, args.approver_login, head, live_base)
@@ -575,7 +603,9 @@ def cmd_dismiss_stale(args) -> int:
         try:
             dismiss(args.repo, args.pr_number, rid, message)
         except RuntimeError as e:
-            failed.append(f"{rid}: {e}")
+            # Collapsed per id: these are joined into an ::error:: annotation, and
+            # each carries `gh`'s multi-line stderr.
+            failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
     emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login or '(approver unavailable)'}.")
     if others:
         # Red, not clean: a stale approval this identity cannot touch still counts.
