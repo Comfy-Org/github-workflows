@@ -199,7 +199,9 @@ class DismissStaleHeadTest(unittest.TestCase):
 
         args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
                                   approver_login="cursor-approver")
-        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+        self.printed = []
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             rc = AA.cmd_dismiss_stale(args)
         return rc, dismissed
 
@@ -224,6 +226,27 @@ class DismissStaleHeadTest(unittest.TestCase):
 
     def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
         self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
+
+    def warnings(self):
+        return [line for line in self.printed if "::warning::" in line]
+
+    def test_a_degraded_head_read_is_announced_rather_than_silent(self):
+        # The dismissal below may be the right one or the replay this read exists to
+        # catch — unreadable means UNKNOWN. Exiting green on it without a word is
+        # what makes a wrongly withdrawn approval unattributable afterwards.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        self.assertTrue(any("live head" in line for line in self.warnings()), self.printed)
+
+    def test_a_shapeless_head_read_is_announced_too(self):
+        # The fallback that fires without raising, so an `except`-only diagnostic
+        # would miss it.
+        self.run_dismiss(None, NEW, [self.approval(1, NEW)])
+        self.assertTrue(any("no head SHA" in line for line in self.warnings()), self.printed)
+
+    def test_a_head_that_read_cleanly_warns_about_nothing(self):
+        self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
+        self.assertEqual(self.warnings(), [])
 
     def test_a_shapeless_head_read_never_dismisses_everything(self):
         # read_head returning "" must not reach the filter: "" is not None, so it

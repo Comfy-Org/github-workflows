@@ -426,10 +426,25 @@ def cmd_dismiss_stale(args) -> int:
     # scan this job exists to perform. The `or` matters as much as the `except`: an
     # empty string here is not None, so it would match no recorded SHA and dismiss
     # every marked approval on the PR.
+    #
+    # The degradation is ANNOUNCED. It is the one path on which this job can still
+    # withdraw an approval that is valid for the live head, and it exits green when
+    # it does, so a reader of a green run has no other way to learn that the
+    # comparison was not against the real head.
     try:
-        head_sha = read_head(args.repo, args.pr_number) or args.head_sha
-    except (RuntimeError, ValueError):
-        head_sha = args.head_sha
+        live_head = read_head(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        live_head, degraded = "", f"{type(e).__name__}: {e}"
+    else:
+        degraded = "" if live_head else "the API reported no head SHA"
+    head_sha = live_head or args.head_sha
+    if degraded:
+        print(
+            f"::warning::Could not read the live head of {args.repo}#{args.pr_number} "
+            f"({degraded}); comparing against the event's head {args.head_sha!r} instead. "
+            "A queued or redelivered event can therefore withdraw an approval that is "
+            "valid for the head as it stands now."
+        )
     ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, head_sha)
     failed = []
     for rid in ids:
