@@ -200,7 +200,14 @@ def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha) -> li
         # marked approval without a recorded SHA predates the fix: treat it as
         # stale rather than trust a commit_id GitHub may have moved.
         match = REVIEWED_SHA_RE.search(r.get("body") or "")
-        if head_sha is not None and match and match.group(1) == head_sha.lower():
+        # An EDITED body is not evidence. The recorded SHA is the only staleness
+        # anchor an approval has, and a user with write access can edit this
+        # identity's review and rewrite that marker to the live head — which would
+        # keep a stale approval standing through every later push. Nothing in this
+        # workflow edits its own review (the only write to one is the dismissal
+        # PUT), so an edit is always someone else's and the marker it carries
+        # cannot be trusted to say what was reviewed.
+        if head_sha is not None and match and not r.get("edited") and match.group(1) == head_sha.lower():
             continue
         ids.append(r["id"])
     return ids
@@ -376,9 +383,89 @@ def read_head(repo: str, pr_number) -> str:
     return (json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"])).get("head") or {}).get("sha", "")
 
 
+# The reviews list, read through GraphQL because REST has no field for the one
+# thing the staleness decision now turns on: whether a review's body was EDITED
+# after it was posted.
+REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          # Dismissal is a REST call, so this list carries the REST id.
+          # `fullDatabaseId` first for the same reason gate-unresolved.py reads
+          # it: live review ids are already past 2^31-1, which `databaseId` is
+          # typed for (`Int`). `databaseId` stays as the fallback.
+          fullDatabaseId
+          databaseId
+          state
+          body
+          # The whole reason this is not REST: null until someone edits the
+          # review.
+          lastEditedAt
+          # GraphQL reports a Bot's login WITHOUT the `[bot]` suffix that REST
+          # reports and that the workflow passes as --approver-login. The suffix
+          # is restored in `_review_node`; without it the identity comparison in
+          # `stale_reviews_to_dismiss` matches nothing, no stale approval is
+          # ever dismissed, and the job still exits green.
+          author { __typename login }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _review_node(node: dict) -> dict:
+    """One GraphQL review in the REST shape this module's readers expect."""
+    author = node.get("author") or {}
+    login = author.get("login") or ""
+    if login and author.get("__typename") == "Bot":
+        login = f"{login}[bot]"
+    rid = node.get("fullDatabaseId")
+    if rid is None:
+        rid = node.get("databaseId")
+    return {
+        "id": int(rid) if rid is not None else None,
+        "user": {"login": login},
+        "state": node.get("state") or "",
+        "body": node.get("body") or "",
+        "edited": node.get("lastEditedAt") is not None,
+    }
+
+
 def list_reviews(repo: str, pr_number) -> list:
-    pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100"]))
-    return [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
+    """Every review on the PR, REST-shaped, plus `edited`.
+
+    A missing `pullRequest` in the response raises rather than returning an empty
+    list: both callers treat an empty list as "nothing to dismiss" and exit green,
+    so a shapeless answer has to reach their error paths instead.
+    """
+    owner, _, name = repo.partition("/")
+    out = []
+    cursor = None
+    while True:
+        args = [
+            "api", "graphql",
+            "-f", f"query={REVIEWS_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"pr={int(pr_number)}",
+        ]
+        # Same -F/-f split as gate-unresolved.py: the first page needs a JSON
+        # null, later pages an opaque string cursor.
+        args += ["-F", "cursor=null"] if cursor is None else ["-f", f"cursor={cursor}"]
+        pr = ((json.loads(gh(args)).get("data") or {}).get("repository") or {}).get("pullRequest")
+        if not isinstance(pr, dict):
+            raise ValueError(f"no pullRequest in the GraphQL reviews response for {repo}#{pr_number}")
+        reviews = pr.get("reviews") or {}
+        out += [_review_node(n) for n in (reviews.get("nodes") or []) if isinstance(n, dict)]
+        page = reviews.get("pageInfo") or {}
+        cursor = page.get("endCursor")
+        if not page.get("hasNextPage") or not cursor:
+            return out
 
 
 def withdraw_own_approvals(args) -> int:

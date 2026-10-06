@@ -130,13 +130,116 @@ OLD = "1" * 40
 NEW = "2" * 40
 
 
+def graphql_reviews(reviews, *, has_next=False, cursor=None):
+    """The GraphQL envelope `list_reviews` reads, built from REST-shaped stubs.
+
+    Lets every test below keep writing a review the way the REST payload spelled
+    it — and pins the two translations that payload does not have: the `[bot]`
+    suffix GraphQL drops, and `edited`.
+    """
+    nodes = []
+    for r in reviews:
+        login = (r.get("user") or {}).get("login", "")
+        bot = login.endswith("[bot]")
+        nodes.append({
+            "fullDatabaseId": str(r["id"]),
+            "databaseId": r["id"],
+            "state": r.get("state"),
+            "body": r.get("body"),
+            "lastEditedAt": "2026-10-06T12:00:00Z" if r.get("edited") else None,
+            "author": {"__typename": "Bot" if bot else "User",
+                       "login": login[: -len("[bot]")] if bot else login},
+        })
+    return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+        "nodes": nodes,
+    }}}}})
+
+
+class ReviewsListTest(unittest.TestCase):
+    """The GraphQL reviews list, which exists for `lastEditedAt` alone.
+
+    Each case here is a way the switch away from REST could have broken the
+    dismissal silently — the direction that exits green while withdrawing
+    nothing.
+    """
+
+    def list_reviews(self, *pages):
+        calls = []
+
+        def fake_gh(args, payload=None):
+            calls.append(args)
+            return pages[len(calls) - 1]
+
+        with mock.patch.object(AA, "gh", fake_gh):
+            return AA.list_reviews("o/r", "7"), calls
+
+    def test_a_bots_login_keeps_the_suffix_the_workflow_passes(self):
+        # --approver-login is "${APP_SLUG}[bot]" / "github-actions[bot]", while
+        # GraphQL answers "github-actions". Dropping this would compare the two
+        # and match nothing, for every PR, forever.
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 1, "user": {"login": "github-actions[bot]"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["user"]["login"], "github-actions[bot]")
+
+    def test_a_humans_login_is_untouched(self):
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 2, "user": {"login": "a-human"}, "state": "COMMENTED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["user"]["login"], "a-human")
+
+    def test_the_rest_id_survives_past_the_32_bit_range(self):
+        # Live review ids are already past 2^31-1, and the dismissal endpoint is
+        # REST, so the id this list carries has to be the full one.
+        big = 5434892948
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": big, "user": {"login": "x"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["id"], big)
+
+    def test_an_edit_is_reported_and_an_unedited_review_is_not(self):
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b", "edited": True},
+            {"id": 2, "user": {"login": "x"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual([r["edited"] for r in reviews], [True, False])
+
+    def test_every_page_is_read(self):
+        reviews, calls = self.list_reviews(
+            graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                            has_next=True, cursor="CUR"),
+            graphql_reviews([{"id": 2, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}]),
+        )
+        self.assertEqual([r["id"] for r in reviews], [1, 2])
+        self.assertIn("cursor=null", " ".join(calls[0]))
+        self.assertIn("cursor=CUR", " ".join(calls[1]))
+
+    def test_a_truncated_page_does_not_loop_forever(self):
+        # hasNextPage with no cursor to follow: stop, rather than re-request page
+        # one until the job times out.
+        reviews, calls = self.list_reviews(
+            graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                            has_next=True, cursor=None),
+        )
+        self.assertEqual(([r["id"] for r in reviews], len(calls)), ([1], 1))
+
+    def test_a_shapeless_response_raises_instead_of_listing_nothing(self):
+        # Both callers read an empty list as "nothing to dismiss" and exit green,
+        # so this has to reach their error paths instead.
+        with self.assertRaises(ValueError):
+            self.list_reviews(json.dumps({"data": {"repository": {"pullRequest": None}}}))
+
+
 class StaleReviewTest(unittest.TestCase):
-    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD):
+    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD,
+               edited=False):
         # `commit_id` defaults to NEW on purpose: GitHub moves a still-valid
         # approval's commit_id to each new head, so only the SHA recorded in the
         # body says what was reviewed.
         body = AA.render_body(AA.APPROVE, ["ok"], "low", [], sha) if marker else "ok"
-        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW, "body": body}
+        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW,
+                "body": body, "edited": edited}
 
     def test_dismisses_own_marked_off_head_reviews(self):
         reviews = [
@@ -170,6 +273,25 @@ class StaleReviewTest(unittest.TestCase):
         reviews = [self.review(1, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
 
+    def test_an_edited_approval_is_stale_even_when_its_marker_says_head(self):
+        # The forge: a write-access user edits this identity's approval and
+        # rewrites the recorded SHA to the live head. Trusting the marker would
+        # keep that approval standing through every later push.
+        reviews = [self.review(1, sha=NEW, edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1])
+
+    def test_an_unedited_approval_on_head_still_stands(self):
+        # The other half: distrusting edits must not withdraw the approvals this
+        # workflow posts itself, which are never edited.
+        reviews = [self.review(1, sha=NEW)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
+
+    def test_an_edited_change_request_is_still_not_dismissed(self):
+        # Only APPROVALS are this filter's business; an edited veto is someone
+        # tampering with a review that withholds merge, not one that grants it.
+        reviews = [self.review(1, state="CHANGES_REQUESTED", edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
+
     def test_none_head_selects_every_own_approval(self):
         reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
@@ -191,8 +313,8 @@ class DismissStaleHeadTest(unittest.TestCase):
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 dismissed.append(args[3])
                 return "{}"
-            if args[:2] == ["api", "--paginate"]:
-                return json.dumps([list(reviews)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
             if isinstance(live, Exception):
                 raise live
             return json.dumps({} if live is None else {"head": {"sha": live}})
@@ -267,8 +389,8 @@ class PostWriteRaceTest(unittest.TestCase):
                 return json.dumps({"id": 99})
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 return "{}"
-            if args[:2] == ["api", "--paginate"]:
-                return json.dumps([list(reviews)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
             head = next(heads)
             if isinstance(head, Exception):
                 raise head
