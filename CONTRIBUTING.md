@@ -19,6 +19,9 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 # cursor-review (finding extraction, bot identity)
 python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 
+# cursor-approve (axis prompt rendering, verdict aggregation)
+python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.py' -v
+
 # AGENTS.md standard checker
 python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
 
