@@ -97,7 +97,7 @@ Then ask a maintainer to add your repo to the `CURSOR_REVIEW_CALLERS` roster sec
 
 ```yaml
 contents: read
-pull-requests: write   # posting the consolidated review
+pull-requests: write   # posting the consolidated review (and, at the round cap, the label + comment)
 ```
 
 ## Inputs
@@ -119,6 +119,7 @@ pull-requests: write   # posting the consolidated review
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 | `approve_max_severity` | `''` (off) | `medium`, `low` or `nit`: after each round the bot **approves** (pinned to the reviewed commit) when every finding is at or below that severity, and **requests changes** when any is above it. See [auto-approve](#auto-approve). |
+| `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 
 ## Gotchas
@@ -476,3 +477,65 @@ an approval of the approver's own PR; that is logged and skipped, not failed.
   reviews, add the approver identity to the allowed dismissers. Otherwise the
   dismiss job goes red and the stale review stays — `pull-requests: write` alone
   is not enough.
+
+## Round cap and the `approve_gate` output
+
+**`max_rounds`** (default `5`, `0` disables) stops a PR from cycling through
+review rounds forever. Before the panel starts, the checkout-free **Round cap**
+job counts the consolidated reviews (`## 🔍 Cursor Review — Consolidated panel`)
+the posting identity — the `bot_app_id` App, else `github-actions[bot]` — has
+already left on the PR. Reviews by anyone else carrying the same heading are not
+counted, and neither are rounds that reviewed nothing (a "Review failed" error
+review, or one where every panel cell failed). At or over the cap it:
+
+- runs **no panel** (`Diff size check`, and everything after it, is skipped);
+- adds the `needs-human-review` label, creating it if the repo lacks it.
+  Creating a repo label needs `issues: write`, which the caller's
+  `pull-requests: write` does not grant, so **create `needs-human-review` once
+  by hand** unless the `bot_app_id` App has Issues write. If the label cannot be
+  applied, the cap fails open for that run (the panel runs) with a warning,
+  rather than capping a PR it gave no way to reset;
+- posts **one** comment listing the latest round's open findings above
+  `approve_max_severity` (every open finding when that is empty). A hidden
+  `<!-- cursor-review-round-cap -->` marker keeps a re-trigger from posting it
+  again for the same cap;
+- sets `approve_gate` to `capped`.
+
+While the label is on, auto-approve never approves the PR. **Removing the label
+resets the cap**: only rounds after its most recent removal (read from the issue
+timeline) count, so a human who has looked at the PR can hand it back to the bot
+for another `max_rounds` rounds. A count that cannot be read fails open — the
+panel runs, as it did before the cap existed. Under `blocking: true` a capped
+head holds **Blocking gate** red, the same as an over-cap diff: no panel looked
+at it. With `max_rounds` above 0 the gate reads the live label on every event,
+so resolving the old threads cannot turn it green while `needs-human-review` is
+on the PR — whoever applied it.
+
+**`approve_gate`** is a workflow-level output for a downstream job that should
+run only after a round passed the severity gate:
+
+```yaml
+jobs:
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with: { workflows_ref: <same-sha-as-uses>, approve_max_severity: low }
+    secrets: { CURSOR_API_KEY: "${{ secrets.CURSOR_API_KEY }}" }
+  next:
+    needs: cursor-review
+    if: needs.cursor-review.outputs.approve_gate == 'pass'
+```
+
+| Value | Meaning |
+|---|---|
+| `pass` | The auto-approve decision was APPROVE. |
+| `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
+| `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
+| `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
+| `off` | `approve_max_severity` is empty (and the cap was not hit). |
+
+Two more outputs carry the count, for a "round R of M" display:
+
+| Output | Value |
+|---|---|
+| `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing is not counted). If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
+| `max_rounds` | The effective cap: the `max_rounds` input as applied, or `0` for no cap. A value the cap step rejects as not a whole number reports `0`, because it is not applied. |

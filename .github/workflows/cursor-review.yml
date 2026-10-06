@@ -16,9 +16,10 @@ name: Cursor Review (reusable)
 # that check out PR code and run cursor-agent over it — `review` and
 # `consolidate` — hold `contents: read` and nothing else; the consolidated
 # review is posted from a separate `post-review` job that checks out NO PR code
-# and receives its payload as an artifact. The two jobs that DO carry
-# `pull-requests: write` and the BOT_APP_PRIVATE_KEY mint — `post-review` and
-# `over-cap-comment` — check out nothing but this repo's pinned assets. The
+# and receives its payload as an artifact. The jobs that DO carry
+# `pull-requests: write` and the BOT_APP_PRIVATE_KEY mint — `post-review`,
+# `over-cap-comment`, `dismiss-stale-approval` and `round-cap` — check out
+# nothing but this repo's pinned assets. The
 # panel and the judge run `cursor-agent --print --trust` without `--sandbox`,
 # and print mode can use write and shell tools, so a prompt-injected model could
 # rewrite the assets checkout or a downloaded action inside its own job; on a
@@ -337,6 +338,23 @@ on:
         type: string
         required: false
         default: ''
+      max_rounds:
+        description: >-
+          Cap on review rounds per PR. Before the panel starts, the run counts
+          the consolidated reviews the posting identity has already left on this
+          PR; at or over this number it runs NO panel, labels the PR
+          `needs-human-review` (creating the label if missing), posts one
+          comment listing the latest round's open findings above
+          `approve_max_severity` (every open finding when that is empty), and
+          sets the `approve_gate` output to `capped`. Auto-approve never
+          approves a PR carrying that label. Removing the label resets the
+          count: only rounds after its most recent removal count. 0 → no cap. A
+          count that cannot be read, or a label that cannot be applied, fails
+          open (the panel runs). Creating the label needs `issues: write`, so
+          pre-create it unless the bot App has it. Default 5.
+        type: number
+        required: false
+        default: 5
       runs_on:
         description: >-
           JSON-encoded `runs-on` for the four jobs that hold no write-scoped
@@ -380,6 +398,36 @@ on:
           pull requests" is on. Whichever identity it is must also be allowed to
           dismiss reviews if branch protection restricts dismissals.
         required: false
+    outputs:
+      approve_gate:
+        description: >-
+          The round's severity-gate verdict, for a downstream workflow that
+          must run only after a round passed. Exactly one of: `pass` (the
+          auto-approve decision was APPROVE), `fail` (REQUEST_CHANGES, or an
+          open thread above the threshold withheld approval), `untrusted` (the
+          judge was degraded, a panel cell failed, the review was not delivered,
+          the head moved — or no round was delivered by this run at all, e.g. a
+          skipped or already-reviewed event), `capped` (the `max_rounds` cap was
+          hit this run, or the PR carries `needs-human-review` while
+          `max_rounds` or `approve_max_severity` is set), `off`
+          (`approve_max_severity` is empty and the cap was not hit).
+        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
+      round:
+        description: >-
+          The 1-based number of the review round this run delivered, counted
+          the way `max_rounds` counts (the posting identity's consolidated
+          reviews since `needs-human-review` was last removed; a round that
+          reviewed nothing does not count). When this run hit the cap, the
+          number of the last round instead. Empty when the run delivered no
+          round, the count could not be read, or `max_rounds` is 0 (nothing is
+          counted then).
+        value: ${{ jobs.round-cap.outputs.capped == 'true' && jobs.round-cap.outputs.rounds || jobs.post-review.outputs.delivered == 'true' && jobs.round-cap.outputs.next_round || '' }}
+      max_rounds:
+        description: >-
+          The effective round cap: the `max_rounds` input as applied, `0` when
+          there is no cap (including a value the cap step rejected as not a
+          whole number). Pairs with `round` for a "round R of M" display.
+        value: ${{ jobs.round-cap.outputs.max_rounds || (inputs.max_rounds > 0 && inputs.max_rounds) || 0 }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -824,14 +872,145 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  round-cap:
+    # Per-PR review-round cap (inputs.max_rounds). Runs ahead of the panel on
+    # every fresh round — `diff-size`, and through it everything that spends,
+    # `needs:` it — and decides `capped`. Counting needs the POSTING identity's
+    # login (a body match alone would let any user burn a PR's rounds with a
+    # marker-carrying review), and that login is only known after the bot token
+    # is minted, so this is a write-token job: it checks out NO PR code, only
+    # this repo's assets at the pinned `workflows_ref`, and stays on
+    # GitHub-hosted ubuntu-latest. The logic lives in auto-approve.py's
+    # `round-cap`, which fails OPEN on a read error (the panel runs).
+    name: Round cap
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # `secrets` cannot be read in `if:`, so the credentials-present test is
+      # evaluated here — the same guard over-cap-comment uses. An app id without
+      # its key is a permitted config and must not take the panel down.
+      BOT_CONFIGURED: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY != '' }}
+    outputs:
+      capped: ${{ steps.cap.outputs.capped }}
+      labelled: ${{ steps.cap.outputs.labelled }}
+      rounds: ${{ steps.cap.outputs.rounds }}
+      next_round: ${{ steps.cap.outputs.next_round }}
+      max_rounds: ${{ steps.cap.outputs.max_rounds }}
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ env.BOT_CONFIGURED == 'true' && inputs.max_rounds > 0 }}
+        # Best-effort: a failed mint degrades to github-actions[bot] below rather
+        # than failing this job, which `diff-size` (and so the panel) hangs off.
+        # The count then matches no bot-posted round and fails open.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: Count review rounds
+        id: cap
+        if: ${{ inputs.max_rounds > 0 }}
+        env:
+          # The identity post-review posts under: the bot when configured, else
+          # github-actions[bot]. Its reviews are the rounds, and its token writes
+          # the label and the comment.
+          GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$APP_SLUG" ]; then LOGIN="${APP_SLUG}[bot]"; else LOGIN="github-actions[bot]"; fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" round-cap \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --max-rounds "$MAX_ROUNDS" \
+            --threshold "$THRESHOLD" \
+            --poster-login "$LOGIN"
+
   diff-size:
     name: Diff size check
     # Needs `ledger` (not just `gate`) so it can build the incremental
     # "hunks new since the last reviewed round" diff here too, alongside the
     # main reviewed diff — one checkout, one artifact, instead of every panel
     # cell (plus consolidate) re-deriving it from its own PR checkout.
-    needs: [gate, ledger]
-    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
+    # `round-cap` is the panel's off switch: every job that spends hangs off this
+    # one, so a capped PR (or a red cap job) runs no panel at all.
+    needs: [gate, ledger, round-cap]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.round-cap.outputs.capped != 'true'
     runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     permissions:
       contents: read
@@ -2718,6 +2897,10 @@ jobs:
       gated_findings: ${{ steps.post.outputs.gated_findings }}
       ungated_findings: ${{ steps.post.outputs.ungated_findings }}
       posted: ${{ steps.post.outputs.posted }}
+      # pass / fail / untrusted / capped, written by auto-approve.py `decide`;
+      # empty when auto-approve is off (the workflow-level output then says
+      # `off`) or the step died before deciding (it then says `untrusted`).
+      approve_gate: ${{ steps.approve.outputs.approve_gate }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -3058,6 +3241,7 @@ jobs:
         # `post-review` red, because the blocking gate reads that job's result as
         # "the review did not land" — and it did land. The step's own ::error::
         # and red step mark still show the refusal.
+        id: approve
         if: ${{ inputs.approve_max_severity != '' }}
         continue-on-error: true
         env:
@@ -3311,7 +3495,7 @@ jobs:
     # exists to close, so it runs on cancellation too — and if the teardown
     # takes its steps down with it, the check goes RED, which is the safe side.
     name: Blocking gate
-    needs: [gate, diff-size, post-review]
+    needs: [gate, round-cap, diff-size, post-review]
     if: ${{ always() && inputs.blocking }}
     runs-on: ubuntu-latest
     # One paged GraphQL query through gh — minutes at most; bounded like every
@@ -3378,7 +3562,15 @@ jobs:
           WITHIN_CAP: ${{ needs.diff-size.outputs.within_cap }}
           POST_REVIEW_RESULT: ${{ needs.post-review.result }}
           DELIVERED: ${{ needs.post-review.outputs.delivered }}
+          CAPPED: ${{ needs.round-cap.outputs.capped }}
         run: |
+          # The round cap is not exempt either, for the same reason as the size
+          # cap below: no panel looked at this head. The PR is handed to a human
+          # (needs-human-review); removing that label resets the cap.
+          if [ "$CAPPED" = "true" ]; then
+            echo "::error::This PR hit cursor-review's max_rounds cap, so no review ran on this head and it is labelled needs-human-review — an unreviewed head cannot pass a blocking gate. Have a human review it, then remove the label to resume automated rounds."
+            exit 1
+          fi
           if [ "$DIFF_SIZE_RESULT" = "success" ] && [ "$WITHIN_CAP" != "true" ]; then
             echo "::error::This PR's counted diff exceeds diff_size_cap, so no review ran — and an unreviewed PR cannot pass a blocking gate. Split the PR under the cap and re-trigger the review, or raise diff_size_cap on the caller."
             exit 1
@@ -3427,6 +3619,30 @@ jobs:
         run: |
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::The blocking gate was triggered by '$EVENT_NAME', which carries no pull_request payload, so it cannot read this PR's review threads. Trigger cursor-review from pull_request / pull_request_review_thread events (see the blocking caller shape in docs/callers/cursor-review.md)."
+            exit 1
+          fi
+
+      - name: Fail while the PR is handed to a human (round cap)
+        # The `round-cap` output above only exists on a run that counted rounds.
+        # Every later non-review event on a capped PR — a thread resolve, an
+        # unrelated label, the bot's own label write — skips `round-cap`, so the
+        # CAPPED check above never fires and the thread query alone would pass
+        # once the old threads are resolved or outdated, over a head no panel
+        # reviewed. The label is the cap's persistent state (removing it is the
+        # reset), so read it live on every event. A failed read fails closed,
+        # like every other guard here.
+        if: ${{ inputs.max_rounds > 0 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ! labels="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.labels[].name')"; then
+            echo "::error::Could not read this PR's labels to check the max_rounds cap — refusing to pass the blocking gate. Re-run the job."
+            exit 1
+          fi
+          if printf '%s\n' "$labels" | grep -qixF 'needs-human-review'; then
+            echo "::error::This PR carries needs-human-review (cursor-review's max_rounds cap, or a human hand-off), so automated rounds are paused and no panel has reviewed this head — an unreviewed head cannot pass a blocking gate. Have a human review it, then remove the label to resume automated rounds."
             exit 1
           fi
 
