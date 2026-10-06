@@ -24,7 +24,8 @@ Two subcommands, both pure — nothing here writes to GitHub:
     4. otherwise → ``APPROVE``.
 
     Bad arguments (an unknown axis, an empty axis list, ``--max-yellow-axes``
-    outside 0..3) exit 2. Every decision, including ``NONE``, exits 0.
+    outside 0..3 or not below the number of expected axes) exit 2. Every
+    decision, including ``NONE``, exits 0.
 
 The workflow's decide job submits the review by reusing
 ``.github/cursor-review/auto-approve.py``; this script only says what to submit.
@@ -39,12 +40,16 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 
 AXES = ("business", "design", "correctness", "completeness", "conformance")
 VERDICTS = ("red", "yellow", "green")
 MAX_YELLOW_LIMIT = 3
 SUMMARY_LIMIT = 1200
+# An axis output is one small JSON object; the cap is what decide will read of
+# a model-written file before calling it untrusted.
+MAX_OUTPUT_BYTES = 64 * 1024
 
 APPROVE = "APPROVE"
 NONE = "NONE"
@@ -55,13 +60,21 @@ PLACEHOLDERS = ("pr_number", "repo", "head_sha", "merge_base_sha", "base_ref", "
 SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 # Every value lands in a prompt, two of them inside a `git diff` command line,
 # so each one is checked to be the shape it claims to be.
+# The character class alone would fullmatch `../../../home/runner/.ssh/id_rsa`,
+# and `context_file` names a file the reviewer agent is told to read, so a `..`
+# COMPONENT is rejected as well. Only the component is: `a..b` stays a legal
+# name, and an absolute path stays legal because the workflow passes one
+# ($RUNNER_TEMP/pr-context.md). `..` is not a legal ref component either, so
+# `base_ref` carries the same guard.
+NO_DOTDOT = r"(?!.*(?:^|/)\.\.(?:/|$))"
+PATH_RE = re.compile(NO_DOTDOT + r"[A-Za-z0-9_./-]+")
 VALUE_RES = {
     "pr_number": re.compile(r"[1-9][0-9]*"),
     "repo": re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"),
     "head_sha": SHA_RE,
     "merge_base_sha": SHA_RE,
-    "base_ref": re.compile(r"[A-Za-z0-9_./-]+"),
-    "context_file": re.compile(r"[A-Za-z0-9_./-]+"),
+    "base_ref": PATH_RE,
+    "context_file": PATH_RE,
 }
 
 
@@ -135,12 +148,21 @@ def validate_output(data):
         raise ValueError(f"verdict {_short(verdict)} is not one of {', '.join(VERDICTS)}")
     confidence = data.get("confidence")
     # bool is an int subclass; NaN and the infinities fail the range check.
-    if (
-        isinstance(confidence, bool)
-        or not isinstance(confidence, (int, float))
-        or not math.isfinite(confidence)
-        or not 0 <= confidence <= 1
-    ):
+    # math.isfinite() coerces its argument to float and raises OverflowError --
+    # an ArithmeticError, NOT a ValueError -- for a JSON integer past ~1e308,
+    # which would escape load_output and cmd_decide's per-axis except and abort
+    # the whole decide instead of marking this one axis untrusted.
+    # .github/groom/config.py catches the same pair for the same reason.
+    try:
+        ok = (
+            not isinstance(confidence, bool)
+            and isinstance(confidence, (int, float))
+            and math.isfinite(confidence)
+            and 0 <= confidence <= 1
+        )
+    except OverflowError:
+        ok = False
+    if not ok:
         raise ValueError(f"confidence {_short(confidence)} is not a number from 0 to 1")
     summary = data.get("summary")
     summary = summary[:SUMMARY_LIMIT] if isinstance(summary, str) else ""
@@ -150,15 +172,33 @@ def validate_output(data):
 def load_output(path: str):
     """Parse one axis output file; raise ValueError on anything unusable."""
     try:
+        info = os.stat(path)
+        # This file is model-written and untrusted, so its shape and size are
+        # checked BEFORE it is opened: a FIFO at this path would block the read
+        # indefinitely, and reading an unbounded file only to hand it to
+        # json.loads (which roughly doubles the footprint) can OOM the decide
+        # step. Both failures degrade this axis instead of killing the run.
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("the output is not a regular file")
+        if info.st_size > MAX_OUTPUT_BYTES:
+            raise ValueError(f"the output is larger than {MAX_OUTPUT_BYTES} bytes")
         with open(path, encoding="utf-8") as f:
-            text = f.read()
+            text = f.read(MAX_OUTPUT_BYTES + 1)
     except FileNotFoundError:
         raise ValueError("no output") from None
     except (OSError, UnicodeDecodeError) as e:
         raise ValueError(f"unreadable output ({e.__class__.__name__})") from None
+    # The stat above can go stale -- the file may grow between the two calls --
+    # so the bound is enforced again on what was actually read.
+    if len(text) > MAX_OUTPUT_BYTES:
+        raise ValueError(f"the output is larger than {MAX_OUTPUT_BYTES} bytes")
     try:
         data = json.loads(text)
-    except ValueError:
+    # RecursionError is a RuntimeError, NOT a ValueError: a few hundred KB of
+    # `[[[[...` raises it out of json.loads, and uncaught it would abort the
+    # whole decide on exactly the input this path exists to fail closed on.
+    # .github/cursor-review/build-ledger.py catches it for the same reason.
+    except (ValueError, RecursionError):
         raise ValueError("the output is not valid JSON") from None
     return validate_output(data)
 
@@ -200,7 +240,11 @@ def cmd_render(args) -> int:
     values = {name: getattr(args, name) for name in PLACEHOLDERS}
     try:
         sys.stdout.write(render(args.axis, values))
-    except ValueError as e:
+    # OSError as well as ValueError: render() reads the prompt files, and a
+    # missing or unreadable prompt-common.md / prompt-<axis>.md must produce the
+    # documented ::error:: plus exit 2 that the calling workflow keys on rather
+    # than a traceback and exit 1.
+    except (ValueError, OSError) as e:
         print(f"::error::{e}", file=sys.stderr)
         return 2
     return 0
@@ -210,6 +254,16 @@ def cmd_decide(args) -> int:
     try:
         axes = parse_axes(args.axes)
         max_yellow = parse_max_yellow(args.max_yellow_axes)
+        # Checked against the axis list, not only MAX_YELLOW_LIMIT: a limit at or
+        # above the number of expected axes means every axis could come back
+        # yellow -- every reviewer raising a material concern, zero green -- and
+        # the round would still APPROVE, so narrowing --axes would silently
+        # weaken the gate rather than tighten it.
+        if max_yellow >= len(axes):
+            raise ValueError(
+                f"--max-yellow-axes must be below the number of expected axes "
+                f"({len(axes)}: {', '.join(axes)}), got {max_yellow}"
+            )
     except ValueError as e:
         print(f"::error::{e}", file=sys.stderr)
         return 2

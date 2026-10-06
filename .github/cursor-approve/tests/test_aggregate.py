@@ -321,5 +321,108 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
 
+class UnusableOutputDoesNotCrashTest(DecideCase):
+    """Rule 1 has to hold for inputs that raise something other than ValueError.
+
+    Each case here aborted `decide` with a traceback and exit 1 before, breaking
+    the documented "every decision, including NONE, exits 0" contract on exactly
+    the untrusted model output the rule exists to absorb.
+    """
+
+    def test_huge_int_confidence_degrades(self):
+        # math.isfinite() coerces to float and raises OverflowError, an
+        # ArithmeticError rather than a ValueError, past ~1e308.
+        self.write_all()
+        self.write("design", '{"verdict": "green", "confidence": 1' + "0" * 400 + ', "summary": "s"}')
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("confidence", result["axes"]["design"]["error"])
+
+    def test_deeply_nested_output_degrades(self):
+        """40 KB of `[[[[...` -- inside MAX_OUTPUT_BYTES, so the size cap does not
+        shadow this -- must degrade the axis rather than abort the run.
+
+        On CI's Python 3.12 json.loads raises RecursionError here, a RuntimeError
+        rather than a ValueError, which is the case that escaped the handler. On
+        3.14 the scanner has far more headroom and parses it, and the bare array
+        is then rejected as not-an-object. Both land on NONE with exit 0, which is
+        the contract; the assertion is deliberately written to hold either way so
+        this does not become a version-pinned test.
+        """
+        self.write_all()
+        self.write("design", "[" * 20_000 + "]" * 20_000)
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertTrue(result["axes"]["design"]["error"], "the axis degraded with a reason")
+
+    def test_oversized_output_degrades(self):
+        self.write_all()
+        self.write("design", '{"verdict": "green", "confidence": 0.9, "summary": "'
+                   + "x" * (AG.MAX_OUTPUT_BYTES + 10) + '"}')
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("larger than", result["axes"]["design"]["error"])
+
+    def test_a_fifo_degrades_instead_of_blocking_the_read(self):
+        self.write_all()
+        path = os.path.join(self.dir, "design.json")
+        os.remove(path)
+        os.mkfifo(path)
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("regular file", result["axes"]["design"]["error"])
+
+
+class MaxYellowAgainstAxisCountTest(DecideCase):
+    """A limit that is not below the axis count would approve an all-yellow round."""
+
+    def test_limit_at_or_above_the_axis_count_exits_2(self):
+        self.write_all(verdict="yellow", axes=["design"])
+        for limit in ("1", "3"):
+            with self.subTest(limit=limit):
+                code, out, err = run(["decide", "--outputs-dir", self.dir,
+                                      "--axes", "design", "--max-yellow-axes", limit])
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("::error::", err)
+
+    def test_limit_below_the_axis_count_still_decides(self):
+        self.write_all(verdict="yellow", axes=["design", "correctness"])
+        result = self.decide("--axes", "design,correctness", "--max-yellow-axes", "1")
+        self.assertEqual(result["event"], AG.NONE)
+
+
+class RenderHardeningTest(unittest.TestCase):
+    def test_traversal_components_exit_2(self):
+        for name in ("context_file", "base_ref"):
+            for bad in ("../../../home/runner/.ssh/id_rsa", "..", "a/../../b", "x/.."):
+                with self.subTest(name=name, value=bad):
+                    code, out, _ = run(render_argv("business", **{name: bad}))
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+
+    def test_absolute_and_dotted_names_still_render(self):
+        # The workflow passes an absolute $RUNNER_TEMP path, and `a..b` is an
+        # ordinary name rather than a traversal component, so neither is rejected.
+        for value in ("/tmp/runner/pr-context.md", "a..b.md", "./ctx.md"):
+            with self.subTest(value=value):
+                code, _, err = run(render_argv("business", context_file=value))
+                self.assertEqual(code, 0, err)
+
+    def test_missing_prompt_file_exits_2(self):
+        # An incomplete checkout or a wrong working tree raises OSError out of
+        # render(); the workflow keys on ::error:: plus exit 2, not a traceback.
+        with tempfile.TemporaryDirectory() as empty:
+            original = AG.PROMPT_DIR
+            AG.PROMPT_DIR = empty
+            try:
+                code, out, err = run(render_argv("business"))
+            finally:
+                AG.PROMPT_DIR = original
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("::error::", err)
+
+
 if __name__ == "__main__":
     unittest.main()
