@@ -311,17 +311,16 @@ on:
           requests changes. `medium`, `low` or `nit` → after a round, the bot
           APPROVES (pinned to the reviewed commit) when every finding is at or
           below that severity, and REQUESTS CHANGES when any finding is above
-          it. Any other value fails the run. No approval when the judge did not
-          adjudicate, a panel reviewer did not complete, the review did not land
-          as threads, the head moved mid-run, or an earlier critical/high thread
-          is still open. Deliver `synchronize` too, so a push withdraws the
-          bot's earlier approval promptly. SECURITY: the models read PR code, so
-          a prompt-injected PR can get itself approved; and a writer can enable
-          this input from their own PR. Enable it only where that is accepted. Pass a
-          repo variable (e.g. `vars.CURSOR_APPROVE_MAX_SEVERITY`) to flip it
-          without a PR. The approval only counts where the approving identity
-          can satisfy the ruleset — see APPROVER_TOKEN and
-          docs/callers/cursor-review.md.
+          it. Any other value fails the step. Nothing is submitted when the
+          round can't be trusted (judge degraded, a panel reviewer incomplete,
+          review not delivered, head moved) or an open thread above the
+          threshold remains. Requires the APPROVER_TOKEN secret. Deliver
+          `synchronize` too, so a push withdraws the earlier approval promptly.
+          Pass a repo variable (e.g. `vars.CURSOR_APPROVE_MAX_SEVERITY`) to flip
+          it without a PR. SECURITY: the models read PR code, so a
+          prompt-injected PR can get itself approved; and a writer can enable
+          this input from their own PR. Enable it only where that is accepted
+          — see docs/callers/cursor-review.md.
         type: string
         required: false
         default: ''
@@ -337,13 +336,13 @@ on:
         required: false
       APPROVER_TOKEN:
         description: >-
-          Optional token for approve_max_severity's reviews (approve, request
-          changes, dismiss). Use a user account's token where the ruleset needs a
-          CODE OWNER approval — a GitHub App cannot be a code owner. Absent → the
-          bot_app_id identity, else github-actions[bot], which can approve only
-          when the repo/org setting "Allow GitHub Actions to create and approve
-          pull requests" is on. Whichever identity it is must also be allowed to
-          dismiss reviews if branch protection restricts dismissals.
+          Token for approve_max_severity's reviews (approve, request changes,
+          dismiss). REQUIRED for auto-approve: with it absent nothing is
+          submitted. Deliberately no fallback to the bot_app_id App or
+          github-actions[bot] — the approver should be a dedicated, narrowly
+          scoped user account (an App cannot be a CODE OWNER anyway). That
+          account must be allowed to dismiss reviews if branch protection
+          restricts dismissals.
         required: false
 
 concurrency:
@@ -3011,10 +3010,7 @@ jobs:
         # landed". The step still shows red in the run.
         continue-on-error: true
         env:
-          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
-          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
-          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
@@ -3022,18 +3018,11 @@ jobs:
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
           DELIVERED: ${{ steps.post.outputs.delivered }}
         run: |
-          # Identity precedence, shared with `dismiss-stale-approval` so the login
-          # whose reviews are withdrawn is the login that posted them.
-          if [ -n "$APPROVER_TOKEN" ]; then
-            export GH_TOKEN="$APPROVER_TOKEN"
-            LOGIN="$(gh api user --jq .login)"
-          elif [ -n "$BOT_TOKEN" ]; then
-            export GH_TOKEN="$BOT_TOKEN"
-            LOGIN="${APP_SLUG}[bot]"
-          else
-            export GH_TOKEN="$FALLBACK_TOKEN"
-            LOGIN="github-actions[bot]"
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::approve_max_severity is set but the APPROVER_TOKEN secret is not — auto-approve submits nothing."
+            exit 0
           fi
+          LOGIN="$(gh api user --jq .login)"
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" decide \
             --approver-login "$LOGIN" \
             --threshold "$THRESHOLD" \
@@ -3052,7 +3041,8 @@ jobs:
     # supersedes it). Runs on EVERY same-repo PR event the caller delivers, not
     # only `synchronize`: idempotent, and a run cancelled by a later event — or
     # a caller that never delivers `synchronize` — is caught by the next one.
-    # Independent of `gate`. Checks out no PR code.
+    # Independent of `gate`. Checks out no PR code, and holds only
+    # APPROVER_TOKEN (never the bot App key).
     name: Dismiss stale auto-approval
     if: >-
       ${{ inputs.approve_max_severity != '' &&
@@ -3060,9 +3050,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Every write goes through APPROVER_TOKEN; the job token only reads.
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -3127,35 +3117,19 @@ jobs:
           path: _cursor_review_assets
           persist-credentials: false
 
-      - name: Mint bot-identity token (optional)
-        id: bot_token
-        if: ${{ inputs.bot_app_id != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.bot_app_id }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-
       - name: Dismiss stale auto-approve reviews
         env:
-          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
-          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
-          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          # Same identity precedence as `Auto-approve decision`, so the login
-          # whose reviews are dismissed is the login that posted them.
-          if [ -n "$APPROVER_TOKEN" ]; then
-            export GH_TOKEN="$APPROVER_TOKEN"
-            LOGIN="$(gh api user --jq .login)"
-          elif [ -n "$BOT_TOKEN" ]; then
-            export GH_TOKEN="$BOT_TOKEN"
-            LOGIN="${APP_SLUG}[bot]"
-          else
-            export GH_TOKEN="$FALLBACK_TOKEN"
-            LOGIN="github-actions[bot]"
+          # The approver identity is APPROVER_TOKEN's user — the same login
+          # `Auto-approve decision` posts as. No token → nothing was posted.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "APPROVER_TOKEN is not set; no auto-approve reviews to dismiss."
+            exit 0
           fi
+          LOGIN="$(gh api user --jq .login)"
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \

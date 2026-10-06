@@ -363,7 +363,7 @@ jobs:
       approve_max_severity: ${{ vars.CURSOR_APPROVE_MAX_SEVERITY }}
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-      # Optional: approve as a user account (see below).
+      # Required for auto-approve: the dedicated approver user's token (see below).
       APPROVER_TOKEN: ${{ secrets.CURSOR_APPROVER_TOKEN }}
 ```
 
@@ -383,6 +383,16 @@ own approvals that are not on the live head. Request-changes is kept until a new
 round supersedes it, so a push cannot clear the veto. A push does not start a
 new panel under the label-triggered caller — re-apply the label.
 
+**Who approves.** Only `APPROVER_TOKEN`'s user. There is deliberately no
+fallback to the `bot_app_id` App or `github-actions[bot]`: with the secret unset,
+nothing is submitted. Use a dedicated machine user with a fine-grained token
+scoped to the one repo (Pull requests: read & write, Contents: read), and put
+that user in a team that is a CODE OWNER for the paths you want it to approve —
+an App cannot be a code owner. Paths owned by a narrower team still need a
+human. GitHub refuses an approval of the approver's own PR; that is logged and
+skipped, not failed. Where branch protection restricts who may dismiss reviews,
+add the approver to the allowed dismissers, or the dismiss job goes red.
+
 **Security — read before enabling.**
 
 - *Prompt injection.* The panel and judge read PR code with shell access, and
@@ -394,18 +404,3 @@ new panel under the label-triggered caller — re-apply the label.
   read `APPROVER_TOKEN`. With a code-owner token, push access becomes approval.
 
 Enable auto-approve only where both are accepted risks.
-
-**Who approves.** `APPROVER_TOKEN` if set, else the `bot_app_id` App, else
-`github-actions[bot]`. A GitHub App cannot be a CODE OWNER, so on a ruleset with
-`require_code_owner_review` an App's approval is posted but does not count — use
-`APPROVER_TOKEN` from a user account that is a code owner there. GitHub refuses
-an approval of the approver's own PR; that is logged and skipped, not failed.
-
-- **`github-actions[bot]` fallback** (no `APPROVER_TOKEN`, no `bot_app_id`) can
-  approve only when the repo or org setting *Allow GitHub Actions to create and
-  approve pull requests* is on. It is off by default; with it off the approve
-  step goes red.
-- **Dismissal permission.** Where branch protection restricts who may dismiss
-  reviews, add the approver identity to the allowed dismissers. Otherwise the
-  dismiss job goes red and the stale review stays — `pull-requests: write` alone
-  is not enough.

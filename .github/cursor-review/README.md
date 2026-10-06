@@ -286,7 +286,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
-| `approve_max_severity` | `''` (off) | `medium` / `low` / `nit`: approve the reviewed commit when every finding is at or below it, request changes when any is above; nothing on an untrusted round. See [auto-approve](../../docs/callers/cursor-review.md#auto-approve), including its security notes. |
+| `approve_max_severity` | `''` (off) | `medium` / `low` / `nit`: approve the reviewed commit when every finding is at or below it, request changes when any is above; nothing on an untrusted round. Needs the `APPROVER_TOKEN` secret (a dedicated user; no App fallback). See [auto-approve](../../docs/callers/cursor-review.md#auto-approve), including its security notes. |
 
 ### `workflows_ref` must equal the `uses:` pin
 
