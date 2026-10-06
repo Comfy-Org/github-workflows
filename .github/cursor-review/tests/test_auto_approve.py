@@ -175,6 +175,62 @@ class StaleReviewTest(unittest.TestCase):
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
 
 
+class DismissStaleHeadTest(unittest.TestCase):
+    """`dismiss-stale` judges against the LIVE head, not the delivered event's.
+
+    A queued or redelivered `synchronize` replays an older head, and dismissing an
+    approval that is valid for the current head exits GREEN — nothing reports the
+    loss — so this read is the only thing between a replay and a silently withdrawn
+    approval. An unreadable head degrades to the event's, never to "".
+    """
+
+    def run_dismiss(self, live, event_head, reviews):
+        dismissed = []
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "-X"] and args[2] == "PUT":
+                dismissed.append(args[3])
+                return "{}"
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([list(reviews)])
+            if isinstance(live, Exception):
+                raise live
+            return json.dumps({} if live is None else {"head": {"sha": live}})
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
+                                  approver_login="cursor-approver")
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+            rc = AA.cmd_dismiss_stale(args)
+        return rc, dismissed
+
+    def approval(self, rid, sha):
+        return {"id": rid, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha)}
+
+    def test_a_replayed_older_event_does_not_dismiss_a_current_approval(self):
+        # The race: the event carries OLD, the PR is really on NEW, and the approval
+        # was recorded at NEW. Comparing against args.head_sha would withdraw it.
+        self.assertEqual(self.run_dismiss(NEW, OLD, [self.approval(1, NEW)]), (0, []))
+
+    def test_a_genuinely_stale_approval_is_still_dismissed(self):
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_falls_back_to_the_event_head(self):
+        # Previous behaviour, deliberately: degrade to the delivered head rather
+        # than skip the scan this job exists to perform.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
+
+    def test_a_shapeless_head_read_never_dismisses_everything(self):
+        # read_head returning "" must not reach the filter: "" is not None, so it
+        # would match no recorded SHA and withdraw every marked approval on the PR.
+        self.assertEqual(self.run_dismiss(None, NEW, [self.approval(1, NEW)]), (0, []))
+
+
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
 

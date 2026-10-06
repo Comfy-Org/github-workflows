@@ -51,9 +51,14 @@ counting through a degraded re-run at the same head.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
-judge can steer the round to an approval. Treat the approval as an automated
-review signal, not as a substitute for a human reviewer, and read the caller
-guide's trust-model section before letting it satisfy a ruleset.
+judge can steer the round to an approval. The recorded SHA shares that ceiling:
+a review body is mutable by anyone with repo WRITE access (and by the approver
+token itself), so rewriting the marker to the current head keeps a stale approval
+valid — a strictly higher privilege than planting text in a diff, and not one
+`commit_id` can cross-check, since GitHub has already moved that field to the
+same head. Treat the approval as an automated review signal, not as a substitute
+for a human reviewer, and read the caller guide's trust-model section before
+letting it satisfy a ruleset.
 
 Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
 ever dismissed, so a human's review — or another bot's — is never touched.
@@ -409,7 +414,23 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
 
 
 def cmd_dismiss_stale(args) -> int:
-    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, args.head_sha)
+    # The LIVE head, not `args.head_sha`. The caller passes
+    # `github.event.pull_request.head.sha` — the head at event-delivery time — so a
+    # queued or REDELIVERED `synchronize` for an older push would otherwise dismiss
+    # an approval that is valid for the head as it stands now, and do it silently:
+    # a wrong-but-successful dismissal exits green, so nothing reports the loss.
+    # `cmd_decide` reads the head for this same reason.
+    #
+    # A failed or shapeless read falls back to the event's head, which is exactly
+    # the previous behaviour — degrade to the older comparison rather than skip the
+    # scan this job exists to perform. The `or` matters as much as the `except`: an
+    # empty string here is not None, so it would match no recorded SHA and dismiss
+    # every marked approval on the PR.
+    try:
+        head_sha = read_head(args.repo, args.pr_number) or args.head_sha
+    except (RuntimeError, ValueError):
+        head_sha = args.head_sha
+    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, head_sha)
     failed = []
     for rid in ids:
         try:
