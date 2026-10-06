@@ -386,3 +386,12 @@ under the label-triggered caller — re-apply the label for the next round.
 `require_code_owner_review` an App's approval is posted but does not count — use
 `APPROVER_TOKEN` from a user account that is a code owner there. GitHub refuses
 an approval of the approver's own PR; that is logged and skipped, not failed.
+
+- **`github-actions[bot]` fallback** (no `APPROVER_TOKEN`, no `bot_app_id`) can
+  approve only when the repo or org setting *Allow GitHub Actions to create and
+  approve pull requests* is on. It is off by default; with it off the approve
+  step goes red.
+- **Dismissal permission.** Where branch protection restricts who may dismiss
+  reviews, add the approver identity to the allowed dismissers. Otherwise the
+  dismiss job goes red and the stale review stays — `pull-requests: write` alone
+  is not enough.

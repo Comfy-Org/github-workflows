@@ -17,17 +17,27 @@ subcommands, each run from a job that checks out NO PR code:
     CHANGES_REQUESTED is dismissed too: the next round replaces it, and a stale
     one would otherwise veto the PR after the author fixed it and a human approved.
 
-Fail-closed rules for ``decide`` (any one → no approval):
+Fail-closed rules for ``decide``:
 
-* the threshold is not one of ``medium``, ``low``, ``nit`` (→ exit 2, red);
+* the threshold is not one of ``medium``, ``low``, ``nit`` → exit 2, red.
+
+An untrusted round submits NO review event — neither approve nor request changes
+(its findings are still on the PR as threads):
+
 * the judge did not adjudicate (degraded panel-union fallback);
 * any panel cell is not ``ok`` (a short panel finding nothing proves nothing);
 * the review did not land as resolvable threads (`delivered` is not ``true``);
-* the PR head moved while the panel ran;
-* a finding's severity is missing or unrecognised (post-review.py renders those
-  as ``medium``; for approval they count as above every threshold);
-* an earlier round's critical/high thread is still open (not resolved, not
-  outdated) — so a High argued away in a reply cannot be approved over.
+* the PR head moved while the panel ran. A push racing the POST itself is
+  caught by re-reading the head after the write and withdrawing the review.
+
+On a trusted round:
+
+* any finding above the threshold, or with a missing / unrecognised severity
+  (post-review.py renders those as ``medium``), → REQUEST_CHANGES;
+* else an earlier round's critical/high (or unbadged) thread still open — not
+  resolved, not outdated — → no review, so a High argued away in a reply cannot
+  be approved over;
+* else → APPROVE.
 
 Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
 ever dismissed, so a human's review — or another bot's — is never touched.
@@ -97,17 +107,15 @@ def decide(
     live_head_sha: str,
     open_thread_severities: list,
 ):
-    """Return (event, reasons, blocking_findings). Pure; no I/O."""
-    if judge_status != "ok":
-        # Un-adjudicated panel-union output: neither approve nor veto on it.
-        return NONE, [f"the judge did not adjudicate this round (status={judge_status or 'missing'})"], []
-    blocking = [
-        f for f in findings if not isinstance(f, dict) or above_threshold(f.get("severity"), threshold)
-    ]
-    if blocking:
-        return REQUEST_CHANGES, [f"{len(blocking)} finding(s) above `{threshold}`"], blocking
+    """Return (event, reasons, blocking_findings). Pure; no I/O.
 
+    Trust checks come first and gate BOTH review events: a round that cannot be
+    trusted neither approves nor requests changes. Its findings are still on the
+    PR as threads; only the review event is withheld.
+    """
     reasons = []
+    if judge_status != "ok":
+        reasons.append(f"the judge did not adjudicate this round (status={judge_status or 'missing'})")
     bad_cells = [c for c in panel if not isinstance(c, dict) or c.get("status") != "ok"]
     if not panel:
         reasons.append("no panel metadata")
@@ -117,13 +125,20 @@ def decide(
         reasons.append("the review did not land on the PR as resolvable threads")
     if not reviewed_sha or reviewed_sha != live_head_sha:
         reasons.append("the PR head moved while the review ran")
+    if reasons:
+        return NONE, reasons, []
+
+    blocking = [
+        f for f in findings if not isinstance(f, dict) or above_threshold(f.get("severity"), threshold)
+    ]
+    if blocking:
+        return REQUEST_CHANGES, [f"{len(blocking)} finding(s) above `{threshold}`"], blocking
+
     open_blocking = [
         s for s in open_thread_severities if s is None or s in BLOCKING_THREAD_SEVERITIES
     ]
     if open_blocking:
-        reasons.append(f"{len(open_blocking)} open critical/high (or unbadged) thread(s) from an earlier round")
-    if reasons:
-        return NONE, reasons, []
+        return NONE, [f"{len(open_blocking)} open critical/high (or unbadged) thread(s) from an earlier round"], []
     return APPROVE, [f"every finding is at or below `{threshold}`"], []
 
 
@@ -231,9 +246,11 @@ def cmd_decide(args) -> int:
 
     body = render_body(event, reasons, threshold, blocking)
     try:
-        gh(
-            ["api", "-X", "POST", f"repos/{args.repo}/pulls/{args.pr_number}/reviews", "--input", "-"],
-            {"commit_id": args.commit_sha, "event": event, "body": body},
+        posted = json.loads(
+            gh(
+                ["api", "-X", "POST", f"repos/{args.repo}/pulls/{args.pr_number}/reviews", "--input", "-"],
+                {"commit_id": args.commit_sha, "event": event, "body": body},
+            )
         )
     except RuntimeError as e:
         # GitHub refuses an approval of your own PR (422). That is a property of
@@ -243,8 +260,36 @@ def cmd_decide(args) -> int:
             return 0
         print(f"::error::Could not submit the {event} review: {e}")
         return 1
+
+    # Close the head-read → POST race. A push landing in that window fires a
+    # `synchronize` whose dismissal scan can finish before this review exists, so
+    # nothing else would ever withdraw it. Re-read the head now that the review
+    # is written; if it moved, withdraw our own review here.
+    head_now = (json.loads(gh(["api", f"repos/{args.repo}/pulls/{args.pr_number}"])).get("head") or {}).get("sha", "")
+    if head_now != args.commit_sha:
+        try:
+            dismiss(args.repo, args.pr_number, posted["id"])
+        except RuntimeError as e:
+            print(f"::error::The PR head moved while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            return 1
+        emit(f"ℹ️ **Auto-approve: withdrawn** — the PR head moved while the {event} review was being posted.")
+        return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     return 0
+
+
+DISMISS_PERMISSION_HINT = (
+    "Dismissing a review needs an identity allowed to dismiss reviews on this branch: "
+    "pull-requests: write is not enough when branch protection restricts dismissals "
+    "(add the approver to the allowed dismissers, or lift the restriction)."
+)
+
+
+def dismiss(repo: str, pr_number, review_id) -> None:
+    gh(
+        ["api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals", "--input", "-"],
+        {"message": "New commits pushed — cursor-review auto-approve withdrawn until the next review round.", "event": "DISMISS"},
+    )
 
 
 def cmd_dismiss_stale(args) -> int:
@@ -253,12 +298,18 @@ def cmd_dismiss_stale(args) -> int:
     )
     flat = [r for page in reviews for r in page] if reviews and isinstance(reviews[0], list) else reviews
     ids = stale_reviews_to_dismiss(flat, args.approver_login, args.head_sha)
+    failed = []
     for rid in ids:
-        gh(
-            ["api", "-X", "PUT", f"repos/{args.repo}/pulls/{args.pr_number}/reviews/{rid}/dismissals", "--input", "-"],
-            {"message": "New commits pushed — cursor-review auto-approve withdrawn until the next review round.", "event": "DISMISS"},
-        )
-    emit(f"Auto-approve: dismissed {len(ids)} stale review(s) by {args.approver_login}.")
+        try:
+            dismiss(args.repo, args.pr_number, rid)
+        except RuntimeError as e:
+            failed.append(f"{rid}: {e}")
+    emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login}.")
+    if failed:
+        # Red, not a warning: a stale approval that stays valid is the exact
+        # failure this job exists to prevent.
+        print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
+        return 1
     return 0
 
 

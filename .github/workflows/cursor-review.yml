@@ -338,7 +338,10 @@ on:
           Optional token for approve_max_severity's reviews (approve, request
           changes, dismiss). Use a user account's token where the ruleset needs a
           CODE OWNER approval — a GitHub App cannot be a code owner. Absent → the
-          bot_app_id identity, else github-actions[bot].
+          bot_app_id identity, else github-actions[bot], which can approve only
+          when the repo/org setting "Allow GitHub Actions to create and approve
+          pull requests" is on. Whichever identity it is must also be allowed to
+          dismiss reviews if branch protection restricts dismissals.
         required: false
 
 concurrency:

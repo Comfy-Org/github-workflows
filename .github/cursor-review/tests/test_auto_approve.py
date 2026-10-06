@@ -15,9 +15,13 @@ approval could land on a PR nobody should have approved:
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
 
+import argparse
 import importlib.util
+import json
 import os
+import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "auto-approve.py")
 SPEC = importlib.util.spec_from_file_location("auto_approve", MODULE_PATH)
@@ -79,9 +83,12 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decide(panel=panel)[0], AA.NONE)
         self.assertEqual(decide(panel=[])[0], AA.NONE)
 
-    def test_incomplete_panel_still_requests_changes_on_a_real_high(self):
+    def test_untrusted_round_does_not_request_changes_either(self):
         panel = PANEL_OK + [{"model": "m2", "review_type": "edge-case", "status": "error"}]
-        self.assertEqual(decide(panel=panel, findings=[finding("high")])[0], AA.REQUEST_CHANGES)
+        high = [finding("high")]
+        self.assertEqual(decide(panel=panel, findings=high)[0], AA.NONE)
+        self.assertEqual(decide(delivered=False, findings=high)[0], AA.NONE)
+        self.assertEqual(decide(live="b" * 40, findings=high)[0], AA.NONE)
 
     def test_undelivered_review_withholds(self):
         self.assertEqual(decide(delivered=False)[0], AA.NONE)
@@ -125,6 +132,41 @@ class StaleReviewTest(unittest.TestCase):
             self.review(8, login="Cursor-Approver"),
         ]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 2, 8])
+
+
+class PostWriteRaceTest(unittest.TestCase):
+    """A push between the head read and the POST must not leave our review standing."""
+
+    def run_decide(self, heads):
+        calls = []
+        heads = iter(heads)
+
+        def fake_gh(args, payload=None):
+            calls.append((args, payload))
+            if args[:2] == ["api", "-X"] and args[2] == "POST":
+                return json.dumps({"id": 99})
+            if args[:2] == ["api", "-X"] and args[2] == "PUT":
+                return "{}"
+            return json.dumps({"head": {"sha": next(heads)}})
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"findings": [], "panel": PANEL_OK}, f)
+        args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
+                                  commit_sha=SHA, judge_status="ok", delivered="true")
+        with mock.patch.object(AA, "gh", fake_gh), \
+                mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                mock.patch.object(AA, "emit", lambda *a: None):
+            rc = AA.cmd_decide(args)
+        os.unlink(f.name)
+        return rc, [c[0][2] for c in calls if c[0][:2] == ["api", "-X"]]
+
+    def test_head_unchanged_keeps_the_approval(self):
+        rc, writes = self.run_decide([SHA, SHA])
+        self.assertEqual((rc, writes), (0, ["POST"]))
+
+    def test_head_moved_during_post_withdraws_it(self):
+        rc, writes = self.run_decide([SHA, "b" * 40])
+        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
 
 
 if __name__ == "__main__":
