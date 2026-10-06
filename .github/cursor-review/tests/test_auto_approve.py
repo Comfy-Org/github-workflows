@@ -340,7 +340,7 @@ class DismissStaleHeadTest(unittest.TestCase):
     approval. An unreadable head degrades to the event's, never to "".
     """
 
-    def run_dismiss(self, live, event_head, reviews):
+    def run_dismiss(self, live, event_head, reviews, live_base="main", all_approvals=False):
         dismissed = []
 
         def fake_gh(args, payload=None):
@@ -351,19 +351,23 @@ class DismissStaleHeadTest(unittest.TestCase):
                 return json.dumps([list(reviews)])
             if isinstance(live, Exception):
                 raise live
-            return json.dumps({} if live is None else {"head": {"sha": live}})
+            # A real payload carries a base alongside the head, so the fixture does
+            # too — without it `live_base` is "" on every path and the off-base
+            # comparison is dead in this whole class. `live_base=""` is the
+            # half-shapeless response, exercised deliberately below.
+            return json.dumps({} if live is None else {"head": {"sha": live}, "base": {"ref": live_base}})
 
         args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
-                                  approver_login="cursor-approver", all_approvals=False)
+                                  approver_login="cursor-approver", all_approvals=all_approvals)
         self.printed = []
         with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             rc = AA.cmd_dismiss_stale(args)
         return rc, dismissed
 
-    def approval(self, rid, sha):
+    def approval(self, rid, sha, base=""):
         return {"id": rid, "user": {"login": "cursor-approver"}, "state": "APPROVED",
-                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha)}
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha, base)}
 
     def test_a_replayed_older_event_does_not_dismiss_a_current_approval(self):
         # The race: the event carries OLD, the PR is really on NEW, and the approval
@@ -414,6 +418,41 @@ class DismissStaleHeadTest(unittest.TestCase):
     def test_a_head_that_read_cleanly_warns_about_nothing(self):
         self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
         self.assertEqual(self.warnings(), [])
+
+    def test_a_multiline_read_error_is_collapsed_into_one_annotation(self):
+        # `gh` stderr is usually several lines. Interpolated raw, the tail falls out
+        # of the annotation, and a continuation line starting with `::` is re-parsed
+        # as a new workflow command — truncating this very diagnostic.
+        self.run_dismiss(RuntimeError("HTTP 403\n::error::injected\nsee https://docs"), NEW,
+                         [self.approval(1, NEW)])
+        warned = self.warnings()
+        self.assertEqual(len(warned), 1, self.printed)
+        self.assertNotIn("\n", warned[0])
+        self.assertIn("HTTP 403 ::error::injected see https://docs", warned[0])
+
+    def test_a_live_head_without_a_base_keeps_every_recorded_approval(self):
+        # The off-base twin of the shapeless-head bug, and the reason the head
+        # fallback is not the only announced degradation: "" is not None and no
+        # recorded base equals "", so an unguarded empty live base withdraws every
+        # approval that recorded one — on head, green, and unannounced.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")], live_base="")
+        self.assertEqual((rc, dismissed), (0, []))
+        self.assertTrue(any("no base ref" in line for line in self.warnings()), self.printed)
+
+    def test_a_readable_base_still_dismisses_a_genuinely_retargeted_approval(self):
+        # The guard above skips the base check; it must not disable it.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="old-base")], live_base="main")
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_the_degraded_warning_does_not_name_a_head_when_all_approvals_is_set(self):
+        # `--all-approvals` ignores the head, so naming a SHA as the comparison
+        # basis would misdirect whoever investigates the mass withdrawal.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, NEW)],
+                                         all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("--all-approvals", warned)
+        self.assertNotIn(NEW, warned)
 
     def test_a_shapeless_head_read_never_dismisses_everything(self):
         # read_head returning "" must not reach the filter: "" is not None, so it

@@ -495,6 +495,21 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
     )
 
 
+def annotation_cause(error, fallback: str) -> str:
+    """One single-line cause for a ``::warning::``/``::error::`` annotation.
+
+    Workflow commands are line-oriented, and a `gh` failure carries its captured
+    stderr — usually several lines (an HTTP status plus a docs URL). Interpolated
+    raw, everything after the first newline falls out of the annotation into plain
+    log output, and a continuation line beginning with ``::`` is re-parsed as a
+    new workflow command — truncating the very diagnostic this emits. Collapse
+    the whitespace. The type is named because ``str(RuntimeError())`` is empty.
+    """
+    if not error:
+        return fallback
+    return " ".join(f"{type(error).__name__}: {error}".split()).rstrip(":")
+
+
 def cmd_dismiss_stale(args) -> int:
     # On a retarget the head is unchanged, so an approval pinned to it is
     # exactly as stale as an off-head one: select every marked approval. That
@@ -515,10 +530,10 @@ def cmd_dismiss_stale(args) -> int:
     # `except`: an empty string is not None, so it would match no recorded SHA
     # and dismiss every marked approval on the PR.
     #
-    # The degradation is ANNOUNCED. It is the one path on which this job can still
-    # withdraw an approval that is valid for the live head, and it exits green when
-    # it does, so a reader of a green run has no other way to learn that the
-    # comparison was not against the real head.
+    # Both degradations below are ANNOUNCED. They are the paths on which this job
+    # can still withdraw an approval that is valid for the PR's live state, and it
+    # exits green when it does, so a reader of a green run has no other way to
+    # learn that the comparison was not against the real head and base.
     try:
         live_head, live_base = read_pr(args.repo, args.pr_number)
     except (RuntimeError, ValueError) as e:
@@ -526,17 +541,27 @@ def cmd_dismiss_stale(args) -> int:
     else:
         read_error = None
     if not live_head:
-        # `str(RuntimeError())` is empty, so name the type too: a cause of "()"
-        # tells a reader of the annotation nothing about what failed.
-        cause = f"{type(read_error).__name__}: {read_error}" if read_error else "no head in the response"
+        cause = annotation_cause(read_error, "no head in the response")
         live_head, live_base = args.head_sha, None
         if not live_head:
             print(f"::error::Could not read the PR head to dismiss stale auto-approvals: {cause}")
             return 1
-        print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — judging "
-              f"staleness against the event's head {args.head_sha!r}, without the base check, for this run. A "
-              "queued or redelivered event can therefore withdraw an approval that is valid for the head as it "
-              "stands now.")
+        # `--all-approvals` ignores the head entirely (see `head` below), so naming
+        # a SHA as the basis would misdirect whoever investigates the withdrawal.
+        basis = ("selecting every marked approval regardless of head, because --all-approvals is set"
+                 if args.all_approvals else
+                 f"judging staleness against the event's head {args.head_sha!r}")
+        print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — {basis}, "
+              "without the base check, for this run. A queued or redelivered event can therefore withdraw an "
+              "approval that is valid for the head as it stands now.")
+    elif not live_base:
+        # The same guard as the head, on the other axis. An empty live base is NOT
+        # None, and `_stale_approvals` treats "" as a real base that no recorded
+        # base equals — so letting it through withdraws every approval that
+        # recorded one, green and unannounced. Skip the base check instead.
+        live_base = None
+        print(f"::warning::Read the live head of {args.repo}#{args.pr_number} but no base ref — comparing on head "
+              "alone, without the base check, for this run. The next event redoes it from live state.")
     try:
         reviews = list_reviews(args.repo, args.pr_number)
     except (RuntimeError, ValueError) as e:
