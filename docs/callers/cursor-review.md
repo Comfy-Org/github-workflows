@@ -374,12 +374,40 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
 - **REQUEST_CHANGES** when any finding is above it, or has an unrecognised
   severity;
 - **nothing** when the round can't be trusted: the judge did not adjudicate, a
-  panel reviewer did not complete, the review did not land as threads, the head
-  moved mid-run, or an earlier round's critical/high thread is still open.
+  panel reviewer did not complete, the review did not land as threads (or some
+  finding reached the review body only), the head moved mid-run, the PR state
+  could not be read, or an earlier round's thread above the threshold is still
+  open. A "nothing" round also **withdraws** the bot's own earlier approvals, so
+  a round-1 approval does not keep counting through a degraded re-run.
+
+The decision step is `continue-on-error`: a refused approval shows as a red
+step with an `::error::`, not as a failed `Post review` job (which the blocking
+gate would read as "the review did not land").
 
 On `synchronize` the **Dismiss stale auto-approval** job withdraws the bot's own
-marked reviews that are not on the new head. A push does not start a new panel
-under the label-triggered caller — re-apply the label for the next round.
+marked **approvals** that are not on the new head. A request-changes is left in
+place — a push does not start a new panel under the label-triggered caller, so
+only the next round (re-apply the label) supersedes it.
+
+**Trust model — read before letting the approval count.** The approval is
+only as strong as two things a PR author controls:
+
+- **Prompt injection.** Every signal `decide` gates on — the findings, the
+  panel's status, the judge's status — is model output over the PR's own diff.
+  The panel and judge run with the PR checked out, so a diff written to steer
+  them can produce a clean round, and that round approves. No check computed
+  outside those jobs can tell a genuinely clean diff from a convincing one.
+- **The switch lives in the PR.** For `pull_request` events GitHub runs the
+  caller workflow from the PR's head, so a same-repo PR can add
+  `approve_max_severity` (and drop `synchronize`) in the very commit it wants
+  approved. A repo variable keeps an *admin's* kill switch out of PRs; it does
+  not stop a PR from editing the caller to ignore it.
+
+So enabling auto-approve makes this approval no stronger than **push access**
+to the repo. Do not let it be the only review that satisfies a ruleset for code
+that needs a human's eyes — in particular, think twice before giving it an
+`APPROVER_TOKEN` that is a code owner. Fork PRs never reach it (the `gate` job
+skips them).
 
 **Who approves.** `APPROVER_TOKEN` if set, else the `bot_app_id` App, else
 `github-actions[bot]`. A GitHub App cannot be a CODE OWNER, so on a ruleset with
@@ -390,7 +418,7 @@ an approval of the approver's own PR; that is logged and skipped, not failed.
 - **`github-actions[bot]` fallback** (no `APPROVER_TOKEN`, no `bot_app_id`) can
   approve only when the repo or org setting *Allow GitHub Actions to create and
   approve pull requests* is on. It is off by default; with it off the approve
-  step goes red.
+  step goes red (the job does not).
 - **Dismissal permission.** Where branch protection restricts who may dismiss
   reviews, add the approver identity to the allowed dismissers. Otherwise the
   dismiss job goes red and the stale review stays — `pull-requests: write` alone

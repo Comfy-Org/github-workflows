@@ -319,7 +319,13 @@ on:
           repo variable (e.g. `vars.CURSOR_APPROVE_MAX_SEVERITY`) to flip it
           without a PR. The approval only counts where the approving identity
           can satisfy the ruleset — see APPROVER_TOKEN and
-          docs/callers/cursor-review.md.
+          docs/callers/cursor-review.md. TRUST MODEL: the decision rests on
+          model output over the PR's own content, so a diff that prompt-injects
+          the panel and judge can earn an approval; and for `pull_request`
+          events this input is read from the caller workflow at the PR's head,
+          so a same-repo PR can switch it on for itself. Enabling it makes the
+          approval no stronger than push access — see the guide's trust-model
+          section before letting it satisfy a required review.
         type: string
         required: false
         default: ''
@@ -3003,16 +3009,40 @@ jobs:
         # succeeded, so the decision is about a review that is on the PR. All of
         # the fail-closed rules live in auto-approve.py (see its docstring); this
         # job checks out no PR code, so the PR cannot rewrite the logic judging it.
+        # continue-on-error: the decision is advisory to THIS job. A refused
+        # approval (e.g. the github-actions[bot] fallback with "Allow GitHub
+        # Actions to create and approve pull requests" off) must not turn
+        # `post-review` red, because the blocking gate reads that job's result as
+        # "the review did not land" — and it did land. The step's own ::error::
+        # and red step mark still show the refusal.
         if: ${{ inputs.approve_max_severity != '' }}
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.APPROVER_TOKEN || steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
           DELIVERED: ${{ steps.post.outputs.delivered }}
+          UNGATED: ${{ steps.post.outputs.ungated_findings }}
         run: |
+          # Same identity precedence as `Dismiss stale auto-approval`: the login
+          # passed here is the one whose earlier approvals an untrusted round
+          # withdraws.
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+            LOGIN="$(gh api user --jq .login)"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+            LOGIN="${APP_SLUG}[bot]"
+          else
+            export GH_TOKEN="$FALLBACK_TOKEN"
+            LOGIN="github-actions[bot]"
+          fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" decide \
             --threshold "$THRESHOLD" \
             --findings /tmp/consolidated/consolidated.json \
@@ -3020,14 +3050,17 @@ jobs:
             --pr-number "$PR_NUMBER" \
             --commit-sha "$HEAD_SHA" \
             --judge-status "$JUDGE_STATUS" \
-            --delivered "$DELIVERED"
+            --delivered "$DELIVERED" \
+            --ungated "${UNGATED:-0}" \
+            --approver-login "$LOGIN"
 
   dismiss-stale-approval:
     # Opt-in companion to `Auto-approve decision`. A ruleset with
     # `dismiss_stale_reviews_on_push: false` keeps an approval valid for every
-    # later commit, so on a push the bot withdraws its own auto-approve reviews
-    # (approve AND request-changes — the next round replaces either) that are
-    # not on the new head. Only reviews carrying the auto-approve marker and
+    # later commit, so on a push the bot withdraws its own auto-approve
+    # APPROVALS that are not on the new head. A request-changes stays: a push
+    # under a label-triggered caller starts no new round, so only a later
+    # round's own review may supersede the veto. Only reviews carrying the auto-approve marker and
     # authored by the approver identity are touched. Independent of `gate`: it
     # must run on a push whether or not a panel runs. Checks out no PR code.
     name: Dismiss stale auto-approval

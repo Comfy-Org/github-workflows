@@ -37,8 +37,8 @@ def finding(sev):
 
 
 def decide(threshold="medium", findings=(), panel=PANEL_OK, judge="ok", delivered=True,
-           reviewed=SHA, live=SHA, threads=()):
-    return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads))
+           reviewed=SHA, live=SHA, threads=(), ungated=0):
+    return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads), ungated)
 
 
 class ThresholdTest(unittest.TestCase):
@@ -104,6 +104,17 @@ class DecideTest(unittest.TestCase):
     def test_open_lower_threads_do_not_withhold(self):
         self.assertEqual(decide(threads=["medium", "low", "nit"])[0], AA.APPROVE)
 
+    def test_prior_thread_gate_follows_the_threshold(self):
+        self.assertEqual(decide(threshold="low", threads=["medium"])[0], AA.NONE)
+        self.assertEqual(decide(threshold="nit", threads=["low"])[0], AA.NONE)
+        self.assertEqual(decide(threshold="low", threads=["low", "nit"])[0], AA.APPROVE)
+
+    def test_body_only_findings_withhold(self):
+        # A finding demoted to the review body has no thread, so the open-thread
+        # check could never see it in a later round.
+        self.assertEqual(decide(ungated=1)[0], AA.NONE)
+        self.assertEqual(decide(ungated=2, findings=[finding("high")])[0], AA.NONE)
+
 
 class ThreadSeverityTest(unittest.TestCase):
     def test_reads_post_review_badges(self):
@@ -131,13 +142,23 @@ class StaleReviewTest(unittest.TestCase):
             self.review(7, state="DISMISSED"),
             self.review(8, login="Cursor-Approver"),
         ]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 2, 8])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 8])
+
+    def test_a_push_never_clears_the_bots_change_request(self):
+        # Under a label-triggered caller a push starts no new round, so only a
+        # later round's own review may supersede the veto.
+        reviews = [self.review(1, state="CHANGES_REQUESTED")]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [])
+
+    def test_none_head_selects_every_own_approval(self):
+        reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
 
 
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
 
-    def run_decide(self, heads):
+    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: []):
         calls = []
         heads = iter(heads)
 
@@ -147,18 +168,41 @@ class PostWriteRaceTest(unittest.TestCase):
                 return json.dumps({"id": 99})
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 return "{}"
-            return json.dumps({"head": {"sha": next(heads)}})
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([list(reviews)])
+            head = next(heads)
+            if isinstance(head, Exception):
+                raise head
+            return json.dumps({"head": {"sha": head}})
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"findings": [], "panel": PANEL_OK}, f)
         args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
-                                  commit_sha=SHA, judge_status="ok", delivered="true")
+                                  commit_sha=SHA, judge_status=judge_status, delivered="true",
+                                  ungated="0", approver_login="cursor-approver")
         with mock.patch.object(AA, "gh", fake_gh), \
-                mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                mock.patch.object(AA, "open_thread_severities", threads), \
                 mock.patch.object(AA, "emit", lambda *a: None):
             rc = AA.cmd_decide(args)
         os.unlink(f.name)
         return rc, [c[0][2] for c in calls if c[0][:2] == ["api", "-X"]]
+
+    def test_untrusted_round_withdraws_an_earlier_approval(self):
+        # Round 1 approved this very head; a degraded re-run must not leave it counting.
+        approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                    "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, writes = self.run_decide([SHA], judge_status="error", reviews=[approval])
+        self.assertEqual((rc, writes), (0, ["PUT"]))
+
+    def test_unreadable_threads_fail_closed(self):
+        def boom(*a):
+            raise SystemExit(2)  # gate-unresolved's run_graphql on a query failure
+        rc, writes = self.run_decide([SHA], threads=boom)
+        self.assertEqual((rc, writes), (0, []))
+
+    def test_unreadable_head_after_post_withdraws(self):
+        rc, writes = self.run_decide([SHA, RuntimeError("timeout")])
+        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
 
     def test_head_unchanged_keeps_the_approval(self):
         rc, writes = self.run_decide([SHA, SHA])
@@ -167,6 +211,25 @@ class PostWriteRaceTest(unittest.TestCase):
     def test_head_moved_during_post_withdraws_it(self):
         rc, writes = self.run_decide([SHA, "b" * 40])
         self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+
+class GhTest(unittest.TestCase):
+    def test_a_wedged_call_is_a_runtime_error(self):
+        import subprocess
+        with mock.patch.object(AA.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 60)):
+            with self.assertRaises(RuntimeError):
+                AA.gh(["api", "x"])
+
+
+class RenderBodyTest(unittest.TestCase):
+    def test_model_values_cannot_inject_markdown(self):
+        bad = {"file": "a`b\n## forged @someone", "line": "1\n# x", "severity": "**pwn** " * 50}
+        body = AA.render_body(AA.REQUEST_CHANGES, ["1 finding"], "medium", [bad])
+        self.assertIn("**unknown**", body)
+        self.assertNotIn("\n## forged", body)
+        self.assertNotIn("@someone", body)
+        self.assertNotIn("pwn", body)
+        self.assertIn(":?", body)
 
 
 if __name__ == "__main__":
