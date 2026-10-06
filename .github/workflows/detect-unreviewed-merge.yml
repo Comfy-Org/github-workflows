@@ -155,15 +155,22 @@ jobs:
               owner,
               repo,
               pull_number: pr.number,
-            })).filter(r => !(r.user && ignored.has(r.user.login.toLowerCase())));
+            })).filter(r => {
+              if (!ignored.size) return true;
+              // With an ignore list set, a review with no usable login (a
+              // deleted account or App) cannot be proven NOT to be the ignored
+              // bot's, so it does not count either.
+              const login = typeof r.user?.login === 'string' ? r.user.login.toLowerCase() : '';
+              return login !== '' && !ignored.has(login);
+            });
             if (ignored.size) {
               core.info(`Ignoring reviews by: ${[...ignored].join(', ')}`);
             }
 
-            let hasApproval;
+            let counted;
             if (approvalMode === 'any-approval') {
               // Private repos without stale-dismissal: any historical APPROVED counts.
-              hasApproval = reviews.some(r => r.state === 'APPROVED');
+              counted = reviews.filter(r => r.state === 'APPROVED');
             } else {
               // OSS repos with stale-dismissal: take latest review per reviewer.
               // A DISMISSED state means the approval was invalidated by a later push.
@@ -175,12 +182,18 @@ jobs:
                   latestByReviewer.set(r.user.login, r);
                 }
               }
-              hasApproval = Array.from(latestByReviewer.values()).some(
+              counted = Array.from(latestByReviewer.values()).filter(
                 r => r.state === 'APPROVED'
               );
             }
+            const hasApproval = counted.length > 0;
 
             if (hasApproval) {
+              // ignore-approvers fails open on a typo or a rotated identity, so
+              // say when the only approvals that counted are from Bot accounts.
+              if (counted.every(r => r.user?.type === 'Bot')) {
+                core.warning(`PR #${pr.number}'s approval came only from bot account(s) (${[...new Set(counted.map(r => r.user?.login))].join(', ')}) — if this repo auto-approves, list that identity in ignore-approvers.`);
+              }
               core.info('PR has an approving review — no action needed.');
               return;
             }

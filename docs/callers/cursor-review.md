@@ -376,7 +376,8 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   severity;
 - **nothing** when the round can't be trusted: the judge did not adjudicate, a
   panel reviewer did not complete, the review did not land as threads (or some
-  finding reached the review body only), the head moved mid-run, the PR state
+  finding reached the review body only), the head moved or the base was
+  retargeted mid-run, the PR state
   could not be read, an earlier round's thread above the threshold is still
   open, or the **reviewed diff is empty** — every changed path was stripped by
   `diff_excludes` or the generated-file classifier (or the change is a pure
@@ -389,14 +390,21 @@ step with an `::error::`, not as a failed `Post review` job (which the blocking
 gate would read as "the review did not land").
 
 The **Dismiss stale auto-approval** job withdraws the bot's own marked
-**approvals** when what was reviewed changes:
+**approvals** when what was reviewed changes. It runs on every event of an open
+PR and reads the PR's **live** head and base, not the event, so whichever event
+runs next redoes a dismissal that a cancelled run left undone:
 
-- `synchronize` / `reopened` — every approval not on the new head (a push made
-  while the PR was closed arrives as `reopened`, not `synchronize`);
-- `edited` with a base change (a retarget) — **every** approval, the on-head one
-  too: the head did not move but the diff did. A title/body `edited` runs the
-  off-head pass only; it is admitted because it shares the reusable's concurrency
-  slot with `synchronize` and can cancel a push's in-flight dismissal.
+- an approval not on the current head — a push (`synchronize`, or `reopened` for
+  a push made while the PR was closed);
+- an approval recorded against a base other than the current one — a retarget
+  (`edited`). The head did not move but the diff did, so the on-head approval
+  goes too. Each approval records the base it was reviewed against; one posted
+  before that record is reached only by the retarget's own `edited` run.
+
+If a stale marked approval belongs to a login this run cannot act as — the
+approver identity changed, or the approver's secrets are not available to the
+run (`APPROVER_TOKEN` / `BOT_APP_PRIVATE_KEY` on a Dependabot PR) — the job goes
+**red** rather than passing unchecked; dismiss it by hand.
 
 A request-changes is left in place — a push does not start a new panel under the
 label-triggered caller, so only the next round (re-apply the label) supersedes it.
@@ -406,8 +414,8 @@ is the kill switch for *new* approvals; the next push still withdraws any
 approval already on a PR. On a repo that never approved, the job lists the
 reviews, finds none of its own, and does nothing. It does key on the approver
 identity, though: change `APPROVER_TOKEN` / `bot_app_id` while approvals are
-live and the old identity's approvals are no longer recognised as the bot's —
-dismiss those by hand.
+live and the old identity's approvals can no longer be dismissed — the job goes
+red on the next stale one until you dismiss it by hand.
 
 **Widened callers: keep `edited` from cancelling a panel.** The label-only
 caller above keys its group on `github.event.label.name`, so `edited` never

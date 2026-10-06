@@ -26,7 +26,7 @@ const runScript = new AsyncFunction('github', 'context', 'core', 'process', scri
 const review = (login, state = 'APPROVED', at = '2026-10-01T00:00:00Z', type = 'User') =>
   ({user: {login, type}, state, submitted_at: at});
 
-async function run({reviews, approvalMode = 'latest-per-reviewer', ignore = ''}) {
+async function run({reviews, approvalMode = 'latest-per-reviewer', ignore = '', warnings = []}) {
   const pr = {number: 7, title: 't', body: '', merged_at: '2026-10-02T00:00:00Z', base: {ref: 'main'}, user: {login: 'author'}};
   const created = [];
   const failed = [];
@@ -45,7 +45,7 @@ async function run({reviews, approvalMode = 'latest-per-reviewer', ignore = ''})
   }
   const github = Object.assign(new Octokit(), {rest, paginate: async (fn, params) => fn(params)});
   const context = {sha: 'a'.repeat(40), ref: 'refs/heads/main', repo: {owner: 'o', repo: 'r'}};
-  const core = {info: () => {}, warning: () => {}, setFailed: (m) => failed.push(m)};
+  const core = {info: () => {}, warning: (m) => warnings.push(m), setFailed: (m) => failed.push(m)};
   const env = {APPROVAL_MODE: approvalMode, IGNORE_APPROVERS: ignore, UNREVIEWED_MERGES_TOKEN: 'x'};
   await runScript(github, context, core, {env});
   assert.deepEqual(failed, []);
@@ -74,6 +74,25 @@ for (const approvalMode of ['any-approval', 'latest-per-reviewer']) {
   test(`${approvalMode}: a human approval still counts alongside an ignored bot`, async () => {
     const reviews = [review('review-app[bot]', 'APPROVED'), review('human', 'APPROVED')];
     assert.equal(await run({approvalMode, reviews, ignore: 'review-app[bot]'}), 0);
+  });
+
+  test(`${approvalMode}: with an ignore list, a review with no usable login does not count`, async () => {
+    // A deleted App's approval could be the ignored bot's; a null login must not throw either.
+    for (const user of [null, {login: null, type: 'Bot'}]) {
+      const reviews = [{user, state: 'APPROVED', submitted_at: '2026-10-01T00:00:00Z'}];
+      assert.equal(await run({approvalMode, reviews, ignore: 'review-app[bot]'}), 1);
+    }
+  });
+
+  test(`${approvalMode}: warns when the only counted approval is a Bot's`, async () => {
+    const warnings = [];
+    const reviews = [review('typo-app[bot]', 'APPROVED', undefined, 'Bot')];
+    assert.equal(await run({approvalMode, reviews, ignore: 'review-app[bot]', warnings}), 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /typo-app\[bot\]/);
+    const quiet = [];
+    await run({approvalMode, reviews: [...reviews, review('human')], warnings: quiet});
+    assert.deepEqual(quiet, []);
   });
 }
 

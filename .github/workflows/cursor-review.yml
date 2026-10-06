@@ -313,9 +313,10 @@ on:
           below that severity, and REQUESTS CHANGES when any finding is above
           it. Any other value fails the run. No approval when the judge did not
           adjudicate, a panel reviewer did not complete, the review did not land
-          as threads, the head moved mid-run, an earlier critical/high thread
-          is still open, or the reviewed diff is empty (every changed path
-          excluded by diff_excludes / the generated-file classifier). A caller
+          as threads, the head moved or the base was retargeted mid-run, an
+          earlier critical/high thread is still open, or the reviewed diff is
+          empty (every changed path excluded by diff_excludes / the
+          generated-file classifier). A caller
           that sets this must also deliver `synchronize`, `reopened` and
           `edited`, so a push or a base retarget dismisses the bot's earlier
           approval; that dismissal runs whether or not this input is still
@@ -3033,6 +3034,10 @@ jobs:
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
           DELIVERED: ${{ steps.post.outputs.delivered }}
           UNGATED: ${{ steps.post.outputs.ungated_findings }}
+          # The base this round diffed against (`BASE_SHA` above is this
+          # event's too): decide refuses if the live base differs, and records
+          # it in the review so a later retarget is caught from live state.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3057,7 +3062,8 @@ jobs:
             --delivered "$DELIVERED" \
             --ungated "${UNGATED:-0}" \
             --approver-login "$LOGIN" \
-            --reviewed-diff /tmp/pr-diff.patch
+            --reviewed-diff /tmp/pr-diff.patch \
+            --base-ref "$BASE_REF"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
@@ -3078,17 +3084,18 @@ jobs:
     # Three events change what was reviewed: `synchronize` (a push), `reopened`
     # (a push that landed while the PR was closed arrives as this, not as
     # `synchronize`) and an `edited` that carries `changes.base` (a retarget —
-    # same head, different diff, so every marked approval goes, on-head too).
-    # Each fires only if the caller lists it in `types:`. A title/body `edited`
-    # runs the plain off-head pass too, on purpose: it shares the workflow-level
-    # `label-` concurrency slot with `synchronize`, so it can CANCEL a push's
-    # in-flight dismissal — and must then redo it rather than strand the approval.
+    # same head, different diff). Each fires only if the caller lists it in
+    # `types:`. Staleness is read from the PR's LIVE head and base, never from
+    # the event, so the job runs on EVERY action of an open PR: any event in the
+    # same concurrency slot can cancel an in-flight dismissal, and whichever run
+    # replaces it must redo that dismissal from live state. Each approval
+    # records its base, so a retarget is caught that way too; `BASE_FROM`
+    # (`--all-approvals`) only covers approvals posted before that record.
+    # Open PRs only: a title edit on a merged PR must not try a dismissal.
     name: Dismiss stale auto-approval
     if: >-
       ${{ github.event_name == 'pull_request' &&
-      (github.event.action == 'synchronize' ||
-      github.event.action == 'reopened' ||
-      github.event.action == 'edited') &&
+      github.event.pull_request.state == 'open' &&
       github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -3182,7 +3189,6 @@ jobs:
           BOT_APP_ID: ${{ inputs.bot_app_id }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Non-empty only on a base retarget (`edited` with `changes.base`).
           BASE_FROM: ${{ github.event.changes.base.ref.from }}
         run: |
@@ -3196,16 +3202,22 @@ jobs:
             LOGIN="${APP_SLUG}[bot]"
           elif [ -n "$BOT_APP_ID" ]; then
             # The App is the approver identity but its key is not in this run's
-            # secrets, so we can neither name nor act as it. Falling back to
-            # github-actions[bot] would scan the wrong identity and report clean.
-            echo "::warning::bot_app_id is set but BOT_APP_PRIVATE_KEY is not available to this run (e.g. a Dependabot PR) — cannot act as the approver identity, so no stale auto-approval was checked."
-            exit 0
+            # secrets (e.g. a Dependabot PR), so we can neither name nor act as
+            # it. Read-only with the job token and an EMPTY login: nothing is
+            # dismissed, and any stale marked approval turns the job red.
+            echo "::warning::bot_app_id is set but BOT_APP_PRIVATE_KEY is not available to this run — checking for stale auto-approvals without dismissing any."
+            export GH_TOKEN="$FALLBACK_TOKEN"
+            LOGIN=""
           else
             export GH_TOKEN="$FALLBACK_TOKEN"
             LOGIN="github-actions[bot]"
           fi
           # A retarget: the head did not move, the diff did — so an approval
-          # pinned to the head is as stale as an off-head one.
+          # pinned to the head is as stale as an off-head one. (Approvals that
+          # record their base are caught without this; older ones are not.)
+          # Under APPROVER_TOKEN / the fallback, a stale marked approval by any
+          # OTHER login (e.g. APPROVER_TOKEN unavailable on a Dependabot PR)
+          # also turns the job red rather than passing unchecked.
           ALL=()
           if [ -n "$BASE_FROM" ]; then
             ALL=(--all-approvals)
@@ -3213,7 +3225,6 @@ jobs:
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
-            --head-sha "$HEAD_SHA" \
             --approver-login "$LOGIN" \
             "${ALL[@]}"
 

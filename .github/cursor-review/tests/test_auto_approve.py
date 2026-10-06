@@ -8,13 +8,14 @@ approval could land on a PR nobody should have approved:
 * any finding above the threshold — or with an unrecognised severity — requests
   changes, never approves;
 * an un-adjudicated (judge-degraded) round neither approves nor vetoes;
-* an incomplete panel, an undelivered review, a moved head, or an open
+* an incomplete panel, an undelivered review, a moved head or base, or an open
   critical/high (or unbadged) thread from an earlier round withholds approval;
 * an empty reviewed diff (every path excluded) withholds approval and
   withdraws an earlier one;
-* dismissal touches only the approver's own marked reviews that are off-head —
-  or, on a base retarget, every one of them — and the dismiss job runs on
-  `synchronize`, `reopened` and a base-changing `edited` whether or not
+* dismissal touches only the approver's own marked reviews that are stale
+  against the PR's LIVE head and recorded base — or, on a base retarget, every
+  one of them — goes red over a stale marked approval it cannot act on, and the
+  dismiss job runs on every event of an open PR whether or not
   `approve_max_severity` is still set.
 
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
@@ -46,9 +47,9 @@ def finding(sev):
 
 
 def decide(threshold="medium", findings=(), panel=PANEL_OK, judge="ok", delivered=True,
-           reviewed=SHA, live=SHA, threads=(), ungated=0, empty_diff=False):
+           reviewed=SHA, live=SHA, threads=(), ungated=0, empty_diff=False, reviewed_base="main", live_base="main"):
     return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads), ungated,
-                     empty_diff)
+                     empty_diff, reviewed_base, live_base)
 
 
 class ThresholdTest(unittest.TestCase):
@@ -106,6 +107,12 @@ class DecideTest(unittest.TestCase):
     def test_moved_head_withholds(self):
         self.assertEqual(decide(live="b" * 40)[0], AA.NONE)
         self.assertEqual(decide(reviewed="", live="")[0], AA.NONE)
+
+    def test_retargeted_base_withholds(self):
+        # A retarget never moves the head, so only the base comparison sees it.
+        self.assertEqual(decide(live_base="release")[0], AA.NONE)
+        self.assertEqual(decide(live_base="release", findings=[finding("high")])[0], AA.NONE)
+        self.assertEqual(decide(reviewed_base="")[0], AA.NONE)
 
     def test_open_prior_high_thread_withholds(self):
         for sev in ("critical", "high", None):
@@ -167,8 +174,9 @@ class ThreadSeverityTest(unittest.TestCase):
 
 
 class StaleReviewTest(unittest.TestCase):
-    def review(self, rid, login="cursor-approver", state="APPROVED", commit="old", marker=True):
-        body = (AA.APPROVE_MARKER + "\nok") if marker else "ok"
+    def review(self, rid, login="cursor-approver", state="APPROVED", commit="old", marker=True, base=None):
+        body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], base) if base is not None else (
+            (AA.APPROVE_MARKER + "\nok") if marker else "ok")
         return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit, "body": body}
 
     def test_dismisses_own_marked_off_head_reviews(self):
@@ -194,7 +202,24 @@ class StaleReviewTest(unittest.TestCase):
         reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
 
-    def run_dismiss(self, reviews, all_approvals=False, list_error=None):
+    def test_recorded_base_round_trips(self):
+        for ref in ("main", "release/1.x", "odd-->ref"):
+            self.assertEqual(AA.recorded_base(self.review(1, base=ref)["body"]), ref)
+        self.assertIsNone(AA.recorded_base(AA.APPROVE_MARKER))
+
+    def test_off_base_approval_is_stale_on_head_too(self):
+        reviews = [self.review(1, commit="new", base="main"), self.review(2, commit="new", base="release"),
+                   self.review(3, commit="new")]  # 3 pre-dates the record: only --all-approvals reaches it
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new", "release"), [1])
+
+    def test_other_identities_stale_approvals_are_unactionable(self):
+        reviews = [self.review(1), self.review(2, login="old-approver"), self.review(3, login="old-approver", commit="new"),
+                   self.review(4, login="a-human", marker=False)]
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "cursor-approver", "new"), ["old-approver:2"])
+        # No approver identity in this run: every stale marked approval is unactionable.
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "", "new"), ["cursor-approver:1", "old-approver:2"])
+
+    def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main"):
         puts = []
 
         def fake_gh(args, payload=None):
@@ -202,11 +227,13 @@ class StaleReviewTest(unittest.TestCase):
                 if list_error:
                     raise list_error
                 return json.dumps([reviews])
-            puts.append((args[3], payload["message"]))
-            return "{}"
+            if args[:2] == ["api", "-X"]:
+                puts.append((args[3], payload["message"]))
+                return "{}"
+            # The live PR: head "new", even when the event that started the run carried an older one.
+            return json.dumps({"head": {"sha": "new"}, "base": {"ref": live_base}})
 
-        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha="new", approver_login="cursor-approver",
-                                  all_approvals=all_approvals)
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals)
         with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
             return AA.cmd_dismiss_stale(args), puts
 
@@ -225,6 +252,24 @@ class StaleReviewTest(unittest.TestCase):
         rc, puts = self.run_dismiss([], list_error=RuntimeError("502"))
         self.assertEqual((rc, puts), (1, []))
 
+    def test_a_later_event_redoes_a_cancelled_retarget_dismissal(self):
+        # The retarget's own run was cancelled; a title edit (no BASE_FROM) runs
+        # next and still withdraws the on-head approval recorded against the old base.
+        rc, puts = self.run_dismiss([self.review(1, commit="new", base="main")], live_base="release")
+        self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/1/dismissals"]))
+
+    def test_an_unactionable_stale_approval_goes_red(self):
+        # e.g. APPROVER_TOKEN unavailable on a Dependabot PR: the fallback
+        # identity cannot dismiss the real approver's stale approval.
+        rc, puts = self.run_dismiss([self.review(1, login="cursor-approver")], login="github-actions[bot]")
+        self.assertEqual((rc, puts), (1, []))
+        rc, puts = self.run_dismiss([self.review(1)], login="")
+        self.assertEqual((rc, puts), (1, []))
+
+    def test_nothing_to_check_is_clean_without_the_approver(self):
+        rc, puts = self.run_dismiss([self.review(1, commit="new", base="main")], login="")
+        self.assertEqual((rc, puts), (0, []))
+
 
 class DismissJobTriggerTest(unittest.TestCase):
     """The workflow half of dismissal: when the job runs at all."""
@@ -242,21 +287,27 @@ class DismissJobTriggerTest(unittest.TestCase):
         # of the ones already on the PR.
         self.assertNotIn("approve_max_severity", self.cond)
 
-    def test_runs_on_every_event_that_changes_what_was_reviewed(self):
-        self.assertIn("github.event.action == 'synchronize'", self.cond)
-        self.assertIn("github.event.action == 'reopened'", self.cond)
-        # Every `edited`, not only a retarget: a title edit shares the `label-`
-        # concurrency slot with `synchronize` and can cancel its dismissal.
-        self.assertIn("github.event.action == 'edited')", self.cond)
+    def test_runs_on_every_action_of_an_open_pr(self):
+        # Any event sharing a concurrency slot can cancel an in-flight
+        # dismissal, so none may be filtered out by action — only closed PRs.
+        self.assertNotIn("github.event.action", self.cond)
+        self.assertIn("github.event.pull_request.state == 'open'", self.cond)
+
+    def test_a_missing_app_key_checks_instead_of_passing(self):
+        self.assertNotIn("exit 0", self.job)
+        self.assertIn('LOGIN=""', self.job)
 
     def test_a_retarget_dismisses_every_approval(self):
         self.assertIn("BASE_FROM: ${{ github.event.changes.base.ref.from }}", self.job)
         self.assertIn('if [ -n "$BASE_FROM" ]; then\n            ALL=(--all-approvals)', self.job)
         self.assertIn('"${ALL[@]}"', self.job)
 
-    def test_decide_reads_the_reviewed_diff(self):
+    def test_decide_reads_the_reviewed_diff_and_base(self):
         with open(WORKFLOW_PATH, encoding="utf-8") as f:
-            self.assertIn("--reviewed-diff /tmp/pr-diff.patch", f.read())
+            text = f.read()
+        self.assertIn("--reviewed-diff /tmp/pr-diff.patch", text)
+        self.assertIn("BASE_REF: ${{ github.event.pull_request.base.ref }}", text)
+        self.assertIn('--base-ref "$BASE_REF"', text)
 
 
 class PostWriteRaceTest(unittest.TestCase):
@@ -277,7 +328,8 @@ class PostWriteRaceTest(unittest.TestCase):
             head = next(heads)
             if isinstance(head, Exception):
                 raise head
-            return json.dumps({"head": {"sha": head}})
+            head, base = head if isinstance(head, tuple) else (head, "main")
+            return json.dumps({"head": {"sha": head}, "base": {"ref": base}})
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"findings": [], "panel": PANEL_OK}, f)
@@ -285,7 +337,8 @@ class PostWriteRaceTest(unittest.TestCase):
             p.write(diff)
         args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
                                   commit_sha=SHA, judge_status=judge_status, delivered="true",
-                                  ungated="0", approver_login="cursor-approver", reviewed_diff=p.name)
+                                  ungated="0", approver_login="cursor-approver", reviewed_diff=p.name,
+                                  base_ref="main")
         with mock.patch.object(AA, "gh", fake_gh), \
                 mock.patch.object(AA, "open_thread_severities", threads), \
                 mock.patch.object(AA, "emit", lambda *a: None):
@@ -326,6 +379,19 @@ class PostWriteRaceTest(unittest.TestCase):
     def test_head_moved_during_post_withdraws_it(self):
         rc, writes = self.run_decide([SHA, "b" * 40])
         self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+    def test_base_retargeted_during_post_withdraws_it(self):
+        rc, writes = self.run_decide([SHA, (SHA, "release")])
+        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+    def test_base_retargeted_before_decide_posts_nothing(self):
+        rc, writes = self.run_decide([(SHA, "release")])
+        self.assertEqual((rc, writes), (0, []))
+
+    def test_approval_records_the_reviewed_base(self):
+        body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], "main")
+        self.assertIn(AA.APPROVE_MARKER, body)
+        self.assertEqual(AA.recorded_base(body), "main")
 
 
 class GhTest(unittest.TestCase):
