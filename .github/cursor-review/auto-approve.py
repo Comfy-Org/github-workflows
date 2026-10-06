@@ -10,10 +10,15 @@ subcommands, each run from a job that checks out NO PR code:
     is above it; otherwise submit nothing. The review is pinned (`commit_id`) to
     the commit the panel reviewed.
 
-``dismiss-stale`` (in `dismiss-stale-approval`, on `synchronize`)
+``dismiss-stale`` (in `dismiss-stale-approval`, on `synchronize` / `reopened`,
+and with ``--all-approvals`` on a base-branch retarget)
     Dismiss this identity's own auto-approve APPROVALS that are not on the new
-    head. The caller's ruleset may keep an approval valid across pushes
-    (`dismiss_stale_reviews_on_push: false`), so the bot has to withdraw its own.
+    head — or, on a retarget, every one of them: the head is unchanged there, but
+    the diff it was approved against is not. The caller's ruleset may keep an
+    approval valid across pushes (`dismiss_stale_reviews_on_push: false`), so the
+    bot has to withdraw its own. The job runs whether or not
+    `approve_max_severity` is still set: unsetting it is the kill switch for NEW
+    approvals, and must not also stop old ones from being withdrawn.
     CHANGES_REQUESTED is deliberately NOT dismissed on a push: under the
     label-triggered caller a push starts no new round, so dismissing it would let
     any trivial push clear the bot's veto. Only a later round's own review event
@@ -33,7 +38,11 @@ An untrusted round submits NO review event — neither approve nor request chang
   the open-thread check below cannot see it);
 * the PR state or its threads could not be read;
 * the PR head moved while the panel ran. A push racing the POST itself is
-  caught by re-reading the head after the write and withdrawing the review.
+  caught by re-reading the head after the write and withdrawing the review;
+* the reviewed diff has no content hunk — every changed path was stripped by
+  ``diff_excludes`` or the generated-file classifier (or the change is a pure
+  rename / mode / binary change). Zero findings over nothing is not a clean
+  review, and those paths can still reach production.
 
 On a trusted round:
 
@@ -131,6 +140,7 @@ def decide(
     live_head_sha: str,
     open_thread_severities: list,
     ungated: int = 0,
+    reviewed_diff_empty: bool = False,
 ):
     """Return (event, reasons, blocking_findings). Pure; no I/O.
 
@@ -152,6 +162,8 @@ def decide(
         reasons.append(f"{ungated} finding(s) reached the review body only, not as resolvable threads")
     if not reviewed_sha or reviewed_sha != live_head_sha:
         reasons.append("the PR head moved while the review ran")
+    if reviewed_diff_empty:
+        reasons.append("the reviewed diff is empty — every changed path was excluded from review, so nothing a reviewer saw can earn an approval")
     if reasons:
         return NONE, reasons, []
 
@@ -169,6 +181,20 @@ def decide(
     if open_blocking:
         return NONE, [f"{len(open_blocking)} open thread(s) above `{threshold}` (or unbadged) from an earlier round"], []
     return APPROVE, [f"every finding is at or below `{threshold}`"], []
+
+
+def reviewed_diff_is_empty(path: str) -> bool:
+    """True when the reviewed patch carries no content hunk (or cannot be read).
+
+    A file section with no `@@` hunk — a pure rename, a mode change, a binary
+    file — shows a reviewer no content either, so it does not count. An
+    unreadable patch is no evidence that anything was reviewed: fail closed.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return not any(line.startswith("@@") for line in f)
+    except OSError:
+        return True
 
 
 def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha) -> list:
@@ -294,6 +320,7 @@ def cmd_decide(args) -> int:
             live_head,
             prior,
             ungated,
+            reviewed_diff_is_empty(args.reviewed_diff),
         )
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
@@ -374,6 +401,7 @@ def withdraw_own_approvals(args) -> int:
 
 
 STALE_MESSAGE = "New commits pushed — cursor-review auto-approve withdrawn until the next review round."
+BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve withdrawn until the next review round."
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
 
 
@@ -385,11 +413,19 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
 
 
 def cmd_dismiss_stale(args) -> int:
-    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, args.head_sha)
+    # On a retarget the head is unchanged, so an approval pinned to it is
+    # exactly as stale as an off-head one: select every marked approval.
+    head = None if args.all_approvals else args.head_sha
+    message = BASE_CHANGED_MESSAGE if args.all_approvals else STALE_MESSAGE
+    try:
+        ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, head)
+    except (RuntimeError, ValueError) as e:
+        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {e}")
+        return 1
     failed = []
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid)
+            dismiss(args.repo, args.pr_number, rid, message)
         except RuntimeError as e:
             failed.append(f"{rid}: {e}")
     emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login}.")
@@ -414,11 +450,13 @@ def main() -> int:
     d.add_argument("--delivered", default="")
     d.add_argument("--ungated", default="0")
     d.add_argument("--approver-login", required=True)
+    d.add_argument("--reviewed-diff", required=True)
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
     s.add_argument("--head-sha", required=True)
     s.add_argument("--approver-login", required=True)
+    s.add_argument("--all-approvals", action="store_true")
     args = parser.parse_args()
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)
 

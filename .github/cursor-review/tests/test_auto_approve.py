@@ -10,7 +10,12 @@ approval could land on a PR nobody should have approved:
 * an un-adjudicated (judge-degraded) round neither approves nor vetoes;
 * an incomplete panel, an undelivered review, a moved head, or an open
   critical/high (or unbadged) thread from an earlier round withholds approval;
-* dismissal touches only the approver's own marked reviews that are off-head.
+* an empty reviewed diff (every path excluded) withholds approval and
+  withdraws an earlier one;
+* dismissal touches only the approver's own marked reviews that are off-head —
+  or, on a base retarget, every one of them — and the dismiss job runs on
+  `synchronize`, `reopened` and a base-changing `edited` whether or not
+  `approve_max_severity` is still set.
 
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
@@ -19,6 +24,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -28,7 +34,10 @@ SPEC = importlib.util.spec_from_file_location("auto_approve", MODULE_PATH)
 AA = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AA)
 
+WORKFLOW_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "cursor-review.yml")
+
 SHA = "a" * 40
+DIFF = "diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -1 +1 @@\n-a\n+b\n"
 PANEL_OK = [{"model": "m", "review_type": "adversarial", "status": "ok"}]
 
 
@@ -37,8 +46,9 @@ def finding(sev):
 
 
 def decide(threshold="medium", findings=(), panel=PANEL_OK, judge="ok", delivered=True,
-           reviewed=SHA, live=SHA, threads=(), ungated=0):
-    return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads), ungated)
+           reviewed=SHA, live=SHA, threads=(), ungated=0, empty_diff=False):
+    return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads), ungated,
+                     empty_diff)
 
 
 class ThresholdTest(unittest.TestCase):
@@ -116,6 +126,36 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decide(ungated=2, findings=[finding("high")])[0], AA.NONE)
 
 
+    def test_empty_reviewed_diff_withholds(self):
+        # A PR touching only diff_excludes paths: zero findings over nothing.
+        event, reasons, _ = decide(empty_diff=True)
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("reviewed diff is empty", reasons[0])
+
+
+class ReviewedDiffTest(unittest.TestCase):
+    def check(self, text):
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+            f.write(text)
+        try:
+            return AA.reviewed_diff_is_empty(f.name)
+        finally:
+            os.unlink(f.name)
+
+    def test_a_content_hunk_is_not_empty(self):
+        self.assertFalse(self.check(DIFF))
+
+    def test_no_hunk_is_empty(self):
+        self.assertTrue(self.check(""))
+        self.assertTrue(self.check("\n"))
+        # Pure rename / binary: a header, but no content a reviewer could read.
+        self.assertTrue(self.check("diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to y\n"))
+        self.assertTrue(self.check("diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n"))
+
+    def test_missing_patch_is_empty(self):
+        self.assertTrue(AA.reviewed_diff_is_empty("/nonexistent/pr-diff.patch"))
+
+
 class ThreadSeverityTest(unittest.TestCase):
     def test_reads_post_review_badges(self):
         self.assertEqual(AA.thread_severity("🟠 **High** — something"), "high")
@@ -154,11 +194,75 @@ class StaleReviewTest(unittest.TestCase):
         reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
 
+    def run_dismiss(self, reviews, all_approvals=False, list_error=None):
+        puts = []
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "--paginate"]:
+                if list_error:
+                    raise list_error
+                return json.dumps([reviews])
+            puts.append((args[3], payload["message"]))
+            return "{}"
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha="new", approver_login="cursor-approver",
+                                  all_approvals=all_approvals)
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+            return AA.cmd_dismiss_stale(args), puts
+
+    def test_push_keeps_an_on_head_approval(self):
+        rc, puts = self.run_dismiss([self.review(1, commit="new"), self.review(2)])
+        self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/2/dismissals"]))
+
+    def test_retarget_dismisses_the_on_head_approval_too(self):
+        # `edited` with changes.base: the head did not move, the diff did.
+        rc, puts = self.run_dismiss([self.review(1, commit="new"), self.review(2)], all_approvals=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(puts), 2)
+        self.assertTrue(all(m == AA.BASE_CHANGED_MESSAGE for _, m in puts))
+
+    def test_unlistable_reviews_fail_red_without_a_traceback(self):
+        rc, puts = self.run_dismiss([], list_error=RuntimeError("502"))
+        self.assertEqual((rc, puts), (1, []))
+
+
+class DismissJobTriggerTest(unittest.TestCase):
+    """The workflow half of dismissal: when the job runs at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            text = f.read()
+        job = re.search(r"^  dismiss-stale-approval:\n(.*?)^  \S", text, re.S | re.M).group(1)
+        cls.job = job
+        cls.cond = re.search(r"^    if: >-\n(.*?)^    \S", job, re.S | re.M).group(1)
+
+    def test_not_gated_on_the_kill_switch(self):
+        # Unsetting approve_max_severity must stop NEW approvals, not dismissal
+        # of the ones already on the PR.
+        self.assertNotIn("approve_max_severity", self.cond)
+
+    def test_runs_on_every_event_that_changes_what_was_reviewed(self):
+        self.assertIn("github.event.action == 'synchronize'", self.cond)
+        self.assertIn("github.event.action == 'reopened'", self.cond)
+        # Every `edited`, not only a retarget: a title edit shares the `label-`
+        # concurrency slot with `synchronize` and can cancel its dismissal.
+        self.assertIn("github.event.action == 'edited')", self.cond)
+
+    def test_a_retarget_dismisses_every_approval(self):
+        self.assertIn("BASE_FROM: ${{ github.event.changes.base.ref.from }}", self.job)
+        self.assertIn('if [ -n "$BASE_FROM" ]; then\n            ALL=(--all-approvals)', self.job)
+        self.assertIn('"${ALL[@]}"', self.job)
+
+    def test_decide_reads_the_reviewed_diff(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            self.assertIn("--reviewed-diff /tmp/pr-diff.patch", f.read())
+
 
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
 
-    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: []):
+    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: [], diff=DIFF):
         calls = []
         heads = iter(heads)
 
@@ -177,14 +281,17 @@ class PostWriteRaceTest(unittest.TestCase):
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"findings": [], "panel": PANEL_OK}, f)
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as p:
+            p.write(diff)
         args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
                                   commit_sha=SHA, judge_status=judge_status, delivered="true",
-                                  ungated="0", approver_login="cursor-approver")
+                                  ungated="0", approver_login="cursor-approver", reviewed_diff=p.name)
         with mock.patch.object(AA, "gh", fake_gh), \
                 mock.patch.object(AA, "open_thread_severities", threads), \
                 mock.patch.object(AA, "emit", lambda *a: None):
             rc = AA.cmd_decide(args)
         os.unlink(f.name)
+        os.unlink(p.name)
         return rc, [c[0][2] for c in calls if c[0][:2] == ["api", "-X"]]
 
     def test_untrusted_round_withdraws_an_earlier_approval(self):
@@ -192,6 +299,14 @@ class PostWriteRaceTest(unittest.TestCase):
         approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
                     "commit_id": SHA, "body": AA.APPROVE_MARKER}
         rc, writes = self.run_decide([SHA], judge_status="error", reviews=[approval])
+        self.assertEqual((rc, writes), (0, ["PUT"]))
+
+    def test_excluded_only_pr_posts_nothing_and_withdraws(self):
+        # Round 1 approved real content; a later round over an all-excluded diff
+        # must neither approve nor leave that approval counting.
+        approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                    "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, writes = self.run_decide([SHA], reviews=[approval], diff="")
         self.assertEqual((rc, writes), (0, ["PUT"]))
 
     def test_unreadable_threads_fail_closed(self):
