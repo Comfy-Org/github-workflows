@@ -154,10 +154,13 @@ jobs:
           # from `job.workflow_sha` rather than `workflows_ref` — deliberately, see
           # groom.yml — but for a SHA-pinned caller that is this same commit, which is
           # exactly the SHA this fleet is about to pin.
-          # DELIBERATELY ABSENT: key-broker.mjs. broker.mjs is what every agent job
-          # actually starts; no step here loads key-broker.mjs, so listing it would
-          # let its eventual cleanup freeze this fleet behind a `::warning::` — the
-          # false-decommission failure mode.
+          # The CONVERSE of that same test binds too: a file NO pinned caller loads
+          # at run time stays OFF this list, because listing it would let its
+          # eventual cleanup freeze this fleet behind a `::warning::` — the
+          # false-decommission failure mode. The worked example was the superseded
+          # standalone loopback key proxy (BE-4419), called out here as deliberately
+          # absent until it was deleted in this same change; broker.mjs — the proxy
+          # every agent job actually starts — is listed, and stays listed.
           WATCHED_EXEC: |
             .github/workflows/groom.yml
             .github/groom/agent-sandbox.sh
