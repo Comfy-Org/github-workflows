@@ -262,14 +262,35 @@ class ReviewsListTest(unittest.TestCase):
         self.assertIn("cursor=null", " ".join(calls[0]))
         self.assertIn("cursor=CUR", " ".join(calls[1]))
 
-    def test_a_truncated_page_does_not_loop_forever(self):
-        # hasNextPage with no cursor to follow: stop, rather than re-request page
-        # one until the job times out.
-        reviews, calls = self.list_reviews(
-            graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
-                            has_next=True, cursor=None),
-        )
-        self.assertEqual(([r["id"] for r in reviews], len(calls)), ([1], 1))
+    def test_a_page_with_no_cursor_to_follow_raises(self):
+        # hasNextPage with no cursor: neither re-request page one until the job
+        # times out, nor return the truncated list — reviews come back
+        # oldest-first, so the dropped page holds the newest approval.
+        page = graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                               has_next=True, cursor=None)
+        with self.assertRaises(ValueError):
+            self.list_reviews(page)
+
+    def test_a_cursor_that_does_not_advance_raises(self):
+        page = graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                               has_next=True, cursor="CUR")
+        with self.assertRaises(ValueError):
+            self.list_reviews(page, page)
+
+    def test_a_null_reviews_connection_raises(self):
+        with self.assertRaises(ValueError):
+            self.list_reviews(json.dumps({"data": {"repository": {"pullRequest": {"reviews": None}}}}))
+
+    def test_a_review_with_no_id_raises(self):
+        # Not a None carried into the dismissal URL, which 404s as a misleading
+        # "could not dismiss".
+        page = json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"fullDatabaseId": None, "databaseId": None, "state": "APPROVED", "body": "b",
+                       "lastEditedAt": None, "author": {"__typename": "User", "login": "x"}}],
+        }}}}})
+        with self.assertRaises(ValueError):
+            self.list_reviews(page)
 
     def test_a_shapeless_response_raises_instead_of_listing_nothing(self):
         # Both callers read an empty list as "nothing to dismiss" and exit green,
@@ -333,6 +354,25 @@ class StaleReviewTest(unittest.TestCase):
         # workflow posts itself, which are never edited.
         reviews = [self.review(1, sha=NEW)]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
+
+    def test_an_edited_approval_with_its_marker_removed_is_still_dismissed(self):
+        # The cheaper forgery: delete the marker rather than rewrite the SHA.
+        # Gating on the marker first would take the approval out of every filter.
+        reviews = [self.review(1, marker=False, edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1])
+
+    def test_an_unedited_unmarked_approval_is_still_untouched(self):
+        # e.g. a manual approval by a human APPROVER_TOKEN identity.
+        reviews = [self.review(1, marker=False)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [])
+
+    def test_another_logins_edited_unmarked_approval_is_not_unactionable(self):
+        # A human editing their own approval is not a stale auto-approval, so it
+        # must not turn the dismissal job red.
+        reviews = [self.review(1, login="a-human", marker=False, edited=True)]
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "cursor-approver", NEW), [])
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), [])
 
     def test_an_edited_change_request_is_still_not_dismissed(self):
         # Only APPROVALS are this filter's business; an edited veto is someone
