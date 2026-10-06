@@ -569,6 +569,26 @@ class ApproveGateTest(unittest.TestCase):
         self.assertIn("approve_gate: ${{ steps.approve.outputs.approve_gate }}", text)
         self.assertIn("needs.round-cap.outputs.capped != 'true'", text)
 
+    def test_workflow_round_and_max_rounds_outputs(self):
+        # `round` is the last round when capped, the delivered round's number
+        # otherwise (a delivered review is exactly what round_reviews counts),
+        # and empty when no round landed; `max_rounds` is the applied cap.
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "cursor-review.yml")
+        with open(wf, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(
+            "value: ${{ jobs.round-cap.outputs.capped == 'true' && jobs.round-cap.outputs.rounds || "
+            "jobs.post-review.outputs.delivered == 'true' && jobs.round-cap.outputs.next_round || '' }}",
+            text,
+        )
+        self.assertIn(
+            "value: ${{ jobs.round-cap.outputs.max_rounds || (inputs.max_rounds > 0 && inputs.max_rounds) || 0 }}",
+            text,
+        )
+        self.assertIn("next_round: ${{ steps.cap.outputs.next_round }}", text)
+        self.assertIn("max_rounds: ${{ steps.cap.outputs.max_rounds }}", text)
+        self.assertIn("delivered: ${{ steps.post.outputs.delivered }}", text)
+
 
 class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
@@ -874,6 +894,35 @@ class RoundCapCommandTest(unittest.TestCase):
     def test_integral_float_max_rounds_is_accepted(self):
         _, out, _ = self.run_cap(self.FIVE, max_rounds="5.0")
         self.assertEqual(out["capped"], "true")
+
+    def test_round_outputs_under_the_cap(self):
+        # `next_round` is the number this run's round takes; `max_rounds` the
+        # effective cap. Together they feed the workflow's `round` / `max_rounds`.
+        _, out, _ = self.run_cap(self.FIVE[:2], max_rounds="5.0")
+        self.assertEqual((out["rounds"], out["next_round"], out["max_rounds"]), ("2", "3", "5"))
+
+    def test_round_outputs_at_the_cap(self):
+        # Capped: the workflow reports `rounds` (the last round), not next_round.
+        _, out, _ = self.run_cap(self.FIVE)
+        self.assertEqual((out["capped"], out["rounds"], out["max_rounds"]), ("true", "5", "5"))
+
+    def test_round_outputs_after_a_reset_count_from_the_removal(self):
+        _, out, _ = self.run_cap(self.FIVE, timeline=[unlabeled("2026-01-03T12:00:00Z")])
+        self.assertEqual((out["rounds"], out["next_round"]), ("2", "3"))
+
+    def test_no_cap_reports_zero_and_no_round(self):
+        for value in ("0", "", "five", "2.5"):
+            with self.subTest(value=value):
+                _, out, _ = self.run_cap(self.FIVE, max_rounds=value)
+                self.assertEqual(out["max_rounds"], "0")
+                self.assertNotIn("next_round", out)
+
+    def test_unreadable_count_leaves_the_round_empty(self):
+        # Fail-open: the cap is still configured, but no round number is guessed.
+        _, out, _ = self.run_cap(self.FIVE, fail=("/reviews",))
+        self.assertEqual(out["max_rounds"], "5")
+        self.assertNotIn("next_round", out)
+        self.assertNotIn("rounds", out)
 
 
 class NonRoundBannerParityTest(unittest.TestCase):

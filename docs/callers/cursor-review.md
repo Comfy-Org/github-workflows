@@ -532,3 +532,10 @@ jobs:
 | `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
 | `off` | `approve_max_severity` is empty (and the cap was not hit). |
+
+Two more outputs carry the count, for a "round R of M" display:
+
+| Output | Value |
+|---|---|
+| `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing is not counted). If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
+| `max_rounds` | The effective cap: the `max_rounds` input as applied, or `0` for no cap. A value the cap step rejects as not a whole number reports `0`, because it is not applied. |

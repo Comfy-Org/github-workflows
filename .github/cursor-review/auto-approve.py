@@ -848,6 +848,9 @@ def parse_max_rounds(value) -> int:
 def cmd_round_cap(args) -> int:
     set_output("capped", "false")
     set_output("labelled", "false")
+    # The EFFECTIVE cap, for the workflow's `max_rounds` output: an invalid value
+    # is not applied, so it reports 0 (no cap), not what the caller typed.
+    set_output("max_rounds", 0)
     try:
         max_rounds = parse_max_rounds(args.max_rounds)
     except ValueError as e:
@@ -858,6 +861,7 @@ def cmd_round_cap(args) -> int:
     if max_rounds <= 0:
         emit("Round cap: off (`max_rounds: 0`).")
         return 0
+    set_output("max_rounds", max_rounds)
     # The threshold only shapes the comment here; an invalid one is decide()'s
     # to fail on, so it must not stop the cap.
     try:
@@ -882,6 +886,10 @@ def cmd_round_cap(args) -> int:
         print(f"::warning::Could not count this PR's review rounds, so the round cap is not applied this run: {e}")
         return 0
     set_output("rounds", len(rounds))
+    # For the workflow's `round` output: the number THIS run's round takes if it
+    # delivers one. Unset on a fail-open read error, so `round` is empty rather
+    # than a guess.
+    set_output("next_round", len(rounds) + 1)
     if len(rounds) < max_rounds:
         emit(f"Round cap: {len(rounds)}/{max_rounds} round(s) so far — running the panel.")
         return 0

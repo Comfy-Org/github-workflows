@@ -412,6 +412,22 @@ on:
           `max_rounds` or `approve_max_severity` is set), `off`
           (`approve_max_severity` is empty and the cap was not hit).
         value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
+      round:
+        description: >-
+          The 1-based number of the review round this run delivered, counted
+          the way `max_rounds` counts (the posting identity's consolidated
+          reviews since `needs-human-review` was last removed; a round that
+          reviewed nothing does not count). When this run hit the cap, the
+          number of the last round instead. Empty when the run delivered no
+          round, the count could not be read, or `max_rounds` is 0 (nothing is
+          counted then).
+        value: ${{ jobs.round-cap.outputs.capped == 'true' && jobs.round-cap.outputs.rounds || jobs.post-review.outputs.delivered == 'true' && jobs.round-cap.outputs.next_round || '' }}
+      max_rounds:
+        description: >-
+          The effective round cap: the `max_rounds` input as applied, `0` when
+          there is no cap (including a value the cap step rejected as not a
+          whole number). Pairs with `round` for a "round R of M" display.
+        value: ${{ jobs.round-cap.outputs.max_rounds || (inputs.max_rounds > 0 && inputs.max_rounds) || 0 }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -883,6 +899,8 @@ jobs:
       capped: ${{ steps.cap.outputs.capped }}
       labelled: ${{ steps.cap.outputs.labelled }}
       rounds: ${{ steps.cap.outputs.rounds }}
+      next_round: ${{ steps.cap.outputs.next_round }}
+      max_rounds: ${{ steps.cap.outputs.max_rounds }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
