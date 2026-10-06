@@ -44,6 +44,9 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<full-commit-sha>
     with:
       approval-mode: latest-per-reviewer   # 'any-approval' for private repos
+      # Only if this repo auto-approves (cursor-review `approve_max_severity`):
+      # the identity that approves, so its approval is not counted as a review.
+      # ignore-approvers: my-review-app[bot]
     secrets:
       UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
 ```
@@ -66,6 +69,7 @@ Read-only on your repo. The issue write happens on the tracking repo via the PAT
 | Input | Default | Notes |
 |---|---|---|
 | `approval-mode` | `latest-per-reviewer` | Which historical approvals count. Pick deliberately — see below. |
+| `ignore-approvers` | `''` | Logins (whitespace- or comma-separated, case-insensitive, `[bot]` suffix included) whose reviews the check ignores in both modes. **Required in practice for any repo that auto-approves** — see below. |
 
 ### Choosing `approval-mode`
 
@@ -77,6 +81,15 @@ Read-only on your repo. The issue write happens on the tracking repo via the PAT
 
 Getting this backwards produces audit noise in one direction or false confidence
 in the other. Check the repo's branch-protection settings, then pick.
+
+### Automated approvers: `ignore-approvers`
+
+An approval by a bot is not a human review. If the repo enables cursor-review's
+`approve_max_severity`, the bot's `APPROVED` would otherwise satisfy this check
+in either mode — a PR could be labelled, auto-approved and merged with nobody
+looking, and no tracking issue filed. Pass the identity that approves: the
+`APPROVER_TOKEN` account's login, else your `bot_app_id` App's `<slug>[bot]`,
+else `github-actions[bot]`. A human approval alongside the bot's still counts.
 
 ## Gotchas
 

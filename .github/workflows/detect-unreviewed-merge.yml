@@ -24,6 +24,9 @@ name: Detect Unreviewed Merge (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<full-commit-sha>  # v1 — substitute a real 40-char SHA
 #       with:
 #         approval-mode: latest-per-reviewer  # or 'any-approval' for private repos
+#         # Logins whose APPROVED reviews do not count — e.g. the identity a
+#         # cursor-review `approve_max_severity` caller approves as.
+#         ignore-approvers: ''
 #       secrets:
 #         UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
 #
@@ -40,6 +43,17 @@ on:
         type: string
         required: false
         default: latest-per-reviewer
+      ignore-approvers:
+        description: >-
+          Logins (whitespace- or comma-separated, case-insensitive, `[bot]`
+          suffix included) whose reviews are ignored by the approval check in
+          BOTH modes. Pass any automated approver — e.g. the identity a
+          cursor-review caller with `approve_max_severity` approves as — so a
+          PR whose only approval is the bot's is still reported as unreviewed.
+          Default '' ignores no one.
+        type: string
+        required: false
+        default: ''
     secrets:
       UNREVIEWED_MERGES_TOKEN:
         description: Fine-grained PAT with issues:write on Comfy-Org/unreviewed-merges
@@ -58,8 +72,12 @@ jobs:
         env:
           UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
           APPROVAL_MODE: ${{ inputs.approval-mode }}
+          IGNORE_APPROVERS: ${{ inputs.ignore-approvers }}
         with:
+          # The HARNESS sentinels bracket the whole script, so
+          # .github/detect-unreviewed-merge/tests/ runs these exact bytes.
           script: |
+            // HARNESS:script:begin
             const sha = context.sha;
             const { owner, repo } = context.repo;
             const branch = context.ref.replace('refs/heads/', '');
@@ -124,16 +142,35 @@ jobs:
               pull_number: pr.number,
             });
 
-            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+            // An automated approver (ignore-approvers) is not a reviewer: drop
+            // its reviews before EITHER mode looks, so its APPROVED can neither
+            // count itself nor shadow anything in latest-per-reviewer.
+            const ignored = new Set(
+              (process.env.IGNORE_APPROVERS || '')
+                .split(/[\s,]+/)
+                .filter(Boolean)
+                .map(l => l.toLowerCase())
+            );
+            const reviews = (await github.paginate(github.rest.pulls.listReviews, {
               owner,
               repo,
               pull_number: pr.number,
+            })).filter(r => {
+              if (!ignored.size) return true;
+              // With an ignore list set, a review with no usable login (a
+              // deleted account or App) cannot be proven NOT to be the ignored
+              // bot's, so it does not count either.
+              const login = typeof r.user?.login === 'string' ? r.user.login.toLowerCase() : '';
+              return login !== '' && !ignored.has(login);
             });
+            if (ignored.size) {
+              core.info(`Ignoring reviews by: ${[...ignored].join(', ')}`);
+            }
 
-            let hasApproval;
+            let counted;
             if (approvalMode === 'any-approval') {
               // Private repos without stale-dismissal: any historical APPROVED counts.
-              hasApproval = reviews.some(r => r.state === 'APPROVED');
+              counted = reviews.filter(r => r.state === 'APPROVED');
             } else {
               // OSS repos with stale-dismissal: take latest review per reviewer.
               // A DISMISSED state means the approval was invalidated by a later push.
@@ -145,12 +182,18 @@ jobs:
                   latestByReviewer.set(r.user.login, r);
                 }
               }
-              hasApproval = Array.from(latestByReviewer.values()).some(
+              counted = Array.from(latestByReviewer.values()).filter(
                 r => r.state === 'APPROVED'
               );
             }
+            const hasApproval = counted.length > 0;
 
             if (hasApproval) {
+              // ignore-approvers fails open on a typo or a rotated identity, so
+              // say when the only approvals that counted are from Bot accounts.
+              if (counted.every(r => r.user?.type === 'Bot')) {
+                core.warning(`PR #${pr.number}'s approval came only from bot account(s) (${[...new Set(counted.map(r => r.user?.login))].join(', ')}) — if this repo auto-approves, list that identity in ignore-approvers.`);
+              }
               core.info('PR has an approving review — no action needed.');
               return;
             }
@@ -301,3 +344,4 @@ jobs:
             }
 
             core.info(`Created tracking issue: ${issue.data.html_url}`);
+            // HARNESS:script:end

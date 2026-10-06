@@ -11,10 +11,22 @@ checks out NO PR code:
     is above it; otherwise submit nothing. The review is pinned (`commit_id`) to
     the commit the panel reviewed.
 
-``dismiss-stale`` (in `dismiss-stale-approval`, on `synchronize`)
-    Dismiss this identity's own auto-approve APPROVALS that are not on the new
-    head. The caller's ruleset may keep an approval valid across pushes
-    (`dismiss_stale_reviews_on_push: false`), so the bot has to withdraw its own.
+``dismiss-stale`` (in `dismiss-stale-approval`, on every same-repo
+`pull_request` event of an open PR; ``--all-approvals`` on a base retarget)
+    Dismiss this identity's own auto-approve APPROVALS that are stale against
+    the PR's LIVE state: not on its current head, or recorded (``BASE_MARKER``)
+    against a base other than its current one — and, on a retarget, every one
+    of them, for approvals posted before the base was recorded. Staleness is
+    read from the PR, not from the event payload, so whichever event runs next
+    redoes a dismissal a cancelled run left undone. (Only when the PR cannot be
+    read does it fall back to the event's head, skipping the base check.) A stale marked approval by
+    ANY OTHER login — one this run cannot act as (a rotated identity, or a run
+    without the approver's secrets) — turns the job red rather than passing
+    unchecked. The caller's ruleset may keep an
+    approval valid across pushes (`dismiss_stale_reviews_on_push: false`), so the
+    bot has to withdraw its own. The job runs whether or not
+    `approve_max_severity` is still set: unsetting it is the kill switch for NEW
+    approvals, and must not also stop old ones from being withdrawn.
     CHANGES_REQUESTED is deliberately NOT dismissed on a push: under the
     label-triggered caller a push starts no new round, so dismissing it would let
     any trivial push clear the bot's veto. Only a later round's own review event
@@ -57,8 +69,13 @@ An untrusted round submits NO review event — neither approve nor request chang
   or any finding reached the review body only — ``ungated_findings`` > 0 — where
   the open-thread check below cannot see it);
 * the PR state or its threads could not be read;
-* the PR head moved while the panel ran. A push racing the POST itself is
-  caught by re-reading the head after the write and withdrawing the review.
+* the PR head moved, or its base branch was retargeted, while the panel ran.
+  A push or retarget racing the POST itself is caught by re-reading both after
+  the write and withdrawing the review;
+* the reviewed diff has no content hunk — every changed path was stripped by
+  ``diff_excludes`` or the generated-file classifier (or the change is a pure
+  rename / mode / binary change). Zero findings over nothing is not a clean
+  review, and those paths can still reach production.
 
 On a trusted round:
 
@@ -76,9 +93,14 @@ counting through a degraded re-run at the same head.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
-judge can steer the round to an approval. Treat the approval as an automated
-review signal, not as a substitute for a human reviewer, and read the caller
-guide's trust-model section before letting it satisfy a ruleset.
+judge can steer the round to an approval. The recorded SHA shares that ceiling:
+a review body is mutable by anyone with repo WRITE access (and by the approver
+token itself), so rewriting the marker to the current head keeps a stale approval
+valid — a strictly higher privilege than planting text in a diff, and not one
+`commit_id` can cross-check, since GitHub has already moved that field to the
+same head. Treat the approval as an automated review signal, not as a substitute
+for a human reviewer, and read the caller guide's trust-model section before
+letting it satisfy a ruleset.
 
 Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
 ever dismissed, so a human's review — or another bot's — is never touched.
@@ -95,6 +117,16 @@ import sys
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit"]
 ALLOWED_THRESHOLDS = ("medium", "low", "nit")
 APPROVE_MARKER = "<!-- cursor-review-auto-approve -->"
+# The commit this decision reviewed, recorded IN the body. A review's API
+# `commit_id` cannot be trusted for staleness: with `dismiss_stale_reviews_on_push`
+# off, GitHub moves a still-valid approval's `commit_id` forward to each new head
+# (seen live: an approval on b01cf98 read back as edaf99f after a push), so a
+# commit_id comparison never finds the approval stale.
+REVIEWED_SHA_RE = re.compile(r"<!-- cursor-review-auto-approve:sha=([0-9a-f]{40}) -->")
+# The base branch a review was posted against, hex-encoded so no ref name can
+# close the HTML comment early. dismiss-stale withdraws an approval whose
+# recorded base is no longer the PR's base.
+BASE_MARKER_RE = re.compile(r"<!-- cursor-review-auto-approve-base:([0-9a-f]*) -->")
 # post-review.py prefixes every inline comment with `<emoji> **<Label>** — `.
 BADGE_RE = re.compile(r"^\S+\s+\*\*(Critical|High|Medium|Low|Nit)\*\*\s+—")
 
@@ -168,6 +200,9 @@ def decide(
     live_head_sha: str,
     open_thread_severities: list,
     ungated: int = 0,
+    reviewed_diff_empty: bool = False,
+    reviewed_base: str = "",
+    live_base: str = "",
     human_review: bool = False,
 ):
     """Return (event, reasons, blocking_findings). Pure; no I/O.
@@ -179,6 +214,7 @@ def decide(
     event, _, reasons, blocking = decide_gate(
         threshold, findings, panel, judge_status, delivered, reviewed_sha,
         live_head_sha, open_thread_severities, ungated, human_review,
+        reviewed_diff_empty, reviewed_base, live_base,
     )
     return event, reasons, blocking
 
@@ -194,6 +230,9 @@ def decide_gate(
     open_thread_severities: list,
     ungated: int = 0,
     human_review: bool = False,
+    reviewed_diff_empty: bool = False,
+    reviewed_base: str = "",
+    live_base: str = "",
 ):
     """decide(), plus the approve_gate value: (event, gate, reasons, blocking)."""
     if human_review:
@@ -214,6 +253,11 @@ def decide_gate(
         reasons.append(f"{ungated} finding(s) reached the review body only, not as resolvable threads")
     if not reviewed_sha or reviewed_sha != live_head_sha:
         reasons.append("the PR head moved while the review ran")
+    if reviewed_base != live_base:
+        # A retarget never moves the head, so the head check cannot see it.
+        reasons.append("the PR base branch changed while the review ran")
+    if reviewed_diff_empty:
+        reasons.append("the reviewed diff is empty — every changed path was excluded from review, so nothing a reviewer saw can earn an approval")
     if reasons:
         return NONE, GATE_UNTRUSTED, reasons, []
 
@@ -233,24 +277,72 @@ def decide_gate(
     return APPROVE, GATE_PASS, [f"every finding is at or below `{threshold}`"], []
 
 
-def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha) -> list:
-    """Ids of this identity's live auto-approve APPROVALS not on head_sha.
+def reviewed_diff_is_empty(path: str) -> bool:
+    """True when the reviewed patch carries no content hunk (or cannot be read).
 
-    `head_sha=None` selects every such approval, wherever it is pinned.
+    A file section with no `@@` hunk — a pure rename, a mode change, a binary
+    file — shows a reviewer no content either, so it does not count. An
+    unreadable patch is no evidence that anything was reviewed: fail closed.
     """
-    ids = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return not any(line.startswith("@@") for line in f)
+    except OSError:
+        return True
+
+
+def recorded_base(body: str):
+    """The base ref a marked review recorded, or None (pre-dates the record)."""
+    match = BASE_MARKER_RE.search(body or "")
+    if not match:
+        return None
+    try:
+        return bytes.fromhex(match.group(1)).decode("utf-8")
+    except ValueError:
+        return ""  # garbled → matches no real base → stale
+
+
+def _stale_approvals(reviews: list, head_sha, live_base):
+    """(login, id) of every live marked APPROVAL that is stale.
+
+    Stale = not on `head_sha` (`None` selects every one, wherever pinned), or
+    recorded against a base other than `live_base` (`None` skips that check).
+    """
+    out = []
     for r in reviews:
-        user = (r.get("user") or {}).get("login", "")
-        if user.lower() != approver_login.lower():
-            continue
         if r.get("state") != "APPROVED":
             continue
-        if APPROVE_MARKER not in (r.get("body") or ""):
+        body = r.get("body") or ""
+        if APPROVE_MARKER not in body:
             continue
-        if head_sha is not None and r.get("commit_id") == head_sha:
-            continue
-        ids.append(r["id"])
-    return ids
+        # The SHA recorded in the body, NOT `commit_id` (see REVIEWED_SHA_RE). A
+        # marked approval without a recorded SHA predates that record: treat it
+        # as stale rather than trust a commit_id GitHub may have moved.
+        match = REVIEWED_SHA_RE.search(body)
+        off_head = head_sha is None or not match or match.group(1) != head_sha.lower()
+        base = recorded_base(body)
+        off_base = live_base is not None and base is not None and base != live_base
+        if off_head or off_base:
+            login = (r.get("user") or {}).get("login")
+            out.append((login if isinstance(login, str) else "", r["id"]))
+    return out
+
+
+def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha, live_base=None) -> list:
+    """Ids of this identity's stale auto-approve APPROVALS (see _stale_approvals)."""
+    return [rid for login, rid in _stale_approvals(reviews, head_sha, live_base)
+            if login.lower() == approver_login.lower()]
+
+
+def unactionable_stale_approvals(reviews: list, approver_login: str, head_sha, live_base=None) -> list:
+    """`login:id` of stale marked APPROVALS by any login OTHER than the approver.
+
+    This run cannot dismiss them, so it must not report clean over them. An
+    empty `approver_login` (the approver's secrets are not in this run) puts
+    every stale marked approval here.
+    """
+    return [f"{login or '?'}:{rid}" for login, rid in _stale_approvals(reviews, head_sha, live_base)
+            if not approver_login or login.lower() != approver_login.lower()]
 
 
 def gh(args: list, payload=None) -> str:
@@ -308,10 +400,16 @@ def open_thread_severities(repo: str, pr: int) -> list:
     return out
 
 
-def render_body(event: str, reasons: list, threshold: str, blocking: list) -> str:
-    lines = [APPROVE_MARKER, "### 🤖 Cursor Review — auto-approve"]
+def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "",
+                base_ref: str = "") -> str:
+    lines = [APPROVE_MARKER]
+    if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
+        lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
+    if base_ref:
+        lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    lines.append("### 🤖 Cursor Review — auto-approve")
     if event == APPROVE:
-        lines.append(f"✅ Approved: {reasons[0]}. A new push dismisses this approval.")
+        lines.append(f"✅ Approved: {reasons[0]}. A new push or a base retarget dismisses this approval.")
     else:
         lines.append(f"❌ Changes requested: {reasons[0]}. Fix them, push, and re-run the review.")
         # severity/file/line are model output over PR content, posted under the
@@ -352,7 +450,7 @@ def cmd_decide(args) -> int:
 
     try:
         pr = read_pr(args.repo, args.pr_number)
-        live_head = (pr.get("head") or {}).get("sha", "")
+        live_head, live_base = pr_head_base(pr)
         human_review = has_label(pr, HUMAN_REVIEW_LABEL)
         prior = open_thread_severities(args.repo, int(args.pr_number))
     except (RuntimeError, SystemExit, ValueError) as e:
@@ -370,13 +468,27 @@ def cmd_decide(args) -> int:
             prior,
             ungated,
             human_review,
+            reviewed_diff_is_empty(args.reviewed_diff),
+            args.base_ref,
+            live_base,
         )
     set_output("approve_gate", gate)
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
 
-    body = render_body(event, reasons, threshold, blocking)
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
+    if event == APPROVE and not REVIEWED_SHA_RE.search(body):
+        # The recorded SHA is the only staleness anchor an approval has (see
+        # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
+        # not a full 40-hex SHA. decide() cannot reach APPROVE unless commit_sha
+        # equals the head read back from the API, so this is unreachable today —
+        # but a future caller that loosened that would otherwise post an approval
+        # dismiss-stale reads as legacy/stale forever, with no diagnostic anywhere.
+        print(
+            f"::warning::Approving without a reviewed-SHA marker: --commit-sha {args.commit_sha!r} "
+            "is not a full 40-hex SHA, so dismiss-stale will treat this approval as stale."
+        )
     try:
         posted = json.loads(
             gh(
@@ -393,22 +505,22 @@ def cmd_decide(args) -> int:
         print(f"::error::Could not submit the {event} review: {e}")
         return 1
 
-    # Close the head-read → POST race. A push landing in that window fires a
-    # `synchronize` whose dismissal scan can finish before this review exists, so
-    # nothing else would ever withdraw it. Re-read the head now that the review
-    # is written; if it moved, withdraw our own review here.
+    # Close the read → POST race. A push or retarget landing in that window fires
+    # an event whose dismissal scan can finish before this review exists, so
+    # nothing else would ever withdraw it. Re-read the head and base now that the
+    # review is written; if either moved, withdraw our own review here.
     try:
-        head_now = read_head(args.repo, args.pr_number)
+        head_now, base_now = pr_head_base(read_pr(args.repo, args.pr_number))
     except (RuntimeError, ValueError):
-        head_now = ""  # unknown → treat as moved: withdraw rather than leave it
-    if head_now != args.commit_sha:
+        head_now = base_now = None  # unknown → treat as moved: withdraw rather than leave it
+    if head_now != args.commit_sha or base_now != args.base_ref:
         set_output("approve_gate", GATE_UNTRUSTED)
         try:
             dismiss(args.repo, args.pr_number, posted["id"])
         except RuntimeError as e:
-            print(f"::error::The PR head moved while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            print(f"::error::The PR head or base moved while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
             return 1
-        emit(f"ℹ️ **Auto-approve: withdrawn** — the PR head moved while the {event} review was being posted.")
+        emit(f"ℹ️ **Auto-approve: withdrawn** — the PR head or base moved while the {event} review was being posted.")
         return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     return 0
@@ -422,11 +534,13 @@ DISMISS_PERMISSION_HINT = (
 
 
 def read_pr(repo: str, pr_number) -> dict:
+    """The PR as it is now. One read serves head, base AND labels."""
     return json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
 
 
-def read_head(repo: str, pr_number) -> str:
-    return (read_pr(repo, pr_number).get("head") or {}).get("sha", "")
+def pr_head_base(pr: dict) -> tuple:
+    """(head sha, base ref) of a PR payload — "" for either when it is shapeless."""
+    return (pr.get("head") or {}).get("sha", ""), (pr.get("base") or {}).get("ref", "")
 
 
 def has_label(pr: dict, name: str) -> bool:
@@ -463,6 +577,7 @@ def withdraw_own_approvals(args) -> int:
 
 
 STALE_MESSAGE = "New commits pushed — cursor-review auto-approve withdrawn until the next review round."
+BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve withdrawn until the next review round."
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
 
 
@@ -474,20 +589,62 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
 
 
 def cmd_dismiss_stale(args) -> int:
-    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, args.head_sha)
+    # On a retarget the head is unchanged, so an approval pinned to it is
+    # exactly as stale as an off-head one: select every marked approval. That
+    # covers approvals posted before the base was recorded; recorded ones are
+    # caught by the live-base comparison on ANY event, retarget or not.
+    message = BASE_CHANGED_MESSAGE if args.all_approvals else STALE_MESSAGE
+    # The LIVE head and base, not the event's. The caller's
+    # `github.event.pull_request.head.sha` is the head at event-delivery time, so
+    # a queued or REDELIVERED `synchronize` for an older push would otherwise
+    # dismiss an approval that is valid for the head as it stands now, and do it
+    # silently: a wrong-but-successful dismissal exits green, so nothing reports
+    # the loss. `cmd_decide` reads the PR for this same reason.
+    #
+    # A failed or shapeless read falls back to the event's head (`--head-sha`),
+    # the older comparison, rather than skip the scan this job exists to perform;
+    # the base check is skipped for that run (no live base to compare), and the
+    # next event redoes it from live state. The `or` matters as much as the
+    # `except`: an empty string is not None, so it would match no recorded SHA
+    # and dismiss every marked approval on the PR.
+    try:
+        live_head, live_base = pr_head_base(read_pr(args.repo, args.pr_number))
+    except (RuntimeError, ValueError) as e:
+        live_head, live_base, read_error = "", None, e
+    else:
+        read_error = None
+    if not live_head:
+        live_head, live_base = args.head_sha, None
+        if not live_head:
+            print(f"::error::Could not read the PR head to dismiss stale auto-approvals: {read_error or 'no head in the response'}")
+            return 1
+        print(f"::warning::Could not read the live PR head ({read_error or 'no head in the response'}) — judging "
+              "staleness against the event's head, without the base check, for this run.")
+    try:
+        reviews = list_reviews(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {e}")
+        return 1
+    head = None if args.all_approvals else live_head
+    ids = stale_reviews_to_dismiss(reviews, args.approver_login, head, live_base)
+    others = unactionable_stale_approvals(reviews, args.approver_login, head, live_base)
     failed = []
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid)
+            dismiss(args.repo, args.pr_number, rid, message)
         except RuntimeError as e:
             failed.append(f"{rid}: {e}")
-    emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login}.")
+    emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login or '(approver unavailable)'}.")
+    if others:
+        # Red, not clean: a stale approval this identity cannot touch still counts.
+        print(f"::error::{len(others)} stale auto-approval(s) by another identity ({', '.join(others)}) — this run "
+              f"cannot dismiss them (the approver changed, or its secrets are not available to this run, e.g. a "
+              f"Dependabot PR). Dismiss them by hand, or re-run with the approver's secrets.")
     if failed:
         # Red, not a warning: a stale approval that stays valid is the exact
         # failure this job exists to prevent.
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
-        return 1
-    return 0
+    return 1 if failed or others else 0
 
 
 def last_unlabeled_at(timeline: list, label: str):
@@ -696,11 +853,18 @@ def main() -> int:
     d.add_argument("--delivered", default="")
     d.add_argument("--ungated", default="0")
     d.add_argument("--approver-login", required=True)
+    d.add_argument("--reviewed-diff", required=True)
+    # The base the panel diffed against (the triggering event's base.ref).
+    d.add_argument("--base-ref", required=True)
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
-    s.add_argument("--head-sha", required=True)
+    # Empty = the approver identity is not available to this run: dismiss
+    # nothing, and go red over any stale marked approval.
     s.add_argument("--approver-login", required=True)
+    s.add_argument("--all-approvals", action="store_true")
+    # The event's head: used ONLY when the live PR head cannot be read.
+    s.add_argument("--head-sha", default="")
     c = sub.add_parser("round-cap")
     c.add_argument("--repo", required=True)
     c.add_argument("--pr-number", required=True)

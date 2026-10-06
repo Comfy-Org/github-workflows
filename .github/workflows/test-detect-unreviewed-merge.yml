@@ -1,0 +1,27 @@
+name: Test detect-unreviewed-merge
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/detect-unreviewed-merge.yml'
+      - '.github/workflows/test-detect-unreviewed-merge.yml'
+      - '.github/detect-unreviewed-merge/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/detect-unreviewed-merge.yml'
+      - '.github/workflows/test-detect-unreviewed-merge.yml'
+      - '.github/detect-unreviewed-merge/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the shipped github-script with API fixtures
+        run: node --test .github/detect-unreviewed-merge/tests/*.test.cjs
