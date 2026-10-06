@@ -70,6 +70,12 @@ import sys
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit"]
 ALLOWED_THRESHOLDS = ("medium", "low", "nit")
 APPROVE_MARKER = "<!-- cursor-review-auto-approve -->"
+# The commit this decision reviewed, recorded IN the body. A review's API
+# `commit_id` cannot be trusted for staleness: with `dismiss_stale_reviews_on_push`
+# off, GitHub moves a still-valid approval's `commit_id` forward to each new head
+# (seen live: an approval on b01cf98 read back as edaf99f after a push), so a
+# commit_id comparison never finds the approval stale.
+REVIEWED_SHA_RE = re.compile(r"<!-- cursor-review-auto-approve:sha=([0-9a-f]{40}) -->")
 # post-review.py prefixes every inline comment with `<emoji> **<Label>** — `.
 BADGE_RE = re.compile(r"^\S+\s+\*\*(Critical|High|Medium|Low|Nit)\*\*\s+—")
 
@@ -185,7 +191,11 @@ def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha) -> li
             continue
         if APPROVE_MARKER not in (r.get("body") or ""):
             continue
-        if head_sha is not None and r.get("commit_id") == head_sha:
+        # The SHA recorded in the body, NOT `commit_id` (see REVIEWED_SHA_RE). A
+        # marked approval without a recorded SHA predates the fix: treat it as
+        # stale rather than trust a commit_id GitHub may have moved.
+        match = REVIEWED_SHA_RE.search(r.get("body") or "")
+        if head_sha is not None and match and match.group(1) == head_sha.lower():
             continue
         ids.append(r["id"])
     return ids
@@ -238,8 +248,11 @@ def open_thread_severities(repo: str, pr: int) -> list:
     return out
 
 
-def render_body(event: str, reasons: list, threshold: str, blocking: list) -> str:
-    lines = [APPROVE_MARKER, "### 🤖 Cursor Review — auto-approve"]
+def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "") -> str:
+    lines = [APPROVE_MARKER]
+    if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
+        lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
+    lines.append("### 🤖 Cursor Review — auto-approve")
     if event == APPROVE:
         lines.append(f"✅ Approved: {reasons[0]}. A new push dismisses this approval.")
     else:
@@ -299,7 +312,7 @@ def cmd_decide(args) -> int:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
 
-    body = render_body(event, reasons, threshold, blocking)
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha)
     try:
         posted = json.loads(
             gh(
