@@ -51,9 +51,14 @@ counting through a degraded re-run at the same head.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
-judge can steer the round to an approval. Treat the approval as an automated
-review signal, not as a substitute for a human reviewer, and read the caller
-guide's trust-model section before letting it satisfy a ruleset.
+judge can steer the round to an approval. The recorded SHA shares that ceiling:
+a review body is mutable by anyone with repo WRITE access (and by the approver
+token itself), so rewriting the marker to the current head keeps a stale approval
+valid — a strictly higher privilege than planting text in a diff, and not one
+`commit_id` can cross-check, since GitHub has already moved that field to the
+same head. Treat the approval as an automated review signal, not as a substitute
+for a human reviewer, and read the caller guide's trust-model section before
+letting it satisfy a ruleset.
 
 Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
 ever dismissed, so a human's review — or another bot's — is never touched.
@@ -70,6 +75,12 @@ import sys
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit"]
 ALLOWED_THRESHOLDS = ("medium", "low", "nit")
 APPROVE_MARKER = "<!-- cursor-review-auto-approve -->"
+# The commit this decision reviewed, recorded IN the body. A review's API
+# `commit_id` cannot be trusted for staleness: with `dismiss_stale_reviews_on_push`
+# off, GitHub moves a still-valid approval's `commit_id` forward to each new head
+# (seen live: an approval on b01cf98 read back as edaf99f after a push), so a
+# commit_id comparison never finds the approval stale.
+REVIEWED_SHA_RE = re.compile(r"<!-- cursor-review-auto-approve:sha=([0-9a-f]{40}) -->")
 # post-review.py prefixes every inline comment with `<emoji> **<Label>** — `.
 BADGE_RE = re.compile(r"^\S+\s+\*\*(Critical|High|Medium|Low|Nit)\*\*\s+—")
 
@@ -185,7 +196,11 @@ def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha) -> li
             continue
         if APPROVE_MARKER not in (r.get("body") or ""):
             continue
-        if head_sha is not None and r.get("commit_id") == head_sha:
+        # The SHA recorded in the body, NOT `commit_id` (see REVIEWED_SHA_RE). A
+        # marked approval without a recorded SHA predates the fix: treat it as
+        # stale rather than trust a commit_id GitHub may have moved.
+        match = REVIEWED_SHA_RE.search(r.get("body") or "")
+        if head_sha is not None and match and match.group(1) == head_sha.lower():
             continue
         ids.append(r["id"])
     return ids
@@ -238,8 +253,11 @@ def open_thread_severities(repo: str, pr: int) -> list:
     return out
 
 
-def render_body(event: str, reasons: list, threshold: str, blocking: list) -> str:
-    lines = [APPROVE_MARKER, "### 🤖 Cursor Review — auto-approve"]
+def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "") -> str:
+    lines = [APPROVE_MARKER]
+    if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
+        lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
+    lines.append("### 🤖 Cursor Review — auto-approve")
     if event == APPROVE:
         lines.append(f"✅ Approved: {reasons[0]}. A new push dismisses this approval.")
     else:
@@ -299,7 +317,18 @@ def cmd_decide(args) -> int:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
 
-    body = render_body(event, reasons, threshold, blocking)
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha)
+    if event == APPROVE and not REVIEWED_SHA_RE.search(body):
+        # The recorded SHA is the only staleness anchor an approval has (see
+        # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
+        # not a full 40-hex SHA. decide() cannot reach APPROVE unless commit_sha
+        # equals the head read back from the API, so this is unreachable today —
+        # but a future caller that loosened that would otherwise post an approval
+        # dismiss-stale reads as legacy/stale forever, with no diagnostic anywhere.
+        print(
+            f"::warning::Approving without a reviewed-SHA marker: --commit-sha {args.commit_sha!r} "
+            "is not a full 40-hex SHA, so dismiss-stale will treat this approval as stale."
+        )
     try:
         posted = json.loads(
             gh(
@@ -385,7 +414,23 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
 
 
 def cmd_dismiss_stale(args) -> int:
-    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, args.head_sha)
+    # The LIVE head, not `args.head_sha`. The caller passes
+    # `github.event.pull_request.head.sha` — the head at event-delivery time — so a
+    # queued or REDELIVERED `synchronize` for an older push would otherwise dismiss
+    # an approval that is valid for the head as it stands now, and do it silently:
+    # a wrong-but-successful dismissal exits green, so nothing reports the loss.
+    # `cmd_decide` reads the head for this same reason.
+    #
+    # A failed or shapeless read falls back to the event's head, which is exactly
+    # the previous behaviour — degrade to the older comparison rather than skip the
+    # scan this job exists to perform. The `or` matters as much as the `except`: an
+    # empty string here is not None, so it would match no recorded SHA and dismiss
+    # every marked approval on the PR.
+    try:
+        head_sha = read_head(args.repo, args.pr_number) or args.head_sha
+    except (RuntimeError, ValueError):
+        head_sha = args.head_sha
+    ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, head_sha)
     failed = []
     for rid in ids:
         try:

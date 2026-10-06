@@ -126,33 +126,109 @@ class ThreadSeverityTest(unittest.TestCase):
         self.assertIsNone(AA.thread_severity(""))
 
 
+OLD = "1" * 40
+NEW = "2" * 40
+
+
 class StaleReviewTest(unittest.TestCase):
-    def review(self, rid, login="cursor-approver", state="APPROVED", commit="old", marker=True):
-        body = (AA.APPROVE_MARKER + "\nok") if marker else "ok"
-        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit, "body": body}
+    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD):
+        # `commit_id` defaults to NEW on purpose: GitHub moves a still-valid
+        # approval's commit_id to each new head, so only the SHA recorded in the
+        # body says what was reviewed.
+        body = AA.render_body(AA.APPROVE, ["ok"], "low", [], sha) if marker else "ok"
+        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW, "body": body}
 
     def test_dismisses_own_marked_off_head_reviews(self):
         reviews = [
             self.review(1),
             self.review(2, state="CHANGES_REQUESTED"),
-            self.review(3, commit="new"),
+            self.review(3, sha=NEW),
             self.review(4, login="a-human"),
             self.review(5, marker=False),
             self.review(6, state="COMMENTED"),
             self.review(7, state="DISMISSED"),
             self.review(8, login="Cursor-Approver"),
         ]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 8])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1, 8])
+
+    def test_moved_commit_id_does_not_hide_a_stale_approval(self):
+        # The live failure: approval on OLD, GitHub reports commit_id=NEW after a push.
+        self.assertEqual(AA.stale_reviews_to_dismiss([self.review(1, commit=NEW, sha=OLD)], "cursor-approver", NEW), [1])
+
+    def test_marked_approval_without_recorded_sha_is_stale(self):
+        r = self.review(1, commit=NEW)
+        r["body"] = AA.APPROVE_MARKER + "\nlegacy"
+        self.assertEqual(AA.stale_reviews_to_dismiss([r], "cursor-approver", NEW), [1])
+
+    def test_body_records_the_reviewed_sha(self):
+        self.assertIn(f"sha={OLD}", AA.render_body(AA.APPROVE, ["ok"], "low", [], OLD))
+        self.assertNotIn("sha=", AA.render_body(AA.APPROVE, ["ok"], "low", [], "not-a-sha"))
 
     def test_a_push_never_clears_the_bots_change_request(self):
         # Under a label-triggered caller a push starts no new round, so only a
         # later round's own review may supersede the veto.
         reviews = [self.review(1, state="CHANGES_REQUESTED")]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
 
     def test_none_head_selects_every_own_approval(self):
         reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
+
+
+class DismissStaleHeadTest(unittest.TestCase):
+    """`dismiss-stale` judges against the LIVE head, not the delivered event's.
+
+    A queued or redelivered `synchronize` replays an older head, and dismissing an
+    approval that is valid for the current head exits GREEN — nothing reports the
+    loss — so this read is the only thing between a replay and a silently withdrawn
+    approval. An unreadable head degrades to the event's, never to "".
+    """
+
+    def run_dismiss(self, live, event_head, reviews):
+        dismissed = []
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "-X"] and args[2] == "PUT":
+                dismissed.append(args[3])
+                return "{}"
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([list(reviews)])
+            if isinstance(live, Exception):
+                raise live
+            return json.dumps({} if live is None else {"head": {"sha": live}})
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
+                                  approver_login="cursor-approver")
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+            rc = AA.cmd_dismiss_stale(args)
+        return rc, dismissed
+
+    def approval(self, rid, sha):
+        return {"id": rid, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha)}
+
+    def test_a_replayed_older_event_does_not_dismiss_a_current_approval(self):
+        # The race: the event carries OLD, the PR is really on NEW, and the approval
+        # was recorded at NEW. Comparing against args.head_sha would withdraw it.
+        self.assertEqual(self.run_dismiss(NEW, OLD, [self.approval(1, NEW)]), (0, []))
+
+    def test_a_genuinely_stale_approval_is_still_dismissed(self):
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_falls_back_to_the_event_head(self):
+        # Previous behaviour, deliberately: degrade to the delivered head rather
+        # than skip the scan this job exists to perform.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
+
+    def test_a_shapeless_head_read_never_dismisses_everything(self):
+        # read_head returning "" must not reach the filter: "" is not None, so it
+        # would match no recorded SHA and withdraw every marked approval on the PR.
+        self.assertEqual(self.run_dismiss(None, NEW, [self.approval(1, NEW)]), (0, []))
 
 
 class PostWriteRaceTest(unittest.TestCase):
