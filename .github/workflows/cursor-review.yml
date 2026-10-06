@@ -23,7 +23,10 @@ name: Cursor Review (reusable)
 # and print mode can use write and shell tools, so a prompt-injected model could
 # rewrite the assets checkout or a downloaded action inside its own job; on a
 # fresh runner with a fresh pinned checkout there is nothing tampered for the
-# minted token to meet. `.github/cursor-review/tests/test_workflow_job_isolation.py`
+# minted token to meet. The optional `runs_on` input moves ONLY the
+# credential-free jobs (`diff-size`, `preflight`, `review`, `consolidate`) to a
+# caller's pool; every job that mints the App token or holds a write scope is
+# hard-pinned to GitHub-hosted `ubuntu-latest`, so a pool never meets one. `.github/cursor-review/tests/test_workflow_job_isolation.py`
 # pins this.
 #
 # Caller pattern (place in source repo at .github/workflows/ci-cursor-review.yml):
@@ -334,6 +337,29 @@ on:
         type: string
         required: false
         default: ''
+      runs_on:
+        description: >-
+          JSON-encoded `runs-on` for the four jobs that hold no write-scoped
+          credential and do the heavy lifting: `diff-size`, `preflight`, the
+          `review` panel and `consolidate`. Same shape as
+          cursor-review-auto-label.yml's `runs_on`, so one repo variable can
+          feed both. Default '"ubuntu-latest"' (a JSON string); an empty value
+          falls back to it too. Pass a JSON array for a self-hosted pool, e.g.
+          '["self-hosted", "linux", "x64"]'. Every other job — the gate, the
+          ledger, the Slack notices, and every job that mints the App token or
+          holds `pull-requests: write` — stays on GitHub-hosted `ubuntu-latest`
+          regardless, so a pool never sees a write credential. Review and
+          consolidate run models with unsandboxed shell over the PR's code, so
+          pick a pool that gives each job a fresh pod (fresh filesystem and
+          $HOME), carries no cloud identity or service-account token, and
+          cannot reach private networks or the metadata server — anything a
+          prompt-injected PR runs there can reach whatever the runner can. The
+          image must be linux/x64 (the cursor-agent installer pins that one
+          artifact) with bash, git, curl, jq, python3, gh, tar and GNU
+          coreutils (sha256sum); diff-size installs Go itself.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -806,7 +832,7 @@ jobs:
     # cell (plus consolidate) re-deriving it from its own PR checkout.
     needs: [gate, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     permissions:
       contents: read
     # within_cap is derived from the shared check-pr-size tool's `over_cap`
@@ -901,8 +927,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -1578,7 +1606,7 @@ jobs:
     name: Preflight — validate model catalog
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1676,8 +1704,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -1777,7 +1807,7 @@ jobs:
     # there, and this job is skipped instead of quietly running a lab short.
     needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     # COUPLED to `consolidate` below — bump this and you must bump those too.
     # The judge reads all of this panel's artifacts at the same reasoning
     # tier, so it needs at least a cell's budget: its `Run judge` step cap
@@ -1869,8 +1899,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -2057,7 +2089,9 @@ jobs:
           MODEL: ${{ matrix.model }}
         run: |
           # --sandbox is intentionally omitted. The hosted runner is already
-          # an ephemeral VM, so the agent's AppArmor sandbox doesn't add
+          # an ephemeral VM — and a `runs_on` pool must be one too: one job per
+          # fresh pod, no cloud identity, no private-network reach (see the
+          # input) — so the agent's AppArmor sandbox doesn't add
           # protection — and as of cursor-agent 2026.05.05 it fails to start
           # on ubuntu-latest, producing empty output.
           #
@@ -2117,7 +2151,7 @@ jobs:
     # was cancelled, so a red or cancelled matrix cell still reaches the judge,
     # which is what `always()` was here for.
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     # ABOVE the `review` cap, never under it. The judge reads every cell's
     # artifact with the same top reasoning tier one cell uses, so it is the
     # strictly harder call — yet at 15m it was capped at HALF the panel it
@@ -2194,8 +2228,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -2725,8 +2761,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3151,8 +3189,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3189,6 +3229,9 @@ jobs:
           BOT_APP_ID: ${{ inputs.bot_app_id }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # The head at event delivery: a fallback ONLY for when the live head
+          # cannot be read — staleness is judged against the live PR otherwise.
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Non-empty only on a base retarget (`edited` with `changes.base`).
           BASE_FROM: ${{ github.event.changes.base.ref.from }}
         run: |
@@ -3226,6 +3269,7 @@ jobs:
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --approver-login "$LOGIN" \
+            --head-sha "$EVENT_HEAD_SHA" \
             "${ALL[@]}"
 
   blocking-gate:
@@ -3428,8 +3472,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3509,8 +3555,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3627,8 +3675,10 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on

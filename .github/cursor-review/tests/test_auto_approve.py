@@ -173,33 +173,53 @@ class ThreadSeverityTest(unittest.TestCase):
         self.assertIsNone(AA.thread_severity(""))
 
 
+OLD = "1" * 40
+NEW = "2" * 40
+
+
 class StaleReviewTest(unittest.TestCase):
-    def review(self, rid, login="cursor-approver", state="APPROVED", commit="old", marker=True, base=None):
-        body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], base) if base is not None else (
-            (AA.APPROVE_MARKER + "\nok") if marker else "ok")
-        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit, "body": body}
+    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD, base=None):
+        # `commit_id` defaults to NEW on purpose: GitHub moves a still-valid
+        # approval's commit_id to each new head, so only the SHA recorded in the
+        # body says what was reviewed. `base=None` records no base (an approval
+        # posted before the base was recorded).
+        body = AA.render_body(AA.APPROVE, ["ok"], "low", [], sha, base or "") if marker else "ok"
+        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW, "body": body}
 
     def test_dismisses_own_marked_off_head_reviews(self):
         reviews = [
             self.review(1),
             self.review(2, state="CHANGES_REQUESTED"),
-            self.review(3, commit="new"),
+            self.review(3, sha=NEW),
             self.review(4, login="a-human"),
             self.review(5, marker=False),
             self.review(6, state="COMMENTED"),
             self.review(7, state="DISMISSED"),
             self.review(8, login="Cursor-Approver"),
         ]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 8])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1, 8])
+
+    def test_moved_commit_id_does_not_hide_a_stale_approval(self):
+        # The live failure: approval on OLD, GitHub reports commit_id=NEW after a push.
+        self.assertEqual(AA.stale_reviews_to_dismiss([self.review(1, commit=NEW, sha=OLD)], "cursor-approver", NEW), [1])
+
+    def test_marked_approval_without_recorded_sha_is_stale(self):
+        r = self.review(1, commit=NEW)
+        r["body"] = AA.APPROVE_MARKER + "\nlegacy"
+        self.assertEqual(AA.stale_reviews_to_dismiss([r], "cursor-approver", NEW), [1])
+
+    def test_body_records_the_reviewed_sha(self):
+        self.assertIn(f"sha={OLD}", AA.render_body(AA.APPROVE, ["ok"], "low", [], OLD))
+        self.assertNotIn("sha=", AA.render_body(AA.APPROVE, ["ok"], "low", [], "not-a-sha"))
 
     def test_a_push_never_clears_the_bots_change_request(self):
         # Under a label-triggered caller a push starts no new round, so only a
         # later round's own review may supersede the veto.
         reviews = [self.review(1, state="CHANGES_REQUESTED")]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
 
     def test_none_head_selects_every_own_approval(self):
-        reviews = [self.review(1, commit="new"), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
+        reviews = [self.review(1, sha=NEW), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
 
     def test_recorded_base_round_trips(self):
@@ -208,16 +228,16 @@ class StaleReviewTest(unittest.TestCase):
         self.assertIsNone(AA.recorded_base(AA.APPROVE_MARKER))
 
     def test_off_base_approval_is_stale_on_head_too(self):
-        reviews = [self.review(1, commit="new", base="main"), self.review(2, commit="new", base="release"),
-                   self.review(3, commit="new")]  # 3 pre-dates the record: only --all-approvals reaches it
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new", "release"), [1])
+        reviews = [self.review(1, sha=NEW, base="main"), self.review(2, sha=NEW, base="release"),
+                   self.review(3, sha=NEW)]  # 3 pre-dates the record: only --all-approvals reaches it
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW, "release"), [1])
 
     def test_other_identities_stale_approvals_are_unactionable(self):
-        reviews = [self.review(1), self.review(2, login="old-approver"), self.review(3, login="old-approver", commit="new"),
+        reviews = [self.review(1), self.review(2, login="old-approver"), self.review(3, login="old-approver", sha=NEW),
                    self.review(4, login="a-human", marker=False)]
-        self.assertEqual(AA.unactionable_stale_approvals(reviews, "cursor-approver", "new"), ["old-approver:2"])
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "cursor-approver", NEW), ["old-approver:2"])
         # No approver identity in this run: every stale marked approval is unactionable.
-        self.assertEqual(AA.unactionable_stale_approvals(reviews, "", "new"), ["cursor-approver:1", "old-approver:2"])
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), ["cursor-approver:1", "old-approver:2"])
 
     def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main"):
         puts = []
@@ -230,20 +250,21 @@ class StaleReviewTest(unittest.TestCase):
             if args[:2] == ["api", "-X"]:
                 puts.append((args[3], payload["message"]))
                 return "{}"
-            # The live PR: head "new", even when the event that started the run carried an older one.
-            return json.dumps({"head": {"sha": "new"}, "base": {"ref": live_base}})
+            # The live PR: head NEW, even when the event that started the run carried an older one.
+            return json.dumps({"head": {"sha": NEW}, "base": {"ref": live_base}})
 
-        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals)
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals,
+                                  head_sha=OLD)
         with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
             return AA.cmd_dismiss_stale(args), puts
 
     def test_push_keeps_an_on_head_approval(self):
-        rc, puts = self.run_dismiss([self.review(1, commit="new"), self.review(2)])
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW), self.review(2)])
         self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/2/dismissals"]))
 
     def test_retarget_dismisses_the_on_head_approval_too(self):
         # `edited` with changes.base: the head did not move, the diff did.
-        rc, puts = self.run_dismiss([self.review(1, commit="new"), self.review(2)], all_approvals=True)
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW), self.review(2)], all_approvals=True)
         self.assertEqual(rc, 0)
         self.assertEqual(len(puts), 2)
         self.assertTrue(all(m == AA.BASE_CHANGED_MESSAGE for _, m in puts))
@@ -255,7 +276,7 @@ class StaleReviewTest(unittest.TestCase):
     def test_a_later_event_redoes_a_cancelled_retarget_dismissal(self):
         # The retarget's own run was cancelled; a title edit (no BASE_FROM) runs
         # next and still withdraws the on-head approval recorded against the old base.
-        rc, puts = self.run_dismiss([self.review(1, commit="new", base="main")], live_base="release")
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main")], live_base="release")
         self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/1/dismissals"]))
 
     def test_an_unactionable_stale_approval_goes_red(self):
@@ -267,7 +288,7 @@ class StaleReviewTest(unittest.TestCase):
         self.assertEqual((rc, puts), (1, []))
 
     def test_nothing_to_check_is_clean_without_the_approver(self):
-        rc, puts = self.run_dismiss([self.review(1, commit="new", base="main")], login="")
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main")], login="")
         self.assertEqual((rc, puts), (0, []))
 
 
@@ -308,6 +329,67 @@ class DismissJobTriggerTest(unittest.TestCase):
         self.assertIn("--reviewed-diff /tmp/pr-diff.patch", text)
         self.assertIn("BASE_REF: ${{ github.event.pull_request.base.ref }}", text)
         self.assertIn('--base-ref "$BASE_REF"', text)
+
+
+class DismissStaleHeadTest(unittest.TestCase):
+    """`dismiss-stale` judges against the LIVE head, not the delivered event's.
+
+    A queued or redelivered `synchronize` replays an older head, and dismissing an
+    approval that is valid for the current head exits GREEN — nothing reports the
+    loss — so this read is the only thing between a replay and a silently withdrawn
+    approval. An unreadable head degrades to the event's, never to "".
+    """
+
+    def run_dismiss(self, live, event_head, reviews):
+        dismissed = []
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "-X"] and args[2] == "PUT":
+                dismissed.append(args[3])
+                return "{}"
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([list(reviews)])
+            if isinstance(live, Exception):
+                raise live
+            return json.dumps({} if live is None else {"head": {"sha": live}})
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
+                                  approver_login="cursor-approver", all_approvals=False)
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+            rc = AA.cmd_dismiss_stale(args)
+        return rc, dismissed
+
+    def approval(self, rid, sha):
+        return {"id": rid, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha)}
+
+    def test_a_replayed_older_event_does_not_dismiss_a_current_approval(self):
+        # The race: the event carries OLD, the PR is really on NEW, and the approval
+        # was recorded at NEW. Comparing against args.head_sha would withdraw it.
+        self.assertEqual(self.run_dismiss(NEW, OLD, [self.approval(1, NEW)]), (0, []))
+
+    def test_a_genuinely_stale_approval_is_still_dismissed(self):
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_falls_back_to_the_event_head(self):
+        # Previous behaviour, deliberately: degrade to the delivered head rather
+        # than skip the scan this job exists to perform.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
+
+    def test_an_unreadable_head_with_no_event_head_goes_red(self):
+        # Nothing to judge against: report it, never fall through to "" (which
+        # would match no recorded SHA and dismiss everything).
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), "", [self.approval(1, NEW)]), (1, []))
+
+    def test_a_shapeless_head_read_never_dismisses_everything(self):
+        # read_head returning "" must not reach the filter: "" is not None, so it
+        # would match no recorded SHA and withdraw every marked approval on the PR.
+        self.assertEqual(self.run_dismiss(None, NEW, [self.approval(1, NEW)]), (0, []))
 
 
 class PostWriteRaceTest(unittest.TestCase):
@@ -389,7 +471,7 @@ class PostWriteRaceTest(unittest.TestCase):
         self.assertEqual((rc, writes), (0, []))
 
     def test_approval_records_the_reviewed_base(self):
-        body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], "main")
+        body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], SHA, "main")
         self.assertIn(AA.APPROVE_MARKER, body)
         self.assertEqual(AA.recorded_base(body), "main")
 
