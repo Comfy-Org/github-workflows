@@ -313,6 +313,17 @@ def cmd_decide(args) -> int:
         return withdraw_own_approvals(args)
 
     body = render_body(event, reasons, threshold, blocking, args.commit_sha)
+    if event == APPROVE and not REVIEWED_SHA_RE.search(body):
+        # The recorded SHA is the only staleness anchor an approval has (see
+        # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
+        # not a full 40-hex SHA. decide() cannot reach APPROVE unless commit_sha
+        # equals the head read back from the API, so this is unreachable today —
+        # but a future caller that loosened that would otherwise post an approval
+        # dismiss-stale reads as legacy/stale forever, with no diagnostic anywhere.
+        print(
+            f"::warning::Approving without a reviewed-SHA marker: --commit-sha {args.commit_sha!r} "
+            "is not a full 40-hex SHA, so dismiss-stale will treat this approval as stale."
+        )
     try:
         posted = json.loads(
             gh(
