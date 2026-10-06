@@ -329,6 +329,20 @@ on:
         type: string
         required: false
         default: ''
+      runner:
+        description: >-
+          `runs-on` label for every job in this workflow. Default
+          `ubuntu-latest` (GitHub-hosted). A caller with its own runners can
+          pass a self-hosted label, ideally behind a repo
+          variable so it can fall back to `ubuntu-latest`. The review and consolidate
+          jobs run models with shell access over the PR's code, so pick a pool
+          whose pods are ephemeral (one job per pod), carry no cloud identity or
+          service-account token, and cannot reach private networks or the
+          metadata server — anything a prompt-injected PR runs there can reach
+          whatever the runner can. The image needs git, curl, python3 and gh.
+        type: string
+        required: false
+        default: ubuntu-latest
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -430,7 +444,7 @@ env:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       pull-requests: read
@@ -616,7 +630,7 @@ jobs:
     name: Prior-review ledger
     needs: gate
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Deliberately longer than the per-step timeouts below: a hung step must
     # trip its OWN timeout (which continue-on-error absorbs) rather than the
     # job's, because a FAILED job here would skip the entire review matrix.
@@ -801,7 +815,7 @@ jobs:
     # cell (plus consolidate) re-deriving it from its own PR checkout.
     needs: [gate, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
     # within_cap is derived from the shared check-pr-size tool's `over_cap`
@@ -896,8 +910,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -1312,7 +1327,7 @@ jobs:
     # additionally re-checks the live PR head, which covers the other half
     # (someone manually re-running an old, uncancelled run).
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Bounded like every other job here. The work is two API calls, but the list
     # paginates over an attacker-growable comment list, so the 6-hour default
     # would let a rate-limited or hung call hold a runner all day.
@@ -1573,7 +1588,7 @@ jobs:
     name: Preflight — validate model catalog
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1671,8 +1686,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -1772,7 +1788,7 @@ jobs:
     # there, and this job is skipped instead of quietly running a lab short.
     needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # COUPLED to `consolidate` below — bump this and you must bump those too.
     # The judge reads all of this panel's artifacts at the same reasoning
     # tier, so it needs at least a cell's budget: its `Run judge` step cap
@@ -1864,8 +1880,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -2112,7 +2129,7 @@ jobs:
     # was cancelled, so a red or cancelled matrix cell still reaches the judge,
     # which is what `always()` was here for.
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # ABOVE the `review` cap, never under it. The judge reads every cell's
     # artifact with the same top reasoning tier one cell uses, so it is the
     # strictly harder call — yet at 15m it was capped at HALF the panel it
@@ -2189,8 +2206,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -2617,7 +2635,7 @@ jobs:
     # NOT this case: its step is `continue-on-error`, so `consolidate` still
     # succeeds and the degraded review still posts.
     if: ${{ !cancelled() && needs.consolidate.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Three artifact downloads, a token mint, and post-review.py's ONE
     # `gh api POST /pulls/N/reviews` carrying every inline comment in a single
     # payload — plus, on a POST failure that is not a pre-write rejection, at most
@@ -2720,8 +2738,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3069,7 +3088,7 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize' &&
       github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -3117,8 +3136,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3215,7 +3235,7 @@ jobs:
     name: Blocking gate
     needs: [gate, diff-size, post-review]
     if: ${{ always() && inputs.blocking }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # One paged GraphQL query through gh — minutes at most; bounded like every
     # other job here so a hung API call cannot hold a runner for the 6-hour
     # default.
@@ -3374,8 +3394,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3409,7 +3430,7 @@ jobs:
     name: Notify start
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
     steps:
@@ -3455,8 +3476,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on
@@ -3527,7 +3549,7 @@ jobs:
     # keeps this job's `needs: consolidate` honest now that `consolidate` is
     # itself `!cancelled()` and no longer runs on a cancelled run.)
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
     steps:
@@ -3573,8 +3595,9 @@ jobs:
           if [ -z "$SHA" ]; then
             # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
             # accessor added in Actions runner v2.334.0, so only an older runner
-            # gets here — every job here is `runs-on: ubuntu-latest`, so that
-            # means a runner group shadowing the label. Warn and continue: a
+            # gets here — every job here runs on `inputs.runner` (ubuntu-latest
+            # by default), so that means an outdated self-hosted runner or a
+            # runner group shadowing the label. Warn and continue: a
             # property nothing could EVALUATE is not evidence of a violation, and
             # failing would take the whole review down on a caller that changed
             # nothing. (public-repo-hygiene.yml fails closed in this branch on

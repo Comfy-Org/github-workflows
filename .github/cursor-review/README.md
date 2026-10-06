@@ -287,6 +287,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
 | `approve_max_severity` | `''` (off) | Opt-in auto-approve: `medium`, `low` or `nit` → the bot approves (pinned to the reviewed commit) when every finding is at or below it and requests changes when any is above; anything else fails the run. Read the trust model in [the setup guide](../../docs/callers/cursor-review.md#auto-approve) first — the approval is no stronger than push access. |
+| `runner` | `ubuntu-latest` | `runs-on` label for every job. Use a self-hosted pool only if its pods are one-job ephemeral, hold no cloud identity or token, and can't reach private networks or the metadata server — the review jobs run models with shell access over PR code. |
 
 ### `workflows_ref` must equal the `uses:` pin
 
