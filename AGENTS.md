@@ -52,6 +52,8 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   `cursor-review.yml` — never duplicate that model list.
 - `.github/cursor-approve/` — the five axis prompts + `aggregate.py`, the pure
   verdict aggregator behind the planned `cursor-approve.yml`; it never writes to GitHub.
+  `context-proxy.py` is the read-only Linear/Notion/Slack MCP proxy the axes
+  query: it holds the tokens, and ONE guard function owns every network call.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
   this AGENTS.md standard, and the lint forbidding a `default:` on `workflows_ref`,
   requiring the empty-ref guard at every checkout, and SHA-pinning every `uses:`.
