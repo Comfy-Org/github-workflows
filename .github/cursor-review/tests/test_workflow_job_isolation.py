@@ -300,6 +300,31 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         }
         self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval"})
 
+    def test_only_credential_free_jobs_follow_the_runs_on_input(self):
+        # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected
+        # model cell may have run. Anything holding the bot key, a write scope,
+        # the Slack token or the gate decisions must stay on GitHub-hosted
+        # ubuntu-latest, so a pool never meets a credential worth stealing.
+        routed, hosted = set(), set()
+        for name, body in self.jobs.items():
+            runs_on = [l.strip() for l in body if l.startswith("    runs-on:")]
+            self.assertEqual(len(runs_on), 1, f"job `{name}` has no single runs-on")
+            if "inputs.runs_on" in runs_on[0]:
+                routed.add(name)
+            else:
+                self.assertEqual(runs_on[0], "runs-on: ubuntu-latest", name)
+                hosted.add(name)
+        self.assertEqual(routed, {"diff-size", "preflight", "review", "consolidate"})
+        for name in routed:
+            body = self.jobs[name]
+            self.assertFalse(references_bot_key(body), name)
+            self.assertFalse(
+                any("secrets." in l and "CURSOR_API_KEY" not in l for l in code_lines(body)),
+                f"job `{name}` follows runs_on but reads a secret other than CURSOR_API_KEY",
+            )
+            for scope, value in sorted((job_permissions(body) or {"": "missing"}).items()):
+                self.assertIn(value, READ_ONLY_VALUES, f"`{name}` grants `{scope}: {value}`")
+
     def test_consolidate_runs_the_judge_over_a_pr_checkout(self):
         # The premise of the whole split. If the judge ever stops running here
         # the tests above go quiet for the wrong reason.
