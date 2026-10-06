@@ -66,6 +66,9 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
               databaseId
               fullDatabaseId
               author { login }
+              # The first comment's body carries the severity badge
+              # auto-approve.py reads to find open critical/high threads.
+              body
               pullRequestReview { body }
             }
           }
