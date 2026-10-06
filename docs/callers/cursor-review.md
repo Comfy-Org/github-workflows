@@ -373,13 +373,27 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   the threshold;
 - **REQUEST_CHANGES** when any finding is above it, or has an unrecognised
   severity;
-- **nothing** when the round can't be trusted: the judge did not adjudicate, a
-  panel reviewer did not complete, the review did not land as threads, the head
-  moved mid-run, or an earlier round's critical/high thread is still open.
+- **nothing** when the round can't be trusted (the judge did not adjudicate, a
+  panel reviewer did not complete, the review did not land, the head moved
+  mid-run, or the PR state could not be read) — and it withdraws its own earlier
+  approvals; or when an open thread above the threshold (or unbadged) remains.
 
-On `synchronize` the **Dismiss stale auto-approval** job withdraws the bot's own
-marked reviews that are not on the new head. A push does not start a new panel
-under the label-triggered caller — re-apply the label for the next round.
+On every PR event the **Dismiss stale auto-approval** job withdraws the bot's
+own approvals that are not on the live head. Request-changes is kept until a new
+round supersedes it, so a push cannot clear the veto. A push does not start a
+new panel under the label-triggered caller — re-apply the label.
+
+**Security — read before enabling.**
+
+- *Prompt injection.* The panel and judge read PR code with shell access, and
+  every signal the decision trusts comes out of those jobs. A PR crafted to
+  inject them can produce a "clean" round and be approved.
+- *Write access ≈ approval.* For `pull_request` events GitHub runs the caller
+  workflow from the PR's head branch, so anyone who can push can enable
+  `approve_max_severity` in their own PR — and any workflow a writer pushes can
+  read `APPROVER_TOKEN`. With a code-owner token, push access becomes approval.
+
+Enable auto-approve only where both are accepted risks.
 
 **Who approves.** `APPROVER_TOKEN` if set, else the `bot_app_id` App, else
 `github-actions[bot]`. A GitHub App cannot be a CODE OWNER, so on a ruleset with

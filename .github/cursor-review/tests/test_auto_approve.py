@@ -97,12 +97,14 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decide(live="b" * 40)[0], AA.NONE)
         self.assertEqual(decide(reviewed="", live="")[0], AA.NONE)
 
-    def test_open_prior_high_thread_withholds(self):
+    def test_open_thread_above_threshold_withholds(self):
         for sev in ("critical", "high", None):
             self.assertEqual(decide(threads=[sev])[0], AA.NONE)
+        self.assertEqual(decide(threshold="low", threads=["medium"])[0], AA.NONE)
 
-    def test_open_lower_threads_do_not_withhold(self):
+    def test_open_threads_at_or_below_threshold_do_not_withhold(self):
         self.assertEqual(decide(threads=["medium", "low", "nit"])[0], AA.APPROVE)
+        self.assertEqual(decide(threshold="nit", threads=["nit"])[0], AA.APPROVE)
 
 
 class ThreadSeverityTest(unittest.TestCase):
@@ -120,8 +122,10 @@ class StaleReviewTest(unittest.TestCase):
         body = (AA.APPROVE_MARKER + "\nok") if marker else "ok"
         return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit, "body": body}
 
-    def test_dismisses_own_marked_off_head_reviews(self):
-        reviews = [
+    REVIEWS = None
+
+    def reviews(self):
+        return [
             self.review(1),
             self.review(2, state="CHANGES_REQUESTED"),
             self.review(3, commit="new"),
@@ -131,7 +135,23 @@ class StaleReviewTest(unittest.TestCase):
             self.review(7, state="DISMISSED"),
             self.review(8, login="Cursor-Approver"),
         ]
-        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", "new"), [1, 2, 8])
+
+    def test_dismisses_only_own_marked_off_head_approvals(self):
+        # Request-changes (2) is kept: only a new decision supersedes the veto.
+        self.assertEqual(AA.stale_reviews_to_dismiss(self.reviews(), "cursor-approver", "new"), [1, 8])
+
+    def test_head_none_withdraws_every_own_approval(self):
+        self.assertEqual(AA.stale_reviews_to_dismiss(self.reviews(), "cursor-approver", None), [1, 3, 8])
+
+
+class RenderBodyTest(unittest.TestCase):
+    def test_model_values_cannot_inject_markdown(self):
+        bad = {"severity": "**x** @everyone", "file": "a`b\n@org/team.go", "line": "9\n# forged"}
+        body = AA.render_body(AA.REQUEST_CHANGES, ["1 finding(s)"], "medium", [bad])
+        self.assertNotIn("@org", body)
+        self.assertNotIn("@everyone", body)
+        self.assertNotIn("# forged", body)
+        self.assertIn("unrecognised severity", body)
 
 
 class PostWriteRaceTest(unittest.TestCase):
@@ -147,12 +167,15 @@ class PostWriteRaceTest(unittest.TestCase):
                 return json.dumps({"id": 99})
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 return "{}"
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([[]])
             return json.dumps({"head": {"sha": next(heads)}})
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"findings": [], "panel": PANEL_OK}, f)
         args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
-                                  commit_sha=SHA, judge_status="ok", delivered="true")
+                                  commit_sha=SHA, judge_status="ok", delivered="true",
+                                  approver_login="cursor-approver")
         with mock.patch.object(AA, "gh", fake_gh), \
                 mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
                 mock.patch.object(AA, "emit", lambda *a: None):
@@ -167,6 +190,25 @@ class PostWriteRaceTest(unittest.TestCase):
     def test_head_moved_during_post_withdraws_it(self):
         rc, writes = self.run_decide([SHA, "b" * 40])
         self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+    def test_api_failure_before_decision_submits_nothing(self):
+        def boom(args, payload=None):
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([[]])
+            raise RuntimeError("gh api failed: 502")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"findings": [], "panel": PANEL_OK}, f)
+        args = argparse.Namespace(threshold="medium", findings=f.name, repo="o/r", pr_number="1",
+                                  commit_sha=SHA, judge_status="ok", delivered="true",
+                                  approver_login="cursor-approver")
+        with mock.patch.object(AA, "gh", boom), mock.patch.object(AA, "emit", lambda *a: None):
+            self.assertEqual(AA.cmd_decide(args), 0)
+        os.unlink(f.name)
+
+    def test_gh_timeout_is_a_runtime_error(self):
+        with mock.patch.object(AA.subprocess, "run", side_effect=AA.subprocess.TimeoutExpired("gh", 60)):
+            with self.assertRaises(RuntimeError):
+                AA.gh(["api", "x"])
 
 
 if __name__ == "__main__":

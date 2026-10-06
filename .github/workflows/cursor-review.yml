@@ -314,8 +314,10 @@ on:
           it. Any other value fails the run. No approval when the judge did not
           adjudicate, a panel reviewer did not complete, the review did not land
           as threads, the head moved mid-run, or an earlier critical/high thread
-          is still open. A caller that sets this must also deliver
-          `synchronize`, so a push dismisses the bot's earlier review. Pass a
+          is still open. Deliver `synchronize` too, so a push withdraws the
+          bot's earlier approval promptly. SECURITY: the models read PR code, so
+          a prompt-injected PR can get itself approved; and a writer can enable
+          this input from their own PR. Enable it only where that is accepted. Pass a
           repo variable (e.g. `vars.CURSOR_APPROVE_MAX_SEVERITY`) to flip it
           without a PR. The approval only counts where the approving identity
           can satisfy the ruleset — see APPROVER_TOKEN and
@@ -3004,8 +3006,15 @@ jobs:
         # the fail-closed rules live in auto-approve.py (see its docstring); this
         # job checks out no PR code, so the PR cannot rewrite the logic judging it.
         if: ${{ inputs.approve_max_severity != '' }}
+        # Advisory to THIS job: a refused POST or a bad threshold must not fail
+        # `post-review`, whose result the blocking gate reads as "the review
+        # landed". The step still shows red in the run.
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.APPROVER_TOKEN || steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
@@ -3013,7 +3022,20 @@ jobs:
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
           DELIVERED: ${{ steps.post.outputs.delivered }}
         run: |
+          # Identity precedence, shared with `dismiss-stale-approval` so the login
+          # whose reviews are withdrawn is the login that posted them.
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+            LOGIN="$(gh api user --jq .login)"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+            LOGIN="${APP_SLUG}[bot]"
+          else
+            export GH_TOKEN="$FALLBACK_TOKEN"
+            LOGIN="github-actions[bot]"
+          fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" decide \
+            --approver-login "$LOGIN" \
             --threshold "$THRESHOLD" \
             --findings /tmp/consolidated/consolidated.json \
             --repo "$REPO" \
@@ -3025,16 +3047,16 @@ jobs:
   dismiss-stale-approval:
     # Opt-in companion to `Auto-approve decision`. A ruleset with
     # `dismiss_stale_reviews_on_push: false` keeps an approval valid for every
-    # later commit, so on a push the bot withdraws its own auto-approve reviews
-    # (approve AND request-changes — the next round replaces either) that are
-    # not on the new head. Only reviews carrying the auto-approve marker and
-    # authored by the approver identity are touched. Independent of `gate`: it
-    # must run on a push whether or not a panel runs. Checks out no PR code.
+    # later commit, so the bot withdraws its own auto-approve APPROVALS that are
+    # not on the PR's live head (request-changes stays until a new decision
+    # supersedes it). Runs on EVERY same-repo PR event the caller delivers, not
+    # only `synchronize`: idempotent, and a run cancelled by a later event — or
+    # a caller that never delivers `synchronize` — is caught by the next one.
+    # Independent of `gate`. Checks out no PR code.
     name: Dismiss stale auto-approval
     if: >-
       ${{ inputs.approve_max_severity != '' &&
-      github.event_name == 'pull_request' &&
-      github.event.action == 'synchronize' &&
+      github.event.pull_request.number &&
       github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -3121,7 +3143,6 @@ jobs:
           FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Same identity precedence as `Auto-approve decision`, so the login
           # whose reviews are dismissed is the login that posted them.
@@ -3138,7 +3159,6 @@ jobs:
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
-            --head-sha "$HEAD_SHA" \
             --approver-login "$LOGIN"
 
   blocking-gate:
