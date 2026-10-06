@@ -44,7 +44,9 @@ aggregate.py decide --outputs-dir out/ [--axes design,correctness] [--max-yellow
    red/yellow/green or a confidence outside 0..1 → `NONE` — untrusted, so the
    approval is withheld; it is never a veto;
 2. any `red` → `NONE`, naming the red axes;
-3. more `yellow` axes than `--max-yellow-axes` (0–3, default 0) → `NONE`;
+3. more `yellow` axes than `--max-yellow-axes` (0–3, default 0, and always
+   strictly below the number of expected axes — a limit that every axis could
+   reach would approve a round with no green axis at all) → `NONE`;
 4. otherwise `APPROVE`.
 
 `decide` is strict about its input: the file must be exactly one JSON object,

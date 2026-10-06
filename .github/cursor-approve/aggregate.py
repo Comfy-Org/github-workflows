@@ -68,9 +68,13 @@ SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 # `base_ref` carries the same guard.
 NO_DOTDOT = r"(?!.*(?:^|/)\.\.(?:/|$))"
 PATH_RE = re.compile(NO_DOTDOT + r"[A-Za-z0-9_./-]+")
+# `repo` is itself an owner/name path fragment that lands in the prompt, so it
+# carries the same `..` guard as the other two. Neither segment may START with
+# `-` either: `-x/-y` is option-shaped, and no real GitHub owner or repo does.
+_SEG = r"[A-Za-z0-9_.][A-Za-z0-9_.-]*"
 VALUE_RES = {
     "pr_number": re.compile(r"[1-9][0-9]*"),
-    "repo": re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"),
+    "repo": re.compile(NO_DOTDOT + _SEG + "/" + _SEG),
     "head_sha": SHA_RE,
     "merge_base_sha": SHA_RE,
     "base_ref": PATH_RE,
@@ -133,6 +137,24 @@ def parse_max_yellow(value) -> int:
     return n
 
 
+class _DuplicateKeyError(ValueError):
+    """A repeated member name in an axis output."""
+
+
+def _no_duplicate_keys(pairs):
+    """json.loads keeps the LAST of a duplicate key, so a repeated member name
+    would let `{"verdict": "red", ..., "verdict": "green"}` read as green and
+    reach APPROVE while anyone opening the raw file plainly sees red. On a path
+    whose whole job is to fail closed on ambiguous model output, that ambiguity
+    is rejected rather than silently resolved either way."""
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise _DuplicateKeyError(f"duplicate key {key!r} in the output")
+        out[key] = value
+    return out
+
+
 def _short(value) -> str:
     """repr() of a model-supplied value, bounded: it is echoed into the reasons."""
     text = repr(value)
@@ -171,36 +193,64 @@ def validate_output(data):
 
 def load_output(path: str):
     """Parse one axis output file; raise ValueError on anything unusable."""
+    # This file is model-written and untrusted. O_NONBLOCK so a FIFO at this
+    # path cannot block the open, and every check runs against the DESCRIPTOR via
+    # fstat rather than the path via stat: a path-level stat followed by a
+    # separate open is two lookups, and whatever can write <axis>.json can swap
+    # the object between them and put the blocking open back.
     try:
-        info = os.stat(path)
-        # This file is model-written and untrusted, so its shape and size are
-        # checked BEFORE it is opened: a FIFO at this path would block the read
-        # indefinitely, and reading an unbounded file only to hand it to
-        # json.loads (which roughly doubles the footprint) can OOM the decide
-        # step. Both failures degrade this axis instead of killing the run.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise ValueError("no output") from None
+    except OSError as e:
+        raise ValueError(f"unreadable output ({e.__class__.__name__})") from None
+    try:
+        info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("the output is not a regular file")
         if info.st_size > MAX_OUTPUT_BYTES:
             raise ValueError(f"the output is larger than {MAX_OUTPUT_BYTES} bytes")
-        with open(path, encoding="utf-8") as f:
-            text = f.read(MAX_OUTPUT_BYTES + 1)
-    except FileNotFoundError:
-        raise ValueError("no output") from None
-    except (OSError, UnicodeDecodeError) as e:
+        # Bytes, not characters: MAX_OUTPUT_BYTES is a byte budget, and a
+        # text-mode read counts characters, so a multibyte file could pass a
+        # character-counted bound at several times the budget. Read first,
+        # bound the bytes, and only then decode.
+        chunks, remaining = [], MAX_OUTPUT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as e:
         raise ValueError(f"unreadable output ({e.__class__.__name__})") from None
-    # The stat above can go stale -- the file may grow between the two calls --
-    # so the bound is enforced again on what was actually read.
-    if len(text) > MAX_OUTPUT_BYTES:
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_OUTPUT_BYTES:
         raise ValueError(f"the output is larger than {MAX_OUTPUT_BYTES} bytes")
     try:
-        data = json.loads(text)
-    # RecursionError is a RuntimeError, NOT a ValueError: a few hundred KB of
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("unreadable output (UnicodeDecodeError)") from None
+    try:
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except _DuplicateKeyError as e:
+        raise ValueError(str(e)) from None
+    # RecursionError is a RuntimeError, NOT a ValueError: a few tens of KB of
     # `[[[[...` raises it out of json.loads, and uncaught it would abort the
     # whole decide on exactly the input this path exists to fail closed on.
     # .github/cursor-review/build-ledger.py catches it for the same reason.
     except (ValueError, RecursionError):
         raise ValueError("the output is not valid JSON") from None
-    return validate_output(data)
+    # Validation is guarded too, not just the parse: _short()'s repr() walks the
+    # value, so a structure json.loads accepted can still overflow the stack
+    # here. Whether that window is open at all depends on repr having less
+    # headroom than the scanner, which is an interpreter and build detail -- so
+    # the contract is made structural rather than left resting on it.
+    try:
+        return validate_output(data)
+    except RecursionError:
+        raise ValueError("the output is nested too deeply to validate") from None
 
 
 def decide(outputs: dict, axes: list, max_yellow: int):
@@ -273,6 +323,11 @@ def cmd_decide(args) -> int:
             outputs[axis] = load_output(os.path.join(args.outputs_dir, f"{axis}.json"))
         except ValueError as e:
             outputs[axis] = e
+        # The per-axis boundary is the last place the "every decision exits 0"
+        # contract can be kept, so it does not depend on load_output having
+        # converted every RecursionError on the way out.
+        except RecursionError:
+            outputs[axis] = ValueError("the output is nested too deeply")
     print(json.dumps(decide(outputs, axes, max_yellow), indent=2))
     return 0
 
