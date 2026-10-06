@@ -36,7 +36,8 @@ on:
         description: >-
           'latest-per-reviewer' (default, for OSS repos with "dismiss stale reviews on
           new commits" enabled — dismissed approvals do NOT count) or 'any-approval'
-          (for private repos without stale-dismissal — any historical APPROVED counts).
+          (for private repos without stale-dismissal — any historical APPROVED review
+          from a GitHub User account counts).
         type: string
         required: false
         default: latest-per-reviewer
@@ -132,14 +133,19 @@ jobs:
 
             let hasApproval;
             if (approvalMode === 'any-approval') {
-              // Private repos without stale-dismissal: any historical APPROVED counts.
-              hasApproval = reviews.some(r => r.state === 'APPROVED');
+              // Private repos without stale-dismissal: any historical APPROVED review
+              // from a GitHub User account counts.
+              hasApproval = reviews.some(
+                r => r.user?.type === 'User' && r.state === 'APPROVED'
+              );
             } else {
               // OSS repos with stale-dismissal: take latest review per reviewer.
               // A DISMISSED state means the approval was invalidated by a later push.
               const latestByReviewer = new Map();
               for (const r of reviews) {
-                if (!r.user || r.state === 'COMMENTED') continue;
+                // Bot reviews remain useful automation, but they are not peer review
+                // evidence for this human-review control.
+                if (r.user?.type !== 'User' || r.state === 'COMMENTED') continue;
                 const prev = latestByReviewer.get(r.user.login);
                 if (!prev || new Date(r.submitted_at) > new Date(prev.submitted_at)) {
                   latestByReviewer.set(r.user.login, r);
