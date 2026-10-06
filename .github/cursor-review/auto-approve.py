@@ -512,7 +512,15 @@ def cmd_decide(args) -> int:
         if "own pull request" in str(e).lower():
             emit(f"ℹ️ **Auto-approve: skipped** — the approver authored this PR ({e}).")
             return 0
+        # No review landed, so this round's verdict stands behind nothing: the
+        # gate must not read pass/fail, and an earlier approval must not keep
+        # satisfying branch protection — dismiss-stale leaves one alone while its
+        # recorded head and base still match. A POST that failed ambiguously (a
+        # timeout) may have written an APPROVE anyway; the withdrawal lists live
+        # reviews, so it catches that one too.
+        set_output("approve_gate", GATE_UNTRUSTED)
         print(f"::error::Could not submit the {event} review: {e}")
+        withdraw_own_approvals(args)
         return 1
 
     # Close the read → POST race. A push or retarget landing in that window fires
@@ -633,6 +641,9 @@ def cmd_dismiss_stale(args) -> int:
         live_head, live_base, read_error = "", None, e
     else:
         read_error = None
+    # An empty base is not None either: it would match no recorded base and
+    # dismiss every marked approval. No base → skip the base check, as below.
+    live_base = live_base or None
     if not live_head:
         live_head, live_base = args.head_sha, None
         if not live_head:

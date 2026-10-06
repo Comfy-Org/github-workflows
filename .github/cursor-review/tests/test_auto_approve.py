@@ -391,6 +391,13 @@ class DismissStaleHeadTest(unittest.TestCase):
         # would match no recorded SHA and withdraw every marked approval on the PR.
         self.assertEqual(self.run_dismiss(None, NEW, [self.approval(1, NEW)]), (0, []))
 
+    def test_a_read_with_a_head_but_no_base_skips_the_base_check(self):
+        # "" is not None: it would mismatch every recorded base and dismiss an
+        # approval that is current on both head and base.
+        approval = {"id": 1, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                    "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], NEW, "main")}
+        self.assertEqual(self.run_dismiss(NEW, NEW, [approval]), (0, []))
+
 
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
@@ -567,7 +574,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None):
+                   labels_after=None, reviews=()):
         heads = iter(heads)
         reads = []
         writes = []
@@ -581,7 +588,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                 writes.append(args[3])
                 return "{}"
             if args[:2] == ["api", "--paginate"]:
-                return json.dumps([[]])
+                return json.dumps([list(reviews)])
             names = labels_after if reads and labels_after is not None else labels
             reads.append(args)
             return json.dumps({"head": {"sha": next(heads)}, "base": {"ref": "main"},
@@ -628,6 +635,20 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def test_head_moved_during_post_is_untrusted(self):
         self.assertEqual(self.run_decide(heads=(SHA, "b" * 40)), (0, "untrusted"))
+
+    def test_a_failed_post_is_untrusted_and_withdraws_an_earlier_approval(self):
+        # A REQUEST_CHANGES that never landed must not leave the last round's
+        # approval standing (dismiss-stale keeps it while head and base match),
+        # nor a `fail` gate over a verdict nobody can see.
+        earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                   "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
+        rc, gate = self.run_decide(findings=[finding("critical")], post_error="HTTP 502", reviews=[earlier])
+        self.assertEqual((rc, gate), (1, "untrusted"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
+
+    def test_a_refused_self_approval_keeps_its_gate(self):
+        # Not a broken round: the verdict stands, only the approver is the author.
+        self.assertEqual(self.run_decide(post_error="Can not approve your own pull request"), (0, "pass"))
 
     def test_invalid_threshold_still_leaves_a_value(self):
         self.assertEqual(self.run_decide(threshold="high"), (2, "untrusted"))

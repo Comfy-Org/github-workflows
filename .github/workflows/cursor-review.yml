@@ -3604,6 +3604,30 @@ jobs:
             exit 1
           fi
 
+      - name: Fail while the PR is handed to a human (round cap)
+        # The `round-cap` output above only exists on a run that counted rounds.
+        # Every later non-review event on a capped PR — a thread resolve, an
+        # unrelated label, the bot's own label write — skips `round-cap`, so the
+        # CAPPED check above never fires and the thread query alone would pass
+        # once the old threads are resolved or outdated, over a head no panel
+        # reviewed. The label is the cap's persistent state (removing it is the
+        # reset), so read it live on every event. A failed read fails closed,
+        # like every other guard here.
+        if: ${{ inputs.max_rounds > 0 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ! labels="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.labels[].name')"; then
+            echo "::error::Could not read this PR's labels to check the max_rounds cap — refusing to pass the blocking gate. Re-run the job."
+            exit 1
+          fi
+          if printf '%s\n' "$labels" | grep -qixF 'needs-human-review'; then
+            echo "::error::This PR carries needs-human-review (cursor-review's max_rounds cap, or a human hand-off), so automated rounds are paused and no panel has reviewed this head — an unreviewed head cannot pass a blocking gate. Have a human review it, then remove the label to resume automated rounds."
+            exit 1
+          fi
+
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
         # `required: true` for workflow_call inputs, so an omitted input arrives

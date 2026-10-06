@@ -507,7 +507,9 @@ timeline) count, so a human who has looked at the PR can hand it back to the bot
 for another `max_rounds` rounds. A count that cannot be read fails open — the
 panel runs, as it did before the cap existed. Under `blocking: true` a capped
 head holds **Blocking gate** red, the same as an over-cap diff: no panel looked
-at it.
+at it. With `max_rounds` above 0 the gate reads the live label on every event,
+so resolving the old threads cannot turn it green while `needs-human-review` is
+on the PR — whoever applied it.
 
 **`approve_gate`** is a workflow-level output for a downstream job that should
 run only after a round passed the severity gate:
