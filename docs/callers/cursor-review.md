@@ -485,10 +485,16 @@ review rounds forever. Before the panel starts, the checkout-free **Round cap**
 job counts the consolidated reviews (`## 🔍 Cursor Review — Consolidated panel`)
 the posting identity — the `bot_app_id` App, else `github-actions[bot]` — has
 already left on the PR. Reviews by anyone else carrying the same heading are not
-counted. At or over the cap it:
+counted, and neither are rounds that reviewed nothing (a "Review failed" error
+review, or one where every panel cell failed). At or over the cap it:
 
 - runs **no panel** (`Diff size check`, and everything after it, is skipped);
-- adds the `needs-human-review` label, creating it if the repo lacks it;
+- adds the `needs-human-review` label, creating it if the repo lacks it.
+  Creating a repo label needs `issues: write`, which the caller's
+  `pull-requests: write` does not grant, so **create `needs-human-review` once
+  by hand** unless the `bot_app_id` App has Issues write. If the label cannot be
+  applied, the cap fails open for that run (the panel runs) with a warning,
+  rather than capping a PR it gave no way to reset;
 - posts **one** comment listing the latest round's open findings above
   `approve_max_severity` (every open finding when that is empty). A hidden
   `<!-- cursor-review-round-cap -->` marker keeps a re-trigger from posting it
@@ -522,5 +528,5 @@ jobs:
 | `pass` | The auto-approve decision was APPROVE. |
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
 | `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
-| `capped` | The round cap was hit by this run, or the PR carries `needs-human-review`. Wins over `off`. |
+| `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
 | `off` | `approve_max_severity` is empty (and the cap was not hit). |

@@ -41,6 +41,8 @@ checks out NO PR code:
     per cap, keyed on ``ROUND_CAP_MARKER``), and tell the workflow to skip the
     panel. A read failure fails OPEN — the panel runs, as it did before the cap
     existed — because a cap nobody can count is not evidence of a runaway loop.
+    So does a label that cannot be applied: the label is the only reset, and a
+    cap with nothing for a human to remove would never lift.
 
 ``decide`` also emits ``approve_gate`` (one of ``APPROVE_GATE_VALUES``) as a
 step output, for a downstream workflow that should run only after a round
@@ -109,6 +111,7 @@ ever dismissed, so a human's review — or another bot's — is never touched.
 import argparse
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -145,6 +148,13 @@ APPROVE_GATE_VALUES = (GATE_PASS, GATE_FAIL, GATE_UNTRUSTED, GATE_CAPPED, GATE_O
 # removal (an `unlabeled` timeline event) is what resets the round count.
 HUMAN_REVIEW_LABEL = "needs-human-review"
 ROUND_CAP_MARKER = "<!-- cursor-review-round-cap -->"
+# post-review.py opens two bodies with CONSOLIDATED_MARKER that report a round
+# which reviewed NOTHING — the "Review failed" error review and the
+# all-panel-cells-failed review (both `delivers=False`). Neither spent a panel's
+# judgement on the PR, so neither counts toward `max_rounds`: five transient
+# CLI failures must not cap a PR no panel ever looked at. Pinned against
+# post-review.py's source by a test, so a reworded banner fails CI here.
+NON_ROUND_BANNERS = ("\n⚠️ **Review failed**\n", "\n⚠️ **Panel did not produce any findings.**\n")
 
 
 def _load_sibling(filename: str, module_name: str):
@@ -509,18 +519,27 @@ def cmd_decide(args) -> int:
     # an event whose dismissal scan can finish before this review exists, so
     # nothing else would ever withdraw it. Re-read the head and base now that the
     # review is written; if either moved, withdraw our own review here.
+    #
+    # The same window can label the PR `needs-human-review` — a human, or a
+    # concurrent run hitting the round cap — and an APPROVE must not outlive
+    # that hand-off either. (A REQUEST_CHANGES withholds nothing, so it stays.)
     try:
-        head_now, base_now = pr_head_base(read_pr(args.repo, args.pr_number))
+        pr_now = read_pr(args.repo, args.pr_number)
+        head_now, base_now = pr_head_base(pr_now)
+        labelled_now = has_label(pr_now, HUMAN_REVIEW_LABEL)
     except (RuntimeError, ValueError):
         head_now = base_now = None  # unknown → treat as moved: withdraw rather than leave it
-    if head_now != args.commit_sha or base_now != args.base_ref:
-        set_output("approve_gate", GATE_UNTRUSTED)
+        labelled_now = False
+    moved = head_now != args.commit_sha or base_now != args.base_ref
+    if moved or (event == APPROVE and labelled_now):
+        set_output("approve_gate", GATE_UNTRUSTED if moved else GATE_CAPPED)
+        why = "the PR head or base moved" if moved else f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"
         try:
-            dismiss(args.repo, args.pr_number, posted["id"])
+            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
         except RuntimeError as e:
-            print(f"::error::The PR head or base moved while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
             return 1
-        emit(f"ℹ️ **Auto-approve: withdrawn** — the PR head or base moved while the {event} review was being posted.")
+        emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     return 0
@@ -579,6 +598,7 @@ def withdraw_own_approvals(args) -> int:
 STALE_MESSAGE = "New commits pushed — cursor-review auto-approve withdrawn until the next review round."
 BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve withdrawn until the next review round."
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
+HUMAN_REVIEW_MESSAGE = f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 
 
 def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> None:
@@ -670,13 +690,15 @@ def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
 
     Body AND author: the marker is public text anyone can put in a review, so a
     body match alone would let any user burn a PR's rounds. Dismissed reviews
-    still count — a round was spent either way.
+    still count — a round was spent either way. A body reporting that the round
+    reviewed nothing (NON_ROUND_BANNERS) does not.
     """
     out = [
         r for r in reviews
         if isinstance(r, dict)
         and ((r.get("user") or {}).get("login") or "").lower() == poster_login.lower()
         and (r.get("body") or "").startswith(marker)
+        and not any(b in (r.get("body") or "") for b in NON_ROUND_BANNERS)
         and _after(r.get("submitted_at"), since)
     ]
     return sorted(out, key=lambda r: r.get("submitted_at") or "")
@@ -762,31 +784,66 @@ def open_thread_ids(repo: str, pr: int):
 
 
 def ensure_label(repo: str, pr_number) -> None:
+    """Apply HUMAN_REVIEW_LABEL to the PR, creating it repo-side first if missing.
+
+    The probe and the create are advisory, not a gate — the same posture as
+    scripts/pr-risk/apply-risk-label.sh. Only a 404 means "missing"; a 403 or a
+    5xx on the probe says nothing about the label. Creating a repo label needs
+    `issues: write`, which a `pull-requests: write`-only token lacks, and a
+    concurrent run can create it first (422 already_exists); either way the add
+    below is still attempted, and it is the add's result that decides.
+    """
     try:
         gh(["api", f"repos/{repo}/labels/{HUMAN_REVIEW_LABEL}"])
-    except RuntimeError:
-        gh(
-            ["api", "-X", "POST", f"repos/{repo}/labels", "--input", "-"],
-            {
-                "name": HUMAN_REVIEW_LABEL,
-                "color": "d93f0b",
-                "description": "cursor-review hit its round cap; a human has to review this PR",
-            },
-        )
+    except RuntimeError as e:
+        if "HTTP 404" in str(e) or "Not Found" in str(e):
+            try:
+                gh(
+                    ["api", "-X", "POST", f"repos/{repo}/labels", "--input", "-"],
+                    {
+                        "name": HUMAN_REVIEW_LABEL,
+                        "color": "d93f0b",
+                        "description": "cursor-review hit its round cap; a human has to review this PR",
+                    },
+                )
+            except RuntimeError as create_err:
+                print(f"::warning::Could not create the `{HUMAN_REVIEW_LABEL}` label ({create_err}); "
+                      "trying to apply it anyway.")
+        else:
+            print(f"::warning::The `{HUMAN_REVIEW_LABEL}` label probe failed with a non-404 ({e}); "
+                  "trying to apply it anyway.")
     gh(
         ["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels", "--input", "-"],
         {"labels": [HUMAN_REVIEW_LABEL]},
     )
 
 
+def parse_max_rounds(value) -> int:
+    """`max_rounds` as an int; ValueError unless it is a finite whole number.
+
+    A `type: number` input can render as `5` or `5.0`, so a float that is
+    integral is accepted — `2.9`, `inf` and `nan` are not silently truncated.
+    """
+    raw = str(value).strip() or "0"
+    try:
+        number = float(raw)
+    except ValueError:
+        raise ValueError(f"max_rounds must be a whole number, got {value!r}") from None
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"max_rounds must be a whole number, got {value!r}")
+    return int(number)
+
+
 def cmd_round_cap(args) -> int:
     set_output("capped", "false")
+    set_output("labelled", "false")
     try:
-        # A `type: number` input can render as `5` or `5.0`.
-        max_rounds = int(float(str(args.max_rounds).strip() or 0))
-    except ValueError:
-        print(f"::error::max_rounds must be a whole number, got {args.max_rounds!r}")
-        return 2
+        max_rounds = parse_max_rounds(args.max_rounds)
+    except ValueError as e:
+        # Fail OPEN like every other way this step can go wrong: a caller typo
+        # must not take the whole panel down (diff-size hangs off this job).
+        print(f"::error::{e} — the round cap is not applied this run.")
+        return 0
     if max_rounds <= 0:
         emit("Round cap: off (`max_rounds: 0`).")
         return 0
@@ -797,6 +854,13 @@ def cmd_round_cap(args) -> int:
     except ValueError:
         threshold = ""
     marker = _load_post_review().CONSOLIDATED_MARKER
+    try:
+        # For the `approve_gate` output only: a PR a human already handed to a
+        # human reports `capped` even when auto-approve (and so decide) is off.
+        if has_label(read_pr(args.repo, args.pr_number), HUMAN_REVIEW_LABEL):
+            set_output("labelled", "true")
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not read this PR's labels: {e}")
     try:
         since = last_unlabeled_at(
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
@@ -811,13 +875,23 @@ def cmd_round_cap(args) -> int:
         emit(f"Round cap: {len(rounds)}/{max_rounds} round(s) so far — running the panel.")
         return 0
 
-    set_output("capped", "true")
-    emit(f"🛑 **Round cap reached** — {len(rounds)}/{max_rounds} round(s); skipping the panel and labelling `{HUMAN_REVIEW_LABEL}`.")
-    failed = []
+    # The label is the hand-off AND the only reset, so it goes on BEFORE the PR
+    # is committed to `capped`. Capped-but-unlabelled would be permanent: every
+    # later trigger recounts, retries the same failing write and skips the panel,
+    # with no label for a human to remove. So a label that cannot be applied
+    # fails OPEN, like an unreadable count.
     try:
         ensure_label(args.repo, args.pr_number)
     except RuntimeError as e:
-        failed.append(f"label: {e}")
+        print(f"::warning::Round cap reached ({len(rounds)}/{max_rounds}) but the `{HUMAN_REVIEW_LABEL}` label "
+              f"could not be applied ({e}), so the cap is not applied this run and the panel runs. Create the "
+              f"label in this repo (creating one needs `issues: write`), or check the posting token's "
+              f"`pull-requests: write`.")
+        return 0
+    set_output("capped", "true")
+    set_output("labelled", "true")
+    emit(f"🛑 **Round cap reached** — {len(rounds)}/{max_rounds} round(s); skipped the panel and labelled `{HUMAN_REVIEW_LABEL}`.")
+    failed = []
     try:
         comments = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/comments?per_page=100")
         if cap_comment_posted(comments, args.poster_login, since):
@@ -833,8 +907,8 @@ def cmd_round_cap(args) -> int:
     except (RuntimeError, ValueError, KeyError) as e:
         failed.append(f"comment: {e}")
     if failed:
-        # Still capped (the panel stays skipped); red so the missing label or
-        # comment is seen.
+        # Still capped (the panel stays skipped, and the label is on, so a human
+        # can reset it); red so the missing comment is seen.
         print(f"::error::Round cap reached but could not finish handing the PR to a human ({'; '.join(failed)}).")
         return 1
     return 0

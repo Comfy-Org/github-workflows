@@ -349,7 +349,9 @@ on:
           sets the `approve_gate` output to `capped`. Auto-approve never
           approves a PR carrying that label. Removing the label resets the
           count: only rounds after its most recent removal count. 0 → no cap. A
-          count that cannot be read fails open (the panel runs). Default 5.
+          count that cannot be read, or a label that cannot be applied, fails
+          open (the panel runs). Creating the label needs `issues: write`, so
+          pre-create it unless the bot App has it. Default 5.
         type: number
         required: false
         default: 5
@@ -406,9 +408,10 @@ on:
           judge was degraded, a panel cell failed, the review was not delivered,
           the head moved — or no round was delivered by this run at all, e.g. a
           skipped or already-reviewed event), `capped` (the `max_rounds` cap was
-          hit this run, or the PR carries `needs-human-review`), `off`
+          hit this run, or the PR carries `needs-human-review` while
+          `max_rounds` or `approve_max_severity` is set), `off`
           (`approve_max_severity` is empty and the cap was not hit).
-        value: ${{ jobs.round-cap.outputs.capped == 'true' && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
+        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -871,8 +874,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    env:
+      # `secrets` cannot be read in `if:`, so the credentials-present test is
+      # evaluated here — the same guard over-cap-comment uses. An app id without
+      # its key is a permitted config and must not take the panel down.
+      BOT_CONFIGURED: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY != '' }}
     outputs:
       capped: ${{ steps.cap.outputs.capped }}
+      labelled: ${{ steps.cap.outputs.labelled }}
       rounds: ${{ steps.cap.outputs.rounds }}
     steps:
       - name: Require a pinned workflows_ref
@@ -942,7 +951,11 @@ jobs:
 
       - name: Mint bot-identity token (optional)
         id: bot_token
-        if: ${{ inputs.bot_app_id != '' && inputs.max_rounds > 0 }}
+        if: ${{ env.BOT_CONFIGURED == 'true' && inputs.max_rounds > 0 }}
+        # Best-effort: a failed mint degrades to github-actions[bot] below rather
+        # than failing this job, which `diff-size` (and so the panel) hangs off.
+        # The count then matches no bot-posted round and fails open.
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ inputs.bot_app_id }}

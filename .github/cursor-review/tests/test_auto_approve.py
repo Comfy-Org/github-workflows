@@ -554,7 +554,8 @@ class ApproveGateTest(unittest.TestCase):
         with open(wf, encoding="utf-8") as f:
             text = f.read()
         self.assertIn(
-            "value: ${{ jobs.round-cap.outputs.capped == 'true' && 'capped' || "
+            "value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') "
+            "&& 'capped' || "
             "inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}",
             text,
         )
@@ -565,8 +566,11 @@ class ApproveGateTest(unittest.TestCase):
 class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
-    def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None):
+    def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
+                   labels_after=None):
         heads = iter(heads)
+        reads = []
+        writes = []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"]:
@@ -574,11 +578,14 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                     raise RuntimeError(post_error)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
+                writes.append(args[3])
                 return "{}"
             if args[:2] == ["api", "--paginate"]:
                 return json.dumps([[]])
+            names = labels_after if reads and labels_after is not None else labels
+            reads.append(args)
             return json.dumps({"head": {"sha": next(heads)}, "base": {"ref": "main"},
-                               "labels": [{"name": n} for n in labels]})
+                               "labels": [{"name": n} for n in names]})
 
         with tempfile.TemporaryDirectory() as d:
             fpath = os.path.join(d, "c.json")
@@ -598,7 +605,16 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                     mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
                     mock.patch.object(AA, "emit", lambda *a: None):
                 rc = AA.cmd_decide(args)
+            self.writes = writes
             return rc, read_outputs(out).get("approve_gate")
+
+    def test_label_applied_during_the_post_withdraws_the_approval(self):
+        self.assertEqual(self.run_decide(labels_after=["needs-human-review"]), (0, "capped"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/99/dismissals"])
+
+    def test_label_applied_during_a_request_changes_leaves_it(self):
+        rc, gate = self.run_decide(findings=[finding("critical")], labels_after=["needs-human-review"])
+        self.assertEqual((rc, gate, self.writes), (0, "fail", []))
 
     def test_pass(self):
         self.assertEqual(self.run_decide(), (0, "pass"))
@@ -693,14 +709,16 @@ class CapFindingsTest(unittest.TestCase):
 class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
-    def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=()):
+    def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
+                probe_error="HTTP 404"):
         writes = []
 
         def fake_gh(args, payload=None):
             path = next(a for a in args if a.startswith("repos/"))
             method = args[2] if args[:2] == ["api", "-X"] else "GET"
             for f in fail:
-                if f in path:
+                # A trailing `$` anchors the match to the end of the path.
+                if (path.endswith(f[:-1]) if f.endswith("$") else f in path):
                     raise RuntimeError(f"boom {path}")
             if method != "GET":
                 writes.append((method, path, payload))
@@ -715,8 +733,10 @@ class RoundCapCommandTest(unittest.TestCase):
                 return json.dumps([[inline(11, "High"), inline(12, "Nit")]])
             if path == "repos/o/r/labels/needs-human-review":
                 if not label_exists:
-                    raise RuntimeError("HTTP 404")
+                    raise RuntimeError(probe_error)
                 return "{}"
+            if path == "repos/o/r/pulls/1":
+                return json.dumps({"labels": [{"name": n} for n in labels]})
             raise AssertionError(path)
 
         with tempfile.TemporaryDirectory() as d:
@@ -781,9 +801,72 @@ class RoundCapCommandTest(unittest.TestCase):
         rc, out, writes = self.run_cap(self.FIVE, fail=("/reviews",))
         self.assertEqual((rc, out["capped"], writes), (0, "false", []))
 
-    def test_a_failed_label_write_stays_capped_and_goes_red(self):
-        rc, out, _ = self.run_cap(self.FIVE, fail=("issues/1/labels",))
-        self.assertEqual((rc, out["capped"]), (1, "true"))
+    def test_a_failed_label_write_fails_open(self):
+        # Capped-but-unlabelled would be permanent (no label to remove = no
+        # reset), so a label that cannot be applied runs the panel instead.
+        rc, out, writes = self.run_cap(self.FIVE, fail=("issues/1/labels",))
+        self.assertEqual((rc, out["capped"], out["labelled"]), (0, "false", "false"))
+        self.assertFalse(any("/comments" in p for _, p, _ in writes))
+
+    def test_a_failed_comment_stays_capped_and_goes_red(self):
+        rc, out, writes = self.run_cap(self.FIVE, fail=("issues/1/comments",))
+        self.assertEqual((rc, out["capped"], out["labelled"]), (1, "true", "true"))
+        self.assertIn(("POST", "repos/o/r/issues/1/labels"), [(m, p) for m, p, _ in writes])
+
+    def test_a_non_404_probe_does_not_create_but_still_applies(self):
+        rc, out, writes = self.run_cap(self.FIVE, label_exists=False, probe_error="HTTP 403: Forbidden")
+        self.assertEqual((rc, out["capped"]), (0, "true"))
+        paths = [p for _, p, _ in writes]
+        self.assertNotIn("repos/o/r/labels", paths)
+        self.assertIn("repos/o/r/issues/1/labels", paths)
+
+    def test_a_failed_create_still_applies(self):
+        # A pull-requests-only token 403s the repo-side create (that needs
+        # issues: write), and a concurrent run can 422 it; the add still runs.
+        rc, out, writes = self.run_cap(self.FIVE, label_exists=False, fail=("repos/o/r/labels$",))
+        self.assertEqual((rc, out["capped"]), (0, "true"))
+        self.assertIn("repos/o/r/issues/1/labels", [p for _, p, _ in writes])
+
+    def test_labelled_pr_under_the_cap_reports_labelled(self):
+        rc, out, writes = self.run_cap(self.FIVE[:2], labels=["Needs-Human-Review"])
+        self.assertEqual((rc, out["capped"], out["labelled"], writes), (0, "false", "true", []))
+
+    def test_unreadable_labels_do_not_stop_the_count(self):
+        rc, out, _ = self.run_cap(self.FIVE, fail=("repos/o/r/pulls/1$",))
+        self.assertEqual((rc, out["capped"], out["labelled"]), (0, "true", "true"))
+
+    def test_rounds_that_reviewed_nothing_do_not_count(self):
+        failed = [review(i, f"2026-01-0{i}T00:00:00Z", body=MARKER + "\n\n⚠️ **Review failed**\n\n```x```")
+                  for i in range(1, 4)]
+        empty = [review(i, f"2026-01-0{i}T00:00:00Z",
+                        body=MARKER + "\n\n⚠️ **Panel did not produce any findings.**\n\nEvery reviewer…")
+                 for i in range(4, 7)]
+        rc, out, writes = self.run_cap(failed + empty + self.FIVE[:2])
+        self.assertEqual((rc, out["capped"], out["rounds"], writes), (0, "false", "2", []))
+
+    def test_non_integral_or_non_finite_max_rounds_fails_open(self):
+        for bad in ("2.9", "0.5", "inf", "nan", "-inf", "five"):
+            with self.subTest(bad=bad):
+                rc, out, writes = self.run_cap(self.FIVE, max_rounds=bad)
+                self.assertEqual((rc, out["capped"], writes), (0, "false", []))
+
+    def test_integral_float_max_rounds_is_accepted(self):
+        _, out, _ = self.run_cap(self.FIVE, max_rounds="5.0")
+        self.assertEqual(out["capped"], "true")
+
+
+class NonRoundBannerParityTest(unittest.TestCase):
+    """NON_ROUND_BANNERS must match what post-review.py actually renders."""
+
+    def test_each_banner_is_in_post_review(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "post-review.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        for banner in AA.NON_ROUND_BANNERS:
+            with self.subTest(banner=banner):
+                # post-review writes them as `\n\n<banner>\n\n` inside f-strings.
+                self.assertIn(banner.strip("\n").replace("\n", "\\n"), src)
+                self.assertIn("\\n\\n" + banner.strip("\n") + "\\n\\n", src)
 
 
 if __name__ == "__main__":
