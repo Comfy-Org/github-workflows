@@ -120,8 +120,11 @@ runs cursor-approve's axes after this round): an APPROVE outcome still reports
 identity's own earlier marked approvals instead, exactly as a no-decision round
 does, so cursor-approve's ``approve-external`` is the only thing that ever
 approves and no severity-only approval can satisfy branch protection while the
-axes judge (or after a failed run that never reaches them). REQUEST_CHANGES is
-unaffected: it approves nothing.
+axes judge (or after a failed run that never reaches them). It also dismisses
+this identity's own earlier REQUEST_CHANGES, which a posted APPROVE would have
+superseded. A withdrawal that fails, or a head/base/label change since the read,
+downgrades the gate as on the posting path. REQUEST_CHANGES is unaffected: it
+approves nothing.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
@@ -751,12 +754,8 @@ def cmd_decide(args) -> int:
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
-    if event == APPROVE and getattr(args, "defer_approval", "") == "true":
-        # The gate stays `pass` for cursor-approve, whose decide approves (and
-        # resolves threads) only once its axes agree. Withdrawing here also
-        # clears an approval this identity posted before defer was switched on.
-        emit(f"ℹ️ **Auto-approve: deferred** — {reasons[0]}; approval is left to cursor-approve.")
-        return withdraw_own_approvals(args, DEFERRED_MESSAGE)
+    if event == APPROVE and (getattr(args, "defer_approval", "") or "").strip().lower() == "true":
+        return defer_to_cursor_approve(args, reasons[0])
 
     body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
@@ -833,6 +832,72 @@ def cmd_decide(args) -> int:
         # Never fatal, never undoes the approval (see resolve_eligible_threads).
         resolve_eligible_threads(args.repo, args.pr_number, getattr(args, "poster_login", "") or "",
                                  threshold, args.commit_sha)
+    return 0
+
+
+def defer_to_cursor_approve(args, reason: str) -> int:
+    """`--defer-approval true` on an APPROVE outcome: post nothing, keep the gate.
+
+    The gate stays `pass` for cursor-approve, whose decide approves (and resolves
+    threads) only once its axes agree — unless one of the steps below says this
+    round can no longer stand behind it, exactly as the posting path would.
+    """
+    emit(f"ℹ️ **Auto-approve: deferred** — {reason}; approval is left to cursor-approve.")
+    # Also clears an approval this identity posted before defer was switched on.
+    # One that cannot be withdrawn keeps satisfying branch protection while the
+    # axes judge, so the gate must not read `pass` over it (same as a failed POST).
+    rc = withdraw_own_approvals(args, DEFERRED_MESSAGE)
+    if rc:
+        set_output("approve_gate", GATE_UNTRUSTED)
+    # Posting path: the APPROVE event supersedes this identity's earlier
+    # REQUEST_CHANGES. Nothing is posted here, so dismiss those instead — else a
+    # fixed High keeps vetoing the merge until cursor-approve approves, which it
+    # never does on a red axis. Failing to is red but withholds nothing.
+    if dismiss_own_change_requests(args):
+        rc = 1
+    # Same post-decision re-check the posting path runs: a push, retarget or
+    # `needs-human-review` label landing since the read must not leave `pass`.
+    try:
+        pr_now = read_pr(args.repo, args.pr_number)
+        head_now, base_now = pr_head_base(pr_now)
+        labelled_now = has_label(pr_now, HUMAN_REVIEW_LABEL)
+    except (RuntimeError, ValueError):
+        head_now = base_now = None  # unknown → treat as moved
+        labelled_now = False
+    if head_now != args.commit_sha or base_now != args.base_ref:
+        set_output("approve_gate", GATE_UNTRUSTED)
+        emit("ℹ️ **Auto-approve: deferred round superseded** — the PR head or base moved.")
+    elif labelled_now:
+        set_output("approve_gate", GATE_CAPPED)
+        emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
+    return rc
+
+
+def dismiss_own_change_requests(args) -> int:
+    """Dismiss this identity's own unedited, marked REQUEST_CHANGES reviews.
+    An edited one is someone else's words (see _stale_approvals) and stays."""
+    login = (args.approver_login or "").strip().lower()
+    if not login:
+        return 0
+    try:
+        ids = [r["id"] for r in list_reviews(args.repo, args.pr_number)
+               if r.get("state") == "CHANGES_REQUESTED" and not r.get("edited")
+               and APPROVE_MARKER in (r.get("body") or "")
+               and (r.get("user") or {}).get("login", "").lower() == login]
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not list reviews to withdraw an earlier request for changes: {annotation_cause(e, 'unknown error')}")
+        return 1
+    failed = []
+    for rid in ids:
+        try:
+            dismiss(args.repo, args.pr_number, rid, PASSED_MESSAGE)
+        except RuntimeError as e:
+            failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
+    if ids:
+        emit(f"Auto-approve: withdrew {len(ids) - len(failed)}/{len(ids)} earlier request(s) for changes by {args.approver_login}.")
+    if failed:
+        print(f"::warning::Could not withdraw {len(failed)} earlier request(s) for changes ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
+        return 1
     return 0
 
 
@@ -1051,6 +1116,7 @@ STALE_MESSAGE = "New commits pushed — cursor-review auto-approve withdrawn unt
 BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve withdrawn until the next review round."
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
 DEFERRED_MESSAGE = "cursor-review defers approval to cursor-approve — auto-approve withdrawn until its axes agree."
+PASSED_MESSAGE = "The latest cursor-review round passed its severity threshold — request for changes withdrawn; approval is left to cursor-approve."
 HUMAN_REVIEW_MESSAGE = f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 
 

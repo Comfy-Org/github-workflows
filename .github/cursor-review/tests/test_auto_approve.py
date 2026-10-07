@@ -1727,17 +1727,24 @@ class AutoResolveCommandTest(unittest.TestCase):
 class DeferApprovalTest(unittest.TestCase):
     """`--defer-approval true`: the gate is reported, but only cursor-approve approves."""
 
-    def run_decide(self, defer, findings=(), reviews=()):
+    def run_decide(self, defer, findings=(), reviews=(), fail_put=False, pr_reads=()):
         self.writes = []
         self.resolved = []
+        later_reads = list(pr_reads)  # PR payloads after the first read, in order
 
         def fake_gh(args, payload=None):
             if args[:2] == ["api", "-X"]:
                 self.writes.append((args[2], args[3], payload))
+                if args[2] == "PUT" and fail_put:
+                    raise RuntimeError("gh api failed: 403 dismissals restricted")
                 return '{"id": 99}' if args[2] == "POST" else "{}"
             if args[:2] == ["api", "graphql"]:
                 return graphql_reviews(list(reviews))
-            return json.dumps({"head": {"sha": SHA}, "base": {"ref": "main"}})
+            pr = {"head": {"sha": SHA}, "base": {"ref": "main"}}
+            if getattr(fake_gh, "read", False) and later_reads:
+                pr = later_reads.pop(0)
+            fake_gh.read = True
+            return json.dumps(pr)
 
         with tempfile.TemporaryDirectory() as d:
             fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
@@ -1774,6 +1781,47 @@ class DeferApprovalTest(unittest.TestCase):
                          [("PUT", "repos/o/r/pulls/1/reviews/7/dismissals")])
         self.assertEqual(self.writes[0][2]["message"], AA.DEFERRED_MESSAGE)
         self.assertEqual(self.resolved, [])
+
+    def test_a_failed_withdrawal_downgrades_the_gate(self):
+        own = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, gate = self.run_decide("true", reviews=[own], fail_put=True)
+        self.assertEqual((rc, gate), (1, AA.GATE_UNTRUSTED))
+
+    def test_own_marked_change_requests_are_dismissed(self):
+        own = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        edited = dict(own, id=6, edited=True)
+        unmarked = dict(own, id=9, body="please fix")
+        other = dict(own, id=10, user={"login": "alice"})
+        rc, gate = self.run_decide("true", reviews=[own, edited, unmarked, other])
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual([(m, path) for m, path, _ in self.writes],
+                         [("PUT", "repos/o/r/pulls/1/reviews/5/dismissals")])
+        self.assertEqual(self.writes[0][2]["message"], AA.PASSED_MESSAGE)
+
+    def test_a_failed_change_request_dismissal_is_red_but_keeps_the_gate(self):
+        own = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, gate = self.run_decide("true", reviews=[own], fail_put=True)
+        self.assertEqual((rc, gate), (1, AA.GATE_PASS))
+
+    def test_a_change_since_the_read_downgrades_the_gate(self):
+        moved = {"head": {"sha": "b" * 40}, "base": {"ref": "main"}}
+        retargeted = {"head": {"sha": SHA}, "base": {"ref": "dev"}}
+        labelled = {"head": {"sha": SHA}, "base": {"ref": "main"},
+                    "labels": [{"name": AA.HUMAN_REVIEW_LABEL}]}
+        for pr, want in ((moved, AA.GATE_UNTRUSTED), (retargeted, AA.GATE_UNTRUSTED),
+                         (labelled, AA.GATE_CAPPED), ("not a dict", AA.GATE_UNTRUSTED)):
+            with self.subTest(pr=pr):
+                rc, gate = self.run_decide("true", pr_reads=[pr])
+                self.assertEqual((rc, gate, self.writes), (0, want, []))
+
+    def test_defer_is_read_case_and_whitespace_insensitively(self):
+        for defer in ("True", " true ", "TRUE"):
+            with self.subTest(defer=defer):
+                rc, gate = self.run_decide(defer)
+                self.assertEqual((rc, gate, self.writes, self.resolved), (0, AA.GATE_PASS, [], []))
 
     def test_request_changes_is_still_posted(self):
         rc, gate = self.run_decide("true", findings=[finding("high")])

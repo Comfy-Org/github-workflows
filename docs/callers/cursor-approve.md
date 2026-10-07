@@ -12,7 +12,7 @@ the context axes (business, design, completeness) are not available yet.
    Call it with `defer_approval: true`: a passing round then reports
    `approve_gate == 'pass'` **without** posting an approval (and without
    resolving any thread), and withdraws the approving identity's own earlier
-   approvals. Without it, cursor-review's `decide` APPROVES first, and that
+   approvals and requests for changes. Without it, cursor-review's `decide` APPROVES first, and that
    severity-only approval satisfies branch protection or auto-merge until the
    start phase withdraws it — and stays standing if the cursor-review run fails
    or is cancelled after approving, because the start phase and the axes are
@@ -122,10 +122,17 @@ jobs:
       round: ${{ needs.cursor-review.outputs.round }}
       max_rounds: ${{ needs.cursor-review.outputs.max_rounds }}
       approve_max_severity: low
-      poster_login: github-actions[bot]
+      poster_login: github-actions[bot]  # `<app-slug>[bot]` if cursor-review runs with bot_app_id
     secrets:
       APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 ```
+
+With `defer_approval: true`, thread auto-resolution moves here too: this
+phase's decide resolves cursor-review's at-or-below-threshold threads only when
+`approve_max_severity` and `poster_login` are both set, and `poster_login` must
+be the login cursor-review posts findings under — `<app-slug>[bot]` when
+cursor-review runs with `bot_app_id`, else `github-actions[bot]`. A wrong login
+resolves nothing, so a "require conversation resolution" ruleset still blocks.
 
 Pass secrets explicitly to the axes — never `secrets: inherit` — so each axis
 receives `CURSOR_API_KEY` and nothing else. `always()` on the decide job makes a

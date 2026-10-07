@@ -344,7 +344,7 @@ on:
           workflow. false (default) → no change. true → a round that would
           APPROVE still reports `approve_gate` = `pass`, but posts no review and
           auto-resolves no thread; it withdraws the approver identity's own
-          earlier auto-approvals instead, so cursor-approve's `phase: decide`
+          earlier auto-approvals (and requests for changes) instead, so cursor-approve's `phase: decide`
           is the only approver and no severity-only approval stands while the
           axes judge — nor after a run that fails before they start.
           REQUEST_CHANGES is still posted. No effect unless
