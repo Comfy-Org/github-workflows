@@ -2083,15 +2083,19 @@ class DeferApprovalTest(unittest.TestCase):
 class ApproveAuthorsTest(unittest.TestCase):
     """approve_authors: an unlisted author gets `off` and no review event."""
 
-    def run_decide(self, author_enabled, findings=()):
+    def run_decide(self, author_enabled, findings=(), reviews=(), dismissed=None, pr_author="Some-Author", **extra):
         posted = []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"]:
                 posted.append(payload)
                 return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "PUT"]:
+                if dismissed is not None:
+                    dismissed.append((args[3], payload["message"]))
+                return "{}"
             if args[:2] == ["api", "graphql"]:
-                return graphql_reviews([])
+                return graphql_reviews(list(reviews))
             return json.dumps({"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []})
 
         with tempfile.TemporaryDirectory() as d:
@@ -2107,7 +2111,7 @@ class ApproveAuthorsTest(unittest.TestCase):
                                       commit_sha=SHA, judge_status="ok", delivered="true",
                                       ungated="0", approver_login="cursor-approver",
                                       reviewed_diff=dpath, base_ref="main",
-                                      author_enabled=author_enabled, pr_author="Some-Author")
+                                      author_enabled=author_enabled, pr_author=pr_author, **extra)
             emitted = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -2123,6 +2127,36 @@ class ApproveAuthorsTest(unittest.TestCase):
                 rc, gate, events, emitted = self.run_decide("false", findings)
                 self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
                 self.assertTrue(any("auto-approve not enabled for author Some-Author" in e for e in emitted))
+
+    def test_unlisted_author_withdraws_own_approval_and_change_request(self):
+        # Narrowing approve_authors moves no head SHA, so dismiss-stale keeps an
+        # approval — or a REQUEST_CHANGES veto — posted at the current head.
+        def own(rid, state):
+            body = AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")
+            return {"id": rid, "user": {"login": "cursor-approver"}, "state": state,
+                    "commit_id": SHA, "body": body, "edited": False}
+        dismissed = []
+        rc, gate, events, _ = self.run_decide(
+            "false", reviews=[own(1, "APPROVED"), own(2, "CHANGES_REQUESTED")], dismissed=dismissed)
+        self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
+        self.assertEqual(sorted(dismissed), [("repos/o/r/pulls/1/reviews/1/dismissals", AA.AUTHOR_OFF_MESSAGE),
+                                             ("repos/o/r/pulls/1/reviews/2/dismissals", AA.AUTHOR_OFF_MESSAGE)])
+
+    def test_unexpected_author_enabled_fails_closed(self):
+        for value in ("0", "no", "1", "unknown"):
+            with self.subTest(value=value):
+                rc, gate, events, _ = self.run_decide(value)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_invalid_inputs_fail_red_for_an_unlisted_author_too(self):
+        for extra in ({"max_failed_reviewers": "1.5"}, {"approve_scope": "bogus"}):
+            with self.subTest(extra=extra):
+                rc, gate, events, _ = self.run_decide("false", **extra)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_decision_note_keeps_underscore_logins(self):
+        _, _, _, emitted = self.run_decide("false", pr_author="mona_acme")
+        self.assertTrue(any("for author mona_acme " in e for e in emitted))
 
     def test_listed_or_unrestricted_author_gets_the_normal_decision(self):
         for enabled in ("true", ""):
@@ -2158,23 +2192,43 @@ class ApproveAuthorsTest(unittest.TestCase):
                            capture_output=True, cwd=d)
             return read_outputs(out).get("approve_author_ok")
 
+    def resolve_with_glob_bait(self, authors, author):
+        # A file named after the author: without `set -f`, an unquoted `*` in
+        # the list would expand to it and match.
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            open(os.path.join(d, author), "w").close()
+            env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": out,
+                   "APPROVE_AUTHORS": authors, "PR_AUTHOR": author}
+            subprocess.run(["bash", "-e", "-c", self.gate_step()], env=env, check=True,
+                           capture_output=True, cwd=d)
+            return read_outputs(out).get("approve_author_ok")
+
     def test_gate_step_resolves_the_list(self):
         cases = [
             ("", "anyone", "true"),
             ("  ", "anyone", "true"),
-            (",", "anyone", "true"),
+            # A non-empty list that names nobody fails closed.
+            (",", "anyone", "false"),
+            ("@", "anyone", "false"),
+            (" , @ ,", "anyone", "false"),
             ("mattmillerai", "mattmillerai", "true"),
             ("alice, MattMillerAI", "mattmillerai", "true"),
             ("alice bob,@carol", "Carol", "true"),
             ("alice\nbob", "bob", "true"),
             ("alice,bob", "mallory", "false"),
-            ("alice", "", "false"),
-            ("*", "mallory", "false"),
+            # No PR author (a non-PR event): left unset, not `false`.
+            ("alice", "", None),
+            ("", "", "true"),
             ("alice-bob", "alice", "false"),
         ]
         for authors, author, want in cases:
             with self.subTest(authors=authors, author=author):
                 self.assertEqual(self.resolve(authors, author), want)
+
+    def test_gate_step_does_not_glob_the_list(self):
+        self.assertEqual(self.resolve_with_glob_bait("*", "mallory"), "false")
 
     def test_workflow_wiring(self):
         src = self._workflow()

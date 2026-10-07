@@ -592,24 +592,34 @@ jobs:
         # approve_authors, resolved ONCE here so the workflow-level
         # `approve_gate` output (which must say `off` on every event, round or
         # not) and `Auto-approve decision` read the same answer. Runs on every
-        # event, before any skip below. `false` only when a non-empty list does
-        # not name the PR author; an empty list is everyone.
+        # event, before any skip below. `false` when a non-empty list does not
+        # name the PR author — including a list that names nobody (`,`, `@`):
+        # a restriction that evaluates empty fails closed. An empty (or
+        # all-whitespace) list is everyone. No PR author (a non-PR event) leaves
+        # the output unset, so `approve_gate` keeps its "no round" meaning.
         id: author
         env:
           APPROVE_AUTHORS: ${{ inputs.approve_authors }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -f  # the list is caller text: no glob expansion of its words
+          if [ -z "$(printf '%s' "$APPROVE_AUTHORS" | tr -d '[:space:]')" ]; then
+            echo "approve_authors is empty — no author restriction."
+            echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$PR_AUTHOR" ]; then
+            echo "No PR author on this event — approve_authors not evaluated."
+            exit 0
+          fi
           author="$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')"
           listed=false
-          any=false
           for login in $(printf '%s' "$APPROVE_AUTHORS" | tr ',' ' '); do
             login="$(printf '%s' "${login#@}" | tr '[:upper:]' '[:lower:]')"
             [ -n "$login" ] || continue
-            any=true
-            if [ -n "$author" ] && [ "$login" = "$author" ]; then listed=true; fi
+            if [ "$login" = "$author" ]; then listed=true; fi
           done
-          if [ "$any" = false ] || [ "$listed" = true ]; then
+          if [ "$listed" = true ]; then
             echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "approve_authors does not list the PR author '$PR_AUTHOR' — auto-approve is off for this PR."
