@@ -111,7 +111,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | Input | Default | Notes |
 |---|---|---|
 | `judge_model` | `claude-opus-5-thinking-xhigh` | Consolidates the panel into one review. |
-| `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight validates them against the live catalog). Use for per-repo experiments such as a reasoning-tier A/B — and prefer wiring it to a **variable** rather than a literal, see [Running a model experiment](#running-a-model-experiment). |
+| `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight checks each one exists in the live catalog — existence only, not ZDR). Use for per-repo experiments such as a reasoning-tier A/B — and prefer wiring it to a **variable** rather than a literal, see [Running a model experiment](#running-a-model-experiment). |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. Under `blocking: true` it is also not green: an unreviewed PR cannot pass the gate. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
@@ -149,14 +149,27 @@ the variable (or every variable) falls back rather than failing. The run log
 names which list is in effect either way, so a deletion mid-experiment is
 visible instead of looking like a round that was never overridden.
 
-Do **not** give the caller its own literal fallback list. `catalog-drift.py`
-reads the pins out of `cursor-review.yml`; a model list copied into a caller is
-invisible to it, so a delisted or newly-`NO ZDR` model sitting there would never
-be flagged — and it would silently keep that snapshot when the shared default
-moves. A **repo**
-variable overrides an **org** variable of the same name, so one repo can trial a
-list the rest of the org is not on, and the org value can be set later without
-touching any caller. Revert is `gh variable delete`.
+**Any override forfeits drift coverage, variable included.**
+`catalog-drift.py` parses the panel pins out of the heredoc in
+`cursor-review.yml`, so while `panel_models` is set the weekly check keeps
+auditing the built-in list while the panel runs yours. A variable is not in the
+tracked tree at all — no review, no grep, no diff. Watch the catalog yourself
+for the duration of an experiment.
+
+What the variable buys over a literal is therefore not auditing — it is the
+revert, and where the fallback lands. Unset, the panel runs the built-in list,
+which *is* the drift-audited one, so an experiment ends with a `gh variable
+delete` and reverts back into coverage. A caller literal **is** the fallback:
+there is nothing to delete, it needs a PR plus a fleet SHA bump to change, and
+it holds its snapshot unaudited while the shared default moves on without it.
+So prefer the variable, and treat a set variable as temporary by default.
+
+A **repo** variable overrides an **org** variable of the same name, so one repo
+can trial a list the rest of the org is not on, and the org value can be set
+later without touching any caller. Note what an org-level value means: it
+retargets every enrolled caller at once, and panel composition then lives in
+mutable state outside the SHA-pinned tree every caller otherwise pins, with the
+run log as the only record of which models judged a given PR.
 
 ```bash
 gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
@@ -176,8 +189,15 @@ variables; moving both at once leaves the result unattributable. Note also that
 tier names are not uniform across families — some ship `-thinking-*` tiers and
 some do not — so the "same" tier of a newer version may not exist.
 
-Preflight validates every id against the live catalog and fails loud before any
-cell spends, so a typo or a delisted id costs nothing but the preflight job.
+Preflight checks that every id **exists** in the live catalog and fails loud
+before any cell spends, so a typo or a delisted id costs nothing but the
+preflight job. It is an existence check only — it does **not** validate ZDR
+eligibility. The match is on the id as a token, so an id whose catalog line
+reads `NO ZDR` passes like any other; NO-ZDR detection lives only in
+`catalog-drift.py`, which never sees an overridden list. On a panel that reviews
+private-repo diffs, confirm ZDR against the catalog yourself before setting the
+variable, and re-check it before a long-running experiment — a model can be
+reclassified while your override is in force.
 
 `judge_model` is **not** a good fit for the same treatment: its input carries a
 real default, and a caller that passes an explicitly-empty value gets `''`

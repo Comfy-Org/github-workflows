@@ -1966,9 +1966,22 @@ jobs:
             # Caller override. Must be a non-empty JSON array of catalog-shaped
             # ids; the shape check here and the live-catalog check below both
             # fail loud, so a bad override costs zero cells.
+            # Bounded at BOTH ends. The matrix fans out to models x 2 review
+            # types and GitHub caps a matrix at 256 jobs, so an oversized array
+            # fails the whole run at startup (permanently red under
+            # `blocking: true`) — and every extra id is another full
+            # cursor-agent pass over the diff. 12 is far above any real panel
+            # (the built-in list is 3) and far below the cap.
             if ! printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -e \
-                 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))' > /dev/null; then
-              echo "::error::panel_models must be a non-empty JSON array of Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $PANEL_MODELS_OVERRIDE"
+                 'type == "array" and length > 0 and length <= 12 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))' > /dev/null; then
+              # Echo the rejected value with newlines stripped and truncated.
+              # This input is caller-settable, and a caller wiring it to a
+              # variable makes it settable with no PR at all, so a raw
+              # multi-line echo would let it smuggle ::workflow commands:: into
+              # a PUBLIC repo's run log. Same reason the `Require a pinned
+              # workflows_ref` step below strips before echoing.
+              SAFE_OVERRIDE="$(printf '%s' "$PANEL_MODELS_OVERRIDE" | tr -d '\n\r' | cut -c1-200)"
+              echo "::error::panel_models must be a JSON array of 1-12 Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $SAFE_OVERRIDE"
               exit 1
             fi
             printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c 'unique' > /tmp/models.json
@@ -1980,7 +1993,7 @@ jobs:
             # line a mid-experiment deletion is indistinguishable in the log
             # from one that was never set — the panel quietly reverts and the
             # rounds either side of it look the same.
-            echo "panel_models not set — using the built-in list: $(cat /tmp/models.json)"
+            echo "panel_models not set — using the built-in list: $(jq -c . /tmp/models.json)"
           fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
