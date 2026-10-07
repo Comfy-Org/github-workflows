@@ -82,17 +82,23 @@ DEFAULT_REVIEW_LABEL = "cursor-review"
 
 
 def safe_label(label) -> str:
-    """cursor-review's `review_label` for a next-step line, or the default.
+    """cursor-review's `review_label` for a next-step line: the default when
+    none is given, "" when it is not a plain label name.
 
     A caller input, but it lands in a code span on a comment posted as the
     approver: only a plain label name is echoed, never markdown or a marker.
+    Anything else is NOT replaced by the default — that would name a label the
+    repo may not have — the line then says "the review label".
     """
     label = str(label or "").strip()
-    return label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:/+-]{0,49}", label) else DEFAULT_REVIEW_LABEL
+    if not label:
+        return DEFAULT_REVIEW_LABEL
+    return label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:/+-]{0,49}", label) else ""
 
 
 def relabel(label=DEFAULT_REVIEW_LABEL) -> str:
-    return f"remove and re-add the `{safe_label(label)}` label"
+    name = safe_label(label)
+    return f"remove and re-add the `{name}` label" if name else "remove and re-add the review label"
 
 
 def next_resolve_text(label=DEFAULT_REVIEW_LABEL) -> str:
@@ -324,7 +330,9 @@ def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, hea
     are decide_gate's, verbatim; `gating` is the findings (or open threads)
     that held the approval back, each a dict with severity/file/line/url/why.
     """
-    lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), "", f"**{headline}**"]
+    # The headline too: callers build it from a reason (`Not approved: …`), and
+    # it sits two lines below the contract markers agents parse.
+    lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), "", f"**{reason_text(headline)}**"]
     rows = [_gating_row(f) for f in (gating or [])[:20] if isinstance(f, dict)]
     if rows:
         lines += ["", *rows]

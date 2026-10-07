@@ -161,6 +161,15 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "own_pr"))
         self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
 
+    def test_a_newer_approval_landing_during_the_post_takes_the_block_back(self):
+        fake = FakeGitHub(head="d" * 40)
+        with mock.patch.object(aa, "own_approval_on", side_effect=[False, True]):
+            rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual(fake.dismiss_messages, [aa.NEWER_APPROVAL_MESSAGE])
+
     def test_a_late_superseded_decide_does_not_veto_a_newer_approval(self):
         newer = "d" * 40
         fake = FakeGitHub(head=newer, reviews=[prior_approval(sha=newer, rid=43)])

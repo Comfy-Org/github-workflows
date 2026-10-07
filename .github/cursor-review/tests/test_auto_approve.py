@@ -2073,6 +2073,8 @@ class DeferApprovalTest(unittest.TestCase):
                "commit_id": SHA, "body": AA.APPROVE_MARKER}
         rc, gate = self.run_decide("true", reviews=[own], fail_put=True)
         self.assertEqual((rc, gate), (1, AA.GATE_UNTRUSTED))
+        # The un-withdrawn approval must not be the PR's only verdict.
+        self.assertEqual([p["event"] for m, _, p in self.writes if m == "POST"], [AA.REQUEST_CHANGES])
 
     def test_own_marked_change_requests_are_dismissed(self):
         own = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
@@ -2101,7 +2103,12 @@ class DeferApprovalTest(unittest.TestCase):
                          (labelled, AA.GATE_CAPPED), ("not a dict", AA.GATE_UNTRUSTED)):
             with self.subTest(pr=pr):
                 rc, gate = self.run_decide("true", pr_reads=[pr])
-                self.assertEqual((rc, gate, self.writes), (0, want, []))
+                # The defer path dismissed every earlier block and cursor-approve
+                # will not run on a non-pass gate, so an untrusted downgrade must
+                # leave a standing block of its own; capped posts none.
+                blocks = [] if want == AA.GATE_CAPPED else [("POST", AA.REQUEST_CHANGES)]
+                self.assertEqual((rc, gate, [(m, p["event"]) for m, _, p in self.writes if m == "POST"]),
+                                 (0, want, blocks))
 
     def test_defer_is_read_case_and_whitespace_insensitively(self):
         for defer in ("True", " true ", "TRUE"):
@@ -2346,11 +2353,13 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
 
     def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
                    reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
-                   head=SHA, card="true", review_label=""):
+                   head=SHA, card="true", review_label="", refuse_pin=False):
         self.reviews_posted, self.dismissed, self.card_writes = [], [], []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
+                if refuse_pin and "commit_id" in payload and payload["event"] == AA.REQUEST_CHANGES:
+                    raise RuntimeError("gh api failed: HTTP 422: No commit found for SHA")
                 self.reviews_posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
@@ -2450,6 +2459,40 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         # The second round edits the same card comment rather than adding one.
         self.assertEqual([(m, u) for m, u, _ in self.card_writes], [("PATCH", "repos/o/r/issues/comments/7")])
 
+    def test_a_late_run_never_sweeps_a_newer_block(self):
+        # Review ids grow monotonically: 150 was posted after this run's 99 by
+        # a newer run, so only the older 5 is dismissed (panel finding on #362).
+        self.run_decide(judge="error", reviews=[own_change_request(5), own_change_request(150)])
+        self.assertEqual(self.dismissed, [(5, AA.STANDING_REPLACED_MESSAGE)])
+
+    def test_an_approval_sweeps_only_blocks_older_than_itself(self):
+        self.run_decide(reviews=[own_change_request(5), own_change_request(150)])
+        self.assertEqual(self.dismissed, [(5, AA.APPROVED_LATER_MESSAGE)])
+
+    def test_an_unloadable_card_module_costs_only_the_card(self):
+        approval = {"id": 7, "user": {"login": APPROVER}, "state": "APPROVED", "body": AA.APPROVE_MARKER}
+        with mock.patch.object(AA, "_load_card", side_effect=SyntaxError("broken card.py")):
+            rc, gate = self.run_decide(judge="error", reviews=[approval])
+            # The earlier approval is still withdrawn — no traceback before it.
+            self.assertEqual((gate, self.dismissed[0][0]), (AA.GATE_UNTRUSTED, 7))
+            self.assertEqual(self.card_writes, [])
+            rc, gate = self.run_decide()
+            self.assertEqual((rc, gate, [p["event"] for p in self.reviews_posted]), (0, AA.GATE_PASS, [AA.APPROVE]))
+
+    def test_a_card_write_that_raises_anything_is_only_a_warning(self):
+        with mock.patch.object(CARD, "upsert", side_effect=KeyError("id")), \
+                mock.patch.object(AA, "_load_card", lambda: CARD):
+            rc, gate = self.run_decide()
+        self.assertEqual((rc, gate, [p["event"] for p in self.reviews_posted]), (0, AA.GATE_PASS, [AA.APPROVE]))
+
+    def test_an_unpinnable_block_is_posted_unpinned(self):
+        # After a force-push the reviewed commit is no longer in the PR and
+        # GitHub refuses the pin with a 422: the block still lands, unpinned.
+        rc, _ = self.run_decide(judge="error", refuse_pin=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual([("commit_id" in p, p["event"]) for p in self.reviews_posted], [(False, AA.REQUEST_CHANGES)])
+        self.assertRegex(self.reviews_posted[0]["body"], AA.REVIEWED_SHA_RE)
+
     def test_an_unlisted_author_gets_no_block_and_no_card(self):
         rc, gate = self.run_decide(judge="error", author_enabled="false")
         self.assertEqual((rc, gate), (0, AA.GATE_OFF))
@@ -2515,9 +2558,11 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.assertIn("remove and re-add the `ai-review` label", self.reviews_posted[0]["body"])
         self.run_decide(findings=[finding("high")], review_label="ai-review")
         self.assertIn("remove and re-add the `ai-review` label", self.card_body())
-        # Anything that is not a plain label name falls back to the default.
+        # Anything that is not a plain label name is not echoed, and is not
+        # swapped for a default the repo may not have either.
         self.run_decide(judge="error", review_label="x` <!-- y -->")
-        self.assertIn("remove and re-add the `cursor-review` label", self.card_body())
+        self.assertIn("remove and re-add the review label", self.card_body())
+        self.assertNotIn("<!-- y", self.card_body())
 
     def test_workflow_passes_the_card_inputs(self):
         src = open(WORKFLOW_PATH, encoding="utf-8").read()
@@ -2528,6 +2573,13 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                        "MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}",
                        '--review-label "$REVIEW_LABEL"'):
             self.assertIn(needle, step)
+
+
+class CardContractMirrorTest(unittest.TestCase):
+    def test_decides_card_constants_match_card_py(self):
+        self.assertEqual((AA.CARD_PASS, AA.CARD_CHANGES, AA.CARD_NO_DECISION, AA.CARD_CAPPED), CARD.STATES)
+        self.assertEqual((AA.CARD_NEXT_NONE, AA.CARD_NEXT_RESOLVE, AA.CARD_NEXT_RELABEL, AA.CARD_NEXT_HUMAN),
+                         CARD.NEXTS)
 
 
 class NoDecisionNextTest(unittest.TestCase):

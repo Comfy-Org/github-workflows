@@ -109,8 +109,15 @@ that finishes after a newer run approved the live head posts none either: as
 the approver's latest review it would override that approval.
 
 The next-step line names cursor-review's `review_label` input (default
-`cursor-review`) on the cards cursor-review writes. This workflow has no such
-input, so its own start and decide cards always say `cursor-review`.
+`cursor-review`) on the cards cursor-review writes; a value that is not a plain
+label name is not echoed, and the line says "the review label" instead. This
+workflow has no such input, so its own start and decide cards always say
+`cursor-review`.
+
+Known gap (BE-19492): only an approving round withdraws a standing block, so a
+PR that is vetoed (`skip-cursor-review`), handed to a human
+(`needs-human-review`), or whose caller clears `approve_max_severity` keeps it
+until someone dismisses it by hand.
 
 ## Prerequisites
 
