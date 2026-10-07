@@ -66,7 +66,9 @@ passed the severity gate:
   the head moved while the review was being posted;
 * ``capped`` — the PR carries ``needs-human-review`` (set by ``round-cap``, or
   by a human): it is never approved;
-* ``off`` — set by the workflow itself when `approve_max_severity` is empty.
+* ``off`` — set by the workflow itself when `approve_max_severity` is empty, and
+  by ``decide`` (``--author-enabled false``) when `approve_authors` does not list
+  the PR's author: no review event is posted, though the findings still are.
 
 Fail-closed rules for ``decide``:
 
@@ -977,6 +979,15 @@ def cmd_decide(args) -> int:
     except ValueError as e:
         print(f"::error::{e}")
         return 2
+    if (getattr(args, "author_enabled", "") or "").strip().lower() == "false":
+        # approve_authors (resolved in the workflow's `gate` job) does not list
+        # this PR's author: auto-approve is off for the PR, exactly as if
+        # approve_max_severity were empty. No review event, no withdrawal —
+        # dismiss-stale still withdraws a stale marked approval on its own.
+        set_output("approve_gate", GATE_OFF)
+        login = re.sub(r"[^A-Za-z0-9\-\[\]]", "", getattr(args, "pr_author", "") or "") or "?"
+        emit(f"ℹ️ **Auto-approve: off** — auto-approve not enabled for author {login} (not in `approve_authors`).")
+        return 0
     try:
         max_failed = parse_max_failed_reviewers(getattr(args, "max_failed_reviewers", ""))
     except ValueError as e:
@@ -2107,6 +2118,11 @@ def main() -> int:
     d.add_argument("--ledger", default="")
     # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
     d.add_argument("--max-failed-reviewers", default="0")
+    # approve_authors, as resolved by the workflow's `gate` job: `false` = the PR
+    # author is not listed, so auto-approve is off for this PR. Anything else
+    # (including the default empty) = decide as usual.
+    d.add_argument("--author-enabled", default="")
+    d.add_argument("--pr-author", default="")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
