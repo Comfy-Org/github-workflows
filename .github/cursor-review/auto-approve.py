@@ -526,7 +526,14 @@ def cmd_decide(args) -> int:
                 {"commit_id": args.commit_sha, "event": event, "body": body},
             )
         )
-    except RuntimeError as e:
+        # The id is what the race check below dismisses by. A `gh` that exits 0
+        # with an unparseable body, `null`, or an object without an id would
+        # otherwise raise past this `except` AFTER the review may have landed —
+        # the job green on a `continue-on-error` step, nothing withdrawn. Treat
+        # it as the ambiguous POST it is (JSONDecodeError is a ValueError).
+        if not isinstance(posted, dict) or posted.get("id") is None:
+            raise ValueError(f"the review POST returned no review id ({type(posted).__name__})")
+    except (RuntimeError, ValueError) as e:
         # GitHub refuses an approval of your own PR (422). That is a property of
         # who authored the PR, not a broken review — report it, don't go red.
         if "own pull request" in str(e).lower():
@@ -619,9 +626,13 @@ def pr_head_base(pr: dict) -> tuple:
 
 
 def has_label(pr: dict, name: str) -> bool:
+    # A truthy non-list `labels` (a number, `true`) is not iterable, and the
+    # TypeError would escape every caller's `except (RuntimeError, ValueError)`.
+    labels = pr.get("labels")
     return any(
-        isinstance(label, dict) and (label.get("name") or "").lower() == name.lower()
-        for label in pr.get("labels") or []
+        isinstance(label, dict) and isinstance(label.get("name"), str)
+        and label["name"].lower() == name.lower()
+        for label in (labels if isinstance(labels, list) else [])
     )
 
 
@@ -666,9 +677,20 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
 
 
 def _review_node(node: dict) -> dict:
-    """One GraphQL review in the REST shape this module's readers expect."""
-    author = node.get("author") or {}
-    login = author.get("login") or ""
+    """One GraphQL review in the REST shape this module's readers expect.
+
+    Every field is coerced to the type its readers assume, or raises ValueError:
+    `_stale_approvals` runs outside its callers' `try`, so a wrong-shaped field
+    there would escape as a traceback instead of reaching the error path.
+    """
+    if not isinstance(node, dict):
+        # Not dropped: both callers read a missing review as "nothing to dismiss"
+        # and exit green, and the dropped one may be the newest approval.
+        raise ValueError(f"a review in the GraphQL response is not an object ({type(node).__name__})")
+    author = node.get("author")
+    author = author if isinstance(author, dict) else {}
+    login = author.get("login")
+    login = login if isinstance(login, str) else ""
     if login and author.get("__typename") == "Bot":
         login = f"{login}[bot]"
     rid = node.get("fullDatabaseId")
@@ -678,11 +700,14 @@ def _review_node(node: dict) -> dict:
         # Raise here rather than carry None into a dismissal URL, where it would
         # surface as a misleading 404 "could not dismiss".
         raise ValueError("a review in the GraphQL response has no database id")
+    if isinstance(rid, bool) or not isinstance(rid, (int, str)):
+        raise ValueError(f"a review in the GraphQL response has a non-numeric id ({type(rid).__name__})")
+    state, body = node.get("state"), node.get("body")
     return {
         "id": int(rid),
         "user": {"login": login},
-        "state": node.get("state") or "",
-        "body": node.get("body") or "",
+        "state": state if isinstance(state, str) else "",
+        "body": body if isinstance(body, str) else "",
         "edited": node.get("lastEditedAt") is not None,
         "submitted_at": node.get("submittedAt"),
         "html_url": node.get("url") or "",
@@ -727,7 +752,10 @@ def list_reviews(repo: str, pr_number) -> list:
         page = reviews.get("pageInfo") if isinstance(reviews, dict) else None
         if not isinstance(page, dict):
             raise ValueError(f"no reviews connection in the GraphQL response for {repo}#{pr_number}")
-        out += [_review_node(n) for n in (reviews.get("nodes") or []) if isinstance(n, dict)]
+        nodes = reviews.get("nodes") or []
+        if not isinstance(nodes, list):
+            raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} are not a list ({type(nodes).__name__})")
+        out += [_review_node(n) for n in nodes]
         if not page.get("hasNextPage"):
             return out
         nxt = page.get("endCursor")
@@ -774,6 +802,9 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
     )
 
 
+ANNOTATION_CAUSE_MAX = 500
+
+
 def annotation_cause(error, fallback: str) -> str:
     """One single-line cause for a ``::warning::``/``::error::`` annotation.
 
@@ -792,7 +823,12 @@ def annotation_cause(error, fallback: str) -> str:
     # reintroduce the very line break collapsing just removed. Display-only:
     # command parsing is per-line and happens before decoding.
     text = f"{type(error).__name__}: {error}".replace("%", "%25")
-    return " ".join(text.split()).rstrip(":")
+    text = " ".join(text.split()).rstrip(":")
+    # Bounded: `gh` captures stderr uncapped (a proxy's HTML error page is
+    # kilobytes), and the failure lists join one cause per review id before
+    # DISMISS_PERMISSION_HINT — which an over-long annotation would push out of
+    # what the renderer shows.
+    return text if len(text) <= ANNOTATION_CAUSE_MAX else text[:ANNOTATION_CAUSE_MAX - 1] + "…"
 
 
 def cmd_dismiss_stale(args) -> int:
@@ -839,19 +875,24 @@ def cmd_dismiss_stale(args) -> int:
         # A read that SUCCEEDED but carried no head may still carry a usable base;
         # keep it, so an off-base approval is still withdrawn. Only a failed read
         # leaves nothing to compare the base against.
-        live_head = args.head_sha
+        # Only a full SHA can stand in: the recorded marker is always lowercase
+        # 40-hex, so an abbreviated SHA or a ref name would match none of them
+        # and withdraw every marked approval — the same reason "" is refused.
+        live_head = args.head_sha.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha or "") else ""
         if read_error is not None:
             live_base = None
         if not live_head and not args.all_approvals:
             # A retarget needs no head to do its job, so it is not blocked by the
             # absence of one; every other mode compares against it and cannot run.
-            print(f"::error::Could not read the PR head to dismiss stale auto-approvals: {cause}")
+            fallback = (f"the event's head {args.head_sha!r} is not a full commit SHA to fall back to"
+                        if args.head_sha else "there is no event head to fall back to")
+            print(f"::error::Could not read the PR head to dismiss stale auto-approvals ({cause}), and {fallback}.")
             return 1
         print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — "
               + ("withdrawing every marked approval regardless of head, because --all-approvals is set. The "
                  "base check is moot on a retarget, which withdraws them all anyway."
                  if args.all_approvals else
-                 f"judging staleness against the event's head {args.head_sha!r}, "
+                 f"judging staleness against the event's head {live_head!r}, "
                  + ("with the base check against the live base" if live_base else "without the base check")
                  + ", for this run. A queued or redelivered event can therefore withdraw an approval that is "
                  "valid for the head as it stands now."))
@@ -916,6 +957,17 @@ def _after(stamp, since) -> bool:
     return since is None or (isinstance(stamp, str) and stamp > since)
 
 
+def _lf(body) -> str:
+    """`body` with GitHub's stored CRLF line endings turned back into LF.
+
+    NON_ROUND_BANNERS carry `\n` anchors, and GitHub rewrites a stored body to
+    CRLF (post-review.py's `_normalize_review_body` exists for the same reason),
+    so an unnormalised body would match neither banner and count a round that
+    reviewed nothing.
+    """
+    return body.replace("\r\n", "\n") if isinstance(body, str) else ""
+
+
 def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
     """The consolidated reviews `poster_login` posted after `since`, oldest first.
 
@@ -929,7 +981,7 @@ def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
         if isinstance(r, dict)
         and ((r.get("user") or {}).get("login") or "").lower() == poster_login.lower()
         and (r.get("body") or "").startswith(marker)
-        and not any(b in (r.get("body") or "") for b in NON_ROUND_BANNERS)
+        and not any(b in _lf(r.get("body")) for b in NON_ROUND_BANNERS)
         and _after(r.get("submitted_at"), since)
     ]
     return sorted(out, key=lambda r: r.get("submitted_at") or "")
@@ -992,8 +1044,18 @@ def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: 
 
 
 def _paginate(path: str) -> list:
+    """Every item of a paginated list endpoint; ValueError on any other shape.
+
+    `--slurp` wraps each page in an outer array. A body that is not a list of
+    lists (`null`, an API error object, a page that is not an array) would
+    otherwise raise KeyError/TypeError past `cmd_round_cap`'s fail-open
+    `except (RuntimeError, ValueError)`, turning `round-cap` red and skipping
+    the panel that hangs off it.
+    """
     pages = json.loads(gh(["api", "--paginate", "--slurp", path]))
-    return [x for page in pages for x in page] if pages and isinstance(pages[0], list) else pages
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise ValueError(f"expected a list of pages from {path.split('?')[0]}, got {type(pages).__name__}")
+    return [x for page in pages for x in page]
 
 
 def open_thread_ids(repo: str, pr: int):

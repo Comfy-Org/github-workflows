@@ -558,13 +558,66 @@ class ShapelessPayloadTest(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(ValueError):
                 self.list_reviews_with(body)
 
-    def test_non_object_reviews_are_dropped_rather_than_iterated(self):
-        body = json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
-            "pageInfo": {"hasNextPage": False, "endCursor": None},
-            "nodes": ["abc", None, json.loads(graphql_reviews([{"id": 1, "user": {"login": "x"}}]))
-                      ["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]],
+    def reviews_body(self, nodes):
+        return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes,
         }}}}})
-        self.assertEqual([r["id"] for r in self.list_reviews_with(body)], [1])
+
+    def good_node(self, **over):
+        node = json.loads(graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED",
+                                            "body": AA.APPROVE_MARKER}]))["data"]["repository"][
+            "pullRequest"]["reviews"]["nodes"][0]
+        node.update(over)
+        return node
+
+    def test_a_non_object_review_is_a_value_error_not_a_silent_drop(self):
+        # Dropping it would be the one unannounced degradation: both callers read
+        # a missing review as "nothing to dismiss" and exit green, and the
+        # dropped node may be the newest approval.
+        for bad in ("abc", None, 7):
+            with self.subTest(node=bad), self.assertRaises(ValueError):
+                self.list_reviews_with(self.reviews_body([bad, self.good_node()]))
+
+    def test_a_non_list_nodes_field_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            self.list_reviews_with(self.reviews_body(5))
+
+    def test_wrong_shaped_review_fields_are_coerced_before_the_staleness_scan(self):
+        # `_stale_approvals` runs outside both callers' `try`, so a non-mapping
+        # author or a non-string body/state there would escape as a traceback.
+        node = self.good_node(author="mallory", body=5, state=["APPROVED"])
+        review = self.list_reviews_with(self.reviews_body([node]))[0]
+        self.assertEqual((review["user"], review["body"], review["state"]), ({"login": ""}, "", ""))
+        self.assertEqual(AA.stale_reviews_to_dismiss([review], "x", None), [])
+        node = self.good_node(author={"__typename": "User", "login": 9})
+        self.assertEqual(self.list_reviews_with(self.reviews_body([node]))[0]["user"], {"login": ""})
+
+    def test_a_non_numeric_review_id_is_a_value_error(self):
+        for rid in ({"x": 1}, [1], True, "abc"):
+            with self.subTest(rid=rid), self.assertRaises(ValueError):
+                self.list_reviews_with(self.reviews_body([self.good_node(fullDatabaseId=rid)]))
+
+    def test_a_non_list_labels_field_answers_has_label(self):
+        # A truthy non-iterable is the shape `or []` does not guard.
+        for body in ('{"labels":5}', '{"labels":true}', '{"labels":{"name":"needs-human-review"}}',
+                     '{"labels":[{"name":7}]}'):
+            with self.subTest(body=body):
+                self.assertFalse(AA.has_label(self.read_pr_with(body), AA.HUMAN_REVIEW_LABEL))
+
+    def paginate_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA._paginate("repos/o/r/issues/1/timeline?per_page=100")
+
+    def test_paginate_flattens_slurped_pages(self):
+        self.assertEqual(self.paginate_with("[[1, 2], [3], []]"), [1, 2, 3])
+        self.assertEqual(self.paginate_with("[]"), [])
+
+    def test_paginate_rejects_every_other_shape_as_a_value_error(self):
+        # Each would otherwise be a KeyError/TypeError past round-cap's fail-open
+        # handler — a red `round-cap` that skips the whole panel.
+        for body in ("null", '{"message":"x"}', '[{"message":"x"}]', "[[1], null]", "[[1], 7]", '"s"'):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.paginate_with(body)
 
 
 class AnnotationCauseTest(unittest.TestCase):
@@ -580,6 +633,14 @@ class AnnotationCauseTest(unittest.TestCase):
     def test_multiline_stderr_collapses_to_one_line(self):
         got = AA.annotation_cause(RuntimeError("gh: HTTP 403\n::error::injected\nsee docs"), "x")
         self.assertEqual(got, "RuntimeError: gh: HTTP 403 ::error::injected see docs")
+
+    def test_an_overlong_cause_is_clamped(self):
+        # A proxy's HTML error page is kilobytes; the failure lists join one cause
+        # per review id ahead of DISMISS_PERMISSION_HINT.
+        got = AA.annotation_cause(RuntimeError("<html>" + "x" * 5000), "x")
+        self.assertEqual(len(got), AA.ANNOTATION_CAUSE_MAX)
+        self.assertTrue(got.endswith("…"))
+        self.assertEqual(AA.annotation_cause(RuntimeError("short"), "x"), "RuntimeError: short")
 
     def test_percent_is_escaped_so_the_runner_cannot_decode_a_newline_back_in(self):
         # The runner percent-decodes %0A/%0D when it renders an annotation, so an
@@ -647,6 +708,19 @@ class DismissStaleHeadTest(unittest.TestCase):
 
     def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
         self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
+
+    def test_an_unreadable_head_never_falls_back_to_a_non_sha_event_head(self):
+        # The recorded marker is always lowercase 40-hex, so an abbreviated SHA or
+        # a ref name matches none and would withdraw every approval — exactly the
+        # reason "" is refused.
+        for event_head in (NEW[:7], "refs/heads/main", "z" * 40):
+            with self.subTest(event_head=event_head):
+                rc, dismissed = self.run_dismiss(RuntimeError("x"), event_head, [self.approval(1, NEW)])
+                self.assertEqual((rc, dismissed), (1, []))
+
+    def test_an_uppercase_event_head_is_still_a_usable_fallback(self):
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), ("a" * 40).upper(),
+                                          [self.approval(1, "a" * 40)]), (0, []))
 
     def test_an_unreadable_head_with_no_event_head_goes_red(self):
         # Nothing to judge against: report it, never fall through to "" (which
@@ -778,14 +852,15 @@ class DismissStaleHeadTest(unittest.TestCase):
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
 
-    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: [], diff=DIFF):
+    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: [], diff=DIFF,
+                   post_response='{"id": 99}'):
         calls = []
         heads = iter(heads)
 
         def fake_gh(args, payload=None):
             calls.append((args, payload))
             if args[:2] == ["api", "-X"] and args[2] == "POST":
-                return json.dumps({"id": 99})
+                return post_response
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 return "{}"
             if args[:2] == ["api", "graphql"]:
@@ -836,6 +911,18 @@ class PostWriteRaceTest(unittest.TestCase):
     def test_unreadable_head_after_post_withdraws(self):
         rc, writes = self.run_decide([SHA, RuntimeError("timeout")])
         self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+    def test_a_post_response_without_a_review_id_withdraws_and_goes_red(self):
+        # `gh` exited 0, so the APPROVE may well have landed — but with no id the
+        # race check cannot dismiss it. Each shape must reach the ambiguous-POST
+        # path (withdraw by listing live reviews, exit 1), not escape as a
+        # traceback after approve_gate already read `pass`.
+        approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                    "body": AA.APPROVE_MARKER}
+        for response in ("not json", "null", "[]", '{"node_id": "x"}', '{"id": null}'):
+            with self.subTest(response=response):
+                rc, writes = self.run_decide([SHA], reviews=[approval], post_response=response)
+                self.assertEqual((rc, writes), (1, ["POST", "PUT"]))
 
     def test_head_unchanged_keeps_the_approval(self):
         rc, writes = self.run_decide([SHA, SHA])
@@ -1097,6 +1184,17 @@ class RoundCounterTest(unittest.TestCase):
             review(6, "2026-01-06T00:00:00Z", login="Cursor-Bot[bot]"),  # login is case-insensitive
         ]
         self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [1, 2, 6])
+
+    def test_a_non_round_banner_is_recognised_in_a_crlf_stored_body(self):
+        # GitHub stores bodies with CRLF line endings; the banners carry `\n`
+        # anchors, so an unnormalised match would count a round that reviewed
+        # nothing toward max_rounds.
+        failed = review(1, "2026-01-01T00:00:00Z",
+                        body=(MARKER + AA.NON_ROUND_BANNERS[0] + "details").replace("\n", "\r\n"))
+        empty = review(2, "2026-01-02T00:00:00Z",
+                       body=(MARKER + AA.NON_ROUND_BANNERS[1] + "details").replace("\n", "\r\n"))
+        real = review(3, "2026-01-03T00:00:00Z", body=(MARKER + "\nfindings").replace("\n", "\r\n"))
+        self.assertEqual([r["id"] for r in AA.round_reviews([failed, empty, real], BOT, None, MARKER)], [3])
 
     def test_unlabel_resets_the_count(self):
         reviews = [review(i, f"2026-01-0{i}T00:00:00Z") for i in range(1, 6)]
