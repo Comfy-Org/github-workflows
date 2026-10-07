@@ -8,8 +8,11 @@ Five subcommands, each run from a job that checks out NO PR code:
 ``decide`` (in `post-review`, after the consolidated review is posted)
     APPROVE when every finding of this round is at or below the threshold and
     nothing below says "don't trust this round"; REQUEST_CHANGES when any finding
-    is above it; otherwise submit nothing. The review is pinned (`commit_id`) to
-    the commit the panel reviewed.
+    is above it; otherwise no decision, which leaves a standing REQUEST_CHANGES
+    (see below). The review is pinned (`commit_id`) to the commit the panel
+    reviewed. With ``--card true`` it then writes cursor-approve's status card
+    (``.github/cursor-approve/card.py``) for the outcome — every outcome except
+    an author ``approve_authors`` does not list.
 
 ``dismiss-stale`` (in `dismiss-stale-approval`, on every same-repo
 `pull_request` event of an open PR; ``--all-approvals`` on a base retarget)
@@ -52,6 +55,8 @@ Five subcommands, each run from a job that checks out NO PR code:
     ``decide`` does (below). ``--approve-scope`` carries the round's
     ``approve_scope_effective``: only ``delta`` lets a marked non-gating thread
     above the threshold stop blocking that resolution; empty or absent is ``full``.
+    An outcome that withholds (``EXTERNAL_BLOCK_OUTCOMES``) leaves the same
+    standing REQUEST_CHANGES a no-decision ``decide`` does (BE-19489).
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
@@ -84,8 +89,14 @@ Fail-closed rules for ``decide``:
   red, earlier approvals withdrawn;
 * the PR carries ``needs-human-review`` → no review event, ``capped``.
 
-An untrusted round submits NO review event — neither approve nor request changes
-(its findings are still on the PR as threads):
+An untrusted round never approves (its findings are still on the PR as threads).
+Since BE-19489 it does leave a standing REQUEST_CHANGES — the reasons, the
+next step, and the usual markers — so a PR whose threads all get resolved still
+does not look done when nothing approved it. A later no-decision round replaces
+that block (posts its own, then dismisses this identity's older marked ones); a
+later approving round — decide's APPROVE, its ``--defer-approval`` path, or
+cursor-approve's ``approve-external`` — dismisses it. A ``capped`` round posts
+none: the label already hands the PR to a human. A round is untrusted when:
 
 * the judge did not adjudicate (degraded panel-union fallback);
 * any panel cell is not ``ok`` (a short panel finding nothing proves nothing) —
@@ -112,8 +123,9 @@ On a trusted round:
 * any finding above the threshold, or with a missing / unrecognised severity
   (post-review.py renders those as ``medium``), → REQUEST_CHANGES;
 * else an earlier round's thread above the threshold (or unbadged) still open
-  — not resolved, not outdated — → no review, so a High argued away in a reply
-  cannot be approved over;
+  — not resolved, not outdated — → no decision (and the standing
+  REQUEST_CHANGES above), so a High argued away in a reply cannot be approved
+  over;
 * else → APPROVE.
 
 After an APPROVE that survived the post-write head/base re-check — and only
@@ -247,6 +259,17 @@ def _load_post_review():
 def _load_incremental_diff():
     """incremental-diff.py, for the same section parser its `check` uses."""
     return _load_sibling("incremental-diff.py", "incremental_diff")
+
+
+def _load_card():
+    """cursor-approve's card.py: decide writes the status card every round.
+
+    Its API calls are routed through THIS module's `gh` (looked up at call
+    time), so one bounded wrapper — and one test seam — covers every write.
+    """
+    module = _load_sibling(os.path.join("..", "cursor-approve", "card.py"), "cursor_approve_card")
+    module.gh = lambda *a, **k: gh(*a, **k)
+    return module
 
 
 # --- approve_scope (rounds 2+ gate on the delta since the last reviewed commit) ---
@@ -602,8 +625,9 @@ def decide(
     """Return (event, reasons, blocking_findings). Pure; no I/O.
 
     Trust checks come first and gate BOTH review events: a round that cannot be
-    trusted neither approves nor requests changes. Its findings are still on the
-    PR as threads; only the review event is withheld.
+    trusted neither approves nor requests changes ON ITS FINDINGS (NONE). Its
+    findings are still on the PR as threads. cmd_decide then posts the
+    standing no-decision REQUEST_CHANGES itself; this function stays pure.
     """
     event, _, reasons, blocking = decide_gate(
         threshold, findings, panel, judge_status, delivered, reviewed_sha,
@@ -611,6 +635,20 @@ def decide(
         reviewed_diff_empty, reviewed_base, live_base, scope, max_failed_reviewers,
     )
     return event, reasons, blocking
+
+
+# The untrusted reasons a re-run cannot fix: the same round would land the same
+# way. The status card and the standing request for changes name the cause and
+# ask for a human instead of a relabel (see no_decision_next).
+REASON_NOT_DELIVERED = "the review did not land on the PR as resolvable threads"
+REASON_UNGATED_TAIL = "finding(s) reached the review body only, not as resolvable threads"
+REASON_EMPTY_DIFF = ("the reviewed diff is empty — every changed path was excluded from review, "
+                     "so nothing a reviewer saw can earn an approval")
+STRUCTURAL_CAUSES = (
+    (REASON_NOT_DELIVERED, "the findings did not land as resolvable threads"),
+    (REASON_UNGATED_TAIL, "some findings reached the review body only, not as resolvable threads"),
+    (REASON_EMPTY_DIFF, "the reviewed diff is empty (every changed path was excluded from review)"),
+)
 
 
 def decide_gate(
@@ -650,16 +688,16 @@ def decide_gate(
     if panel_reason:
         reasons.append(panel_reason)
     if not delivered:
-        reasons.append("the review did not land on the PR as resolvable threads")
+        reasons.append(REASON_NOT_DELIVERED)
     elif ungated:
-        reasons.append(f"{ungated} finding(s) reached the review body only, not as resolvable threads")
+        reasons.append(f"{ungated} {REASON_UNGATED_TAIL}")
     if not reviewed_sha or reviewed_sha != live_head_sha:
         reasons.append("the PR head moved while the review ran")
     if reviewed_base != live_base:
         # A retarget never moves the head, so the head check cannot see it.
         reasons.append("the PR base branch changed while the review ran")
     if reviewed_diff_empty:
-        reasons.append("the reviewed diff is empty — every changed path was excluded from review, so nothing a reviewer saw can earn an approval")
+        reasons.append(REASON_EMPTY_DIFF)
     if reasons:
         return NONE, GATE_UNTRUSTED, reasons, []
 
@@ -849,13 +887,17 @@ def set_output(key: str, value) -> None:
             f.write(f"{key}={value}\n")
 
 
-def open_thread_severities(repo: str, pr: int) -> list:
+def open_thread_severities(repo: str, pr: int, sink=None) -> list:
     """(severity, non_gating) of every open (unresolved, non-outdated) cursor-review thread.
 
     This round's own threads are included on purpose: decide() only reaches the
     thread check when every finding of this round is at or below the threshold
     (never critical/high, never unbadged), so they cannot block — and not having to
     tell this round's threads from earlier ones keeps the check identity-free.
+
+    Given a list as `sink`, each open thread is also appended to it as a dict
+    (severity, non_gating, path, line, start_line, url) from the SAME read, so
+    the status card can link the gating threads without a second query.
     """
     gate = _load_gate_unresolved()
     owner, _, name = repo.partition("/")
@@ -868,7 +910,98 @@ def open_thread_severities(repo: str, pr: int) -> list:
         first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
         body = first.get("body") or ""
         out.append((thread_severity(body), is_non_gating_thread(body)))
+        if sink is not None:
+            sink.append({
+                "severity": out[-1][0],
+                "non_gating": out[-1][1],
+                "path": thread.get("path") if isinstance(thread.get("path"), str) else "",
+                "line": thread.get("line") if isinstance(thread.get("line"), int) else None,
+                "start_line": thread.get("startLine") if isinstance(thread.get("startLine"), int) else None,
+                "url": thread_url(repo, pr, first),
+            })
     return out
+
+
+def thread_url(repo: str, pr, first_comment) -> str:
+    """The `#discussion_r<id>` link of a thread's first comment, or ""."""
+    if not isinstance(first_comment, dict):
+        return ""
+    cid = first_comment.get("fullDatabaseId") or first_comment.get("databaseId")
+    if not re.fullmatch(r"[0-9]{1,20}", str(cid or "")) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        return ""
+    server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
+    if not re.fullmatch(r"https://[A-Za-z0-9.-]+", server):
+        server = "https://github.com"
+    return f"{server}/{repo}/pull/{int(pr)}#discussion_r{cid}"
+
+
+def thread_for(finding, threads: list):
+    """The open thread a finding landed as: same path and its line inside the
+    thread's range, preferring one whose badge matches the finding's severity
+    (an unrecognised severity is posted under another badge). None when there
+    is no such thread."""
+    if not isinstance(finding, dict):
+        return None
+    sev = finding.get("severity")
+    sev = sev.strip().lower() if isinstance(sev, str) else ""
+    line = finding.get("line")
+    if not isinstance(line, int) or isinstance(line, bool):
+        return None
+    hits = [t for t in threads or []
+            if t.get("path") == finding.get("file") and t.get("line") is not None
+            and (t.get("start_line") or t["line"]) <= line <= t["line"]]
+    return next((t for t in hits if t.get("severity") == sev), hits[0] if hits else None)
+
+
+def gating_why(finding, scope: dict, threshold: str) -> str:
+    """Why a blocking finding gated, for the card: gating_reason(), with the
+    `full`-scope reason spelled out."""
+    reason = gating_reason(finding, scope)
+    if reason == "full scope":
+        return f"above `{threshold}` (approve_scope `full`: every finding above the threshold gates)"
+    return reason or ""
+
+
+def card_gating_rows(blocking: list, threads: list, scope: dict, threshold: str) -> list:
+    """The REQUEST_CHANGES card's rows: each blocking finding with its thread."""
+    rows = []
+    for f in blocking:
+        if not isinstance(f, dict):
+            continue
+        t = thread_for(f, threads)
+        rows.append({"severity": f.get("severity"), "file": f.get("file"), "line": f.get("line"),
+                     "url": (t or {}).get("url") or "", "why": gating_why(f, scope, threshold)})
+    return rows
+
+
+def open_blocking_rows(threads: list, threshold: str, scope: dict) -> list:
+    """The card's rows for a round held by earlier open threads — the same
+    selection _trusted_decision makes from their severities."""
+    delta = (scope or {}).get("scope") == SCOPE_DELTA
+    rows = []
+    for t in threads or []:
+        sev = t.get("severity")
+        if (sev is None or above_threshold(sev, threshold)) and not (delta and t.get("non_gating")):
+            rows.append({"severity": sev or "unknown", "file": t.get("path") or "?", "line": t.get("line"),
+                         "url": t.get("url") or "",
+                         "why": "unbadged open thread" if sev is None else "open thread from an earlier round"})
+    return rows
+
+
+def no_decision_next(reasons: list, label: str = ""):
+    """(next marker, next-step text) for a no-decision round.
+
+    A structural cause — the findings did not land as threads, or the reviewed
+    diff is empty — comes back the same on a re-run, so it names the cause and
+    asks for a human. Everything else (a reviewer or judge error, the head or
+    base moving, an unreadable PR) is transient: re-run the round.
+    """
+    card = _load_card()
+    causes = [cause for needle, cause in STRUCTURAL_CAUSES
+              if any(isinstance(r, str) and needle in r for r in reasons or [])]
+    if causes:
+        return card.NEXT_HUMAN, f"A human is needed: {'; '.join(causes)}. A re-run would land the same way."
+    return card.NEXT_RELABEL, card.next_relabel_text(label)
 
 
 # Mirrors gate-unresolved.AUTO_RESOLVE_MARKER, which build-ledger.py reads to keep
@@ -1136,6 +1269,159 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
     return "\n".join(lines)
 
 
+def render_standing_body(headline: str, reasons: list, next_text: str, threshold: str,
+                         reviewed_sha: str = "", base_ref: str = "", prerendered: bool = False) -> str:
+    """The standing REQUEST_CHANGES a no-decision round leaves (BE-19489).
+
+    Same markers as every other auto-approve review, so dismiss_own_change_requests
+    (a later approving round) withdraws it and the next no-decision round
+    replaces it. Reasons are decide_gate's, verbatim (card.reason_text).
+    """
+    reason_text = _load_card().reason_text
+    lines = [APPROVE_MARKER]
+    if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
+        lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
+    if base_ref:
+        lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    lines.append("### 🤖 Cursor Review — auto-approve")
+    lines.append(f"⏸️ {headline}")
+    # `prerendered`: approve-external passes card.decide_reasons' output, which
+    # is already markdown-safe (axis reasons sanitized as on the card).
+    lines += [f"- {r if prerendered else reason_text(r)}" for r in reasons if isinstance(r, str) and r.strip()]
+    lines.append(f"\n**Next step:** {next_text}")
+    if threshold in ALLOWED_THRESHOLDS:
+        lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
+    return "\n".join(lines)
+
+
+NO_DECISION_HEADLINE = "No decision this round, so this PR is not approved."
+CAPPED_HEADLINE = "Needs a human, so this PR is not approved."
+
+# The card contract's values (card.STATES / card.NEXTS; a test pins them
+# equal). Mirrored here so cmd_decide's decision path never needs card.py
+# loaded: a card.py that fails to import must cost only the card.
+CARD_PASS, CARD_CHANGES, CARD_NO_DECISION, CARD_CAPPED = "pass", "changes_requested", "no_decision", "capped"
+CARD_NEXT_NONE, CARD_NEXT_RESOLVE, CARD_NEXT_RELABEL, CARD_NEXT_HUMAN = "none", "resolve_then_relabel", "relabel", "human"
+
+
+def _card_text(name: str, args=None) -> str:
+    """A card.py next-step text — a function of the review label, or a constant
+    — or "" when card.py cannot be loaded (the card is then skipped anyway)."""
+    try:
+        value = getattr(_load_card(), name)
+        return value(_review_label(args)) if callable(value) else value
+    except Exception:  # noqa: BLE001 — reporting only, see write_round_card
+        return ""
+STANDING_REPLACED_MESSAGE = "Superseded by the latest cursor-review round's request for changes."
+NEWER_APPROVAL_MESSAGE = "A newer run already approved the live head — this request for changes is withdrawn."
+APPROVED_LATER_MESSAGE = "A later cursor-review round approved this PR — request for changes withdrawn."
+
+
+def post_standing_change_request(args, headline: str, reasons: list, next_text: str, threshold: str,
+                                 prerendered: bool = False, result=None) -> int:
+    """A no-decision round's standing block: one REQUEST_CHANGES as the approver.
+
+    Without it a NONE round leaves nothing on the PR, and once the author
+    resolves the threads the PR looks done though nothing approved it. Posted
+    first, THEN this identity's older marked requests for changes are
+    dismissed, so a repeated NONE replaces the block rather than stacking one
+    — and a dismissal that fails leaves two blocks, never none. Only blocks
+    OLDER than this one (lower review id) are dismissed, so a run still
+    unwinding after a newer one started cannot sweep the newer block away.
+
+    Pinned to the reviewed commit; when GitHub refuses that pin — the commit
+    left the PR in a force-push, the very case behind "the PR head moved" and
+    `superseded` — it is posted once more unpinned (GitHub then uses the head),
+    the body's reviewed-SHA marker still naming what was reviewed. `result`,
+    when given, receives the posted review's `id`.
+    """
+    try:
+        body = render_standing_body(headline, reasons, next_text, threshold, args.commit_sha, args.base_ref,
+                                    prerendered)
+    except Exception as e:  # noqa: BLE001 — card.py failing to load must not traceback here
+        print(f"::error::Could not render the standing request for changes: {annotation_cause(e, 'unknown error')}")
+        return 1
+    url = f"repos/{args.repo}/pulls/{args.pr_number}/reviews"
+    posted = None
+    for payload in ({"commit_id": args.commit_sha, "event": REQUEST_CHANGES, "body": body},
+                    {"event": REQUEST_CHANGES, "body": body}):
+        try:
+            posted = json.loads(gh(["api", "-X", "POST", url, "--input", "-"], payload))
+            if not isinstance(posted, dict) or posted.get("id") is None:
+                raise ValueError(f"the review POST returned no review id ({type(posted).__name__})")
+            break
+        except (RuntimeError, ValueError) as e:
+            posted = None
+            if "own pull request" in str(e).lower():
+                emit(f"ℹ️ **Auto-approve: no standing request for changes** — the approver authored this PR ({e}).")
+                return 0
+            # Only GitHub REFUSING the pin (a 422) is retried unpinned. Anything
+            # else — a 5xx, a timeout, a reply without an id — may have landed,
+            # and a second POST would only add a duplicate block.
+            if "commit_id" not in payload or not (isinstance(e, RuntimeError) and "422" in str(e)):
+                print(f"::error::Could not post the standing request for changes: {annotation_cause(e, 'unknown error')}")
+                return 1
+            print(f"::warning::The standing request for changes could not be pinned to {args.commit_sha[:7]} "
+                  f"({annotation_cause(e, 'unknown error')}); posting it unpinned.")
+    if result is not None:
+        result["id"] = posted["id"]
+    emit("❌ **Auto-approve: REQUEST_CHANGES (no decision)** — a standing block until a round approves.")
+    return dismiss_own_change_requests(args, STANDING_REPLACED_MESSAGE, older_than=posted["id"])
+
+
+def write_round_card(args, state: str, next_step: str, headline: str, reasons: list, next_text: str,
+                     threshold: str, gating=None) -> None:
+    """Write (or edit in place) the cursor-approve status card for this round.
+
+    Never fatal and never changes the decision: the card is a report. It is
+    keyed on --approver-login, the identity GH_TOKEN carries here, which is the
+    APPROVER_TOKEN identity cursor-approve's own phases write it under.
+    """
+    login = (getattr(args, "approver_login", "") or "").strip()
+    if not login or (getattr(args, "card", "") or "").strip().lower() != "true":
+        return
+    try:
+        card = _load_card()
+        body = card.render_round(getattr(args, "round", ""), getattr(args, "max_rounds", ""), args.commit_sha,
+                                 state, next_step, headline, reasons, next_text,
+                                 getattr(args, "run_url", "") or "", gating, threshold)
+        card.upsert(args.repo, args.pr_number, login, body)
+    except Exception as e:  # noqa: BLE001 — a report: it runs after the decision landed, never undoes it
+        print(f"::warning::Could not write the cursor-approve status card: {annotation_cause(e, 'unknown error')}")
+
+
+def _review_label(args) -> str:
+    """cursor-review's `review_label` (--review-label), for the next-step text."""
+    return getattr(args, "review_label", "") or ""
+
+
+def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list, scope: dict) -> int:
+    """A NONE decision: the card, plus the standing request for changes.
+
+    `capped` keeps its behaviour — the label already hands the PR to a human,
+    so no new request for changes; the card says so.
+    """
+    if gate == GATE_CAPPED:
+        write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
+                         reasons, _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
+        return 0
+    if gate == GATE_FAIL:
+        # Trusted round, but an earlier round's thread above the threshold is
+        # still open.
+        state, nxt, next_text = CARD_CHANGES, CARD_NEXT_RESOLVE, _card_text("next_resolve_text", args)
+        headline = f"Not approved: {reasons[0]}."
+        gating = open_blocking_rows(threads, threshold, scope)
+    else:
+        state, headline, gating = CARD_NO_DECISION, NO_DECISION_HEADLINE, None
+        try:
+            nxt, next_text = no_decision_next(reasons, _review_label(args))
+        except Exception:  # noqa: BLE001 — card.py unloadable: still post the block
+            nxt, next_text = CARD_NEXT_RELABEL, "Re-run the round."
+    rc = post_standing_change_request(args, headline, reasons, next_text, threshold)
+    write_round_card(args, state, nxt, headline, reasons, next_text, threshold, gating)
+    return rc
+
+
 def cmd_decide(args) -> int:
     # Written before anything can fail, so every exit path below leaves a value;
     # each decision overwrites it (GITHUB_OUTPUT keeps the last write of a key).
@@ -1205,11 +1491,13 @@ def cmd_decide(args) -> int:
                           _read_json_optional(getattr(args, "ledger", "") or ""))
     scope = with_snapshot_anchors(scope, getattr(args, "open_anchors", "") or "", args.commit_sha)
 
+    # The open threads behind `prior`, from the same read: the card links them.
+    threads = []
     try:
         pr = read_pr(args.repo, args.pr_number)
         live_head, live_base = pr_head_base(pr)
         human_review = has_label(pr, HUMAN_REVIEW_LABEL)
-        prior = open_thread_severities(args.repo, int(args.pr_number))
+        prior = open_thread_severities(args.repo, int(args.pr_number), threads)
     except (RuntimeError, SystemExit, ValueError) as e:
         # run_graphql exits 2 on a query failure; neither read may go unseen.
         event, gate, reasons, blocking = NONE, GATE_UNTRUSTED, [f"could not read the PR state ({e or 'thread query failed'})"], []
@@ -1240,9 +1528,39 @@ def cmd_decide(args) -> int:
         emit(f"ℹ️ **Auto-approve scope** — {scope_note_of(reasons)}.")
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
-        return withdraw_own_approvals(args)
+        rc = withdraw_own_approvals(args)
+        # The standing request for changes and the card (BE-19489): a NONE
+        # round used to leave nothing on the PR at all.
+        try:
+            if card_for_none(args, gate, reasons, threshold, threads, scope):
+                rc = 1
+        except Exception as e:  # noqa: BLE001 — the withdrawal above already ran; report, don't traceback
+            print(f"::error::Could not leave the no-decision block or card: {annotation_cause(e, 'unknown error')}")
+            rc = 1
+        return rc
     if event == APPROVE and (getattr(args, "defer_approval", "") or "").strip().lower() == "true":
-        return defer_to_cursor_approve(args, reasons[0])
+        result = {}
+        rc = defer_to_cursor_approve(args, reasons[0], result)
+        final = result.get("gate", GATE_PASS)
+        if final == GATE_PASS:
+            write_round_card(args, CARD_PASS, CARD_NEXT_NONE,
+                             "Passed the severity gate; approval is left to cursor-approve's axes.",
+                             reasons, "", threshold)
+        elif final == GATE_CAPPED:
+            write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
+                             [f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"], _card_text("NEXT_HUMAN_CAPPED_TEXT"),
+                             threshold)
+        else:
+            # defer_to_cursor_approve has already dismissed every earlier block
+            # and cursor-approve will not run on a non-`pass` gate, so without a
+            # block here the PR would carry neither approval nor veto.
+            why = [result.get("why") or "the deferred approval could not be stood behind"]
+            next_text = _card_text("next_relabel_text", args)
+            if post_standing_change_request(args, NO_DECISION_HEADLINE, why, next_text, threshold):
+                rc = 1
+            write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
+                             why, next_text, threshold)
+        return rc
 
     body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
@@ -1285,6 +1603,12 @@ def cmd_decide(args) -> int:
         withdraw_decision(GATE_UNTRUSTED)
         print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
+        # A no-decision outcome like any other: leave the standing block (the
+        # same POST may fail again; then it is red twice, and says so).
+        why = [f"the {event} review could not be posted"]
+        next_text = _card_text("next_relabel_text", args)
+        post_standing_change_request(args, NO_DECISION_HEADLINE, why, next_text, threshold)
+        write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE, why, next_text, threshold)
         return 1
 
     # Close the read → POST race. A push or retarget landing in that window fires
@@ -1312,6 +1636,17 @@ def cmd_decide(args) -> int:
             print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
+        if moved:
+            # The review just dismissed was this round's only verdict: without a
+            # standing block the PR would carry neither approval nor veto.
+            reasons_moved = [f"{why} while the {event} review was being posted"]
+            next_text = _card_text("next_relabel_text", args)
+            rc = post_standing_change_request(args, NO_DECISION_HEADLINE, reasons_moved, next_text, threshold)
+            write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
+                             reasons_moved, next_text, threshold)
+            return rc
+        write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
+                         [why], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
         return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     if event == APPROVE:
@@ -1319,6 +1654,17 @@ def cmd_decide(args) -> int:
         # Never fatal, never undoes the approval (see resolve_eligible_threads).
         resolve_eligible_threads(args.repo, args.pr_number, getattr(args, "poster_login", "") or "",
                                  threshold, args.commit_sha, scope.get("scope") == SCOPE_DELTA)
+        # The APPROVE already supersedes an earlier request for changes (GitHub
+        # counts a reviewer's latest review); dismissing it too withdraws a
+        # no-decision round's standing block visibly. Not fatal: it vetoes
+        # nothing once the approval stands.
+        dismiss_own_change_requests(args, APPROVED_LATER_MESSAGE, older_than=posted["id"])
+        write_round_card(args, CARD_PASS, CARD_NEXT_NONE, f"Approved: {reasons[0]}.", reasons, "", threshold)
+    else:
+        write_round_card(args, CARD_CHANGES, CARD_NEXT_RESOLVE,
+                         f"Not approved: {len(blocking)} finding(s) above `{threshold}` gate this round.",
+                         reasons, _card_text("next_resolve_text", args), threshold,
+                         card_gating_rows(blocking, threads, scope, threshold))
     return 0
 
 
@@ -1350,7 +1696,7 @@ def withdraw_decision(gate: str) -> None:
     set_output("approve_scope_effective", SCOPE_FULL)
 
 
-def defer_to_cursor_approve(args, reason: str) -> int:
+def defer_to_cursor_approve(args, reason: str, result=None) -> int:
     """`--defer-approval true` on an APPROVE outcome: post nothing, keep the gate.
 
     The gate stays `pass` for cursor-approve, whose decide approves (and resolves
@@ -1362,6 +1708,7 @@ def defer_to_cursor_approve(args, reason: str) -> int:
     # One that cannot be withdrawn keeps satisfying branch protection while the
     # axes judge, so the gate must not read `pass` over it (same as a failed POST).
     rc = withdraw_own_approvals(args, DEFERRED_MESSAGE)
+    withdrew_failed = bool(rc)
     if rc:
         withdraw_decision(GATE_UNTRUSTED)
     # Posting path: the APPROVE event supersedes this identity's earlier
@@ -1370,6 +1717,11 @@ def defer_to_cursor_approve(args, reason: str) -> int:
     # never does on a red axis. Failing to is red but withholds nothing.
     if dismiss_own_change_requests(args):
         rc = 1
+    # `result` (optional) receives the gate this ends on, and why, for the card.
+    result = result if result is not None else {}
+    result["gate"] = GATE_UNTRUSTED if withdrew_failed else GATE_PASS
+    if result["gate"] != GATE_PASS:
+        result["why"] = "an earlier approval by the approver could not be withdrawn"
     # Same post-decision re-check the posting path runs: a push, retarget or
     # `needs-human-review` label landing since the read must not leave `pass`.
     try:
@@ -1381,16 +1733,21 @@ def defer_to_cursor_approve(args, reason: str) -> int:
         labelled_now = False
     if head_now != args.commit_sha or base_now != args.base_ref:
         withdraw_decision(GATE_UNTRUSTED)
+        result["gate"], result["why"] = GATE_UNTRUSTED, "the PR head or base moved after the round was decided"
         emit("ℹ️ **Auto-approve: deferred round superseded** — the PR head or base moved.")
     elif labelled_now:
         withdraw_decision(GATE_CAPPED)
+        result["gate"] = GATE_CAPPED
         emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
     return rc
 
 
-def dismiss_own_change_requests(args, message: str = "") -> int:
-    """Dismiss this identity's own unedited, marked REQUEST_CHANGES reviews.
-    An edited one is someone else's words (see _stale_approvals) and stays."""
+def dismiss_own_change_requests(args, message: str = "", older_than=None) -> int:
+    """Dismiss this identity's own unedited, marked REQUEST_CHANGES reviews —
+    given `older_than` (the id of a review just posted), only those with a
+    lower id, i.e. posted before it: review ids grow monotonically, and a run
+    that finishes late must not dismiss a block a NEWER run posted. An edited
+    one is someone else's words (see _stale_approvals) and stays."""
     login = (args.approver_login or "").strip().lower()
     if not login:
         return 0
@@ -1398,7 +1755,8 @@ def dismiss_own_change_requests(args, message: str = "") -> int:
         ids = [r["id"] for r in list_reviews(args.repo, args.pr_number)
                if r.get("state") == "CHANGES_REQUESTED" and not r.get("edited")
                and APPROVE_MARKER in (r.get("body") or "")
-               and (r.get("user") or {}).get("login", "").lower() == login]
+               and (r.get("user") or {}).get("login", "").lower() == login
+               and (older_than is None or int(r["id"]) < int(older_than))]
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not list reviews to withdraw an earlier request for changes: {annotation_cause(e, 'unknown error')}")
         return 1
@@ -2138,6 +2496,68 @@ def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str
     return "\n".join(lines)
 
 
+# approve-external outcomes that WITHHOLD (BE-19489): each leaves the same
+# standing REQUEST_CHANGES a no-decision cursor-review round does, so under
+# `defer_approval` — where the passing cursor-review round already dismissed
+# every earlier block — a red axis still leaves the PR visibly blocked until
+# something approves. `vetoed` (a human's label) and `own_pr` (nothing can
+# approve) do not; neither does an approval.
+EXTERNAL_BLOCK_OUTCOMES = ("not_approved", "error", "superseded", "needs_human")
+EXTERNAL_BLOCK_HEADLINE = "cursor-approve did not approve this round, so this PR is not approved."
+
+
+def own_approval_on(args, head: str) -> bool:
+    """Whether this identity has an unedited marked approval recorded for
+    `head` — a newer run's, when this one is superseded. Unreadable → False."""
+    login = (args.approver_login or "").strip().lower()
+    try:
+        reviews = list_reviews(args.repo, args.pr_number)
+    except (RuntimeError, ValueError):
+        return False
+    for r in reviews:
+        match = REVIEWED_SHA_RE.search(r.get("body") or "")
+        if (r.get("state") == "APPROVED" and not r.get("edited") and match
+                and APPROVE_MARKER in (r.get("body") or "") and match.group(1) == (head or "").lower()
+                and (r.get("user") or {}).get("login", "").lower() == login):
+            return True
+    return False
+
+
+def external_block(args, outcome: str, decision, why: str, live_head: str = "") -> int:
+    """Post the standing REQUEST_CHANGES for a withholding outcome; 0 when none is due.
+
+    The body is the decide card's own reasons (card.decide_reasons) and next
+    step. A `superseded` decide that finishes late must not veto a newer run's
+    approval of the live head (GitHub counts a reviewer's LATEST review), so
+    it posts nothing when one stands.
+    """
+    if outcome not in EXTERNAL_BLOCK_OUTCOMES:
+        return 0
+    card = _load_card()
+    if outcome == "superseded":
+        if live_head and own_approval_on(args, live_head):
+            emit("ℹ️ **cursor-approve: no standing request for changes** — a newer run already approved the live head.")
+            return 0
+        reasons = [card.reason_text(why)]
+    else:
+        reasons = card.decide_reasons(outcome, decision)
+    posted = {}
+    rc = post_standing_change_request(args, EXTERNAL_BLOCK_HEADLINE, reasons, card.DECIDE_NEXT_TEXT[outcome],
+                                      getattr(args, "threshold", "") or "", prerendered=True, result=posted)
+    # The check above is a read; a newer run's approval can land between it
+    # and the POST, and the block — now the latest review — would override
+    # it. Re-read after the write and take the block back if so.
+    if outcome == "superseded" and live_head and posted.get("id") is not None and own_approval_on(args, live_head):
+        try:
+            dismiss(args.repo, args.pr_number, posted["id"], NEWER_APPROVAL_MESSAGE)
+            emit("ℹ️ **cursor-approve: standing request for changes withdrawn** — a newer run approved the live head meanwhile.")
+        except RuntimeError as e:
+            print(f"::error::A newer run approved the live head while this block was posted, and withdrawing it "
+                  f"failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
+            return 1
+    return rc
+
+
 def cmd_approve_external(args) -> int:
     set_output("outcome", "error")
     axes = [a.strip().lower() for a in (args.axes or "").split(",") if a.strip()]
@@ -2168,6 +2588,7 @@ def cmd_approve_external(args) -> int:
     except (RuntimeError, ValueError) as e:
         print(f"::error::Could not read the PR state: {e}")
         withdraw_own_approvals(args)
+        external_block(args, "error", decision, "")
         return 1
     # The veto is PR-wide, so it outranks `superseded`: that path withdraws only
     # what is stale against the live head, and would leave an approval already
@@ -2193,10 +2614,14 @@ def cmd_approve_external(args) -> int:
             # A newer head or base is a newer run's to judge: withdraw only what
             # is stale against the LIVE head and base, so a decide that finishes
             # late cannot dismiss an approval that run already posted.
-            return withdraw_own_approvals(args, STALE_MESSAGE, live_head, live_base)
-        if outcome == "vetoed":
-            return withdraw_own_approvals(args, SKIP_REVIEW_MESSAGE)
-        return withdraw_own_approvals(args)
+            rc = withdraw_own_approvals(args, STALE_MESSAGE, live_head, live_base)
+        elif outcome == "vetoed":
+            rc = withdraw_own_approvals(args, SKIP_REVIEW_MESSAGE)
+        else:
+            rc = withdraw_own_approvals(args)
+        if external_block(args, outcome, decision, why, live_head):
+            rc = 1
+        return rc
 
     body = render_external_body(args.card_url, args.commit_sha, args.base_ref)
     try:
@@ -2217,6 +2642,7 @@ def cmd_approve_external(args) -> int:
             return 0
         print(f"::error::Could not submit the APPROVE review: {e}")
         withdraw_own_approvals(args)
+        external_block(args, "error", decision, "")
         return 1
 
     # Same read → POST race cmd_decide closes: re-read after the write.
@@ -2254,13 +2680,21 @@ def cmd_approve_external(args) -> int:
             # still count toward branch protection on a PR that cannot be cleared.
             if withdraw_own_approvals(args, message):
                 return 1
+        # The withdrawn approval leaves the PR unblocked unless this does.
+        blocked = external_block(args, outcome, decision, "the PR head or base moved while the approval was being posted",
+                                 head_now or "")
         if outcome == "error":
             print(f"::error::{LABELS_UNREADABLE_MESSAGE}")
             return 1
         emit("ℹ️ **cursor-approve: withdrawn** — the PR changed while the approval was being posted.")
-        return 0
+        return 1 if blocked else 0
     set_output("outcome", "approved")
     emit("✅ **cursor-approve: APPROVE**")
+    # Withdraw a standing request for changes an earlier no-decision round left
+    # (BE-19489) — the same path cursor-review's own approving decide takes.
+    # Not fatal: the APPROVE, as this identity's latest review, already
+    # supersedes it.
+    dismiss_own_change_requests(args, APPROVED_LATER_MESSAGE, older_than=posted["id"])
     # Only here, exactly as cmd_decide: the APPROVE is posted AND the head/base
     # re-check passed. Never fatal, never undoes the approval (see
     # resolve_eligible_threads). Without a threshold there is no "at or below"
@@ -2337,6 +2771,16 @@ def main() -> int:
     # (including the default empty) = decide as usual.
     d.add_argument("--author-enabled", default="")
     d.add_argument("--pr-author", default="")
+    # For the status card decide writes every round (round-cap's next_round /
+    # max_rounds, and this run's URL). All optional: they only label the card.
+    # `true` = write the card (the workflow always passes it); anything else
+    # leaves the PR's comments alone, e.g. a local run.
+    d.add_argument("--card", default="")
+    d.add_argument("--round", default="")
+    d.add_argument("--max-rounds", default="")
+    d.add_argument("--run-url", default="")
+    # cursor-review's `review_label`, named in the next-step line; '' = the default.
+    d.add_argument("--review-label", default="")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)

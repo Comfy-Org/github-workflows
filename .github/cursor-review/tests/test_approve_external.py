@@ -95,24 +95,118 @@ class ApproveExternal(unittest.TestCase):
         self.assertIn("Approved, see the [cursor-approve card](https://github.com/o/r/pull/1#issuecomment-9).", review["body"])
         self.assertEqual(fake.dismissed, [])
 
-    def test_one_red_posts_nothing_and_withdraws_prior_approval(self):
-        fake = FakeGitHub(reviews=[prior_approval()])
-        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
-        self.assertEqual((rc, outcome), (0, "not_approved"))
-        self.assertEqual(fake.posted, [])
-        self.assertEqual(fake.dismissed, ["42"])
+    def test_an_approval_withdraws_a_standing_request_for_changes(self):
+        # BE-19489: a no-decision round left a standing REQUEST_CHANGES; the
+        # deferred approval that finally lands withdraws it.
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.APPROVED_LATER_MESSAGE])
 
-    def test_missing_axis_posts_nothing(self):
+    def test_a_red_axis_posts_a_standing_request_for_changes(self):
+        # BE-19489 under defer_approval: the passing cursor-review round already
+        # dismissed every earlier block, so withholding here must leave one.
         fake = FakeGitHub()
-        rc, outcome = self.run_cmd(fake, {"correctness": "green"}, event="APPROVE")
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"}, threshold="low")
         self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        review = fake.posted[0]
+        self.assertEqual(review["commit_id"], SHA)
+        self.assertIn(aa.APPROVE_MARKER, review["body"])
+        self.assertIn(f"<!-- cursor-review-auto-approve:sha={SHA} -->", review["body"])
+        card = aa._load_card()
+        # The card's own reasons and next step, word for word.
+        self.assertEqual(card.decide_reasons("not_approved", {"reasons": []}), ["no decision was reached"])
+        self.assertIn("- no decision was reached", review["body"])
+        self.assertIn(f"**Next step:** {card.DECIDE_NEXT_TEXT['not_approved']}", review["body"])
+        self.assertIn("_Threshold: `low`", review["body"])
+
+    def test_the_block_carries_the_axis_reasons_sanitized(self):
+        fake = FakeGitHub()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "decision.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"event": "NONE", "verdicts": {"correctness": "red", "conformance": "green"},
+                           "reasons": ["red on correctness @team <!-- x -->"]}, f)
+            args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
+                                      approver_login=LOGIN, base_ref="main", card_url="", threshold="",
+                                      poster_login="")
+            with mock.patch.object(aa, "gh", fake), \
+                    mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.join(tmp, "out"), "GITHUB_STEP_SUMMARY": ""}):
+                self.assertEqual(aa.cmd_approve_external(args), 0)
+        body = fake.posted[0]["body"]
+        self.assertIn("red on correctness", body)
+        self.assertNotIn("<!-- x", body)
+        self.assertNotRegex(body, r"@(?!\u200b)")
+        self.assertNotIn("_Threshold", body)  # no threshold given → no threshold line
+
+    def test_vetoed_and_own_pr_post_no_block(self):
+        fake = FakeGitHub(labels=[aa.SKIP_REVIEW_LABEL])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "vetoed"))
         self.assertEqual(fake.posted, [])
 
-    def test_head_moved_posts_nothing(self):
-        fake = FakeGitHub(head="d" * 40, reviews=[prior_approval()])
+        class OwnPR(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "POST"]:
+                    self.posted.append(payload)
+                    raise RuntimeError("gh api failed: Can not approve your own pull request")
+                return super().__call__(args, payload)
+
+        fake = OwnPR()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "own_pr"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+
+    def test_a_newer_approval_landing_during_the_post_takes_the_block_back(self):
+        fake = FakeGitHub(head="d" * 40)
+        with mock.patch.object(aa, "own_approval_on", side_effect=[False, True]):
+            rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual(fake.dismiss_messages, [aa.NEWER_APPROVAL_MESSAGE])
+
+    def test_a_late_superseded_decide_does_not_veto_a_newer_approval(self):
+        newer = "d" * 40
+        fake = FakeGitHub(head=newer, reviews=[prior_approval(sha=newer, rid=43)])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "superseded"))
         self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, [])
+
+    def test_a_non_approval_leaves_a_standing_request_for_changes(self):
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        # Replaced, not stacked: the new block (555) is posted, then the old one goes.
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.STANDING_REPLACED_MESSAGE])
+
+    def test_one_red_blocks_and_withdraws_prior_approval(self):
+        fake = FakeGitHub(reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_missing_axis_blocks(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green"}, event="APPROVE")
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+
+    def test_head_moved_approves_nothing_and_blocks(self):
+        fake = FakeGitHub(head="d" * 40, reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
         self.assertEqual(fake.dismissed, ["42"])
 
     def test_head_moved_during_post_withdraws(self):
@@ -121,11 +215,11 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "superseded"))
         self.assertEqual(fake.dismissed, ["555"])
 
-    def test_needs_human_review_label_posts_nothing(self):
+    def test_needs_human_review_label_approves_nothing_and_blocks(self):
         fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "needs_human"))
-        self.assertEqual(fake.posted, [])
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
 
     # --- the skip-cursor-review veto, re-read live at decide time ---
 
@@ -177,7 +271,7 @@ class ApproveExternal(unittest.TestCase):
             fake = FakeGitHub(pr_override={"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": labels})
             rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
             self.assertEqual((rc, outcome), (1, "error"), labels)
-            self.assertEqual(fake.posted, [], labels)
+            self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"], labels)
 
     def test_skip_label_match_is_exact(self):
         fake = FakeGitHub(labels=["skip-cursor-review-later", "no-skip-cursor-review"])
@@ -185,11 +279,11 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assertEqual(len(fake.posted), 1)
 
-    def test_label_read_failure_posts_nothing(self):
+    def test_label_read_failure_approves_nothing_and_blocks(self):
         fake = FakeGitHub(read_error=True, reviews=[prior_approval()])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (1, "error"))
-        self.assertEqual(fake.posted, [])
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
         self.assertEqual(fake.dismissed, ["42"])
 
     def test_missing_label_list_fails_closed(self):
@@ -201,7 +295,7 @@ class ApproveExternal(unittest.TestCase):
             fake = FakeGitHub(pr_override=pr)
             rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
             self.assertEqual((rc, outcome), (1, "error"), labels)
-            self.assertEqual(fake.posted, [], labels)
+            self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"], labels)
 
     def test_skip_label_applied_during_post_withdraws(self):
         fake = FakeGitHub(labels_after=[aa.SKIP_REVIEW_LABEL])

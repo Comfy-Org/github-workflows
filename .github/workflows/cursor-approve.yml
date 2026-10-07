@@ -12,7 +12,9 @@ name: Cursor approve
 #                    approval must not stand while the axes judge — then
 #                    writes the status card (every axis pending, or "Round
 #                    limit reached" when cursor-review reported
-#                    approve_gate == capped).
+#                    approve_gate == capped). cursor-review's decide has
+#                    already written the card for this round, on every
+#                    outcome; this overwrites it on the outcomes it runs for.
 #   phase: decide  — after them: downloads the axis-* artifacts of THIS run,
 #                    runs .github/cursor-approve/aggregate.py decide (each axis
 #                    read only from its own axis-<name> artifact, and only for
@@ -20,8 +22,10 @@ name: Cursor approve
 #                    .github/cursor-review/auto-approve.py approve-external
 #                    (head and base re-read, reviewed-SHA marker, own stale
 #                    approvals withdrawn, never over needs-human-review or
-#                    skip-cursor-review, both re-read live at decide time)
-#                    and rewrites the card with the verdicts.
+#                    skip-cursor-review, both re-read live at decide time;
+#                    on not_approved / error / superseded / needs_human it
+#                    leaves a standing REQUEST_CHANGES instead) and rewrites
+#                    the card with the verdicts.
 #
 # No job here checks out PR code; the only checkout is this repo at
 # workflows_ref, for the scripts.
