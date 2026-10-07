@@ -109,11 +109,25 @@ def next_relabel_text(label=DEFAULT_REVIEW_LABEL) -> str:
     return f"Re-run the round: {relabel(label)}."
 
 
+def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    """The relabel the workflow is doing itself (BE-19526).
+
+    Still ``NEXT_RELABEL``: the next step IS a relabel, and an agent reading the
+    contract marker should wait for the new round either way. Only the prose
+    differs, so nobody re-does by hand what already fired. Written before the
+    relabel runs (a later job; it can fail or be cancelled by a push), hence the
+    "if no new round starts" fallback rather than a promise.
+    """
+    return (f"Nothing — the round is being re-run automatically ({relabel(label)}). Once only; "
+            "if no new round starts, or it is wrong again, re-run it by hand.")
+
+
 # The default-label texts. cursor-approve.yml has no `review_label` input, so
 # its own phases always use these; cursor-review's decide passes its input.
 RELABEL = relabel()
 NEXT_RESOLVE_TEXT = next_resolve_text()
 NEXT_RELABEL_TEXT = next_relabel_text()
+NEXT_AUTO_RETRY_TEXT = next_auto_retry_text()
 # The hand-off withdraws the bot's own requests for changes (BE-19492), so a
 # human's review is what clears the PR; the label only resets the round count.
 # Not stated as done: every caller writes this card whether or not that

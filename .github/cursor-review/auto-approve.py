@@ -184,6 +184,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit"]
 ALLOWED_THRESHOLDS = ("medium", "low", "nit")
@@ -655,6 +656,17 @@ STRUCTURAL_CAUSES = (
     (REASON_EMPTY_DIFF, "the reviewed diff is empty (every changed path was excluded from review)"),
 )
 
+# The two causes a fresh round on the LIVE head actually fixes, and the only
+# ones auto_retry_eligible() re-runs the round for (BE-19526). Both mean the
+# panel judged a commit the PR has moved past, so the next round reads
+# different content and the gate's same-SHA dedupe cannot no-op it. Every other
+# transient cause (a panel cell or the judge errored, the PR could not be read)
+# leaves the head where it was, so the re-run would be skipped as
+# already-reviewed — see the gate's `dup` step. Those still ask for a human.
+REASON_HEAD_MOVED = "the PR head moved while the review ran"
+REASON_BASE_CHANGED = "the PR base branch changed while the review ran"
+RETRYABLE_CAUSES = (REASON_HEAD_MOVED, REASON_BASE_CHANGED)
+
 
 def decide_gate(
     threshold: str,
@@ -697,10 +709,10 @@ def decide_gate(
     elif ungated:
         reasons.append(f"{ungated} {REASON_UNGATED_TAIL}")
     if not reviewed_sha or reviewed_sha != live_head_sha:
-        reasons.append("the PR head moved while the review ran")
+        reasons.append(REASON_HEAD_MOVED)
     if reviewed_base != live_base:
         # A retarget never moves the head, so the head check cannot see it.
-        reasons.append("the PR base branch changed while the review ran")
+        reasons.append(REASON_BASE_CHANGED)
     if reviewed_diff_empty:
         reasons.append(REASON_EMPTY_DIFF)
     if reasons:
@@ -1009,6 +1021,154 @@ def no_decision_next(reasons: list, label: str = ""):
     return card.NEXT_RELABEL, card.next_relabel_text(label)
 
 
+# BE-19526. A round the head outran is a full panel spent on a commit the PR has
+# moved past, and the recovery was a human noticing the card and re-applying the
+# label by hand — so the PR sat behind a standing block until someone looked.
+# The run re-runs it itself instead, ONCE per PR (decide decides; the
+# workflow's last job, `auto-retry`, relabels — see cmd_auto_retry).
+#
+# The budget is counted off the PR's own reviews, not a run-local counter: this
+# job is stateless and a retry's round is a different run. Every retry marks its
+# standing block with AUTO_RETRY_MARKER, and a marked block still counts after a
+# later round dismisses it (a DISMISSED review is still listed), so the ceiling
+# holds across rounds. Past it the card asks for a human, as before.
+#
+# One is deliberate. A second retry only helps when the head moved again during
+# the retry — i.e. the author is still pushing — and then re-running on every
+# settle is exactly the "every push becomes a panel" cost this avoids.
+AUTO_RETRY_MARKER = "<!-- cursor-review-auto-retry -->"
+MAX_AUTO_RETRIES = 1
+# card.DEFAULT_REVIEW_LABEL, mirrored like the card contract constants below
+# so the relabel never needs card.py loaded (a test pins the two equal).
+DEFAULT_REVIEW_LABEL = "cursor-review"
+
+
+def auto_retry_eligible(reasons: list) -> bool:
+    """Would a fresh round on the live head decide what this one could not?
+
+    Only when the head moved — that is what makes the next round read different
+    content, so the gate's same-SHA dedupe cannot skip it. A base retarget
+    alongside it rides along (the relabel fixes both); a retarget ALONE does
+    not, because the head is unchanged and the re-run would be deduped away.
+    Any other reason in the list means a re-run would hit the same wall.
+    """
+    reasons = [r for r in (reasons or []) if isinstance(r, str) and r.strip()]
+    if not reasons or REASON_HEAD_MOVED not in reasons:
+        return False
+    return all(r in RETRYABLE_CAUSES for r in reasons)
+
+
+def auto_retries_spent(reviews: list, approver_login: str) -> int:
+    """How many auto-retries this PR has already had: this identity's own
+    reviews carrying AUTO_RETRY_MARKER, dismissed ones included."""
+    login = (approver_login or "").strip().lower()
+    if not login:
+        return 0
+    spent = 0
+    for r in reviews or []:
+        if not isinstance(r, dict):
+            continue
+        if ((r.get("user") or {}).get("login") or "").lower() != login:
+            continue
+        if AUTO_RETRY_MARKER in (r.get("body") or ""):
+            spent += 1
+    return spent
+
+
+def round_cap_leaves_room(args) -> bool:
+    """Would the re-run's own round-cap let its panel run?
+
+    round-cap runs the panel while the delivered rounds so far are under
+    `max_rounds`, and this round (`--round`, its number) is one of them once it
+    lands. So a retry from the last allowed round would cap out and skip its
+    panel, spending the one retry on nothing. `max_rounds` 0 is the cap off; an
+    empty or unparsable round (round-cap failed open) is unknown, so no retry.
+    """
+    try:
+        max_rounds = int(str(getattr(args, "max_rounds", "") or "").strip())
+        this_round = int(str(getattr(args, "round", "") or "").strip())
+    except ValueError:
+        return False
+    return max_rounds <= 0 or this_round < max_rounds
+
+
+def auto_retry_budget_left(args, reasons: list) -> bool:
+    """auto_retry_eligible() plus the per-PR ceiling, read from live reviews.
+
+    An unreadable review list spends the budget rather than retrying blind: a
+    wrong "no retries yet" is how one becomes a loop. So does an unknown
+    approver login, which would otherwise match no marked block and read as
+    "no retries yet" forever.
+
+    Only an explicit `--can-relabel true` retries. cursor-review.yml passes
+    `false` when neither APPROVER_TOKEN nor the bot App token is configured, so
+    decide is running on GITHUB_TOKEN: a GITHUB_TOKEN-applied label fires no
+    workflow run, so the relabel would succeed and start nothing, leaving the
+    PR silently waiting on a round that is never coming. The card's
+    hand-recovery is correct there.
+    """
+    if (getattr(args, "can_relabel", "") or "").strip().lower() != "true":
+        return False
+    if not auto_retry_eligible(reasons):
+        return False
+    if not (getattr(args, "approver_login", "") or "").strip():
+        return False
+    if not round_cap_leaves_room(args):
+        return False
+    try:
+        spent = auto_retries_spent(list_reviews(args.repo, args.pr_number), args.approver_login)
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not count earlier auto-retries, so this round is not re-run: "
+              f"{annotation_cause(e, 'unknown error')}")
+        return False
+    return spent < MAX_AUTO_RETRIES
+
+
+def cmd_auto_retry(args) -> int:
+    """Re-run the round: take the review label off the PR and put it back.
+
+    NOT run by decide: decide only sets `auto_retry=true` once the marked block
+    is on the PR, and cursor-review.yml's `auto-retry` job runs this LAST, after
+    every job that reports on this round. The relabel fires `unlabeled` and
+    `labeled` events that land in the caller's `cancel-in-progress` group, so
+    whatever of this run is still going when they arrive is cancelled — the
+    Blocking gate and panel-integrity checks included, had it run in decide.
+
+    The label write must come from APPROVER_TOKEN (a PAT) or the bot App token,
+    never GITHUB_TOKEN: a GITHUB_TOKEN-applied label fires no workflow run, so
+    the retry would silently relabel and start nothing.
+
+    The DELETE tolerates a 404 — the label is already off (a run_without_label
+    caller, or a human removed it mid-panel) and the POST alone starts the round.
+    The POST is tried twice, since a failed one after a successful DELETE leaves
+    the trigger label stripped. Any failure exits 1, so the job goes red; the
+    card's next step already says to re-run by hand if no round starts.
+    """
+    label = (args.review_label or "").strip() or DEFAULT_REVIEW_LABEL
+    url = f"repos/{args.repo}/issues/{args.pr_number}/labels"
+    try:
+        gh(["api", "-X", "DELETE", f"{url}/{urllib.parse.quote(label, safe='')}"])
+    except (RuntimeError, ValueError) as e:
+        if "404" not in str(e):
+            print(f"::error::Could not re-run the round automatically: removing `{label}` failed "
+                  f"({annotation_cause(e, 'unknown error')}). Re-run it by hand: remove and re-add `{label}`.")
+            return 1
+    err = None
+    for _ in range(2):
+        try:
+            gh(["api", "-X", "POST", url, "--input", "-"], {"labels": [label]})
+            break
+        except (RuntimeError, ValueError) as e:
+            err = e
+    else:
+        print(f"::error::Could not re-run the round automatically: re-adding `{label}` failed "
+              f"({annotation_cause(err, 'unknown error')}), so the PR may now be WITHOUT the label. "
+              f"Add `{label}` back by hand to start the round.")
+        return 1
+    emit(f"🔁 **Auto-approve: re-running the round** — the head moved, so `{label}` was removed and re-added.")
+    return 0
+
+
 # Mirrors gate-unresolved.AUTO_RESOLVE_MARKER, which build-ledger.py reads to keep
 # this reply out of its answer count (a test pins the two equal).
 AUTO_RESOLVE_MARKER = "<!-- cursor-review-auto-resolve -->"
@@ -1275,7 +1435,8 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
 
 
 def render_standing_body(headline: str, reasons: list, next_text: str, threshold: str,
-                         reviewed_sha: str = "", base_ref: str = "", prerendered: bool = False) -> str:
+                         reviewed_sha: str = "", base_ref: str = "", prerendered: bool = False,
+                         retry: bool = False) -> str:
     """The standing REQUEST_CHANGES a no-decision round leaves (BE-19489).
 
     Same markers as every other auto-approve review, so dismiss_own_change_requests
@@ -1288,6 +1449,11 @@ def render_standing_body(headline: str, reasons: list, next_text: str, threshold
         lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
     if base_ref:
         lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    if retry:
+        # The auto-retry budget's ledger: counted off this PR's reviews by
+        # auto_retries_spent, and still countable once a later round dismisses
+        # this block. See AUTO_RETRY_MARKER.
+        lines.append(AUTO_RETRY_MARKER)
     lines.append("### 🤖 Cursor Review — auto-approve")
     lines.append(f"⏸️ {headline}")
     # `prerendered`: approve-external passes card.decide_reasons' output, which
@@ -1323,7 +1489,7 @@ APPROVED_LATER_MESSAGE = "A later cursor-review round approved this PR — reque
 
 
 def post_standing_change_request(args, headline: str, reasons: list, next_text: str, threshold: str,
-                                 prerendered: bool = False, result=None) -> int:
+                                 prerendered: bool = False, result=None, retry: bool = False) -> int:
     """A no-decision round's standing block: one REQUEST_CHANGES as the approver.
 
     Without it a NONE round leaves nothing on the PR, and once the author
@@ -1342,7 +1508,7 @@ def post_standing_change_request(args, headline: str, reasons: list, next_text: 
     """
     try:
         body = render_standing_body(headline, reasons, next_text, threshold, args.commit_sha, args.base_ref,
-                                    prerendered)
+                                    prerendered, retry)
     except Exception as e:  # noqa: BLE001 — card.py failing to load must not traceback here
         print(f"::error::Could not render the standing request for changes: {annotation_cause(e, 'unknown error')}")
         return 1
@@ -1412,9 +1578,11 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
         write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
                          reasons, _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
         return rc
+    retry = False
     if gate == GATE_FAIL:
         # Trusted round, but an earlier round's thread above the threshold is
-        # still open.
+        # still open. Never auto-retried: the round decided, and a re-run on the
+        # same head would be deduped away anyway.
         state, nxt, next_text = CARD_CHANGES, CARD_NEXT_RESOLVE, _card_text("next_resolve_text", args)
         headline = f"Not approved: {reasons[0]}."
         gating = open_blocking_rows(threads, threshold, scope)
@@ -1424,8 +1592,25 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
             nxt, next_text = no_decision_next(reasons, _review_label(args))
         except Exception:  # noqa: BLE001 — card.py unloadable: still post the block
             nxt, next_text = CARD_NEXT_RELABEL, "Re-run the round."
-    rc = post_standing_change_request(args, headline, reasons, next_text, threshold)
+        # BE-19526: the head outran the round, and this PR has a retry left —
+        # say so on the block and the card, then fire it below. Decided BEFORE
+        # the block is posted so the marker it is counted by is on it.
+        retry = auto_retry_budget_left(args, reasons)
+    hand_text = next_text
+    if retry:
+        next_text = _card_text("next_auto_retry_text", args) or next_text
+    posted = {}
+    rc = post_standing_change_request(args, headline, reasons, next_text, threshold, retry=retry, result=posted)
+    if retry and posted.get("id") is None:
+        # No block landed (the approver authored the PR, the POST failed, the
+        # body would not render), so no marker counts this retry: firing it
+        # anyway would re-fire on every later moved head, unbounded. The card
+        # goes back to the hand-recovery too, since nothing is re-running.
+        retry, next_text = False, hand_text
     write_round_card(args, state, nxt, headline, reasons, next_text, threshold, gating)
+    if retry:
+        # cursor-review.yml's `auto-retry` job relabels; see cmd_auto_retry.
+        set_output("auto_retry", "true")
     return rc
 
 
@@ -2931,6 +3116,10 @@ def main() -> int:
     d.add_argument("--run-url", default="")
     # cursor-review's `review_label`, named in the next-step line; '' = the default.
     d.add_argument("--review-label", default="")
+    # Whether the token decide holds can start a run by relabelling (BE-19526):
+    # `false` on the GITHUB_TOKEN fallback, which applies labels that fire
+    # nothing. Fails closed: only an explicit `true` retries.
+    d.add_argument("--can-relabel", default="false")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
@@ -2966,6 +3155,10 @@ def main() -> int:
     # cursor-review's `approve_scope_effective`: `delta` exempts marked
     # non-gating threads from blocking resolution, as decide did. Default `full`.
     e.add_argument("--approve-scope", default=SCOPE_FULL)
+    r = sub.add_parser("auto-retry")
+    r.add_argument("--repo", required=True)
+    r.add_argument("--pr-number", required=True)
+    r.add_argument("--review-label", default="")
     w = sub.add_parser("withdraw")
     w.add_argument("--repo", required=True)
     w.add_argument("--pr-number", required=True)
@@ -2979,6 +3172,8 @@ def main() -> int:
         return cmd_withdraw(args)
     if args.cmd == "round-cap":
         return cmd_round_cap(args)
+    if args.cmd == "auto-retry":
+        return cmd_auto_retry(args)
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)
 
 
