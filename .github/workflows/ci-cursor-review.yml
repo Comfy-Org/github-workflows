@@ -33,10 +33,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@0eac47eef787b9cf9c9ee7c0e8249d470e70e8af # github-workflows main (0eac47e)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@eef55d3565eef918d29cdfc076bbfb51d12a8e32 # github-workflows main (eef55d3)
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
-      workflows_ref: 0eac47eef787b9cf9c9ee7c0e8249d470e70e8af
+      workflows_ref: eef55d3565eef918d29cdfc076bbfb51d12a8e32
       # Panel model override, as a VARIABLE so a reasoning-tier A/B needs no PR
       # and no fleet bump — set it, watch a few rounds, unset it to revert. The
       # reusable's `panel_models` treats empty as "use the built-in list", so an
