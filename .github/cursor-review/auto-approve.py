@@ -3,7 +3,7 @@
 
 Used by cursor-review.yml when the caller sets `approve_max_severity` (and,
 for ``round-cap``, `max_rounds`), and by cursor-approve.yml (``approve-external``).
-Four subcommands, each run from a job that checks out NO PR code:
+Five subcommands, each run from a job that checks out NO PR code:
 
 ``decide`` (in `post-review`, after the consolidated review is posted)
     APPROVE when every finding of this round is at or below the threshold and
@@ -48,6 +48,10 @@ Four subcommands, each run from a job that checks out NO PR code:
     Post an APPROVE decided outside cursor-review (by
     ``.github/cursor-approve/aggregate.py``) under the same protections — see
     ``cmd_approve_external``.
+
+``withdraw`` (in cursor-approve.yml's start phase)
+    Withdraw this identity's own marked approvals while the axes run — see
+    ``cmd_withdraw``.
 
 ``decide`` also emits ``approve_gate`` (one of ``APPROVE_GATE_VALUES``) as a
 step output, for a downstream workflow that should run only after a round
@@ -587,17 +591,19 @@ def list_reviews(repo: str, pr_number) -> list:
     return [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
 
 
-def withdraw_own_approvals(args) -> int:
-    """Dismiss every marked approval by this identity. Red if any could not be."""
+def withdraw_own_approvals(args, message: str = "", head_sha=None, live_base=None) -> int:
+    """Dismiss every marked approval by this identity — or, given `head_sha`,
+    only those stale against it and `live_base` (see _stale_approvals). Red if
+    any could not be."""
     try:
-        ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, None)
+        ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, head_sha, live_base)
     except (RuntimeError, ValueError) as e:
         print(f"::error::Could not list reviews to withdraw an earlier auto-approval: {e}")
         return 1
     failed = []
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid, UNTRUSTED_MESSAGE)
+            dismiss(args.repo, args.pr_number, rid, message or UNTRUSTED_MESSAGE)
         except RuntimeError as e:
             failed.append(f"{rid}: {e}")
     if ids:
@@ -941,8 +947,8 @@ def cmd_round_cap(args) -> int:
 # --- approve-external: an approval decided OUTSIDE cursor-review ------------
 #
 # cursor-approve.yml decides with .github/cursor-approve/aggregate.py and posts
-# here, so the protections above apply unchanged: the head is re-read and the
-# review withheld when it moved from the decided commit, the reviewed SHA and
+# here, so the protections above apply unchanged: the head and base are re-read
+# and the review withheld when either moved from what the axes judged, the reviewed SHA and
 # base ride in the body's markers (so `dismiss-stale` withdraws it on a push or
 # retarget like any other auto-approval), this identity's own earlier approvals
 # are withdrawn on every non-approval, and a `needs-human-review` PR is never
@@ -986,6 +992,11 @@ def cmd_approve_external(args) -> int:
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit_sha or ""):
         print(f"::error::--commit-sha must be a full 40-hex SHA, got {args.commit_sha!r}")
         return 2
+    # An empty login matches no review, so every withdrawal below would silently
+    # be a no-op and leave an earlier approval standing.
+    if not (args.approver_login or "").strip():
+        print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
+        return 2
     try:
         with open(args.decision, encoding="utf-8") as f:
             decision = json.load(f)
@@ -1001,6 +1012,10 @@ def cmd_approve_external(args) -> int:
         return 1
     if live_head != args.commit_sha:
         outcome, why = "superseded", f"the PR head moved from {args.commit_sha[:7]} to {live_head[:7] or '?'}"
+    elif live_base != args.base_ref:
+        # Same head, different base: the axes diffed against a base the PR no
+        # longer targets, so their verdicts are about a diff nobody reviewed.
+        outcome, why = "superseded", "the PR base changed since the axes ran"
     elif human_review:
         outcome, why = "needs_human", f"the PR is labelled `{HUMAN_REVIEW_LABEL}`"
     elif not external_decision_approves(decision, axes):
@@ -1010,9 +1025,14 @@ def cmd_approve_external(args) -> int:
     if outcome != "approved":
         set_output("outcome", outcome)
         emit(f"ℹ️ **cursor-approve: no approval** — {why}.")
+        if outcome == "superseded" and live_head:
+            # A newer head or base is a newer run's to judge: withdraw only what
+            # is stale against the LIVE head and base, so a decide that finishes
+            # late cannot dismiss an approval that run already posted.
+            return withdraw_own_approvals(args, STALE_MESSAGE, live_head, live_base)
         return withdraw_own_approvals(args)
 
-    body = render_external_body(args.card_url, args.commit_sha, live_base)
+    body = render_external_body(args.card_url, args.commit_sha, args.base_ref)
     try:
         posted = json.loads(
             gh(
@@ -1037,7 +1057,7 @@ def cmd_approve_external(args) -> int:
     except (RuntimeError, ValueError):
         head_now = base_now = None
         labelled_now = False
-    moved = head_now != args.commit_sha or base_now != live_base
+    moved = head_now != args.commit_sha or base_now != args.base_ref
     if moved or labelled_now:
         set_output("outcome", "superseded" if moved else "needs_human")
         try:
@@ -1050,6 +1070,21 @@ def cmd_approve_external(args) -> int:
     set_output("outcome", "approved")
     emit("✅ **cursor-approve: APPROVE**")
     return 0
+
+
+AXES_PENDING_MESSAGE = "cursor-approve's axes are judging this PR — auto-approve withdrawn until they agree."
+
+
+def cmd_withdraw(args) -> int:
+    """cursor-approve.yml's start phase: withdraw this identity's own marked
+    approvals before the axes run. cursor-review's `decide` has ALREADY approved
+    when it reports `approve_gate == 'pass'`, so without this the axes would
+    judge a PR that is approved for their whole run, and branch protection or
+    auto-merge could land it before a red axis withdrew the approval."""
+    if not (args.approver_login or "").strip():
+        print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
+        return 2
+    return withdraw_own_approvals(args, AXES_PENDING_MESSAGE)
 
 
 def main() -> int:
@@ -1090,10 +1125,17 @@ def main() -> int:
     e.add_argument("--axes", required=True)
     e.add_argument("--decision", required=True)
     e.add_argument("--approver-login", required=True)
+    e.add_argument("--base-ref", required=True)
     e.add_argument("--card-url", default="")
+    w = sub.add_parser("withdraw")
+    w.add_argument("--repo", required=True)
+    w.add_argument("--pr-number", required=True)
+    w.add_argument("--approver-login", required=True)
     args = parser.parse_args()
     if args.cmd == "approve-external":
         return cmd_approve_external(args)
+    if args.cmd == "withdraw":
+        return cmd_withdraw(args)
     if args.cmd == "round-cap":
         return cmd_round_cap(args)
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)

@@ -30,6 +30,11 @@ on:
       - '.github/cursor-approve/**'
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
+      # The cursor-approve suite asserts properties of these workflows too
+      # (secret isolation, the guard byte-copy, the CLI pin).
+      - '.github/workflows/cursor-approve.yml'
+      - '.github/workflows/cursor-axis-base.yml'
+      - '.github/workflows/axis-*.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
   push:
     branches: [main]
@@ -38,6 +43,11 @@ on:
       - '.github/cursor-approve/**'
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
+      # The cursor-approve suite asserts properties of these workflows too
+      # (secret isolation, the guard byte-copy, the CLI pin).
+      - '.github/workflows/cursor-approve.yml'
+      - '.github/workflows/cursor-axis-base.yml'
+      - '.github/workflows/axis-*.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
 
 permissions:

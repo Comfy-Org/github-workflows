@@ -1,6 +1,8 @@
 """Tests for card.py (the status card) and the cursor-approve workflow wiring."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -202,9 +204,6 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(len(pins("cursor-review.yml")), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class GuardParity(unittest.TestCase):
     def test_cursor_approve_guard_is_a_byte_copy_of_cursor_review(self):
@@ -223,3 +222,21 @@ class GuardParity(unittest.TestCase):
         review = set(guards("cursor-review.yml"))
         self.assertEqual(len(approve), 1)
         self.assertIn(approve[0], review)
+
+
+class EmptyLogin(unittest.TestCase):
+    def test_empty_login_exits_2_without_calling_github(self):
+        with mock.patch.object(card, "list_comments", side_effect=AssertionError("no API call")):
+            for phase in ("start", "ensure"):
+                argv = [phase, "--repo", "o/r", "--pr-number", "1", "--login", " ",
+                        "--commit-sha", "a" * 40, "--axes", "correctness"]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(card.main(argv), 2)
+
+    def test_integral_float_renders_as_integer(self):
+        self.assertEqual(card._int_or_q("0.0"), "0")
+        self.assertEqual(card._int_or_q("1.5"), "?")
+
+
+if __name__ == "__main__":
+    unittest.main()

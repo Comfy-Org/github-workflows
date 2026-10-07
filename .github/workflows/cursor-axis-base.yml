@@ -18,7 +18,8 @@ name: Cursor axis (base)
 #   CURSOR_API_KEY
 #
 # Output: one artifact, `axis-<axis>`, holding `<axis>.json` — exactly one JSON
-# object `{"verdict", "confidence", "summary"}`. A failing run uploads nothing,
+# object `{"verdict", "confidence", "summary", "commit_sha"}` (commit_sha is
+# stamped from this job's input, not taken from the model). A failing run uploads nothing,
 # which cursor-approve.yml's decide phase reads as "no result" and never approves.
 #
 # The scripts and prompts load from THIS repo at `job.workflow_sha` — the
@@ -82,6 +83,8 @@ jobs:
           MCP_CONFIG: ${{ inputs.mcp_config }}
           NO_SHELL: ${{ inputs.no_shell }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           case "$AXIS" in
@@ -99,6 +102,13 @@ jobs:
           fi
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::an axis runs on a pull_request(_target) event only"; exit 1
+          fi
+          # Same rule as cursor-review.yml's gate: a fork PR never gets a
+          # checkout plus a --trust agent run with CURSOR_API_KEY in its env
+          # (under pull_request_target it would). Failing uploads no verdict,
+          # which decide reads as "no result" and never approves.
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error::PR is from a fork ($HEAD_REPO != $BASE_REPO); the axes do not run on fork PRs"; exit 1
           fi
           # actions/checkout with ref '' takes the default branch — mutable
           # scripts under a pinned uses:. job.workflow_sha is '' only below
@@ -179,9 +189,10 @@ jobs:
       - name: Extract the verdict
         env:
           AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/axis-out"
-          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" extract \
+          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" extract --commit-sha "$COMMIT_SHA" \
             --raw "$RUNNER_TEMP/axis-raw.txt" --out "$RUNNER_TEMP/axis-out/$AXIS.json"
           cat "$RUNNER_TEMP/axis-out/$AXIS.json"
 

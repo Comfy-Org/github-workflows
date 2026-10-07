@@ -9,18 +9,25 @@ the context axes (business, design, completeness) are not available yet.
 ## What it does
 
 1. `cursor-review` runs a round and exposes `approve_gate`, `round` and `max_rounds`.
-2. `cursor-approve` with `phase: start` writes the **status card** — one PR
-   comment, found by `<!-- cursor-approve-card -->` and edited in place — with
-   every axis pending. When cursor-review reports `approve_gate == 'capped'` it
-   writes "Round limit reached, needs a human" instead.
-3. Each axis runs only when `approve_gate == 'pass'`: a read-only checkout of
-   the PR head, one `cursor-agent` call over `.github/cursor-approve/`'s prompt,
-   and one `axis-<name>` artifact holding `{"verdict", "confidence", "summary"}`.
-   A failed axis uploads nothing.
+2. `cursor-approve` with `phase: start` first withdraws the approving
+   identity's own approvals — cursor-review's `decide` has already APPROVED
+   when it reports `approve_gate == 'pass'`, and that approval must not stand
+   (and satisfy branch protection or auto-merge) while the axes judge. It then
+   writes the **status card** — one PR comment, found by
+   `<!-- cursor-approve-card -->` and edited in place — with every axis
+   pending. When cursor-review reports `approve_gate == 'capped'` it writes
+   "Round limit reached, needs a human" instead.
+3. Each axis runs only when `approve_gate == 'pass'`, after the start phase: a
+   read-only checkout of the PR head, one `cursor-agent` call over
+   `.github/cursor-approve/`'s prompt, and one `axis-<name>` artifact holding
+   `{"verdict", "confidence", "summary", "commit_sha"}`. A failed axis uploads
+   nothing, and an axis refuses to run on a fork PR.
 4. `cursor-approve` with `phase: decide` runs `aggregate.py decide` (any
-   missing/malformed axis, any red, or more yellow than `max_yellow_axes` → no
-   approval), then `auto-approve.py approve-external`: it re-reads the head and
-   withholds when it moved, never approves a PR labelled `needs-human-review`,
+   missing/malformed axis, one not stamped with `commit_sha`, any red, or more
+   yellow than `max_yellow_axes` → no approval), reading each axis only from its
+   own `axis-<name>` artifact, then `auto-approve.py approve-external`: it
+   re-reads the head and base and withholds when either moved since the axes
+   ran, never approves a PR labelled `needs-human-review`,
    records the reviewed SHA in the review body, and withdraws this identity's
    own earlier approvals whenever it does not approve. An approval is one line
    linking the card. The card is rewritten with the verdicts, the result and
@@ -40,9 +47,16 @@ heading, fire a mention or forge the card marker.
 
 ## Caller
 
-Pin every `uses:` and `workflows_ref` to the same full commit SHA.
+Pin every `uses:` and `workflows_ref` to the same full commit SHA. Keep the
+per-PR `concurrency:` group cursor-review's caller already carries: it cancels an
+older run when a newer one starts, so two runs never write the card or decide
+on the same PR at once.
 
 ```yaml
+concurrency:
+  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   cursor-review:
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
@@ -67,7 +81,7 @@ jobs:
       APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 
   axis-correctness:
-    needs: cursor-review
+    needs: [cursor-review, approve-start]
     if: needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-correctness.yml@<sha>  # v1
     with:
@@ -76,7 +90,7 @@ jobs:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 
   axis-conformance:
-    needs: cursor-review
+    needs: [cursor-review, approve-start]
     if: needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-conformance.yml@<sha>  # v1
     with:
@@ -103,7 +117,9 @@ jobs:
 Pass secrets explicitly to the axes — never `secrets: inherit` — so each axis
 receives `CURSOR_API_KEY` and nothing else. `always()` on the decide job makes a
 failed axis read as "no result" (withheld) instead of skipping the decision and
-leaving an earlier approval standing.
+leaving an earlier approval standing. The axes `needs: approve-start` so they
+never start while cursor-review's approval still stands; a start phase that
+fails to withdraw it skips them, which decide reads as "no result".
 
 ## Inputs
 

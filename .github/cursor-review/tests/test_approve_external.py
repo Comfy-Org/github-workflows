@@ -19,8 +19,8 @@ AXES = "correctness,conformance"
 
 
 class FakeGitHub:
-    def __init__(self, head=SHA, labels=(), reviews=(), head_after=None):
-        self.head, self.labels, self.reviews = head, list(labels), list(reviews)
+    def __init__(self, head=SHA, labels=(), reviews=(), head_after=None, base="main"):
+        self.head, self.labels, self.reviews, self.base = head, list(labels), list(reviews), base
         self.head_after = head_after
         self.posted, self.dismissed, self.reads = [], [], 0
 
@@ -35,17 +35,17 @@ class FakeGitHub:
             return json.dumps([self.reviews])
         self.reads += 1
         head = self.head_after if (self.head_after and self.reads > 1) else self.head
-        return json.dumps({"head": {"sha": head}, "base": {"ref": "main"},
+        return json.dumps({"head": {"sha": head}, "base": {"ref": self.base},
                            "labels": [{"name": n} for n in self.labels]})
 
 
-def prior_approval():
-    return {"id": 42, "state": "APPROVED", "user": {"login": LOGIN},
-            "body": aa.APPROVE_MARKER + f"\n<!-- cursor-review-auto-approve:sha={'c' * 40} -->"}
+def prior_approval(sha="c" * 40, rid=42):
+    return {"id": rid, "state": "APPROVED", "user": {"login": LOGIN},
+            "body": aa.APPROVE_MARKER + f"\n<!-- cursor-review-auto-approve:sha={sha} -->"}
 
 
 class ApproveExternal(unittest.TestCase):
-    def run_cmd(self, fake, verdicts, event=None):
+    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main"):
         if event is None:
             event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,7 +54,7 @@ class ApproveExternal(unittest.TestCase):
                 json.dump({"event": event, "verdicts": verdicts, "axes": {}, "reasons": []}, f)
             out = os.path.join(tmp, "out")
             args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
-                                      approver_login=LOGIN, card_url="https://github.com/o/r/pull/1#issuecomment-9")
+                                      approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9")
             with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
                 rc = aa.cmd_approve_external(args)
@@ -105,6 +105,41 @@ class ApproveExternal(unittest.TestCase):
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "needs_human"))
         self.assertEqual(fake.posted, [])
+
+    def test_late_superseded_decide_keeps_an_approval_on_the_live_head(self):
+        # An older run's decide finishing after a newer run approved the new head
+        # must withdraw only what is stale against that head.
+        fake = FakeGitHub(head="d" * 40, reviews=[prior_approval(), prior_approval("d" * 40, 77)])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_base_changed_since_the_axes_posts_nothing(self):
+        fake = FakeGitHub(base="release", reviews=[prior_approval(SHA)])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"}, base_ref="main")
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual(fake.posted, [])
+
+    def test_approval_records_the_axes_base(self):
+        fake = FakeGitHub()
+        self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertIn(f"base:{'main'.encode().hex()}", fake.posted[0]["body"])
+
+    def test_empty_login_refuses(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"}, login="")
+        self.assertEqual((rc, outcome), (2, "error"))
+        self.assertEqual(fake.posted, [])
+
+    def test_withdraw_dismisses_own_marked_approvals(self):
+        fake = FakeGitHub(reviews=[prior_approval(SHA)])
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN)
+        with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+            self.assertEqual(aa.cmd_withdraw(args), 0)
+        self.assertEqual(fake.dismissed, ["42"])
+        args.approver_login = " "
+        with mock.patch.object(aa, "gh", fake):
+            self.assertEqual(aa.cmd_withdraw(args), 2)
 
     def test_unreadable_decision_posts_nothing(self):
         self.assertFalse(aa.external_decision_approves(None, ["correctness"]))

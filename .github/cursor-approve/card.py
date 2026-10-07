@@ -100,6 +100,9 @@ def parse_axes(value: str) -> list:
 
 def _int_or_q(value) -> str:
     text = str(value or "").strip()
+    # A `type: number` input can render as `0.0`; show it as the integer it is.
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
     return text if text.isdigit() else "?"
 
 
@@ -238,6 +241,10 @@ def main(argv=None) -> int:
             p.add_argument("--outcome", required=True)
             p.add_argument("--max-yellow-axes", default="0")
     args = parser.parse_args(argv)
+    # An empty login matches no comment, so every phase would post a fresh card.
+    if not (args.login or "").strip():
+        print("::error::--login is empty; refusing to post a card that can never be found again")
+        return 2
     axes = parse_axes(args.axes)
     if args.cmd == "start":
         body = render_start(args.round, args.max_rounds, args.commit_sha, axes, args.approve_gate, args.run_url)
