@@ -1724,6 +1724,131 @@ class AutoResolveCommandTest(unittest.TestCase):
         self.assertIn("resolved 1, skipped-human 1, skipped-unbadged 1, skipped-above-threshold 1", lines[-1])
 
 
+class DeferApprovalTest(unittest.TestCase):
+    """`--defer-approval true`: the gate is reported, but only cursor-approve approves."""
+
+    def run_decide(self, defer, findings=(), reviews=(), fail_put=False, pr_reads=()):
+        self.writes = []
+        self.resolved = []
+        later_reads = list(pr_reads)  # PR payloads after the first read, in order
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "-X"]:
+                self.writes.append((args[2], args[3], payload))
+                if args[2] == "PUT" and fail_put:
+                    raise RuntimeError("gh api failed: 403 dismissals restricted")
+                return '{"id": 99}' if args[2] == "POST" else "{}"
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
+            pr = {"head": {"sha": SHA}, "base": {"ref": "main"}}
+            if getattr(fake_gh, "read", False) and later_reads:
+                pr = later_reads.pop(0)
+            fake_gh.read = True
+            return json.dumps(pr)
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": PANEL_OK}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            open(out, "w").close()
+            args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status="ok", delivered="true",
+                                      ungated="0", approver_login="cursor-approver",
+                                      reviewed_diff=dpath, base_ref="main", poster_login=POSTER)
+            if defer is not None:
+                args.defer_approval = defer
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                    mock.patch.object(AA, "resolve_eligible_threads", lambda *a: self.resolved.append(a)), \
+                    mock.patch.object(AA, "emit", lambda *a: None):
+                rc = AA.cmd_decide(args)
+            return rc, read_outputs(out).get("approve_gate")
+
+    def test_a_passing_round_posts_nothing_and_resolves_nothing(self):
+        rc, gate = self.run_decide("true")
+        self.assertEqual((rc, gate, self.writes, self.resolved), (0, AA.GATE_PASS, [], []))
+
+    def test_earlier_marked_approvals_by_the_approver_are_withdrawn(self):
+        own = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        human = {"id": 8, "user": {"login": "alice"}, "state": "APPROVED", "commit_id": SHA, "body": "lgtm"}
+        rc, gate = self.run_decide("true", reviews=[own, human])
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual([(m, path) for m, path, _ in self.writes],
+                         [("PUT", "repos/o/r/pulls/1/reviews/7/dismissals")])
+        self.assertEqual(self.writes[0][2]["message"], AA.DEFERRED_MESSAGE)
+        self.assertEqual(self.resolved, [])
+
+    def test_a_failed_withdrawal_downgrades_the_gate(self):
+        own = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, gate = self.run_decide("true", reviews=[own], fail_put=True)
+        self.assertEqual((rc, gate), (1, AA.GATE_UNTRUSTED))
+
+    def test_own_marked_change_requests_are_dismissed(self):
+        own = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        edited = dict(own, id=6, edited=True)
+        unmarked = dict(own, id=9, body="please fix")
+        other = dict(own, id=10, user={"login": "alice"})
+        rc, gate = self.run_decide("true", reviews=[own, edited, unmarked, other])
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual([(m, path) for m, path, _ in self.writes],
+                         [("PUT", "repos/o/r/pulls/1/reviews/5/dismissals")])
+        self.assertEqual(self.writes[0][2]["message"], AA.PASSED_MESSAGE)
+
+    def test_a_failed_change_request_dismissal_is_red_but_keeps_the_gate(self):
+        own = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+               "commit_id": SHA, "body": AA.APPROVE_MARKER}
+        rc, gate = self.run_decide("true", reviews=[own], fail_put=True)
+        self.assertEqual((rc, gate), (1, AA.GATE_PASS))
+
+    def test_a_change_since_the_read_downgrades_the_gate(self):
+        moved = {"head": {"sha": "b" * 40}, "base": {"ref": "main"}}
+        retargeted = {"head": {"sha": SHA}, "base": {"ref": "dev"}}
+        labelled = {"head": {"sha": SHA}, "base": {"ref": "main"},
+                    "labels": [{"name": AA.HUMAN_REVIEW_LABEL}]}
+        for pr, want in ((moved, AA.GATE_UNTRUSTED), (retargeted, AA.GATE_UNTRUSTED),
+                         (labelled, AA.GATE_CAPPED), ("not a dict", AA.GATE_UNTRUSTED)):
+            with self.subTest(pr=pr):
+                rc, gate = self.run_decide("true", pr_reads=[pr])
+                self.assertEqual((rc, gate, self.writes), (0, want, []))
+
+    def test_defer_is_read_case_and_whitespace_insensitively(self):
+        for defer in ("True", " true ", "TRUE"):
+            with self.subTest(defer=defer):
+                rc, gate = self.run_decide(defer)
+                self.assertEqual((rc, gate, self.writes, self.resolved), (0, AA.GATE_PASS, [], []))
+
+    def test_request_changes_is_still_posted(self):
+        rc, gate = self.run_decide("true", findings=[finding("high")])
+        self.assertEqual((rc, gate), (0, AA.GATE_FAIL))
+        self.assertEqual([(m, p["event"]) for m, _, p in self.writes], [("POST", AA.REQUEST_CHANGES)])
+
+    def test_off_still_approves_and_resolves(self):
+        for defer in (None, "", "false"):
+            with self.subTest(defer=defer):
+                rc, gate = self.run_decide(defer)
+                self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+                self.assertEqual([(m, p["event"]) for m, _, p in self.writes], [("POST", AA.APPROVE)])
+                self.assertEqual(len(self.resolved), 1)
+
+    def test_the_workflow_passes_the_input_to_decide(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            src = f.read()
+        declared = src[src.index("\n      defer_approval:\n"):]
+        declared = declared[: declared.index("\n      max_rounds:\n")]
+        self.assertIn("type: boolean", declared)
+        self.assertIn("default: false", declared)
+        step = src[src.index("- name: Auto-approve decision"):]
+        step = step[: step.index("\n\n  dismiss-stale-approval:")]
+        self.assertIn("DEFER_APPROVAL: ${{ inputs.defer_approval }}", step)
+        self.assertIn('--defer-approval "$DEFER_APPROVAL"', step)
+
+
 class AutoResolveWiringTest(unittest.TestCase):
     """The workflow passes the findings poster's login to `decide`."""
 

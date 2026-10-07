@@ -338,6 +338,20 @@ on:
         type: string
         required: false
         default: ''
+      defer_approval:
+        description: >-
+          For a caller that runs cursor-approve's per-axis approval after this
+          workflow. false (default) → no change. true → a round that would
+          APPROVE still reports `approve_gate` = `pass`, but posts no review and
+          auto-resolves no thread; it withdraws the approver identity's own
+          earlier auto-approvals (and requests for changes) instead, so cursor-approve's `phase: decide`
+          is the only approver and no severity-only approval stands while the
+          axes judge — nor after a run that fails before they start.
+          REQUEST_CHANGES is still posted. No effect unless
+          `approve_max_severity` is set. See docs/callers/cursor-approve.md.
+        type: boolean
+        required: false
+        default: false
       max_rounds:
         description: >-
           Cap on review rounds per PR. Before the panel starts, the run counts
@@ -403,7 +417,8 @@ on:
         description: >-
           The round's severity-gate verdict, for a downstream workflow that
           must run only after a round passed. Exactly one of: `pass` (the
-          auto-approve decision was APPROVE), `fail` (REQUEST_CHANGES, or an
+          auto-approve decision was APPROVE — posted, unless `defer_approval`
+          left it to cursor-approve), `fail` (REQUEST_CHANGES, or an
           open thread above the threshold withheld approval), `untrusted` (the
           judge was degraded, a panel cell failed, the review was not delivered,
           the head moved — or no round was delivered by this run at all, e.g. a
@@ -3260,6 +3275,7 @@ jobs:
           # event's too): decide refuses if the live base differs, and records
           # it in the review so a later retarget is caught from live state.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFER_APPROVAL: ${{ inputs.defer_approval }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3290,7 +3306,8 @@ jobs:
             --approver-login "$LOGIN" \
             --reviewed-diff /tmp/pr-diff.patch \
             --base-ref "$BASE_REF" \
-            --poster-login "$POSTER"
+            --poster-login "$POSTER" \
+            --defer-approval "$DEFER_APPROVAL"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
