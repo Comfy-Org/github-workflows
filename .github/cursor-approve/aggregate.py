@@ -4,12 +4,16 @@
 Five reviewers each judge one axis of a PR (business, design, correctness,
 completeness, conformance) and answer with one JSON object:
 ``{"verdict": "red"|"yellow"|"green", "confidence": 0..1, "summary": "..."}``.
-Two subcommands, both pure — nothing here writes to GitHub:
+Three subcommands, all pure — nothing here writes to GitHub:
 
 ``render``
     Print the prompt for one axis: ``prompt-common.md`` followed by
     ``prompt-<axis>.md``, with every ``{{placeholder}}`` substituted. An unknown
     axis exits 2.
+
+``extract``
+    Pull the one JSON object out of a model's raw reply (cursor-axis-base.yml
+    runs this before uploading); zero or several candidates exit 1.
 
 ``decide``
     Read ``<axis>.json`` for each expected axis from a directory and print one
@@ -286,6 +290,51 @@ def decide(outputs: dict, axes: list, max_yellow: int):
     return {"event": event, "verdicts": verdicts, "axes": detail, "reasons": reasons}
 
 
+def extract_object(raw: str):
+    """The ONE JSON object carrying a ``verdict`` in a model's raw reply.
+
+    The reply may wrap it in prose or a code fence. Every top-level ``{...}``
+    that parses is a candidate; zero or several with a ``verdict`` key raise
+    ValueError — two answers in one reply is ambiguity, and this path fails
+    closed on ambiguity rather than picking one.
+    """
+    decoder = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+    found, i = [], 0
+    while True:
+        i = raw.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, i)
+        except (ValueError, RecursionError):
+            i += 1
+            continue
+        if isinstance(obj, dict) and "verdict" in obj:
+            found.append(obj)
+        i = end
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one JSON object with a verdict, found {len(found)}")
+    return found[0]
+
+
+def cmd_extract(args) -> int:
+    try:
+        with open(args.raw, encoding="utf-8", errors="replace") as f:
+            raw = f.read(4 * MAX_OUTPUT_BYTES)
+        obj = extract_object(raw)
+        validate_output(obj)
+    except (OSError, ValueError) as e:
+        print(f"::error::{e}", file=sys.stderr)
+        return 1
+    text = json.dumps(obj)
+    if len(text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        print(f"::error::the output is larger than {MAX_OUTPUT_BYTES} bytes", file=sys.stderr)
+        return 1
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    return 0
+
+
 def cmd_render(args) -> int:
     values = {name: getattr(args, name) for name in PLACEHOLDERS}
     try:
@@ -343,7 +392,12 @@ def main(argv=None) -> int:
     d.add_argument("--outputs-dir", required=True)
     d.add_argument("--axes", default=",".join(AXES))
     d.add_argument("--max-yellow-axes", default="0")
+    x = sub.add_parser("extract")
+    x.add_argument("--raw", required=True)
+    x.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if args.cmd == "extract":
+        return cmd_extract(args)
     return cmd_render(args) if args.cmd == "render" else cmd_decide(args)
 
 

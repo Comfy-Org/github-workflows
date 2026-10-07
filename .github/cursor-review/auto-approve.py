@@ -2,8 +2,8 @@
 """Opt-in auto-approve: turn a cursor-review round into an approval decision.
 
 Used by cursor-review.yml when the caller sets `approve_max_severity` (and,
-for ``round-cap``, `max_rounds`). Three subcommands, each run from a job that
-checks out NO PR code:
+for ``round-cap``, `max_rounds`), and by cursor-approve.yml (``approve-external``).
+Four subcommands, each run from a job that checks out NO PR code:
 
 ``decide`` (in `post-review`, after the consolidated review is posted)
     APPROVE when every finding of this round is at or below the threshold and
@@ -43,6 +43,11 @@ checks out NO PR code:
     existed — because a cap nobody can count is not evidence of a runaway loop.
     So does a label that cannot be applied: the label is the only reset, and a
     cap with nothing for a human to remove would never lift.
+
+``approve-external`` (in cursor-approve.yml's decide phase)
+    Post an APPROVE decided outside cursor-review (by
+    ``.github/cursor-approve/aggregate.py``) under the same protections — see
+    ``cmd_approve_external``.
 
 ``decide`` also emits ``approve_gate`` (one of ``APPROVE_GATE_VALUES``) as a
 step output, for a downstream workflow that should run only after a round
@@ -933,6 +938,120 @@ def cmd_round_cap(args) -> int:
     return 0
 
 
+# --- approve-external: an approval decided OUTSIDE cursor-review ------------
+#
+# cursor-approve.yml decides with .github/cursor-approve/aggregate.py and posts
+# here, so the protections above apply unchanged: the head is re-read and the
+# review withheld when it moved from the decided commit, the reviewed SHA and
+# base ride in the body's markers (so `dismiss-stale` withdraws it on a push or
+# retarget like any other auto-approval), this identity's own earlier approvals
+# are withdrawn on every non-approval, and a `needs-human-review` PR is never
+# approved. The outcome is written as the step output `outcome` for the card.
+
+EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "own_pr", "error")
+EXTERNAL_AXES = ("business", "design", "correctness", "completeness", "conformance")
+
+
+def external_decision_approves(decision, axes: list) -> bool:
+    """True only for an APPROVE decision whose every expected axis reported a
+    non-red verdict. aggregate.py already guarantees that; re-checking it here
+    keeps a hand-edited or truncated decision file from reaching an approval."""
+    if not isinstance(decision, dict) or decision.get("event") != APPROVE or not axes:
+        return False
+    verdicts = decision.get("verdicts")
+    if not isinstance(verdicts, dict):
+        return False
+    return all(verdicts.get(axis) in ("green", "yellow") for axis in axes)
+
+
+def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str:
+    lines = [APPROVE_MARKER]
+    if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
+        lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
+    if base_ref:
+        lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    if re.fullmatch(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./#-]+", card_url or ""):
+        lines.append(f"Approved, see the [cursor-approve card]({card_url}).")
+    else:
+        lines.append("Approved, see the cursor-approve card.")
+    return "\n".join(lines)
+
+
+def cmd_approve_external(args) -> int:
+    set_output("outcome", "error")
+    axes = [a.strip().lower() for a in (args.axes or "").split(",") if a.strip()]
+    if not axes or any(a not in EXTERNAL_AXES for a in axes):
+        print(f"::error::--axes must name some of {', '.join(EXTERNAL_AXES)}, got {args.axes!r}")
+        return 2
+    if not re.fullmatch(r"[0-9a-f]{40}", args.commit_sha or ""):
+        print(f"::error::--commit-sha must be a full 40-hex SHA, got {args.commit_sha!r}")
+        return 2
+    try:
+        with open(args.decision, encoding="utf-8") as f:
+            decision = json.load(f)
+    except (OSError, ValueError):
+        decision = None
+    try:
+        pr = read_pr(args.repo, args.pr_number)
+        live_head, live_base = pr_head_base(pr)
+        human_review = has_label(pr, HUMAN_REVIEW_LABEL)
+    except (RuntimeError, ValueError) as e:
+        print(f"::error::Could not read the PR state: {e}")
+        withdraw_own_approvals(args)
+        return 1
+    if live_head != args.commit_sha:
+        outcome, why = "superseded", f"the PR head moved from {args.commit_sha[:7]} to {live_head[:7] or '?'}"
+    elif human_review:
+        outcome, why = "needs_human", f"the PR is labelled `{HUMAN_REVIEW_LABEL}`"
+    elif not external_decision_approves(decision, axes):
+        outcome, why = "not_approved", "the axes did not approve"
+    else:
+        outcome, why = "approved", ""
+    if outcome != "approved":
+        set_output("outcome", outcome)
+        emit(f"ℹ️ **cursor-approve: no approval** — {why}.")
+        return withdraw_own_approvals(args)
+
+    body = render_external_body(args.card_url, args.commit_sha, live_base)
+    try:
+        posted = json.loads(
+            gh(
+                ["api", "-X", "POST", f"repos/{args.repo}/pulls/{args.pr_number}/reviews", "--input", "-"],
+                {"commit_id": args.commit_sha, "event": APPROVE, "body": body},
+            )
+        )
+    except RuntimeError as e:
+        if "own pull request" in str(e).lower():
+            set_output("outcome", "own_pr")
+            emit(f"ℹ️ **cursor-approve: skipped** — the approver authored this PR ({e}).")
+            return 0
+        print(f"::error::Could not submit the APPROVE review: {e}")
+        withdraw_own_approvals(args)
+        return 1
+
+    # Same read → POST race cmd_decide closes: re-read after the write.
+    try:
+        pr_now = read_pr(args.repo, args.pr_number)
+        head_now, base_now = pr_head_base(pr_now)
+        labelled_now = has_label(pr_now, HUMAN_REVIEW_LABEL)
+    except (RuntimeError, ValueError):
+        head_now = base_now = None
+        labelled_now = False
+    moved = head_now != args.commit_sha or base_now != live_base
+    if moved or labelled_now:
+        set_output("outcome", "superseded" if moved else "needs_human")
+        try:
+            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
+        except RuntimeError as e:
+            print(f"::error::The PR changed while the approval was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            return 1
+        emit("ℹ️ **cursor-approve: withdrawn** — the PR changed while the approval was being posted.")
+        return 0
+    set_output("outcome", "approved")
+    emit("✅ **cursor-approve: APPROVE**")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -964,7 +1083,17 @@ def main() -> int:
     c.add_argument("--max-rounds", required=True)
     c.add_argument("--threshold", default="")
     c.add_argument("--poster-login", required=True)
+    e = sub.add_parser("approve-external")
+    e.add_argument("--repo", required=True)
+    e.add_argument("--pr-number", required=True)
+    e.add_argument("--commit-sha", required=True)
+    e.add_argument("--axes", required=True)
+    e.add_argument("--decision", required=True)
+    e.add_argument("--approver-login", required=True)
+    e.add_argument("--card-url", default="")
     args = parser.parse_args()
+    if args.cmd == "approve-external":
+        return cmd_approve_external(args)
     if args.cmd == "round-cap":
         return cmd_round_cap(args)
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)

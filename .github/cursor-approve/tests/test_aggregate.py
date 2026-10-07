@@ -468,3 +468,21 @@ class RenderHardeningTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Extract(unittest.TestCase):
+    def setUp(self):
+        import importlib.util as u
+        spec = u.spec_from_file_location("aggregate_x", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "aggregate.py"))
+        self.agg = u.module_from_spec(spec)
+        spec.loader.exec_module(self.agg)
+
+    def test_one_object_in_prose_and_fence(self):
+        raw = 'Here you go:\n```json\n{"verdict": "green", "confidence": 0.8, "summary": "ok {x}"}\n```\n'
+        self.assertEqual(self.agg.extract_object(raw)["verdict"], "green")
+
+    def test_zero_or_two_objects_fail(self):
+        with self.assertRaises(ValueError):
+            self.agg.extract_object("no json here {")
+        with self.assertRaises(ValueError):
+            self.agg.extract_object('{"verdict": "green"} {"verdict": "red"}')
