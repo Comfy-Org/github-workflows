@@ -1440,5 +1440,313 @@ class NonRoundBannerParityTest(unittest.TestCase):
                 self.assertIn("\\n\\n" + banner.strip("\n") + "\\n\\n", src)
 
 
+POSTER = "cloud-code-bot[bot]"
+GATE = AA._load_gate_unresolved()
+
+
+def bot(login=POSTER):
+    """A GraphQL author: a Bot's login comes back WITHOUT the `[bot]` suffix."""
+    if login.endswith("[bot]"):
+        return {"__typename": "Bot", "login": login[: -len("[bot]")]}
+    return {"__typename": "User", "login": login}
+
+
+def thread(tid, sev="low", author=POSTER, repliers=(), resolved=False, outdated=False,
+           marker=True, total=None):
+    badge = f"🔵 **{sev.capitalize()}** — x" if sev else "no badge here"
+    review_body = GATE.CONSOLIDATED_MARKER + "\n…" if marker else "a human review"
+    authors = [bot(author)] + [bot(r) for r in repliers]
+    return {
+        "id": tid, "isResolved": resolved, "isOutdated": outdated,
+        "comments": {"nodes": [{"author": authors[0], "body": badge,
+                                "pullRequestReview": {"body": review_body}}]},
+        "participants": {"totalCount": len(authors) if total is None else total,
+                         "nodes": [{"author": a} for a in authors]},
+    }
+
+
+class AutoResolvePlanTest(unittest.TestCase):
+    """plan_thread_resolution: which threads an approval may resolve."""
+
+    def plan(self, threads, threshold="low", poster=POSTER):
+        todo, counts = AA.plan_thread_resolution(threads, poster, threshold)
+        return [t["id"] for t, _ in todo], counts
+
+    def test_approvable_state_resolves_only_eligible_bot_threads(self):
+        ids, counts = self.plan([
+            thread("ok-low", "low"), thread("ok-nit", "nit"),
+            thread("human-started", "low", author="alice"),
+            thread("human-replied", "low", repliers=["alice"]),
+            thread("other-bot-replied", "low", repliers=["dependabot[bot]"]),
+            thread("wrong-author", "low", author="github-actions[bot]"),
+            thread("already-resolved", "low", resolved=True),
+            thread("not-consolidated", "low", marker=False),
+            thread("outdated-low", "low", outdated=True),
+        ])
+        self.assertEqual(ids, ["ok-low", "ok-nit", "outdated-low"])
+        self.assertEqual(counts, {"resolved": 3, "skipped-human": 2, "skipped-unbadged": 0,
+                                  "skipped-above-threshold": 0})
+
+    def test_bot_own_replies_do_not_disqualify(self):
+        ids, _ = self.plan([thread("t", "low", repliers=[POSTER])])
+        self.assertEqual(ids, ["t"])
+
+    def test_a_user_sharing_the_bot_name_is_not_the_bot(self):
+        # GraphQL drops `[bot]`; a User literally named `cloud-code-bot` must not match.
+        t = thread("t", "low")
+        t["comments"]["nodes"][0]["author"] = {"__typename": "User", "login": "cloud-code-bot"}
+        self.assertEqual(self.plan([t])[0], [])
+
+    def test_any_live_thread_above_threshold_resolves_nothing(self):
+        for blocker in (thread("hi", "high"), thread("med", "medium"), thread("bare", None),
+                        thread("human-hi", "high", author="alice")):
+            with self.subTest(blocker=blocker["id"]):
+                ids, counts = self.plan([thread("ok", "low"), thread("ok2", "nit"), blocker])
+                self.assertEqual(ids, [])
+                self.assertEqual(counts["resolved"], 0)
+
+    def test_resolved_or_outdated_blocker_does_not_block(self):
+        # decide() ignores those too, so the PR is approvable.
+        ids, counts = self.plan([thread("ok", "low"), thread("hi", "high", resolved=True)])
+        self.assertEqual(ids, ["ok"])
+        ids, counts = self.plan([thread("ok", "low"), thread("hi", "high", outdated=True)])
+        self.assertEqual((ids, counts["skipped-above-threshold"]), (["ok"], 1))
+
+    def test_threshold_is_respected(self):
+        ids, counts = self.plan([thread("low", "low"), thread("nit", "nit")], threshold="nit")
+        # `low` is above a `nit` threshold — the PR is not approvable, so nothing.
+        self.assertEqual(ids, [])
+
+    def test_unbadged_bot_thread_is_never_resolved(self):
+        # Outdated, so it does not block — but it is still not resolved.
+        ids, counts = self.plan([thread("bare", None, outdated=True), thread("ok", "low")])
+        self.assertEqual((ids, counts["skipped-unbadged"]), (["ok"], 1))
+
+    def test_unseen_comments_leave_the_thread(self):
+        self.assertEqual(self.plan([thread("t", "low", total=101)])[0], [])
+
+    def test_deleted_author_leaves_the_thread(self):
+        t = thread("t", "low", repliers=["alice"])
+        t["participants"]["nodes"][1]["author"] = None
+        self.assertEqual(self.plan([t])[0], [])
+
+    def test_no_poster_resolves_nothing(self):
+        self.assertEqual(self.plan([thread("t", "low")], poster="")[0], [])
+
+
+def graphql_fake(log, threads, fail_on=(), live=None):
+    """A `gh api graphql` stand-in for the resolver's three calls. The re-read
+    answers from `live[tid]` when given (the thread as it is NOW), else from the
+    planned snapshot. Each call is logged as (kind, thread id, body)."""
+    by_id = {t["id"]: t for t in threads}
+    live = live or {}
+
+    def fake(args):
+        query = args[3]
+        tid = next(a.split("=", 1)[1] for a in args if a.startswith("threadId="))
+        if "addPullRequestReviewThreadReply" in query:
+            kind = "reply"
+        elif "resolveReviewThread" in query:
+            kind = "resolve"
+        else:
+            kind = "recheck"
+        body = next((a.split("=", 1)[1] for a in args if a.startswith("body=")), None)
+        log.append((kind, tid, body))
+        if (kind, tid) in fail_on:
+            raise RuntimeError("HTTP 502")
+        if (kind, tid, "errors") in fail_on:
+            return json.dumps({"errors": [{"message": "nope"}]})
+        if (kind, tid, "null") in fail_on:
+            return "null"
+        if kind == "recheck":
+            now = live.get(tid, by_id.get(tid, {}))
+            return json.dumps({"data": {"node": {"isResolved": now.get("isResolved", False),
+                                                 "participants": now.get("participants")}}})
+        return json.dumps({"data": {}})
+    return fake
+
+
+class AutoResolveCommandTest(unittest.TestCase):
+    """cmd_decide: resolution only on a standing APPROVE; failures never fatal."""
+
+    def run_decide(self, threads, findings=(), heads=(SHA, SHA), fail_on=(), poster=POSTER,
+                   thread_error=None, labels_after=(), live=None):
+        heads = iter(heads)
+        self.mutations = []
+        self.writes = []
+        reads = []
+        fake_graphql = graphql_fake(self.mutations, threads, fail_on, live)
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "graphql"]:
+                return fake_graphql(args)
+            if args[:3] == ["api", "-X", "POST"]:
+                self.writes.append("POST")
+                return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "PUT"]:
+                self.writes.append("PUT")
+                return "{}"
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([[]])
+            labels = labels_after if reads else ()
+            reads.append(args)
+            return json.dumps({"head": {"sha": next(heads)}, "base": {"ref": "main"},
+                               "labels": [{"name": n} for n in labels]})
+
+        def fake_iter(owner, name, pr):
+            if thread_error:
+                raise thread_error
+            return iter(threads)
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, "c.json")
+            dpath = os.path.join(d, "pr.patch")
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": PANEL_OK}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status="ok", delivered="true",
+                                      ungated="0", approver_login="cursor-approver",
+                                      reviewed_diff=dpath, base_ref="main", poster_login=poster)
+            with mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                    mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                    mock.patch.object(GATE, "iter_threads", fake_iter), \
+                    mock.patch.object(AA, "emit", lambda *a: None):
+                return AA.cmd_decide(args)
+
+    def test_approval_rechecks_resolves_then_replies_on_each_eligible_thread(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "nit"), thread("H", "low", author="alice")])
+        self.assertEqual(rc, 0)
+        self.assertEqual([(k, t) for k, t, _ in self.mutations],
+                         [("recheck", "T1"), ("resolve", "T1"), ("reply", "T1"),
+                          ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2")])
+        reply = self.mutations[2][2]
+        self.assertIn(AA.AUTO_RESOLVE_MARKER, reply)
+        self.assertIn("Resolved by auto-approve: Low finding, at or below the `low` threshold, "
+                      f"on commit {SHA[:7]}.", reply)
+
+    def test_above_threshold_finding_resolves_nothing(self):
+        rc = self.run_decide([thread("T1", "low")], findings=[finding("medium")])
+        self.assertEqual((rc, self.mutations), (0, []))
+
+    def test_open_above_threshold_thread_resolves_nothing(self):
+        # decide() itself withholds approval (real open_thread_severities would
+        # see the High); the resolver re-checks the threads it reads independently.
+        rc = self.run_decide([thread("T1", "low"), thread("H", "high")])
+        self.assertEqual((rc, self.mutations), (0, []))
+
+    def test_moved_head_after_the_approval_resolves_nothing(self):
+        rc = self.run_decide([thread("T1", "low")], heads=(SHA, "b" * 40))
+        self.assertEqual((rc, self.writes, self.mutations), (0, ["POST", "PUT"], []))
+
+    def test_human_review_label_after_the_approval_resolves_nothing(self):
+        rc = self.run_decide([thread("T1", "low")], labels_after=["needs-human-review"])
+        self.assertEqual((rc, self.writes, self.mutations), (0, ["POST", "PUT"], []))
+
+    def test_a_failing_mutation_does_not_stop_the_others_or_the_approval(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "low"), thread("T3", "low")],
+                             fail_on={("resolve", "T1"), ("reply", "T2", "errors")})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.writes, ["POST"])  # the approval stands, nothing dismissed
+        # A failed resolve posts NO reply: a reply from the approver would make
+        # the still-open thread look human-touched to every later round.
+        self.assertEqual([(k, t) for k, t, _ in self.mutations],
+                         [("recheck", "T1"), ("resolve", "T1"),
+                          ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2"),
+                          ("recheck", "T3"), ("resolve", "T3"), ("reply", "T3")])
+
+    def test_a_human_reply_after_the_snapshot_stops_that_thread(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "low")],
+                             live={"T1": thread("T1", "low", repliers=["alice"])})
+        self.assertEqual(rc, 0)
+        self.assertEqual([(k, t) for k, t, _ in self.mutations],
+                         [("recheck", "T1"), ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2")])
+
+    def test_a_thread_resolved_since_the_snapshot_is_left_alone(self):
+        rc = self.run_decide([thread("T1", "low")], live={"T1": thread("T1", "low", resolved=True)})
+        self.assertEqual([(k, t) for k, t, _ in self.mutations], [("recheck", "T1")])
+        self.assertEqual(rc, 0)
+
+    def test_a_non_object_graphql_body_is_not_fatal(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "low")],
+                             fail_on={("recheck", "T1", "null")})
+        self.assertEqual((rc, self.writes), (0, ["POST"]))
+        self.assertIn(("resolve", "T2"), [(k, t) for k, t, _ in self.mutations])
+
+    def test_consecutive_failures_stop_the_loop(self):
+        threads = [thread(f"T{i}", "low") for i in range(6)]
+        rc = self.run_decide(threads, fail_on={("resolve", f"T{i}") for i in range(6)})
+        self.assertEqual(rc, 0)
+        self.assertEqual([t for k, t, _ in self.mutations if k == "resolve"],
+                         [f"T{i}" for i in range(AA.MAX_CONSECUTIVE_FAILURES)])
+
+    def test_a_success_resets_the_failure_streak(self):
+        threads = [thread(f"T{i}", "low") for i in range(6)]
+        rc = self.run_decide(threads, fail_on={("resolve", "T0"), ("resolve", "T1"), ("resolve", "T3"),
+                                               ("resolve", "T4")})
+        self.assertEqual(rc, 0)
+        self.assertEqual([t for k, t, _ in self.mutations if k == "resolve"], [f"T{i}" for i in range(6)])
+
+    def test_one_round_resolves_at_most_the_cap(self):
+        threads = [thread(f"T{i}", "low") for i in range(AA.MAX_AUTO_RESOLVE + 5)]
+        self.run_decide(threads)
+        self.assertEqual(sum(1 for k, _, _ in self.mutations if k == "resolve"), AA.MAX_AUTO_RESOLVE)
+
+    def test_an_unloadable_thread_module_is_not_fatal(self):
+        def boom():
+            raise RuntimeError("gate-unresolved.py missing")
+        with mock.patch.object(AA, "_load_gate_unresolved", boom), mock.patch.object(AA, "emit", lambda *a: None):
+            counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
+        self.assertEqual(counts["resolved"], 0)
+
+    def test_unreadable_threads_are_not_fatal(self):
+        rc = self.run_decide([], thread_error=SystemExit(2))
+        self.assertEqual((rc, self.writes, self.mutations), (0, ["POST"], []))
+
+    def test_no_poster_login_resolves_nothing(self):
+        rc = self.run_decide([thread("T1", "low")], poster="")
+        self.assertEqual((rc, self.mutations), (0, []))
+
+    def test_counts_are_logged(self):
+        lines = []
+        threads = [thread("T1", "low"), thread("H", "low", repliers=["alice"]),
+                   thread("U", None, outdated=True), thread("M", "medium", outdated=True)]
+        fake = graphql_fake([], threads)
+        with mock.patch.object(AA, "emit", lines.append), \
+                mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)), \
+                mock.patch.object(AA, "gh", lambda args, payload=None: fake(args)):
+            counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
+        self.assertEqual(counts, {"resolved": 1, "skipped-human": 1, "skipped-unbadged": 1,
+                                  "skipped-above-threshold": 1, "failed": 0, "deferred": 0})
+        self.assertIn("resolved 1, skipped-human 1, skipped-unbadged 1, skipped-above-threshold 1", lines[-1])
+
+
+class AutoResolveWiringTest(unittest.TestCase):
+    """The workflow passes the findings poster's login to `decide`."""
+
+    def test_decide_step_passes_poster_login(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            src = f.read()
+        step = src[src.index("auto-approve.py\" decide"):]
+        step = step[: step.index("\n\n")]
+        self.assertIn('--poster-login "$POSTER"', step)
+        # Keyed on the token Post review used, not on the slug alone.
+        self.assertIn('if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; '
+                      'else POSTER="github-actions[bot]"; fi', src)
+
+    def test_auto_resolve_marker_matches_the_ledgers(self):
+        # build-ledger.py reads gate-unresolved's copy to keep this reply out of
+        # its answer count; the two must never drift.
+        self.assertEqual(AA.AUTO_RESOLVE_MARKER, GATE.AUTO_RESOLVE_MARKER)
+
+    def test_thread_query_fetches_what_the_resolver_needs(self):
+        for field in ("participants: comments(first: 100)", "totalCount", "__typename", "\n          id\n"):
+            with self.subTest(field=field):
+                self.assertIn(field, GATE.QUERY)
+
+
 if __name__ == "__main__":
     unittest.main()
