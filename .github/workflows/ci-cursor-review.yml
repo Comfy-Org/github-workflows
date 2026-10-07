@@ -33,10 +33,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@55d3b34779fb38b1e133b34d60cc8cd6cd70eb2c # github-workflows main (55d3b34)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@cfca7947230f54ffc9ce75c28804aba44043b69a # github-workflows main (cfca794)
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
-      workflows_ref: 55d3b34779fb38b1e133b34d60cc8cd6cd70eb2c
+      workflows_ref: cfca7947230f54ffc9ce75c28804aba44043b69a
       # No vendored/generated content in this repo; defensive excludes only.
       # These live in extra_generated_globs, not diff_excludes: since BE-7633
       # diff_excludes leaves the reviewed diff but is still COUNTED against
