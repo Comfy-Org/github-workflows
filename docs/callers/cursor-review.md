@@ -140,11 +140,11 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 ```bash
 # one repo
 gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
-  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-max","claude-opus-5-5-max","kimi-k3-high"]'
 
 # or the whole fleet at once (visibility must include private repos)
 gh variable set CURSOR_PANEL_MODELS --org <org> --visibility all \
-  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-max","claude-opus-5-5-max","kimi-k3-high"]'
 ```
 
 `vars` inside a reusable workflow resolves against the **caller's** repo and
@@ -178,8 +178,8 @@ caller outright, so it is not a new trust boundary; it is a quieter one.
 
 Two things to get right:
 
-**Use Cursor catalog ids, with the tier suffix.** `claude-opus-5-thinking-xhigh`,
-not `claude-opus-5`. If your org keeps model slugs in variables for workflows
+**Use Cursor catalog ids, with the tier suffix.** `claude-opus-5-5-xhigh`,
+not `claude-opus-5-5`. If your org keeps model slugs in variables for workflows
 that call a model API directly, those are a *different namespace* — an API slug
 has no tier and the preflight's live-catalog check will reject it. Keep the two
 apart rather than pointing this input at them.

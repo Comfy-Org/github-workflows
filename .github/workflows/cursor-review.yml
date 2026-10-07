@@ -1934,24 +1934,31 @@ jobs:
         # validates every entry — so a bump only ever touches this one list.
         # Keep in sync with the README model table.
         #
-        # Three labs (last checked 2026-08-27). OpenAI: GPT-5.6 Sol is the
-        # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
-        # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
-        # all Fable entries are marked NO ZDR in Cursor, and this panel
-        # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
-        # its max tier is ZDR-eligible (confirmed against the live catalog —
-        # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
-        # Opus 4.8 at identical per-token pricing. Moonshot: Kimi K3 at the
-        # `high` tier — same model as the former `kimi-k3-max` pin, one
-        # reasoning notch lower; no NO-ZDR marker in the catalog.
+        # Three labs (Anthropic cell last checked 2026-10-07, others
+        # 2026-08-27). OpenAI: GPT-5.6 Sol is the 5.6-family coding flagship
+        # (Luna is the cost tier, Terra mid; the Codex line stops at 5.3).
+        # Anthropic: Opus 5.5 at the `xhigh` tier. Fable tops the catalog but
+        # every Fable entry is marked NO ZDR in Cursor and this panel reviews
+        # private-repo diffs, so that family stays excluded; no
+        # `claude-opus-5-5-*` line carries a NO-ZDR marker. Note 5.5 ships NO
+        # `-thinking-` variants — Opus 5 had both lines, 5.5 has only
+        # `claude-opus-5-5-<tier>`, so `claude-opus-5-thinking-max` has no
+        # literal counterpart here and the nearest is a plain tier id.
+        # Moonshot: Kimi K3 at the `high` tier — same model as the former
+        # `kimi-k3-max` pin, one reasoning notch lower; no NO-ZDR marker.
         #
         # Gemini 3.1 Pro was removed 2026-08-27. Over 1,450 judge-kept
         # findings (172 PRs), its two cells were the sole raiser of 2.5% of
         # kept findings and 3 of 213 critical/high ones, while costing ~9% of
         # every run; every other Gemini finding was also raised by the OpenAI
         # or Anthropic cell. The Kimi tier drop and the judge's move to
-        # `-xhigh` come from the same spend review. The `panel_models` input
-        # overrides this list per caller for A/B experiments.
+        # `-xhigh` come from the same spend review, and the Anthropic cell
+        # moved from Opus 5 `-thinking-max` to Opus 5.5 `-xhigh` on
+        # 2026-10-07 for the same reason: a newer model one reasoning notch
+        # down. That is deliberately TWO axes at once (version + tier) — it
+        # is a default change, not an attribution experiment. The
+        # `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
+        # env block below — overrides this list for A/B experiments.
         env:
           # Falls back to a VARIABLE when the caller passes no input, so the
           # panel list is settable in ONE place for the whole fleet with no
@@ -1970,7 +1977,7 @@ jobs:
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
-            "claude-opus-5-thinking-max",
+            "claude-opus-5-5-xhigh",
             "kimi-k3-high"
           ]
           JSON
