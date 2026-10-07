@@ -119,6 +119,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 | `approve_max_severity` | `''` (off) | `medium`, `low` or `nit`: after each round the bot **approves** (pinned to the reviewed commit) when every finding is at or below that severity, and **requests changes** when any is above it. See [auto-approve](#auto-approve). |
+| `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 
@@ -582,7 +583,7 @@ jobs:
 
 | Value | Meaning |
 |---|---|
-| `pass` | The auto-approve decision was APPROVE. |
+| `pass` | The auto-approve decision was APPROVE (posted, unless `defer_approval` left it to cursor-approve). |
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
 | `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |

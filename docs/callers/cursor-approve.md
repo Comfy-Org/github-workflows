@@ -9,10 +9,19 @@ the context axes (business, design, completeness) are not available yet.
 ## What it does
 
 1. `cursor-review` runs a round and exposes `approve_gate`, `round` and `max_rounds`.
+   Call it with `defer_approval: true`: a passing round then reports
+   `approve_gate == 'pass'` **without** posting an approval (and without
+   resolving any thread), and withdraws the approving identity's own earlier
+   approvals. Without it, cursor-review's `decide` APPROVES first, and that
+   severity-only approval satisfies branch protection or auto-merge until the
+   start phase withdraws it — and stays standing if the cursor-review run fails
+   or is cancelled after approving, because the start phase and the axes are
+   then skipped. With it, this workflow's decide phase is the only approver.
 2. `cursor-approve` with `phase: start` first withdraws the approving
-   identity's own approvals — cursor-review's `decide` has already APPROVED
-   when it reports `approve_gate == 'pass'`, and that approval must not stand
-   (and satisfy branch protection or auto-merge) while the axes judge. It then
+   identity's own approvals — a backstop: with `defer_approval: true` there is
+   none from this round, but a caller that does not set it has one standing
+   from cursor-review's `decide`, which must not satisfy branch protection or
+   auto-merge while the axes judge. It then
    writes the **status card** — one PR comment, found by
    `<!-- cursor-approve-card -->` and edited in place — with every axis
    pending. When cursor-review reports `approve_gate == 'capped'` it writes
@@ -44,6 +53,7 @@ heading, fire a mention or forge the card marker.
 | `secrets.CURSOR_API_KEY` | The axes bill through it. The only secret an axis receives. |
 | `secrets.APPROVER_TOKEN` | Token of the approving identity (needs `pull-requests: write` on the repo, and to be allowed to dismiss reviews if branch protection restricts that). Empty → both phases warn and do nothing; there is deliberately no fallback to an App or `GITHUB_TOKEN`. |
 | cursor-review with `approve_max_severity` set | Without it `approve_gate` is `off` and no axis runs. |
+| cursor-review with `defer_approval: true` | Without it cursor-review approves on severity alone before any axis has judged the PR (see step 1). |
 
 ## Caller
 
@@ -63,6 +73,7 @@ jobs:
     with:
       workflows_ref: <sha>
       approve_max_severity: low
+      defer_approval: true  # only cursor-approve's decide approves
     secrets: inherit
 
   approve-start:

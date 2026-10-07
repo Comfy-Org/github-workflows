@@ -114,6 +114,15 @@ own earlier marked approvals, wherever they are pinned: GitHub counts a
 reviewer's most recent review, so a round-1 APPROVED would otherwise keep
 counting through a degraded re-run at the same head.
 
+``--defer-approval true`` (the workflow's `defer_approval`, for a caller that
+runs cursor-approve's axes after this round): an APPROVE outcome still reports
+``pass``, but posts NO review and resolves NO thread — it withdraws this
+identity's own earlier marked approvals instead, exactly as a no-decision round
+does, so cursor-approve's ``approve-external`` is the only thing that ever
+approves and no severity-only approval can satisfy branch protection while the
+axes judge (or after a failed run that never reaches them). REQUEST_CHANGES is
+unaffected: it approves nothing.
+
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
 judge can steer the round to an approval. The recorded SHA is mutable too — a
@@ -742,6 +751,12 @@ def cmd_decide(args) -> int:
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
+    if event == APPROVE and getattr(args, "defer_approval", "") == "true":
+        # The gate stays `pass` for cursor-approve, whose decide approves (and
+        # resolves threads) only once its axes agree. Withdrawing here also
+        # clears an approval this identity posted before defer was switched on.
+        emit(f"ℹ️ **Auto-approve: deferred** — {reasons[0]}; approval is left to cursor-approve.")
+        return withdraw_own_approvals(args, DEFERRED_MESSAGE)
 
     body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
@@ -1035,6 +1050,7 @@ def withdraw_own_approvals(args, message: str = "", head_sha=None, live_base=Non
 STALE_MESSAGE = "New commits pushed — cursor-review auto-approve withdrawn until the next review round."
 BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve withdrawn until the next review round."
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
+DEFERRED_MESSAGE = "cursor-review defers approval to cursor-approve — auto-approve withdrawn until its axes agree."
 HUMAN_REVIEW_MESSAGE = f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 
 
@@ -1604,10 +1620,12 @@ AXES_PENDING_MESSAGE = "cursor-approve's axes are judging this PR — auto-appro
 
 def cmd_withdraw(args) -> int:
     """cursor-approve.yml's start phase: withdraw this identity's own marked
-    approvals before the axes run. cursor-review's `decide` has ALREADY approved
-    when it reports `approve_gate == 'pass'`, so without this the axes would
-    judge a PR that is approved for their whole run, and branch protection or
-    auto-merge could land it before a red axis withdrew the approval."""
+    approvals before the axes run. Unless the caller passes cursor-review
+    `defer_approval: true` (``--defer-approval``), its `decide` has ALREADY
+    approved when it reports `approve_gate == 'pass'`, so without this the axes
+    would judge a PR that is approved for their whole run, and branch protection
+    or auto-merge could land it before a red axis withdrew the approval. With
+    defer on it is a backstop."""
     if not (args.approver_login or "").strip():
         print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
         return 2
@@ -1634,6 +1652,8 @@ def main() -> int:
     # `<slug>[bot]`, else github-actions[bot]). On APPROVE, only threads it
     # started are auto-resolved; empty = resolve nothing.
     d.add_argument("--poster-login", default="")
+    # `true` = report the gate but never post an APPROVE (see the docstring).
+    d.add_argument("--defer-approval", default="")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)

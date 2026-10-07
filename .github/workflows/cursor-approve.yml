@@ -5,9 +5,11 @@ name: Cursor approve
 # passed (`approve_gate == 'pass'`), then call this TWICE:
 #
 #   phase: start   — before the axis jobs (they `needs:` it): withdraws this
-#                    identity's own approvals — cursor-review's decide has
-#                    ALREADY approved when it reports approve_gate == pass, and
-#                    that approval must not stand while the axes judge — then
+#                    identity's own approvals — unless cursor-review ran with
+#                    `defer_approval: true` (recommended: then this phase's
+#                    decide is the only approver), its decide has ALREADY
+#                    approved when it reports approve_gate == pass, and that
+#                    approval must not stand while the axes judge — then
 #                    writes the status card (every axis pending, or "Round
 #                    limit reached" when cursor-review reported
 #                    approve_gate == capped).
