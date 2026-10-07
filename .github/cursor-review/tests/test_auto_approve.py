@@ -1358,7 +1358,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def test_scope_effective_is_full_unless_the_round_gated_on_delta(self):
         # cursor-approve's approve-external honours non-gating marks only on this
-        # output's `delta`, so every fallback — and every early exit — says `full`.
+        # output's `delta`, so every fallback — and every exit with no decision
+        # standing, before or after the scope resolves — says `full`.
         with tempfile.TemporaryDirectory() as d:
             ledger = os.path.join(d, "ledger.json")
             with open(ledger, "w") as f:
@@ -1373,11 +1374,19 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                 (dict(delta, incremental_state="built", open_anchors=""), 0, "full"),
                 (dict(delta, incremental_state="built"), 0, "delta"),
                 (dict(delta, incremental_state="built", findings=[finding("critical")]), 0, "delta"),
+                (dict(delta, incremental_state="built", defer_approval="true"), 0, "delta"),
                 (dict(delta, incremental_state="none"), 0, "full"),
                 (dict(delta, incremental_state="unavailable"), 0, "full"),
                 (dict(delta, incremental_state="built", approve_scope="full"), 0, "full"),
                 (dict(delta, incremental_state="built", approve_scope="partial"), 2, "full"),
                 (dict(delta, incremental_state="built", max_failed="x"), 2, "full"),
+                # Exits after the scope resolves with no decision standing behind it.
+                (dict(delta, incremental_state="built", heads=(SHA, "b" * 40)), 0, "full"),
+                (dict(delta, incremental_state="built", labels_after=["needs-human-review"]), 0, "full"),
+                (dict(delta, incremental_state="built", post_error="HTTP 502"), 1, "full"),
+                (dict(delta, incremental_state="built", judge_status="error"), 0, "full"),
+                (dict(delta, incremental_state="built", defer_approval="true", heads=(SHA, "b" * 40)),
+                 0, "full"),
             ):
                 with self.subTest(kwargs=kwargs):
                     self.assertEqual(self.run_decide(**kwargs)[0], rc)

@@ -73,8 +73,9 @@ passed the severity gate:
   the PR's author: no review event is posted, though the findings still are.
 
 It also emits ``approve_scope_effective`` — the scope the round gated under after
-``resolve_scope`` and the open-thread snapshot (``delta``, or ``full`` on every fail-closed fallback and on an
-exit before the scope is resolved) — for cursor-approve's ``--approve-scope``.
+``resolve_scope`` and the open-thread snapshot (``delta``, or ``full`` on every fail-closed fallback and
+whenever no decision stands: an exit before the gate decides, a ``none`` decision,
+and every later downgrade to ``untrusted`` or ``capped``) — for cursor-approve's ``--approve-scope``.
 
 Fail-closed rules for ``decide``:
 
@@ -1140,8 +1141,8 @@ def cmd_decide(args) -> int:
     # each decision overwrites it (GITHUB_OUTPUT keeps the last write of a key).
     set_output("approve_gate", GATE_UNTRUSTED)
     # The scope this round gated under, for cursor-approve's approve-external
-    # (`approve_scope_effective`). `full` until resolve_scope says otherwise, so
-    # an early exit never tells a deferred approval to honour non-gating marks.
+    # (`approve_scope_effective`). `full` until a decision stands on a `delta`
+    # scope, so no exit without one tells cursor-approve to honour non-gating marks.
     set_output("approve_scope_effective", SCOPE_FULL)
     try:
         threshold = validate_threshold(args.threshold)
@@ -1203,7 +1204,6 @@ def cmd_decide(args) -> int:
                           _read_optional(getattr(args, "incremental", "") or ""),
                           _read_json_optional(getattr(args, "ledger", "") or ""))
     scope = with_snapshot_anchors(scope, getattr(args, "open_anchors", "") or "", args.commit_sha)
-    set_output("approve_scope_effective", scope.get("scope") or SCOPE_FULL)
 
     try:
         pr = read_pr(args.repo, args.pr_number)
@@ -1232,6 +1232,10 @@ def cmd_decide(args) -> int:
             max_failed,
         )
     set_output("approve_gate", gate)
+    if event != NONE:
+        # Only a decision that ran reports its scope; withdraw_decision() puts
+        # `full` back on every later path that stops standing behind it.
+        set_output("approve_scope_effective", scope.get("scope") or SCOPE_FULL)
     if scope_note_of(reasons):
         emit(f"ℹ️ **Auto-approve scope** — {scope_note_of(reasons)}.")
     if event == NONE:
@@ -1278,7 +1282,7 @@ def cmd_decide(args) -> int:
         # recorded head and base still match. A POST that failed ambiguously (a
         # timeout) may have written an APPROVE anyway; the withdrawal lists live
         # reviews, so it catches that one too.
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
         print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
         return 1
@@ -1300,7 +1304,7 @@ def cmd_decide(args) -> int:
         labelled_now = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
     if moved or (event == APPROVE and labelled_now):
-        set_output("approve_gate", GATE_UNTRUSTED if moved else GATE_CAPPED)
+        withdraw_decision(GATE_UNTRUSTED if moved else GATE_CAPPED)
         why = "the PR head or base moved" if moved else f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"
         try:
             dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
@@ -1339,6 +1343,13 @@ def _read_json_optional(path: str):
     return data if isinstance(data, dict) else None
 
 
+def withdraw_decision(gate: str) -> None:
+    """The round no longer stands behind its decision: downgrade the gate, and
+    report `full` so cursor-approve never honours this round's non-gating marks."""
+    set_output("approve_gate", gate)
+    set_output("approve_scope_effective", SCOPE_FULL)
+
+
 def defer_to_cursor_approve(args, reason: str) -> int:
     """`--defer-approval true` on an APPROVE outcome: post nothing, keep the gate.
 
@@ -1352,7 +1363,7 @@ def defer_to_cursor_approve(args, reason: str) -> int:
     # axes judge, so the gate must not read `pass` over it (same as a failed POST).
     rc = withdraw_own_approvals(args, DEFERRED_MESSAGE)
     if rc:
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
     # Posting path: the APPROVE event supersedes this identity's earlier
     # REQUEST_CHANGES. Nothing is posted here, so dismiss those instead — else a
     # fixed High keeps vetoing the merge until cursor-approve approves, which it
@@ -1369,10 +1380,10 @@ def defer_to_cursor_approve(args, reason: str) -> int:
         head_now = base_now = None  # unknown → treat as moved
         labelled_now = False
     if head_now != args.commit_sha or base_now != args.base_ref:
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
         emit("ℹ️ **Auto-approve: deferred round superseded** — the PR head or base moved.")
     elif labelled_now:
-        set_output("approve_gate", GATE_CAPPED)
+        withdraw_decision(GATE_CAPPED)
         emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
     return rc
 

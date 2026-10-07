@@ -506,8 +506,9 @@ on:
           The scope this run's auto-approve decision actually gated under:
           `delta` only when `approve_scope` was `delta` and the round did not
           fall back to `full` (round 1, an unavailable, discarded or empty
-          incremental block, an unparseable path, an unknown ledger); `full`
-          otherwise, including when no decision ran. Pass it to cursor-approve's
+          incremental block, an unparseable path, an unknown ledger, an
+          unreadable list of earlier open threads); `full` otherwise, including
+          when no decision ran or the round withdrew it (`untrusted`/`capped`). Pass it to cursor-approve's
           `approve_scope` so a deferred approval resolves threads under the
           same rule this round's decide used.
         value: ${{ jobs.post-review.outputs.approve_scope_effective || 'full' }}
