@@ -5,7 +5,8 @@ name: Test cursor-review scripts
 # drive panel consolidation for every consumer repo, so they are cheap to
 # guard with a unit run on change.
 # Inputs/secrets: none. Triggers: path-filtered pull requests and pushes to main.
-# Also runs the .github/cursor-approve/ suite (axis prompts + verdict aggregator).
+# Also runs the .github/cursor-approve/ suite (axis prompts, verdict aggregator
+# and the read-only context proxy).
 # Caller pattern: none; this is repository-local CI, not a reusable workflow.
 #
 # cursor-review.yml itself is in the path filter because two suites read it:
@@ -78,7 +79,9 @@ jobs:
         run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 
       - name: Run cursor-approve script tests
-        # The axis prompts and verdict aggregator behind cursor-approve. That
-        # workflow's decide job reuses cursor-review's auto-approve.py, so the
-        # two suites share this job.
+        # The axis prompts and verdict aggregator behind cursor-approve, plus
+        # context-proxy.py, the read-only Linear/Notion/Slack MCP proxy the axes
+        # query (every network call in its suite is mocked). That workflow's
+        # decide job reuses cursor-review's auto-approve.py, so the suites share
+        # this job.
         run: python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.py' -v

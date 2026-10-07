@@ -387,6 +387,61 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   nobody looked, not that the change is clean. A "nothing" round also **withdraws** the bot's own earlier approvals, so
   a round-1 approval does not keep counting through a degraded re-run.
 
+**Resolving the bot's own nits on approval.** A ruleset that requires every
+conversation resolved would otherwise hold an approval hostage to the Low / Nit
+threads it approved over. So after an APPROVE is posted **and** the post-write
+re-read confirms the head and base did not move (and no `needs-human-review`
+label landed), the approver identity resolves a thread when all of these hold:
+
+1. it is unresolved;
+2. its first comment was posted by the identity that posts the findings — the
+   `bot_app_id` App's `<slug>[bot]`, else `github-actions[bot]` (passed in by the
+   workflow, never read from the thread);
+3. that comment's severity badge is at or below the threshold — unbadged
+   threads are never resolved;
+4. no other account has commented in it — any human reply, or another bot's,
+   leaves it for a person.
+
+Each thread is re-read just before it is touched (a reply that landed since the
+snapshot leaves it for a person), then resolved with `resolveReviewThread`, then
+given a reply — ``Resolved by auto-approve: Low finding, at or below the `low`
+threshold, on commit abc1234.`` (hidden marker `<!-- cursor-review-auto-resolve -->`).
+Resolve comes first so a failed resolve leaves no approver reply behind to make
+the thread look human-touched on every later round.
+If **any** live thread is above the threshold or unbadged, nothing is resolved,
+not even the eligible ones; a REQUEST_CHANGES or "nothing" round resolves nothing.
+A failure on one thread is logged and skipped: it never undoes the approval. A
+round resolves at most 30 threads and stops after 3 failures in a row (a missing
+permission or a rate limit); the rest wait for the next approving round. The step
+summary logs the resolved / skipped-human / skipped-unbadged /
+skipped-above-threshold / failed / deferred counts. Resolving a thread needs the
+approver to have **write access** to the repo (e.g. `APPROVER_TOKEN` from a
+member of a team with write); without it the approval still lands and each
+resolve logs a warning. Withdrawing an approval later does not unresolve anything.
+
+**On the blocking caller, give thread events their own concurrency slot.** A
+resolve made with `APPROVER_TOKEN` or the bot App's token (not `GITHUB_TOKEN`)
+fires `pull_request_review_thread: resolved`, and under the PR-number-only group
+shown above that new run cancels the very run doing the resolving — mid-loop.
+Key thread events apart:
+
+```yaml
+concurrency:
+  group: cursor-review-pr-${{ github.event.pull_request.number }}${{ github.event_name == 'pull_request_review_thread' && format('-thread-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+```
+
+Those runs only re-run the Blocking gate against live thread state, so letting
+them overlap costs nothing.
+
+How later rounds see such a thread: the blocking gate counts it as resolved, and
+the prior-review ledger carries it with `resolved=true` plus the auto-resolve
+reply. The ledger never counts that reply as an *answer*, even when the approver
+is an OWNER / MEMBER / COLLABORATOR account: it gives no technical reason, so it
+neither lets the judge drop the finding nor spends a `repeat_of` slot. In effect
+a finding at or below the threshold is treated as addressed, which is the point
+of the threshold.
+
 The decision step is `continue-on-error`: a refused approval shows as a red
 step with an `::error::`, not as a failed `Post review` job (which the blocking
 gate would read as "the review did not land").

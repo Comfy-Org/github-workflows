@@ -3274,6 +3274,10 @@ jobs:
             export GH_TOKEN="$FALLBACK_TOKEN"
             LOGIN="github-actions[bot]"
           fi
+          # The identity `Post review` posted the findings under — keyed on the
+          # same `bot_token.outputs.token || GITHUB_TOKEN` choice it made, not on
+          # the slug alone: on APPROVE, only threads it started are auto-resolved.
+          if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"; fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" decide \
             --threshold "$THRESHOLD" \
             --findings /tmp/consolidated/consolidated.json \
@@ -3285,7 +3289,8 @@ jobs:
             --ungated "${UNGATED:-0}" \
             --approver-login "$LOGIN" \
             --reviewed-diff /tmp/pr-diff.patch \
-            --base-ref "$BASE_REF"
+            --base-ref "$BASE_REF" \
+            --poster-login "$POSTER"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with

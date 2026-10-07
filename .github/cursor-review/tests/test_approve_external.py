@@ -31,8 +31,14 @@ class FakeGitHub:
         if args[:3] == ["api", "-X", "PUT"]:
             self.dismissed.append(args[3].split("/")[-2])
             return "{}"
-        if "--paginate" in args:
-            return json.dumps([self.reviews])
+        if args[:2] == ["api", "graphql"]:
+            # list_reviews reads through GraphQL (for `lastEditedAt`).
+            nodes = [{"fullDatabaseId": str(r["id"]), "databaseId": r["id"], "state": r.get("state"),
+                      "body": r.get("body"), "lastEditedAt": None, "submittedAt": None, "url": "",
+                      "author": {"__typename": "User", "login": (r.get("user") or {}).get("login", "")}}
+                     for r in self.reviews]
+            return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}})
         self.reads += 1
         head = self.head_after if (self.head_after and self.reads > 1) else self.head
         return json.dumps({"head": {"sha": head}, "base": {"ref": self.base},
@@ -45,7 +51,7 @@ def prior_approval(sha="c" * 40, rid=42):
 
 
 class ApproveExternal(unittest.TestCase):
-    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main"):
+    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster=""):
         if event is None:
             event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,9 +60,13 @@ class ApproveExternal(unittest.TestCase):
                 json.dump({"event": event, "verdicts": verdicts, "axes": {}, "reasons": []}, f)
             out = os.path.join(tmp, "out")
             args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
-                                      approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9")
+                                      approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9",
+                                      threshold=threshold, poster_login=poster)
+            self.resolve_calls = []
             with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
-                    mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+                    mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                    mock.patch.object(aa, "resolve_eligible_threads",
+                                      lambda *a: self.resolve_calls.append(a) or {}):
                 rc = aa.cmd_approve_external(args)
             with open(out, encoding="utf-8") as f:
                 outcome = f.read().strip().split("\n")[-1].split("=", 1)[1]
@@ -140,6 +150,50 @@ class ApproveExternal(unittest.TestCase):
         args.approver_login = " "
         with mock.patch.object(aa, "gh", fake):
             self.assertEqual(aa.cmd_withdraw(args), 2)
+
+    # --- the bot's own at-or-below-threshold threads, as cursor-review's decide ---
+
+    def test_approve_resolves_the_posters_threads(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                                   threshold="Low", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA)])
+
+    def test_none_resolves_nothing(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"},
+                                   threshold="low", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual(self.resolve_calls, [])
+
+    def test_approval_withdrawn_after_post_resolves_nothing(self):
+        fake = FakeGitHub(head_after="d" * 40)
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                                   threshold="low", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual(self.resolve_calls, [])
+
+    def test_superseded_and_needs_human_resolve_nothing(self):
+        for fake in (FakeGitHub(head="d" * 40), FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL])):
+            self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                         threshold="low", poster="cr-bot[bot]")
+            self.assertEqual(self.resolve_calls, [])
+
+    def test_no_threshold_resolves_nothing(self):
+        rc, outcome = self.run_cmd(FakeGitHub(), {"correctness": "green", "conformance": "green"},
+                                   poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(self.resolve_calls, [])
+
+    def test_invalid_threshold_keeps_the_approval_and_resolves_nothing(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                                   threshold="bogus", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(len(fake.posted), 1)
+        self.assertEqual(fake.dismissed, [])
+        self.assertEqual(self.resolve_calls, [])
 
     def test_unreadable_decision_posts_nothing(self):
         self.assertFalse(aa.external_decision_approves(None, ["correctness"]))

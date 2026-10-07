@@ -110,6 +110,8 @@ jobs:
       max_yellow_axes: 0
       round: ${{ needs.cursor-review.outputs.round }}
       max_rounds: ${{ needs.cursor-review.outputs.max_rounds }}
+      approve_max_severity: low
+      poster_login: github-actions[bot]
     secrets:
       APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 ```
@@ -135,6 +137,8 @@ fails to withdraw it skips them, which decide reads as "no result".
 | `round` | `''` | cursor-review's `round` output, for the card heading. |
 | `max_rounds` | `''` | cursor-review's `max_rounds` output, for the card heading. |
 | `approve_gate` | `''` | cursor-review's `approve_gate` output; `capped` makes the start card say a human is needed. |
+| `approve_max_severity` | `''` | Decide phase: the same threshold cursor-review runs with. With `poster_login`, an approval that stands auto-resolves cursor-review's own at-or-below-threshold threads exactly as cursor-review's own approval does. Empty → no thread is resolved. |
+| `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. |
 
 ## Axis inputs
 

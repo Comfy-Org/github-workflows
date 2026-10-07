@@ -33,6 +33,12 @@ name: Cursor approve
 #   round            cursor-review's `round` output
 #   max_rounds       cursor-review's `max_rounds` output
 #   approve_gate     cursor-review's `approve_gate` output (start phase)
+#   approve_max_severity  cursor-review's threshold (decide phase); with
+#                    poster_login, an approval auto-resolves cursor-review's
+#                    own at-or-below-threshold threads, as cursor-review does
+#   poster_login     the login cursor-review posts findings under
+#                    (`<app-slug>[bot]` under its GitHub App, else
+#                    github-actions[bot]); empty = resolve nothing
 # Secrets:
 #   APPROVER_TOKEN   token of the approving identity. Empty → warn and exit 0;
 #                    there is deliberately no fallback to an App or GITHUB_TOKEN.
@@ -67,6 +73,12 @@ on:
         type: string
         default: ''
       approve_gate:
+        type: string
+        default: ''
+      approve_max_severity:
+        type: string
+        default: ''
+      poster_login:
         type: string
         default: ''
     secrets:
@@ -279,11 +291,15 @@ jobs:
           CARD_URL: ${{ steps.card.outputs.card_url }}
           # The base the axes diffed: the same event payload they rendered from.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # Both empty by default: no thread is auto-resolved.
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          POSTER: ${{ inputs.poster_login }}
         run: |
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" approve-external --repo "$REPO" \
             --pr-number "$PR_NUMBER" --commit-sha "$COMMIT_SHA" --axes "$AXES" \
             --decision "$RUNNER_TEMP/decision.json" --approver-login "$LOGIN" \
-            --base-ref "$BASE_REF" --card-url "$CARD_URL"
+            --base-ref "$BASE_REF" --card-url "$CARD_URL" \
+            --threshold "$THRESHOLD" --poster-login "$POSTER"
 
       - name: Write the decide card
         if: always() && steps.token.outputs.present == 'true' && inputs.phase == 'decide' && steps.login.outcome == 'success'
