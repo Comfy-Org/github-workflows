@@ -111,7 +111,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | Input | Default | Notes |
 |---|---|---|
 | `judge_model` | `claude-opus-5-thinking-xhigh` | Consolidates the panel into one review. |
-| `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight validates them against the live catalog). Use for per-repo experiments such as a reasoning-tier A/B. |
+| `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight validates them against the live catalog). Use for per-repo experiments such as a reasoning-tier A/B — and prefer wiring it to a **variable** rather than a literal, see [Running a model experiment](#running-a-model-experiment). |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. Under `blocking: true` it is also not green: an unreviewed PR cannot pass the gate. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
@@ -131,6 +131,51 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
+
+## Running a model experiment
+
+`panel_models` replaces the built-in panel list. Wire it to a **variable**
+rather than a literal, so a reasoning-tier or model-version A/B needs no PR and
+no SHA-bump across the fleet:
+
+```yaml
+    with:
+      panel_models: ${{ vars.CURSOR_PANEL_MODELS }}
+```
+
+An unset variable is exactly today's behaviour — the reusable reads empty as
+"use the built-in list" — so the wiring is inert until you set it. A **repo**
+variable overrides an **org** variable of the same name, so one repo can trial a
+list the rest of the org is not on, and the org value can be set later without
+touching any caller. Revert is `gh variable delete`.
+
+```bash
+gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
+  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
+```
+
+Two things to get right:
+
+**Use Cursor catalog ids, with the tier suffix.** `claude-opus-5-thinking-xhigh`,
+not `claude-opus-5`. If your org keeps model slugs in variables for workflows
+that call a model API directly, those are a *different namespace* — an API slug
+has no tier and the preflight's live-catalog check will reject it. Keep the two
+apart rather than pointing this input at them.
+
+**Change one axis at a time.** A model version and a reasoning tier are separate
+variables; moving both at once leaves the result unattributable. Note also that
+tier names are not uniform across families — some ship `-thinking-*` tiers and
+some do not — so the "same" tier of a newer version may not exist.
+
+Preflight validates every id against the live catalog and fails loud before any
+cell spends, so a typo or a delisted id costs nothing but the preflight job.
+
+`judge_model` is **not** a good fit for the same treatment: its input carries a
+real default, and a caller that passes an explicitly-empty value gets `''`
+rather than that default — so a variable-wired caller would have to restate the
+default and then drift from it. (`catalog-drift.py` also parses that default out
+of the workflow.) Overriding the judge is better done with a literal, or by
+changing the default in the reusable.
 
 ## Gotchas
 
