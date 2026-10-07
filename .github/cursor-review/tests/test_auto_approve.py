@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -1230,7 +1231,8 @@ class ApproveGateTest(unittest.TestCase):
         self.assertIn(
             "value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') "
             "&& 'capped' || "
-            "inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}",
+            "(inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off' || "
+            "jobs.post-review.outputs.approve_gate || 'untrusted' }}",
             text,
         )
         self.assertIn("approve_gate: ${{ steps.approve.outputs.approve_gate }}", text)
@@ -2076,6 +2078,175 @@ class DeferApprovalTest(unittest.TestCase):
         step = step[: step.index("\n\n  dismiss-stale-approval:")]
         self.assertIn("DEFER_APPROVAL: ${{ inputs.defer_approval }}", step)
         self.assertIn('--defer-approval "$DEFER_APPROVAL"', step)
+
+
+class ApproveAuthorsTest(unittest.TestCase):
+    """approve_authors: an unlisted author gets `off` and no review event."""
+
+    def run_decide(self, author_enabled, findings=(), reviews=(), dismissed=None, pr_author="Some-Author", **extra):
+        posted = []
+
+        def fake_gh(args, payload=None):
+            if args[:3] == ["api", "-X", "POST"]:
+                posted.append(payload)
+                return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "PUT"]:
+                if dismissed is not None:
+                    dismissed.append((args[3], payload["message"]))
+                return "{}"
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
+            return json.dumps({"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []})
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, "c.json")
+            dpath = os.path.join(d, "pr.patch")
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": list(PANEL_OK)}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            args = argparse.Namespace(threshold="medium", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status="ok", delivered="true",
+                                      ungated="0", approver_login="cursor-approver",
+                                      reviewed_diff=dpath, base_ref="main",
+                                      author_enabled=author_enabled, pr_author=pr_author, **extra)
+            emitted = []
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                    mock.patch.object(AA, "emit", emitted.append), \
+                    mock.patch("builtins.print", lambda *a, **k: None):
+                rc = AA.cmd_decide(args)
+            return rc, read_outputs(out).get("approve_gate"), [p["event"] for p in posted], emitted
+
+    def test_unlisted_author_is_off_with_no_review_event(self):
+        for findings in ((), [finding("critical")]):
+            with self.subTest(findings=findings):
+                rc, gate, events, emitted = self.run_decide("false", findings)
+                self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
+                self.assertTrue(any("auto-approve not enabled for author Some-Author" in e for e in emitted))
+
+    def test_unlisted_author_withdraws_own_approval_and_change_request(self):
+        # Narrowing approve_authors moves no head SHA, so dismiss-stale keeps an
+        # approval — or a REQUEST_CHANGES veto — posted at the current head.
+        def own(rid, state):
+            body = AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")
+            return {"id": rid, "user": {"login": "cursor-approver"}, "state": state,
+                    "commit_id": SHA, "body": body, "edited": False}
+        dismissed = []
+        rc, gate, events, _ = self.run_decide(
+            "false", reviews=[own(1, "APPROVED"), own(2, "CHANGES_REQUESTED")], dismissed=dismissed)
+        self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
+        self.assertEqual(sorted(dismissed), [("repos/o/r/pulls/1/reviews/1/dismissals", AA.AUTHOR_OFF_MESSAGE),
+                                             ("repos/o/r/pulls/1/reviews/2/dismissals", AA.AUTHOR_OFF_MESSAGE)])
+
+    def test_unexpected_author_enabled_fails_closed(self):
+        for value in ("0", "no", "1", "unknown"):
+            with self.subTest(value=value):
+                rc, gate, events, _ = self.run_decide(value)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_invalid_inputs_fail_red_for_an_unlisted_author_too(self):
+        for extra in ({"max_failed_reviewers": "1.5"}, {"approve_scope": "bogus"}):
+            with self.subTest(extra=extra):
+                rc, gate, events, _ = self.run_decide("false", **extra)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_decision_note_keeps_underscore_logins(self):
+        _, _, _, emitted = self.run_decide("false", pr_author="mona_acme")
+        self.assertTrue(any("for author mona_acme " in e for e in emitted))
+
+    def test_listed_or_unrestricted_author_gets_the_normal_decision(self):
+        for enabled in ("true", ""):
+            with self.subTest(enabled=enabled):
+                self.assertEqual(self.run_decide(enabled)[:3], (0, AA.GATE_PASS, [AA.APPROVE]))
+                rc, gate, events, _ = self.run_decide(enabled, [finding("critical")])
+                self.assertEqual((gate, events), (AA.GATE_FAIL, [AA.REQUEST_CHANGES]))
+
+    def test_invalid_threshold_still_fails_red_for_an_unlisted_author(self):
+        args = argparse.Namespace(threshold="high", author_enabled="false", pr_author="x")
+        with mock.patch("builtins.print", lambda *a, **k: None):
+            self.assertEqual(AA.cmd_decide(args), 2)
+
+    @staticmethod
+    def _workflow():
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            return f.read()
+
+    def gate_step(self):
+        src = self._workflow()
+        step = src[src.index("- name: Resolve the auto-approve author opt-in"):]
+        step = step[: step.index("\n      - name:")]
+        script = step[step.index("run: |\n") + len("run: |\n"):]
+        return "\n".join(line[10:] for line in script.splitlines())
+
+    def resolve(self, authors, author):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": out,
+                   "APPROVE_AUTHORS": authors, "PR_AUTHOR": author}
+            subprocess.run(["bash", "-e", "-c", self.gate_step()], env=env, check=True,
+                           capture_output=True, cwd=d)
+            return read_outputs(out).get("approve_author_ok")
+
+    def resolve_with_glob_bait(self, authors, author):
+        # A file named after the author: without `set -f`, an unquoted `*` in
+        # the list would expand to it and match.
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            open(os.path.join(d, author), "w").close()
+            env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": out,
+                   "APPROVE_AUTHORS": authors, "PR_AUTHOR": author}
+            subprocess.run(["bash", "-e", "-c", self.gate_step()], env=env, check=True,
+                           capture_output=True, cwd=d)
+            return read_outputs(out).get("approve_author_ok")
+
+    def test_gate_step_resolves_the_list(self):
+        cases = [
+            ("", "anyone", "true"),
+            ("  ", "anyone", "true"),
+            # A non-empty list that names nobody fails closed.
+            (",", "anyone", "false"),
+            ("@", "anyone", "false"),
+            (" , @ ,", "anyone", "false"),
+            ("mattmillerai", "mattmillerai", "true"),
+            ("alice, MattMillerAI", "mattmillerai", "true"),
+            ("alice bob,@carol", "Carol", "true"),
+            ("alice\nbob", "bob", "true"),
+            ("alice,bob", "mallory", "false"),
+            # No PR author (a non-PR event): left unset, not `false`.
+            ("alice", "", None),
+            ("", "", "true"),
+            ("alice-bob", "alice", "false"),
+        ]
+        for authors, author, want in cases:
+            with self.subTest(authors=authors, author=author):
+                self.assertEqual(self.resolve(authors, author), want)
+
+    def test_gate_step_does_not_glob_the_list(self):
+        self.assertEqual(self.resolve_with_glob_bait("*", "mallory"), "false")
+
+    def test_workflow_wiring(self):
+        src = self._workflow()
+        declared = src[src.index("\n      approve_authors:\n"):]
+        declared = declared[: declared.index("\n      approve_scope:\n")]
+        self.assertIn("type: string", declared)
+        self.assertIn("default: ''", declared)
+        self.assertIn("approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}", src)
+        # The workflow-level output says `off` for an unlisted author, round or not.
+        self.assertIn("(inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off'", src)
+        step = src[src.index("- name: Auto-approve decision"):]
+        step = step[: step.index("\n\n  dismiss-stale-approval:")]
+        self.assertIn("AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}", step)
+        self.assertIn('--author-enabled "$AUTHOR_ENABLED"', step)
+        self.assertIn('--pr-author "$PR_AUTHOR"', step)
+        self.assertIn("needs: [gate, consolidate, ledger, diff-size]", src)
+        # No "not blocking auto-approve" marks for an author no decision is taken for.
+        self.assertIn("APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}", src)
 
 
 class AutoResolveWiringTest(unittest.TestCase):

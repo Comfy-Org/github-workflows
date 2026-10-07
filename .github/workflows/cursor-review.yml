@@ -339,6 +339,24 @@ on:
         type: string
         required: false
         default: ''
+      approve_authors:
+        description: >-
+          Per-author opt-in for auto-approve. A comma- or space-separated list
+          of GitHub logins (case-insensitive; a leading `@` is ignored). ''
+          (default) → every author, the behaviour before this input existed.
+          Otherwise a PR whose author (`pull_request.user.login`) is not listed
+          gets auto-approve OFF: `approve_gate` is `off`, no APPROVE or
+          REQUEST_CHANGES is posted (the decision note says "auto-approve not
+          enabled for author <login>"), and the panel still reviews and posts
+          its threads. `Dismiss stale auto-approval` still withdraws an earlier
+          marked approval as usual. No effect unless `approve_max_severity` is
+          set. Pass a repo variable (e.g. `vars.CURSOR_APPROVE_AUTHORS`) to
+          change it without a PR — and note it is read from the caller at the
+          PR's head, like `approve_max_severity`, so it is no stronger than
+          push access either.
+        type: string
+        required: false
+        default: ''
       approve_scope:
         description: >-
           What an auto-approve round after the first gates on. `delta`
@@ -461,8 +479,9 @@ on:
           skipped or already-reviewed event), `capped` (the `max_rounds` cap was
           hit this run, or the PR carries `needs-human-review` while
           `max_rounds` or `approve_max_severity` is set), `off`
-          (`approve_max_severity` is empty and the cap was not hit).
-        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
+          (`approve_max_severity` is empty, or `approve_authors` does not list
+          the PR's author, and the cap was not hit).
+        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || (inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
       round:
         description: >-
           The 1-based number of the review round this run delivered, counted
@@ -567,7 +586,46 @@ jobs:
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
+      approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
     steps:
+      - name: Resolve the auto-approve author opt-in
+        # approve_authors, resolved ONCE here so the workflow-level
+        # `approve_gate` output (which must say `off` on every event, round or
+        # not) and `Auto-approve decision` read the same answer. Runs on every
+        # event, before any skip below. `false` when a non-empty list does not
+        # name the PR author — including a list that names nobody (`,`, `@`):
+        # a restriction that evaluates empty fails closed. An empty (or
+        # all-whitespace) list is everyone. No PR author (a non-PR event) leaves
+        # the output unset, so `approve_gate` keeps its "no round" meaning.
+        id: author
+        env:
+          APPROVE_AUTHORS: ${{ inputs.approve_authors }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -f  # the list is caller text: no glob expansion of its words
+          if [ -z "$(printf '%s' "$APPROVE_AUTHORS" | tr -d '[:space:]')" ]; then
+            echo "approve_authors is empty — no author restriction."
+            echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$PR_AUTHOR" ]; then
+            echo "No PR author on this event — approve_authors not evaluated."
+            exit 0
+          fi
+          author="$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')"
+          listed=false
+          for login in $(printf '%s' "$APPROVE_AUTHORS" | tr ',' ' '); do
+            login="$(printf '%s' "${login#@}" | tr '[:upper:]' '[:lower:]')"
+            [ -n "$login" ] || continue
+            if [ "$login" = "$author" ]; then listed=true; fi
+          done
+          if [ "$listed" = true ]; then
+            echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approve_authors does not list the PR author '$PR_AUTHOR' — auto-approve is off for this PR."
+            echo "approve_author_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check trigger label
         id: check
         env:
@@ -2876,7 +2934,7 @@ jobs:
     # job writes has to record the merge base THIS round's reviewed diff was taken
     # against. Already a transitive dependency (consolidate → review → diff-size), so
     # this adds no ordering, only the outputs.
-    needs: [consolidate, ledger, diff-size]
+    needs: [gate, consolidate, ledger, diff-size]
     # `!cancelled()` rather than `always()`, for the same reason
     # `over-cap-comment` documents at its own `if:`: the documented caller sets
     # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
@@ -3159,7 +3217,9 @@ jobs:
           LEDGER_DOWNLOAD_JUDGE: ${{ steps.meta.outputs.ledger_download }}
           # approve_scope: post-review.py marks the threads auto-approve will not
           # count, from the same inputs `Auto-approve decision` passes below.
-          APPROVE_THRESHOLD: ${{ inputs.approve_max_severity }}
+          # Empty for an author approve_authors does not list: no decision is
+          # taken for them, so no thread may claim it is "not blocking" one.
+          APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
         run: |
@@ -3336,6 +3396,10 @@ jobs:
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
           MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
+          # approve_authors, resolved by `gate`: `false` → decide posts nothing
+          # and reports `off` for this author.
+          AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3372,7 +3436,9 @@ jobs:
             --incremental /tmp/pr-diff-new.patch \
             --incremental-state "$INCREMENTAL_STATE" \
             --ledger /tmp/ledger/ledger.json \
-            --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}"
+            --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}" \
+            --author-enabled "$AUTHOR_ENABLED" \
+            --pr-author "$PR_AUTHOR"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with

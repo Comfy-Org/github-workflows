@@ -66,11 +66,15 @@ passed the severity gate:
   the head moved while the review was being posted;
 * ``capped`` — the PR carries ``needs-human-review`` (set by ``round-cap``, or
   by a human): it is never approved;
-* ``off`` — set by the workflow itself when `approve_max_severity` is empty.
+* ``off`` — set by the workflow itself when `approve_max_severity` is empty, and
+  by ``decide`` (``--author-enabled false``) when `approve_authors` does not list
+  the PR's author: no review event is posted, though the findings still are.
 
 Fail-closed rules for ``decide``:
 
 * the threshold is not one of ``medium``, ``low``, ``nit`` → exit 2, red;
+* ``--author-enabled`` is anything but ``true``, ``false`` or empty → exit 2,
+  red, earlier approvals withdrawn;
 * the PR carries ``needs-human-review`` → no review event, ``capped``.
 
 An untrusted round submits NO review event — neither approve nor request changes
@@ -985,6 +989,38 @@ def cmd_decide(args) -> int:
         # earlier round's approval does not keep satisfying branch protection.
         withdraw_own_approvals(args)
         return 2
+    try:
+        requested_scope = validate_scope(getattr(args, "approve_scope", "") or "")
+    except ValueError as e:
+        print(f"::error::{e}")
+        return 2
+    # Every decision input is validated above, so a caller misconfiguration
+    # fails red the same way whoever opened the PR.
+    author_enabled = (getattr(args, "author_enabled", "") or "").strip().lower()
+    if author_enabled not in ("", "true", "false"):
+        # Only the gate job's `true`/`false` (or nothing, for no restriction) is
+        # meaningful: anything else is a wiring fault, never a silent opt-in.
+        print(f"::error::--author-enabled must be 'true', 'false' or empty, got {args.author_enabled!r}")
+        withdraw_own_approvals(args)
+        return 2
+    if author_enabled == "false":
+        # approve_authors (resolved in the workflow's `gate` job) does not list
+        # this PR's author: auto-approve is off for the PR, exactly as if
+        # approve_max_severity were empty. No review event is posted, and this
+        # identity's own earlier verdicts are withdrawn: narrowing the list
+        # (e.g. via a repo variable) moves no head SHA, so dismiss-stale would
+        # leave an approval — or a REQUEST_CHANGES veto — at the current head.
+        set_output("approve_gate", GATE_OFF)
+        login = re.sub(r"[^A-Za-z0-9_\-\[\]]", "", getattr(args, "pr_author", "") or "") or "?"
+        emit(f"ℹ️ **Auto-approve: off** — auto-approve not enabled for author {login} (not in `approve_authors`).")
+        rc = withdraw_own_approvals(args, AUTHOR_OFF_MESSAGE)
+        if rc:
+            # An approval that could not be withdrawn still satisfies branch
+            # protection: the gate must not read `off` over it.
+            set_output("approve_gate", GATE_UNTRUSTED)
+        if dismiss_own_change_requests(args, AUTHOR_OFF_MESSAGE):
+            rc = 1
+        return rc
     with open(args.findings, encoding="utf-8") as f:
         data = json.load(f)
     findings = data.get("findings") or []
@@ -993,11 +1029,6 @@ def cmd_decide(args) -> int:
         ungated = int(args.ungated or 0)
     except ValueError:
         ungated = 1  # unparseable → assume something missed a thread
-    try:
-        requested_scope = validate_scope(getattr(args, "approve_scope", "") or "")
-    except ValueError as e:
-        print(f"::error::{e}")
-        return 2
     scope = resolve_scope(requested_scope, getattr(args, "incremental_state", "") or "",
                           _read_optional(getattr(args, "incremental", "") or ""),
                           _read_json_optional(getattr(args, "ledger", "") or ""))
@@ -1174,7 +1205,7 @@ def defer_to_cursor_approve(args, reason: str) -> int:
     return rc
 
 
-def dismiss_own_change_requests(args) -> int:
+def dismiss_own_change_requests(args, message: str = "") -> int:
     """Dismiss this identity's own unedited, marked REQUEST_CHANGES reviews.
     An edited one is someone else's words (see _stale_approvals) and stays."""
     login = (args.approver_login or "").strip().lower()
@@ -1191,7 +1222,7 @@ def dismiss_own_change_requests(args) -> int:
     failed = []
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid, PASSED_MESSAGE)
+            dismiss(args.repo, args.pr_number, rid, message or PASSED_MESSAGE)
         except RuntimeError as e:
             failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
     if ids:
@@ -1429,6 +1460,7 @@ BASE_CHANGED_MESSAGE = "The base branch changed — cursor-review auto-approve w
 UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to approve — auto-approve withdrawn until a round that can."
 DEFERRED_MESSAGE = "cursor-review defers approval to cursor-approve — auto-approve withdrawn until its axes agree."
 PASSED_MESSAGE = "The latest cursor-review round passed its severity threshold — request for changes withdrawn; approval is left to cursor-approve."
+AUTHOR_OFF_MESSAGE = "cursor-review auto-approve is not enabled for this PR's author (`approve_authors`) — earlier auto-approve verdict withdrawn."
 HUMAN_REVIEW_MESSAGE = f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 SKIP_REVIEW_WITHDRAWN_MESSAGE = f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 
@@ -2107,6 +2139,11 @@ def main() -> int:
     d.add_argument("--ledger", default="")
     # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
     d.add_argument("--max-failed-reviewers", default="0")
+    # approve_authors, as resolved by the workflow's `gate` job: `false` = the PR
+    # author is not listed, so auto-approve is off for this PR. Anything else
+    # (including the default empty) = decide as usual.
+    d.add_argument("--author-enabled", default="")
+    d.add_argument("--pr-author", default="")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
