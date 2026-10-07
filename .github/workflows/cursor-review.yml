@@ -345,10 +345,11 @@ on:
           (default) → a finding above `approve_max_severity` blocks only when it
           sits inside a hunk of the verified incremental block (the changes
           since the last reviewed commit), re-raises an earlier finding whose
-          thread is still unresolved, or is High/Critical anywhere in the
-          reviewed diff. Every other finding is still posted, as a thread
-          marked "Outside this round's changes: not blocking auto-approve",
-          and is never auto-resolved. Round 1, an incremental block that was
+          thread is still unresolved (named in `repeat_of`, or on the path and
+          line of an earlier round's still-open thread), or is High/Critical
+          anywhere in the reviewed diff. Every other finding is still posted,
+          as a thread marked "Outside this round's changes: not blocking
+          auto-approve", and is never auto-resolved. Round 1, an incremental block that was
           unavailable or discarded, and an unknown prior-review ledger all
           fail closed to `full`. `full` → every finding counts, wherever it
           sits (the behaviour before this input existed). The panel reviews

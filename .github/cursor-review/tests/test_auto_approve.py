@@ -2207,6 +2207,87 @@ class ApproveScopeTest(unittest.TestCase):
         resolved = dict(repeat, repeat_of=RESOLVED_URL)
         self.assertEqual(self.gate([resolved], self.scope())[0], "APPROVE")
 
+    def anchored(self, scope, threads):
+        with mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)):
+            return AA.with_open_anchors(scope, "o/r", 1, SHA)
+
+    @staticmethod
+    def earlier(path="app/other.py", line=3, start=None, commit="b" * 40, **kw):
+        node = thread("earlier", "medium", **kw)
+        first = node["comments"]["nodes"][0]
+        first["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        first["originalCommit"] = {"oid": commit}
+        return dict(node, path=path, line=line, startLine=start)
+
+    def test_reraise_without_repeat_of_on_an_open_non_gating_thread_is_not_approved(self):
+        # Round N-1 marked a Medium outside its delta non-gating; nobody answered
+        # it, so the judge re-raises it in round N with no repeat_of, again
+        # outside the delta. The open marked thread is skipped under `delta`, so
+        # only the anchor match stands between this round and an APPROVE.
+        reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
+        earlier = self.earlier()
+        self.assertTrue(AA.is_non_gating_thread(earlier["comments"]["nodes"][0]["body"]))
+        self.assertEqual(self.gate([reraise], self.scope(), threads=[("medium", True)])[0], "APPROVE")
+        scope = self.anchored(self.scope(), [earlier])
+        event, gate, reasons, blocking = self.gate([reraise], scope, threads=[("medium", True)])
+        self.assertEqual((event, gate, blocking), ("REQUEST_CHANGES", "fail", [reraise]))
+        self.assertIn("unresolved earlier thread", reasons[-1])
+        self.assertFalse(AA.non_gating(reraise, "low", scope))
+
+    def test_anchor_match_ignores_this_rounds_closed_and_elsewhere_threads(self):
+        reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
+        for name, node in (("this round's own thread", self.earlier(commit=SHA)),
+                           ("resolved", self.earlier(resolved=True)),
+                           ("outdated", self.earlier(outdated=True)),
+                           ("another line", self.earlier(line=4)),
+                           ("another file", self.earlier(path="app/handler.py")),
+                           ("not cursor-review's", self.earlier(marker=False)),
+                           ("no line", self.earlier(line=None))):
+            with self.subTest(name):
+                scope = self.anchored(self.scope(), [node])
+                self.assertEqual(self.gate([reraise], scope)[0], "APPROVE")
+
+    def test_anchor_match_covers_a_multi_line_thread(self):
+        scope = self.anchored(self.scope(), [self.earlier(line=9, start=5)])
+        self.assertEqual(scope["open"], {"app/other.py": [(5, 9)]})
+        for line, event in ((5, "REQUEST_CHANGES"), (9, "REQUEST_CHANGES"), (10, "APPROVE")):
+            with self.subTest(line=line):
+                finding = {"severity": "medium", "file": "app/other.py", "line": line}
+                self.assertEqual(self.gate([finding], scope)[0], event)
+
+    def test_anchors_are_read_only_under_delta(self):
+        full = self.scope(requested="full")
+        with mock.patch.object(AA, "_load_gate_unresolved", side_effect=AssertionError("read")):
+            self.assertIs(AA.with_open_anchors(full, "o/r", 1, SHA), full)
+
+    def test_post_review_leaves_a_reraise_on_an_open_thread_unmarked(self):
+        post_review = AA._load_post_review()
+        with tempfile.TemporaryDirectory() as d:
+            inc, led = os.path.join(d, "inc.patch"), os.path.join(d, "ledger.json")
+            with open(inc, "w", encoding="utf-8") as f:
+                f.write(_fixture_text())
+            with open(led, "w", encoding="utf-8") as f:
+                json.dump(_ledger(), f)
+            args = argparse.Namespace(approve_threshold="low", approve_scope="delta", incremental=inc,
+                                      incremental_state="built", ledger=led, repo="o/r",
+                                      pr_number="1", commit_sha=SHA)
+            reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
+            # post-review loads its own copies of both scripts, so stub the one
+            # thing they share: the `gh api graphql` call under iter_threads.
+            page = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [self.earlier()]}}}}}
+            ok = mock.Mock(returncode=0, stdout=json.dumps(page), stderr="")
+            with mock.patch("subprocess.run", return_value=ok) as run:
+                predicate = post_review.load_non_gating(args)
+            self.assertIn("graphql", run.call_args[0][0])
+            self.assertFalse(predicate(reraise))
+            self.assertTrue(predicate(dict(reraise, line=30)))
+            # An unreadable thread list marks nothing (the fail-closed direction).
+            failed = mock.Mock(returncode=1, stdout="", stderr="boom")
+            with mock.patch("subprocess.run", return_value=failed):
+                self.assertIsNone(post_review.load_non_gating(args))
+
     def test_discarded_or_missing_block_fails_closed_to_full(self):
         outside = {"severity": "medium", "file": "app/other.py", "line": 3}
         for kwargs in ({"state": "discarded"}, {"state": "unavailable"}, {"state": ""},

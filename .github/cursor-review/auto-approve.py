@@ -242,8 +242,11 @@ def _load_incremental_diff():
 # On a round after the first, a finding above the threshold counts toward the
 # gate under `delta` only when it is IN the verified incremental block (its path
 # and line fall inside one of that block's new-side hunks), a LIVE REPEAT (its
-# `repeat_of` names an earlier thread the ledger reads as unresolved), or SEVERE
-# (High/Critical, or a severity nobody recognises) anywhere in the reviewed diff.
+# `repeat_of` names an earlier thread the ledger reads as unresolved, OR its path
+# and line sit on an earlier round's still-open thread — the judge only emits
+# `repeat_of` for an ANSWERED entry, so the anchor match is what catches a re-raise
+# of an unanswered one), or SEVERE (High/Critical, or a severity nobody
+# recognises) anywhere in the reviewed diff.
 # Everything else is still posted, as a thread carrying NON_GATING_MARKER, but
 # does not block — and that thread is never auto-resolved, so it stays for a human.
 #
@@ -326,6 +329,47 @@ def resolve_scope(requested: str, incremental_state: str, incremental_text, ledg
     return {"scope": SCOPE_DELTA, "note": "", "ranges": hunk_ranges(incremental_text), "live": live_thread_urls(ledger)}
 
 
+def earlier_thread_anchors(threads, head_sha: str) -> dict:
+    """{path: [(first, last), ...]} of every open cursor-review thread from an earlier round. Pure.
+
+    Open means unresolved and not outdated, so `line` is on the current head.
+    "Earlier" is a thread opened on a commit other than `head_sha`: this round's
+    own threads are opened on the reviewed head, so without that filter every
+    finding would match the thread it just posted. A `delta` round always has a
+    last-reviewed commit that differs from the head, so an earlier round's
+    threads are on another commit — except after a force-push back to a head an
+    even earlier round reviewed, where they are skipped (the pre-anchor
+    behaviour), never over-counted.
+    """
+    gate = _load_gate_unresolved()
+    out = {}
+    for thread in threads:
+        if not gate.is_cursor_thread(thread) or thread.get("isResolved") or thread.get("isOutdated"):
+            continue
+        first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+        commit = (first.get("originalCommit") or {}).get("oid")
+        path, last = thread.get("path"), thread.get("line")
+        if not commit or commit == head_sha or not isinstance(path, str) or not isinstance(last, int):
+            continue
+        start = thread.get("startLine")
+        start = start if isinstance(start, int) and start <= last else last
+        out.setdefault(path, []).append((start, last))
+    return out
+
+
+def with_open_anchors(scope: dict, repo: str, pr: int, head_sha: str) -> dict:
+    """`scope` plus the earlier open-thread anchors gating_reason() matches. `delta` only.
+
+    Reads the PR's threads; a failure propagates, so the caller fails closed
+    (decide: untrusted; post-review: marks nothing non-gating).
+    """
+    if (scope or {}).get("scope") != SCOPE_DELTA:
+        return scope
+    owner, _, name = repo.partition("/")
+    threads = _load_gate_unresolved().iter_threads(owner, name, pr)
+    return {**scope, "open": earlier_thread_anchors(threads, head_sha)}
+
+
 def gating_reason(finding, scope: dict):
     """Why `finding` counts toward the gate, or None when it does not. Pure."""
     if not isinstance(finding, dict):
@@ -347,7 +391,11 @@ def gating_reason(finding, scope: dict):
     except (TypeError, ValueError):
         return "no usable line anchor"
     path = finding.get("file")
-    for first, last in scope.get("ranges", {}).get(path, ()) if isinstance(path, str) else ():
+    path = path if isinstance(path, str) else None
+    for first, last in scope.get("open", {}).get(path, ()):
+        if first <= line <= last:
+            return "on an unresolved earlier thread's line"
+    for first, last in scope.get("ranges", {}).get(path, ()):
         if first <= line <= last:
             return "inside this round's changes"
     return None
@@ -1007,6 +1055,7 @@ def cmd_decide(args) -> int:
         live_head, live_base = pr_head_base(pr)
         human_review = has_label(pr, HUMAN_REVIEW_LABEL)
         prior = open_thread_severities(args.repo, int(args.pr_number))
+        scope = with_open_anchors(scope, args.repo, int(args.pr_number), args.commit_sha)
     except (RuntimeError, SystemExit, ValueError) as e:
         # run_graphql exits 2 on a query failure; neither read may go unseen.
         event, gate, reasons, blocking = NONE, GATE_UNTRUSTED, [f"could not read the PR state ({e or 'thread query failed'})"], []

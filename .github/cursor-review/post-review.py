@@ -2600,7 +2600,10 @@ def load_non_gating(args):
             approve._read_optional(getattr(args, "incremental", "") or ""),
             approve._read_json_optional(getattr(args, "ledger", "") or ""),
         )
-    except Exception as e:  # noqa: BLE001 - fail closed: mark nothing
+        # The earlier open-thread anchors decide matches too, read before this
+        # round's threads exist; decide skips those by their opening commit.
+        scope = approve.with_open_anchors(scope, args.repo, int(args.pr_number), args.commit_sha)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - fail closed: mark nothing
         print(f"Could not resolve approve_scope, marking no finding non-gating: {e}", file=sys.stderr)
         return None
     if scope["scope"] != approve.SCOPE_DELTA:
