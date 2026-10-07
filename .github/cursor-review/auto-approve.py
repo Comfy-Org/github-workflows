@@ -88,6 +88,14 @@ On a trusted round:
   cannot be approved over;
 * else → APPROVE.
 
+After an APPROVE that survived the post-write head/base re-check — and only
+then — the poster's own threads (``--poster-login``) whose badge is at or below
+the threshold, and in which no other account has commented, get a reply from the
+approver identity (``AUTO_RESOLVE_MARKER``) and are resolved, so a ruleset that
+requires resolved conversations does not hold the approval hostage to nits. If
+any live thread is above the threshold or unbadged, nothing is resolved. A
+failure on one thread is logged and skipped; it never undoes the approval.
+
 An untrusted round (or an open blocking thread) also WITHDRAWS this identity's
 own earlier marked approvals, wherever they are pinned: GitHub counts a
 reviewer's most recent review, so a round-1 APPROVED would otherwise keep
@@ -410,6 +418,154 @@ def open_thread_severities(repo: str, pr: int) -> list:
     return out
 
 
+AUTO_RESOLVE_MARKER = "<!-- cursor-review-auto-resolve -->"
+RESOLVED = "resolved"
+SKIP_HUMAN = "skipped-human"
+SKIP_UNBADGED = "skipped-unbadged"
+SKIP_ABOVE = "skipped-above-threshold"
+NOT_OURS = "not-ours"  # resolved already, or not a thread the poster started
+
+REPLY_MUTATION = """
+mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment { id }
+  }
+}
+"""
+RESOLVE_MUTATION = """
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } }
+}
+"""
+
+
+def author_login(node) -> str:
+    """REST-shaped login of a GraphQL comment author: a Bot gets its `[bot]`
+    suffix back (GraphQL drops it), so it compares equal to the login the
+    workflow passes in and never to a user account of the same name."""
+    author = (node or {}).get("author") or {}
+    login = author.get("login") or ""
+    if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+        login += "[bot]"
+    return login
+
+
+def classify_thread(thread: dict, poster_login: str, threshold: str, gate=None):
+    """(verdict, severity) for one review thread under the auto-resolve rule.
+
+    RESOLVED only when ALL hold: unresolved; a cursor-review consolidated
+    thread whose first comment `poster_login` wrote; that comment carries a
+    badge at or below `threshold`; and no other account commented in it. The
+    poster is passed in, never read from thread content.
+    """
+    gate = gate or _load_gate_unresolved()
+    if thread.get("isResolved") or not gate.is_cursor_thread(thread):
+        return NOT_OURS, None
+    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+    if not poster_login or author_login(first).lower() != poster_login.lower():
+        return NOT_OURS, None
+    severity = thread_severity(first.get("body") or "")
+    if severity is None:
+        return SKIP_UNBADGED, None
+    if above_threshold(severity, threshold):
+        return SKIP_ABOVE, severity
+    participants = thread.get("participants") or {}
+    nodes = participants.get("nodes") or []
+    # Every comment must be visible to prove nobody else spoke: a missing page,
+    # a short page or a deleted (null) author all leave the thread for a person.
+    if not nodes or participants.get("totalCount") != len(nodes) or any(
+        author_login(n).lower() != poster_login.lower() for n in nodes
+    ):
+        return SKIP_HUMAN, severity
+    return RESOLVED, severity
+
+
+def plan_thread_resolution(threads: list, poster_login: str, threshold: str):
+    """([(thread, severity)] to resolve, {verdict: count}). Pure.
+
+    All-or-nothing on the PR's state: if ANY live (unresolved, non-outdated)
+    cursor-review thread is above the threshold or unbadged, the PR is not
+    approvable and nothing is resolved — not even the eligible ones. decide()
+    already refuses to APPROVE in that state; this re-checks it against the
+    threads read after the approval, for any caller that reaches here.
+    """
+    gate = _load_gate_unresolved()
+    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0}
+    blocked = False
+    plan = []
+    for thread in threads:
+        if gate.is_cursor_thread(thread) and not thread.get("isResolved") and not thread.get("isOutdated"):
+            first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+            live = thread_severity(first.get("body") or "")
+            if live is None or above_threshold(live, threshold):
+                blocked = True
+        verdict, severity = classify_thread(thread, poster_login, threshold, gate)
+        if verdict == NOT_OURS:
+            continue
+        counts[verdict] += 1
+        if verdict == RESOLVED:
+            plan.append((thread, severity))
+    if blocked:
+        counts[SKIP_ABOVE] += len(plan)
+        counts[RESOLVED] = 0
+        return [], counts
+    return plan, counts
+
+
+def resolve_reply(severity: str, threshold: str, commit_sha: str) -> str:
+    return (f"Resolved by auto-approve: {severity.capitalize()} finding, at or below the "
+            f"`{threshold}` threshold, on commit {(commit_sha or '')[:7]}.\n\n{AUTO_RESOLVE_MARKER}")
+
+
+def _graphql(query: str, **variables) -> dict:
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for key, value in variables.items():
+        args += ["-f", f"{key}={value}"]
+    data = json.loads(gh(args))
+    if data.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {data['errors']}")
+    return data
+
+
+def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str) -> dict:
+    """Reply to and resolve the poster's own at-or-below-threshold threads.
+
+    Call ONLY after an APPROVE has been posted and the head re-checked. Every
+    failure is logged and skipped: nothing here is fatal, and nothing here undoes
+    the approval. Returns the counts it logged (plus ``failed``).
+    """
+    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, "failed": 0}
+    if not poster_login:
+        emit("Auto-resolve: skipped — no cursor-review poster login was passed.")
+        return counts
+    gate = _load_gate_unresolved()
+    owner, _, name = repo.partition("/")
+    try:
+        threads = list(gate.iter_threads(owner, name, int(pr)))
+        plan, planned = plan_thread_resolution(threads, poster_login, threshold)
+    except (RuntimeError, SystemExit, ValueError, KeyError, TypeError) as e:
+        print(f"::warning::Auto-resolve: could not read this PR's review threads, so none were resolved: {e or 'thread query failed'}")
+        return counts
+    counts.update(planned)
+    counts[RESOLVED] = 0
+    for thread, severity in plan:
+        thread_id = thread.get("id") or ""
+        try:
+            if not thread_id:
+                raise RuntimeError("thread has no node id")
+            _graphql(REPLY_MUTATION, threadId=thread_id, body=resolve_reply(severity, threshold, commit_sha))
+            _graphql(RESOLVE_MUTATION, threadId=thread_id)
+        except (RuntimeError, ValueError) as e:
+            counts["failed"] += 1
+            print(f"::warning::Auto-resolve: could not resolve thread {thread_id or '?'}: {e}")
+            continue
+        counts[RESOLVED] += 1
+    emit(f"Auto-resolve: resolved {counts[RESOLVED]}, skipped-human {counts[SKIP_HUMAN]}, "
+         f"skipped-unbadged {counts[SKIP_UNBADGED]}, skipped-above-threshold {counts[SKIP_ABOVE]}, "
+         f"failed {counts['failed']}.")
+    return counts
+
+
 def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "",
                 base_ref: str = "") -> str:
     lines = [APPROVE_MARKER]
@@ -550,6 +706,11 @@ def cmd_decide(args) -> int:
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
+    if event == APPROVE:
+        # Only here: the APPROVE is posted AND the head/base re-check passed.
+        # Never fatal, never undoes the approval (see resolve_eligible_threads).
+        resolve_eligible_threads(args.repo, args.pr_number, getattr(args, "poster_login", "") or "",
+                                 threshold, args.commit_sha)
     return 0
 
 
@@ -949,6 +1110,10 @@ def main() -> int:
     d.add_argument("--reviewed-diff", required=True)
     # The base the panel diffed against (the triggering event's base.ref).
     d.add_argument("--base-ref", required=True)
+    # The login that posts cursor-review findings (the bot_app_id App's
+    # `<slug>[bot]`, else github-actions[bot]). On APPROVE, only threads it
+    # started are auto-resolved; empty = resolve nothing.
+    d.add_argument("--poster-login", default="")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)

@@ -387,6 +387,42 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   nobody looked, not that the change is clean. A "nothing" round also **withdraws** the bot's own earlier approvals, so
   a round-1 approval does not keep counting through a degraded re-run.
 
+**Resolving the bot's own nits on approval.** A ruleset that requires every
+conversation resolved would otherwise hold an approval hostage to the Low / Nit
+threads it approved over. So after an APPROVE is posted **and** the post-write
+re-read confirms the head and base did not move (and no `needs-human-review`
+label landed), the approver identity resolves a thread when all of these hold:
+
+1. it is unresolved;
+2. its first comment was posted by the identity that posts the findings — the
+   `bot_app_id` App's `<slug>[bot]`, else `github-actions[bot]` (passed in by the
+   workflow, never read from the thread);
+3. that comment's severity badge is at or below the threshold — unbadged
+   threads are never resolved;
+4. no other account has commented in it — any human reply, or another bot's,
+   leaves it for a person.
+
+Each one gets a reply first — ``Resolved by auto-approve: Low finding, at or below
+the `low` threshold, on commit abc1234.`` (hidden marker
+`<!-- cursor-review-auto-resolve -->`) — then the `resolveReviewThread` mutation.
+If **any** live thread is above the threshold or unbadged, nothing is resolved,
+not even the eligible ones; a REQUEST_CHANGES or "nothing" round resolves nothing.
+A failure on one thread is logged and skipped: it never stops the others and
+never undoes the approval. The step summary logs the resolved / skipped-human /
+skipped-unbadged / skipped-above-threshold counts. Resolving a thread needs the
+approver to have **write access** to the repo (e.g. `APPROVER_TOKEN` from a
+member of a team with write); without it the approval still lands and each
+resolve logs a warning. Withdrawing an approval later does not unresolve anything.
+
+How later rounds see such a thread: the blocking gate counts it as resolved, and
+the prior-review ledger carries it with `resolved=true` plus the auto-resolve
+reply. When the approver is a user account the repo lists as OWNER / MEMBER /
+COLLABORATOR, that reply also counts as an *answer*, so a later round re-raising
+the finding must name it with `repeat_of` (spending a repeat slot) — the reply
+gives no technical reason, so it never on its own lets the judge drop the
+finding. In effect a finding at or below the threshold is treated as addressed,
+which is the point of the threshold.
+
 The decision step is `continue-on-error`: a refused approval shows as a red
 step with an `::error::`, not as a failed `Post review` job (which the blocking
 gate would read as "the review did not land").

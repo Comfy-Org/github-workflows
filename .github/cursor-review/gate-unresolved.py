@@ -53,6 +53,8 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
+          # The thread's node id: auto-approve.py's resolveReviewThread target.
+          id
           isResolved
           isOutdated
           comments(first: 1) {
@@ -65,12 +67,22 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
               # keeps databaseId only as a fallback.
               databaseId
               fullDatabaseId
-              author { login }
+              # __typename tells a Bot (whose GraphQL login has no `[bot]`
+              # suffix) from a user that merely shares the name.
+              author { __typename login }
               # The first comment's body carries the severity badge
               # auto-approve.py reads to find open critical/high threads.
               body
               pullRequestReview { body }
             }
+          }
+          # Every comment's author, for auto-approve.py's "nobody else spoke in
+          # this thread" check. A separate alias so the first-comment fields
+          # above (the consolidated review body is large) are not repeated per
+          # reply; totalCount past the page means "could not see them all".
+          participants: comments(first: 100) {
+            totalCount
+            nodes { author { __typename login } }
           }
         }
       }
