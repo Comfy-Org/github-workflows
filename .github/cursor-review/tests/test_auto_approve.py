@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -1230,7 +1231,8 @@ class ApproveGateTest(unittest.TestCase):
         self.assertIn(
             "value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') "
             "&& 'capped' || "
-            "inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}",
+            "(inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off' || "
+            "jobs.post-review.outputs.approve_gate || 'untrusted' }}",
             text,
         )
         self.assertIn("approve_gate: ${{ steps.approve.outputs.approve_gate }}", text)
@@ -1261,7 +1263,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None):
+                   labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None,
+                   approve_scope=None):
         heads = iter(heads)
         reads = []
         writes = []
@@ -1300,6 +1303,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                                       reviewed_diff=dpath, base_ref="main")
             if max_failed is not None:
                 args.max_failed_reviewers = max_failed
+            if approve_scope is not None:
+                args.approve_scope = approve_scope
             self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -1340,6 +1345,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
                    "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
         self.assertEqual(self.run_decide(max_failed="x", reviews=[earlier]), (2, "untrusted"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
+
+    def test_an_invalid_approve_scope_withdraws_an_earlier_approval(self):
+        earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                   "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
+        self.assertEqual(self.run_decide(approve_scope="partial", reviews=[earlier]), (2, "untrusted"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
 
     def test_fail(self):
@@ -1697,8 +1708,8 @@ def thread(tid, sev="low", author=POSTER, repliers=(), resolved=False, outdated=
 class AutoResolvePlanTest(unittest.TestCase):
     """plan_thread_resolution: which threads an approval may resolve."""
 
-    def plan(self, threads, threshold="low", poster=POSTER):
-        todo, counts = AA.plan_thread_resolution(threads, poster, threshold)
+    def plan(self, threads, threshold="low", poster=POSTER, honour_non_gating=False):
+        todo, counts = AA.plan_thread_resolution(threads, poster, threshold, honour_non_gating)
         return [t["id"] for t, _ in todo], counts
 
     def test_approvable_state_resolves_only_eligible_bot_threads(self):
@@ -1714,7 +1725,7 @@ class AutoResolvePlanTest(unittest.TestCase):
         ])
         self.assertEqual(ids, ["ok-low", "ok-nit", "outdated-low"])
         self.assertEqual(counts, {"resolved": 3, "skipped-human": 2, "skipped-unbadged": 0,
-                                  "skipped-above-threshold": 0})
+                                  "skipped-above-threshold": 0, "skipped-non-gating": 0})
 
     def test_bot_own_replies_do_not_disqualify(self):
         ids, _ = self.plan([thread("t", "low", repliers=[POSTER])])
@@ -1949,7 +1960,8 @@ class AutoResolveCommandTest(unittest.TestCase):
                 mock.patch.object(AA, "gh", lambda args, payload=None: fake(args)):
             counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
         self.assertEqual(counts, {"resolved": 1, "skipped-human": 1, "skipped-unbadged": 1,
-                                  "skipped-above-threshold": 1, "failed": 0, "deferred": 0})
+                                  "skipped-above-threshold": 1, "skipped-non-gating": 0,
+                                  "failed": 0, "deferred": 0})
         self.assertIn("resolved 1, skipped-human 1, skipped-unbadged 1, skipped-above-threshold 1", lines[-1])
 
 
@@ -2078,6 +2090,175 @@ class DeferApprovalTest(unittest.TestCase):
         self.assertIn('--defer-approval "$DEFER_APPROVAL"', step)
 
 
+class ApproveAuthorsTest(unittest.TestCase):
+    """approve_authors: an unlisted author gets `off` and no review event."""
+
+    def run_decide(self, author_enabled, findings=(), reviews=(), dismissed=None, pr_author="Some-Author", **extra):
+        posted = []
+
+        def fake_gh(args, payload=None):
+            if args[:3] == ["api", "-X", "POST"]:
+                posted.append(payload)
+                return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "PUT"]:
+                if dismissed is not None:
+                    dismissed.append((args[3], payload["message"]))
+                return "{}"
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
+            return json.dumps({"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []})
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, "c.json")
+            dpath = os.path.join(d, "pr.patch")
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": list(PANEL_OK)}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            args = argparse.Namespace(threshold="medium", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status="ok", delivered="true",
+                                      ungated="0", approver_login="cursor-approver",
+                                      reviewed_diff=dpath, base_ref="main",
+                                      author_enabled=author_enabled, pr_author=pr_author, **extra)
+            emitted = []
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
+                    mock.patch.object(AA, "emit", emitted.append), \
+                    mock.patch("builtins.print", lambda *a, **k: None):
+                rc = AA.cmd_decide(args)
+            return rc, read_outputs(out).get("approve_gate"), [p["event"] for p in posted], emitted
+
+    def test_unlisted_author_is_off_with_no_review_event(self):
+        for findings in ((), [finding("critical")]):
+            with self.subTest(findings=findings):
+                rc, gate, events, emitted = self.run_decide("false", findings)
+                self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
+                self.assertTrue(any("auto-approve not enabled for author Some-Author" in e for e in emitted))
+
+    def test_unlisted_author_withdraws_own_approval_and_change_request(self):
+        # Narrowing approve_authors moves no head SHA, so dismiss-stale keeps an
+        # approval — or a REQUEST_CHANGES veto — posted at the current head.
+        def own(rid, state):
+            body = AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")
+            return {"id": rid, "user": {"login": "cursor-approver"}, "state": state,
+                    "commit_id": SHA, "body": body, "edited": False}
+        dismissed = []
+        rc, gate, events, _ = self.run_decide(
+            "false", reviews=[own(1, "APPROVED"), own(2, "CHANGES_REQUESTED")], dismissed=dismissed)
+        self.assertEqual((rc, gate, events), (0, AA.GATE_OFF, []))
+        self.assertEqual(sorted(dismissed), [("repos/o/r/pulls/1/reviews/1/dismissals", AA.AUTHOR_OFF_MESSAGE),
+                                             ("repos/o/r/pulls/1/reviews/2/dismissals", AA.AUTHOR_OFF_MESSAGE)])
+
+    def test_unexpected_author_enabled_fails_closed(self):
+        for value in ("0", "no", "1", "unknown"):
+            with self.subTest(value=value):
+                rc, gate, events, _ = self.run_decide(value)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_invalid_inputs_fail_red_for_an_unlisted_author_too(self):
+        for extra in ({"max_failed_reviewers": "1.5"}, {"approve_scope": "bogus"}):
+            with self.subTest(extra=extra):
+                rc, gate, events, _ = self.run_decide("false", **extra)
+                self.assertEqual((rc, gate, events), (2, AA.GATE_UNTRUSTED, []))
+
+    def test_decision_note_keeps_underscore_logins(self):
+        _, _, _, emitted = self.run_decide("false", pr_author="mona_acme")
+        self.assertTrue(any("for author mona_acme " in e for e in emitted))
+
+    def test_listed_or_unrestricted_author_gets_the_normal_decision(self):
+        for enabled in ("true", ""):
+            with self.subTest(enabled=enabled):
+                self.assertEqual(self.run_decide(enabled)[:3], (0, AA.GATE_PASS, [AA.APPROVE]))
+                rc, gate, events, _ = self.run_decide(enabled, [finding("critical")])
+                self.assertEqual((gate, events), (AA.GATE_FAIL, [AA.REQUEST_CHANGES]))
+
+    def test_invalid_threshold_still_fails_red_for_an_unlisted_author(self):
+        args = argparse.Namespace(threshold="high", author_enabled="false", pr_author="x")
+        with mock.patch("builtins.print", lambda *a, **k: None):
+            self.assertEqual(AA.cmd_decide(args), 2)
+
+    @staticmethod
+    def _workflow():
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            return f.read()
+
+    def gate_step(self):
+        src = self._workflow()
+        step = src[src.index("- name: Resolve the auto-approve author opt-in"):]
+        step = step[: step.index("\n      - name:")]
+        script = step[step.index("run: |\n") + len("run: |\n"):]
+        return "\n".join(line[10:] for line in script.splitlines())
+
+    def resolve(self, authors, author):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": out,
+                   "APPROVE_AUTHORS": authors, "PR_AUTHOR": author}
+            subprocess.run(["bash", "-e", "-c", self.gate_step()], env=env, check=True,
+                           capture_output=True, cwd=d)
+            return read_outputs(out).get("approve_author_ok")
+
+    def resolve_with_glob_bait(self, authors, author):
+        # A file named after the author: without `set -f`, an unquoted `*` in
+        # the list would expand to it and match.
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            open(out, "w").close()
+            open(os.path.join(d, author), "w").close()
+            env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": out,
+                   "APPROVE_AUTHORS": authors, "PR_AUTHOR": author}
+            subprocess.run(["bash", "-e", "-c", self.gate_step()], env=env, check=True,
+                           capture_output=True, cwd=d)
+            return read_outputs(out).get("approve_author_ok")
+
+    def test_gate_step_resolves_the_list(self):
+        cases = [
+            ("", "anyone", "true"),
+            ("  ", "anyone", "true"),
+            # A non-empty list that names nobody fails closed.
+            (",", "anyone", "false"),
+            ("@", "anyone", "false"),
+            (" , @ ,", "anyone", "false"),
+            ("mattmillerai", "mattmillerai", "true"),
+            ("alice, MattMillerAI", "mattmillerai", "true"),
+            ("alice bob,@carol", "Carol", "true"),
+            ("alice\nbob", "bob", "true"),
+            ("alice,bob", "mallory", "false"),
+            # No PR author (a non-PR event): left unset, not `false`.
+            ("alice", "", None),
+            ("", "", "true"),
+            ("alice-bob", "alice", "false"),
+        ]
+        for authors, author, want in cases:
+            with self.subTest(authors=authors, author=author):
+                self.assertEqual(self.resolve(authors, author), want)
+
+    def test_gate_step_does_not_glob_the_list(self):
+        self.assertEqual(self.resolve_with_glob_bait("*", "mallory"), "false")
+
+    def test_workflow_wiring(self):
+        src = self._workflow()
+        declared = src[src.index("\n      approve_authors:\n"):]
+        declared = declared[: declared.index("\n      approve_scope:\n")]
+        self.assertIn("type: string", declared)
+        self.assertIn("default: ''", declared)
+        self.assertIn("approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}", src)
+        # The workflow-level output says `off` for an unlisted author, round or not.
+        self.assertIn("(inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off'", src)
+        step = src[src.index("- name: Auto-approve decision"):]
+        step = step[: step.index("\n\n  dismiss-stale-approval:")]
+        self.assertIn("AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}", step)
+        self.assertIn('--author-enabled "$AUTHOR_ENABLED"', step)
+        self.assertIn('--pr-author "$PR_AUTHOR"', step)
+        self.assertIn("needs: [gate, consolidate, ledger, diff-size]", src)
+        # No "not blocking auto-approve" marks for an author no decision is taken for.
+        self.assertIn("APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}", src)
+
+
 class AutoResolveWiringTest(unittest.TestCase):
     """The workflow passes the findings poster's login to `decide`."""
 
@@ -2169,9 +2350,9 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertFalse(AA.is_non_gating_thread(bodies["app/handler.py"]))
         medium = thread("medium", "medium")
         medium["comments"]["nodes"][0]["body"] = bodies["app/other.py"]
-        ids, counts = AutoResolvePlanTest.plan(self, [medium, thread("low", "low")])
+        ids, counts = AutoResolvePlanTest.plan(self, [medium, thread("low", "low")], honour_non_gating=True)
         self.assertEqual(ids, ["low"])
-        self.assertEqual(counts[AA.SKIP_ABOVE], 1)
+        self.assertEqual(counts[AA.SKIP_NON_GATING], 1)
 
     def test_model_text_cannot_carry_the_marker(self):
         post_review = AA._load_post_review()
@@ -2300,17 +2481,93 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertEqual(AA.resolve_scope("delta", "built", None, _ledger())["scope"], "full")
         self.assertEqual(AA.resolve_scope("delta", "built", "", None)["scope"], "full")
 
-    def test_empty_delta_rebase_approves_without_open_blocking_threads(self):
-        scope = self.scope(text="")
-        self.assertEqual(scope["scope"], "delta")
-        old = {"severity": "medium", "file": "app/handler.py", "line": 11}
-        self.assertEqual(self.gate([old], scope, threads=[("medium", True)])[:2], ("APPROVE", "pass"))
-        # An earlier GATING thread above the threshold still holds it back.
-        self.assertEqual(self.gate([], scope, threads=[("medium", False)])[:2], ("NONE", "fail"))
-        # And so does every trust check: an incomplete panel is still untrusted.
-        bad = AA.decide_gate("low", [], [{"status": "error"}], "ok", True, SHA, SHA, [],
-                             0, False, False, "main", "main", scope)
-        self.assertEqual(bad[1], "untrusted")
+    def test_empty_delta_rebase_fails_closed_to_full(self):
+        # #357 review: an empty block made every non-severe finding non-gating, and
+        # the rebase that empties it also outdates the earlier threads the
+        # open-thread check would otherwise have counted.
+        for text in ("", "diff --git a/bin.png b/bin.png\nBinary files a/bin.png and b/bin.png differ\n"):
+            with self.subTest(text=text):
+                scope = self.scope(text=text)
+                self.assertEqual(scope["scope"], "full")
+                self.assertIn("no new-side hunk", scope["note"])
+                old = {"severity": "medium", "file": "app/handler.py", "line": 11}
+                self.assertEqual(self.gate([old], scope)[:2], ("REQUEST_CHANGES", "fail"))
+                self.assertFalse(AA.non_gating(old, "low", scope))
+
+    def test_unparseable_section_path_fails_closed_to_full(self):
+        # #357 review: git C-quotes an odd path and parse_paths rejects it; dropping
+        # the section recorded no ranges, so findings in it failed open.
+        quoted = ('diff --git "a/app/we\\"ird.py" "b/app/we\\"ird.py"\n'
+                  '--- "a/app/we\\"ird.py"\n+++ "b/app/we\\"ird.py"\n@@ -1 +1 @@\n-a\n+b\n')
+        self.assertIsNone(AA.hunk_ranges(_fixture_text() + quoted))
+        scope = self.scope(text=_fixture_text() + quoted)
+        self.assertEqual(scope["scope"], "full")
+        self.assertIn("could not be parsed", scope["note"])
+        odd = {"severity": "medium", "file": 'app/we"ird.py', "line": 1}
+        self.assertEqual(self.gate([odd], scope)[:2], ("REQUEST_CHANGES", "fail"))
+
+    def test_quoted_rename_path_fails_closed_to_full(self):
+        # #359 review: section_paths returns `rename from`/`rename to` verbatim, so a
+        # C-quoted rename yielded a truthy-but-quoted pair keyed under the raw form.
+        renamed = ('diff --git "a/app/o\\"ld.py" "b/app/we\\"ird.py"\n'
+                   'similarity index 90%\nrename from "app/o\\"ld.py"\nrename to "app/we\\"ird.py"\n'
+                   '--- "a/app/o\\"ld.py"\n+++ "b/app/we\\"ird.py"\n@@ -1 +1 @@\n-a\n+b\n')
+        self.assertIsNone(AA.hunk_ranges(_fixture_text() + renamed))
+        scope = self.scope(text=_fixture_text() + renamed)
+        self.assertEqual(scope["scope"], "full")
+        odd = {"severity": "medium", "file": 'app/we"ird.py', "line": 1}
+        self.assertEqual(self.gate([odd], scope)[:2], ("REQUEST_CHANGES", "fail"))
+
+    def test_finding_without_usable_file_gates(self):
+        scope = self.scope()
+        for path in (None, "", 7, ["a"]):
+            with self.subTest(path=path):
+                f = {"severity": "medium", "file": path, "line": 3}
+                self.assertEqual(AA.gating_reason(f, scope), "no usable file anchor")
+                self.assertFalse(AA.non_gating(f, "low", scope))
+                self.assertEqual(self.gate([f], scope)[0], "REQUEST_CHANGES")
+
+    def test_untrusted_reasons_are_never_read_as_the_scope_note(self):
+        scope = self.scope()
+        event, gate, reasons, _ = AA.decide_gate("low", [], PANEL_OK, "error", True, SHA, "b" * 40, [],
+                                                 0, False, False, "main", "main", scope)
+        self.assertEqual(gate, "untrusted")
+        self.assertGreater(len(reasons), 1)
+        self.assertEqual(AA.scope_note_of(reasons), "")
+        body = AA.render_body(event, reasons, "low", [])
+        self.assertNotIn("_Scope:", body)
+        _, _, scoped, _ = self.gate([], scope)
+        self.assertTrue(AA.scope_note_of(scoped).startswith("approve_scope `delta`"))
+        self.assertIn("_Scope: approve_scope `delta`", AA.render_body("APPROVE", scoped, "low", []))
+
+    def test_marked_thread_blocks_resolution_unless_the_round_was_delta(self):
+        marked = thread("marked", "medium")
+        marked["comments"]["nodes"][0]["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        ids, counts = AutoResolvePlanTest.plan(self, [marked, thread("low", "low")])
+        self.assertEqual((ids, counts[AA.RESOLVED]), ([], 0))
+        ids, _ = AutoResolvePlanTest.plan(self, [marked, thread("low", "low")], honour_non_gating=True)
+        self.assertEqual(ids, ["low"])
+
+    def test_marked_thread_is_never_resolved_even_under_a_looser_threshold(self):
+        marked = thread("marked", "medium")
+        marked["comments"]["nodes"][0]["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        self.assertEqual(AA.classify_thread(marked, POSTER, "medium", GATE), (AA.SKIP_NON_GATING, "medium"))
+        for honour in (False, True):
+            ids, counts = AutoResolvePlanTest.plan(self, [marked], threshold="medium", honour_non_gating=honour)
+            self.assertEqual((ids, counts[AA.SKIP_NON_GATING]), ([], 1))
+
+    def test_nested_marker_cannot_reform_after_stripping(self):
+        post_review = AA._load_post_review()
+        m = AA.NON_GATING_MARKER
+        nested = m[:len(m) // 2] + m + m[len(m) // 2:]
+        for text in (nested, m[:5] + nested + m[5:], f"x\n{nested}\ny", AA.NON_GATING_NOTE,
+                     AA.NON_GATING_NOTE[:9] + AA.NON_GATING_NOTE + AA.NON_GATING_NOTE[9:]):
+            with self.subTest(text=text):
+                sneaky = {"severity": "medium", "file": "a.py", "line": 1, "body": text}
+                body = post_review.normalize_comments([sneaky])[0]["comment"]["body"]
+                self.assertNotIn(m, body)
+                self.assertNotIn(AA.NON_GATING_NOTE, body)
+                self.assertFalse(AA.is_non_gating_thread(body))
 
     def test_full_scope_matches_todays_behaviour(self):
         scope = self.scope(requested="full")
@@ -2326,8 +2583,13 @@ class ApproveScopeTest(unittest.TestCase):
                 self.assertEqual(scoped[3], legacy[3])
 
     def test_scope_validation(self):
-        self.assertEqual(AA.validate_scope(""), "delta")
+        # Empty is fail-closed `full`; only the workflow input's default picks delta.
+        self.assertEqual(AA.validate_scope(""), "full")
+        self.assertEqual(AA.validate_scope("delta"), "delta")
         self.assertEqual(AA.validate_scope("FULL"), "full")
+        # Whitespace-only is empty too, not an invalid value (#359 review).
+        for blank in (" ", "\n", " \t\n"):
+            self.assertEqual(AA.validate_scope(blank), "full")
         with self.assertRaises(ValueError):
             AA.validate_scope("partial")
 

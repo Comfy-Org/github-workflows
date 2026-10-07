@@ -2519,7 +2519,7 @@ def normalize_comments(
                     # job summary — the one copy that WAS sanitized, so the two channels
                     # would disagree on the finding's text.
                     "body": encodable(
-                        badge + neutralize_mentions(body.replace(marker, "")) + repeat_line
+                        badge + strip_non_gating(neutralize_mentions(body)) + repeat_line
                         + (f"\n\n{NON_GATING_NOTE}\n{marker}" if non_gating and non_gating(finding) else "")
                     ),
                 },
@@ -2573,6 +2573,23 @@ def warn_membership_guard_off() -> None:
 # Mirrors auto-approve.NON_GATING_MARKER / NON_GATING_NOTE (a test pins them equal).
 NON_GATING_MARKER = "<!-- cursor-review-non-gating -->"
 NON_GATING_NOTE = "_Outside this round's changes: not blocking auto-approve._"
+
+
+def strip_non_gating(text: str) -> str:
+    """`text` with every NON_GATING_MARKER and NON_GATING_NOTE removed — to a fixpoint.
+
+    One replace() pass never re-scans its own output, so a nested copy
+    (`<!-- cursor-review-non<!-- cursor-review-non-gating -->-gating -->`) would
+    collapse INTO the marker and let model text exempt its own finding. The note
+    goes too, so a gating thread cannot display the trusted non-blocking line.
+    Each pass that changes anything shortens the text, so this terminates.
+    """
+    text = str(text)
+    while True:
+        stripped = text.replace(NON_GATING_MARKER, "").replace(NON_GATING_NOTE, "")
+        if stripped == text:
+            return text
+        text = stripped
 
 
 def load_non_gating(args):
