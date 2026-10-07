@@ -2567,20 +2567,27 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.assertIn(AA.APPROVE_MARKER, body)
         self.assertRegex(body, AA.REVIEWED_SHA_RE)
         self.assertIn("- the judge did not adjudicate this round (status=error)", body)
-        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+        # The head never moved, so a relabel alone would be deduped away (BE-19527).
+        self.assertIn("**Next step:** Dismiss the consolidated Cursor Review", body)
 
     def test_no_decision_card_has_markers_reasons_verbatim_and_next_step(self):
         panel = panel_with(("m1", "edge-case"), ("m2", "adversarial"))
         self.run_decide(panel=panel)
         body = self.card_body()
-        self.assert_markers(body, "no_decision", "relabel")
+        self.assert_markers(body, "no_decision", "dismiss_then_relabel")
         self.assertIn("**No decision this round, so this PR is not approved.**", body)
         _, _, reasons, _ = AA.decide_gate("low", [], panel, "ok", True, SHA, SHA, [])
         self.assertEqual(reasons, ["2/6 panel reviewers did not complete"])
         for r in reasons:
             self.assertIn(f"- {r}", body)  # verbatim, not markdown-escaped
-        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+        self.assertIn("**Next step:** Dismiss the consolidated Cursor Review", body)
         self.assertIn("Cursor approve · round 2 of 5 · `aaaaaaa`", body)
+
+    def test_the_card_keeps_the_threshold_the_block_no_longer_repeats(self):
+        # BE-19527: one rendering of the decision's context, not two.
+        self.run_decide(judge="error")
+        self.assertNotIn("_Threshold:", self.reviews_posted[0]["body"])
+        self.assertIn("`low`", self.card_body())
 
     def test_structural_no_decision_names_the_cause_and_asks_for_a_human(self):
         for kwargs, cause in (({"delivered": "false"}, "the findings did not land as resolvable threads"),
@@ -2758,16 +2765,28 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
 class CardContractMirrorTest(unittest.TestCase):
     def test_decides_card_constants_match_card_py(self):
         self.assertEqual((AA.CARD_PASS, AA.CARD_CHANGES, AA.CARD_NO_DECISION, AA.CARD_CAPPED), CARD.STATES)
-        self.assertEqual((AA.CARD_NEXT_NONE, AA.CARD_NEXT_RESOLVE, AA.CARD_NEXT_RELABEL, AA.CARD_NEXT_HUMAN),
-                         CARD.NEXTS)
+        self.assertEqual((AA.CARD_NEXT_NONE, AA.CARD_NEXT_RESOLVE, AA.CARD_NEXT_RELABEL, AA.CARD_NEXT_DISMISS,
+                          AA.CARD_NEXT_HUMAN), CARD.NEXTS)
 
 
 class NoDecisionNextTest(unittest.TestCase):
-    def test_transient_causes_relabel(self):
+    def test_a_moved_head_relabels(self):
+        # The only transient cause a relabel alone clears: the new round reads a
+        # different head, so the gate's same-SHA dedupe cannot skip it.
+        for reasons in ([AA.REASON_HEAD_MOVED], [AA.REASON_HEAD_MOVED, AA.REASON_BASE_CHANGED]):
+            self.assertEqual(AA.no_decision_next(reasons)[0], CARD.NEXT_RELABEL, reasons)
+
+    def test_a_same_head_transient_cause_needs_the_review_dismissed_first(self):
+        # BE-19527: the head never moved, so re-applying the label alone starts a
+        # run the gate's `dup` step skips. Say so instead.
         for reason in ("the judge did not adjudicate this round (status=error)",
-                       "2/6 panel reviewers did not complete", "the PR head moved while the review ran",
-                       "could not read the PR state (boom)"):
-            self.assertEqual(AA.no_decision_next([reason])[0], CARD.NEXT_RELABEL, reason)
+                       "2/6 panel reviewers did not complete",
+                       "could not read the PR state (boom)",
+                       AA.REASON_BASE_CHANGED):
+            nxt, text = AA.no_decision_next([reason])
+            self.assertEqual(nxt, CARD.NEXT_DISMISS, reason)
+            self.assertIn("Dismiss the consolidated Cursor Review", text)
+            self.assertIn("then re-run the round", text)
 
     def test_structural_causes_need_a_human(self):
         for reason in (AA.REASON_NOT_DELIVERED, f"3 {AA.REASON_UNGATED_TAIL}", AA.REASON_EMPTY_DIFF):
@@ -3164,11 +3183,12 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertEqual(gate, "untrusted")
         self.assertGreater(len(reasons), 1)
         self.assertEqual(AA.scope_note_of(reasons), "")
-        body = AA.render_body(event, reasons, "low", [])
-        self.assertNotIn("_Scope:", body)
         _, _, scoped, _ = self.gate([], scope)
         self.assertTrue(AA.scope_note_of(scoped).startswith("approve_scope `delta`"))
-        self.assertIn("_Scope: approve_scope `delta`", AA.render_body("APPROVE", scoped, "low", []))
+        # The note is the card's now (BE-19527): neither review body renders one,
+        # so an untrusted reason cannot be read as a scope note there either.
+        for reasons_in in (reasons, scoped):
+            self.assertNotIn("_Scope:", AA.render_body(event, reasons_in, "low", []))
 
     def test_marked_thread_blocks_resolution_unless_the_round_was_delta(self):
         marked = thread("marked", "medium")
