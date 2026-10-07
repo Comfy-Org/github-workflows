@@ -159,6 +159,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit"]
 ALLOWED_THRESHOLDS = ("medium", "low", "nit")
@@ -246,8 +247,11 @@ def _load_incremental_diff():
 # On a round after the first, a finding above the threshold counts toward the
 # gate under `delta` only when it is IN the verified incremental block (its path
 # and line fall inside one of that block's new-side hunks), a LIVE REPEAT (its
-# `repeat_of` names an earlier thread the ledger reads as unresolved), or SEVERE
-# (High/Critical, or a severity nobody recognises) anywhere in the reviewed diff.
+# `repeat_of` names an earlier thread the ledger reads as unresolved, OR its path
+# and line sit on an earlier round's still-open thread — the judge only emits
+# `repeat_of` for an ANSWERED entry, so the anchor match is what catches a re-raise
+# of an unanswered one), or SEVERE (High/Critical, or a severity nobody
+# recognises) anywhere in the reviewed diff.
 # Everything else is still posted, as a thread carrying NON_GATING_MARKER, but
 # does not block — and that thread is never auto-resolved, so it stays for a human.
 #
@@ -352,6 +356,105 @@ def resolve_scope(requested: str, incremental_state: str, incremental_text, ledg
     return {"scope": SCOPE_DELTA, "note": "", "ranges": ranges, "live": live_thread_urls(ledger)}
 
 
+# Wall-clock budget for the open-thread read post-review takes ahead of its one
+# review POST: past it the read is abandoned (marking nothing non-gating, the
+# fail-closed direction) rather than starving the post that delivers the review.
+OPEN_ANCHORS_BUDGET_SEC = 90
+
+
+def earlier_thread_anchors(threads) -> dict:
+    """{path: [(first, last), ...]} of every open cursor-review thread in `threads`. Pure.
+
+    Open means unresolved and not outdated, so `line` is on the current head.
+    post-review reads `threads` BEFORE it posts this round's review, so every
+    one belongs to an earlier round (or an earlier attempt of this one) — no
+    commit filter is needed, so a head reset back to a commit an earlier round
+    reviewed still sees that round's threads.
+    """
+    gate = _load_gate_unresolved()
+    out = {}
+    for thread in threads:
+        if not isinstance(thread, dict) or not gate.is_cursor_thread(thread):
+            continue
+        if thread.get("isResolved") or thread.get("isOutdated"):
+            continue
+        path, last = thread.get("path"), thread.get("line")
+        if not isinstance(path, str) or not path or not isinstance(last, int):
+            continue
+        start = thread.get("startLine")
+        start = start if isinstance(start, int) and start <= last else last
+        out.setdefault(path, []).append((start, last))
+    return out
+
+
+def with_open_anchors(scope: dict, repo: str, pr: int, budget: float = OPEN_ANCHORS_BUDGET_SEC) -> dict:
+    """`scope` plus the earlier open-thread anchors gating_reason() matches. `delta` only.
+
+    post-review's read, taken before its own threads exist. A failure (a query
+    error, or the walk outrunning `budget` seconds) propagates, so post-review
+    marks nothing non-gating and writes no snapshot — and decide, finding none,
+    fails closed to `full` with it.
+    """
+    if (scope or {}).get("scope") != SCOPE_DELTA:
+        return scope
+    owner, _, name = repo.partition("/")
+    deadline = time.monotonic() + budget
+
+    def bounded():
+        for thread in _load_gate_unresolved().iter_threads(owner, name, pr):
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"reading the PR's review threads took over {budget:g}s")
+            yield thread
+
+    return {**scope, "open": earlier_thread_anchors(bounded())}
+
+
+def write_open_anchors(path: str, scope: dict, head_sha: str) -> None:
+    """Save post-review's anchor snapshot for decide (no-op without `path` or anchors)."""
+    if not path or "open" not in (scope or {}):
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"commit": head_sha, "open": scope["open"]}, f)
+
+
+def read_open_anchors(path: str, head_sha: str):
+    """post-review's anchor snapshot for `head_sha`, or None (missing, malformed, another commit).
+
+    decide matches against the SAME snapshot post-review marked threads from, so
+    the two can never disagree about which findings are non-gating — and decide
+    takes no second, later read of its own.
+    """
+    data = _read_json_optional(path)
+    if not data or data.get("commit") != head_sha or not isinstance(data.get("open"), dict):
+        return None
+    out = {}
+    for file, spans in data["open"].items():
+        if not isinstance(file, str) or not isinstance(spans, list):
+            return None
+        for span in spans:
+            if (not isinstance(span, list) or len(span) != 2
+                    or not all(isinstance(n, int) and not isinstance(n, bool) for n in span)):
+                return None
+            out.setdefault(file, []).append((span[0], span[1]))
+    return out
+
+
+def with_snapshot_anchors(scope: dict, path: str, head_sha: str) -> dict:
+    """decide's half of with_open_anchors(): the snapshot's anchors, or `full`. `delta` only.
+
+    No snapshot means post-review marked nothing non-gating, so decide gates on
+    `full` too — every above-threshold finding counts, matching the unmarked
+    threads on the PR.
+    """
+    if (scope or {}).get("scope") != SCOPE_DELTA:
+        return scope
+    anchors = read_open_anchors(path, head_sha)
+    if anchors is None:
+        return {"scope": SCOPE_FULL, "ranges": {}, "live": frozenset(),
+                "note": "post-review's earlier open-thread snapshot is unavailable, so the round fails closed to `full`"}
+    return {**scope, "open": anchors}
+
+
 def gating_reason(finding, scope: dict):
     """Why `finding` counts toward the gate, or None when it does not. Pure."""
     if not isinstance(finding, dict):
@@ -375,6 +478,9 @@ def gating_reason(finding, scope: dict):
     path = finding.get("file")
     if not isinstance(path, str) or not path:
         return "no usable file anchor"
+    for first, last in scope.get("open", {}).get(path, ()):
+        if first <= line <= last:
+            return "on an unresolved earlier thread's line"
     for first, last in scope.get("ranges", {}).get(path, ()):
         if first <= line <= last:
             return "inside this round's changes"
@@ -1086,6 +1192,7 @@ def cmd_decide(args) -> int:
     scope = resolve_scope(requested_scope, getattr(args, "incremental_state", "") or "",
                           _read_optional(getattr(args, "incremental", "") or ""),
                           _read_json_optional(getattr(args, "ledger", "") or ""))
+    scope = with_snapshot_anchors(scope, getattr(args, "open_anchors", "") or "", args.commit_sha)
 
     try:
         pr = read_pr(args.repo, args.pr_number)
@@ -2191,6 +2298,7 @@ def main() -> int:
     d.add_argument("--incremental", default="")
     d.add_argument("--incremental-state", default="")
     d.add_argument("--ledger", default="")
+    d.add_argument("--open-anchors", default="", help="post-review's --open-anchors-out snapshot")
     # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
     d.add_argument("--max-failed-reviewers", default="0")
     # approve_authors, as resolved by the workflow's `gate` job: `false` = the PR

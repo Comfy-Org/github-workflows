@@ -2601,6 +2601,14 @@ def load_non_gating(args):
     threshold, a `full` scope, an unreadable input) marks nothing: an unmarked
     thread is the fail-closed direction, since it blocks.
     """
+    # Cleared first: only a snapshot this call completes may reach decide, whose
+    # missing-snapshot fallback is `full` — the same "mark nothing" as here.
+    out = getattr(args, "open_anchors_out", "") or ""
+    if out:
+        try:
+            os.remove(out)
+        except OSError:
+            pass  # absent (the usual case); decide also rejects another commit's
     threshold = (getattr(args, "approve_threshold", "") or "").strip().lower()
     if not threshold:
         return None
@@ -2617,7 +2625,12 @@ def load_non_gating(args):
             approve._read_optional(getattr(args, "incremental", "") or ""),
             approve._read_json_optional(getattr(args, "ledger", "") or ""),
         )
-    except Exception as e:  # noqa: BLE001 - fail closed: mark nothing
+        # The earlier open-thread anchors, read before this round's threads exist
+        # and saved for decide, which matches the SAME snapshot rather than
+        # re-reading (a later read could disagree with what was marked here).
+        scope = approve.with_open_anchors(scope, args.repo, int(args.pr_number))
+        approve.write_open_anchors(out, scope, args.commit_sha)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - fail closed: mark nothing
         print(f"Could not resolve approve_scope, marking no finding non-gating: {e}", file=sys.stderr)
         return None
     if scope["scope"] != approve.SCOPE_DELTA:
@@ -2976,6 +2989,8 @@ def main():
     parser.add_argument("--approve-scope", default="full")
     parser.add_argument("--incremental", default="")
     parser.add_argument("--incremental-state", default="")
+    parser.add_argument("--open-anchors-out", default="",
+                        help="where to save the earlier open-thread snapshot auto-approve.py decide reads")
     parser.add_argument(
         "--ledger-note",
         default=None,

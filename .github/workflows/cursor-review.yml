@@ -363,13 +363,15 @@ on:
           (default) → a finding above `approve_max_severity` blocks only when it
           sits inside a hunk of the verified incremental block (the changes
           since the last reviewed commit), re-raises an earlier finding whose
-          thread is still unresolved, or is High/Critical anywhere in the
-          reviewed diff. Every other finding is still posted, as a thread
+          thread is still unresolved (named in `repeat_of`, or on the path and
+          line of an earlier round's still-open thread), or is High/Critical
+          anywhere in the reviewed diff. Every other finding is still posted, as a thread
           marked "Outside this round's changes: not blocking auto-approve",
           and is never auto-resolved. Round 1, an incremental block that was
           unavailable, discarded or empty (a pure rebase), one naming a path
-          that cannot be parsed, an unknown prior-review ledger and an
-          explicitly empty value all fail closed to `full`. `full` → every finding counts, wherever it
+          that cannot be parsed, an unknown prior-review ledger, an
+          unreadable list of earlier open threads and an explicitly empty
+          value all fail closed to `full`. `full` → every finding counts, wherever it
           sits (the behaviour before this input existed). The panel reviews
           the full diff either way. No effect unless `approve_max_severity` is
           set; any other value fails the decision step.
@@ -3289,8 +3291,12 @@ jobs:
           # as "shown" and wave the re-raise through on exactly the degraded run
           # $LEDGER_NOTE already banners above.
           LEDGER_FLAGS=(--ledger /tmp/ledger/ledger.json)
+          # --open-anchors-out: the earlier rounds' open threads, read before this
+          # review posts; `Auto-approve decision` gates on that same snapshot, and
+          # without it (an unreadable thread list) fails closed to `full`.
           SCOPE_FLAGS=(--approve-threshold "$APPROVE_THRESHOLD" --approve-scope "$APPROVE_SCOPE"
-                       --incremental /tmp/pr-diff-new.patch --incremental-state "$INCREMENTAL_STATE")
+                       --incremental /tmp/pr-diff-new.patch --incremental-state "$INCREMENTAL_STATE"
+                       --open-anchors-out /tmp/open-anchors.json)
           if [ "$JUDGE_LEDGER_OK" != "true" ]; then
             LEDGER_FLAGS+=(--no-judge-ledger)
           fi
@@ -3437,6 +3443,7 @@ jobs:
             --incremental /tmp/pr-diff-new.patch \
             --incremental-state "$INCREMENTAL_STATE" \
             --ledger /tmp/ledger/ledger.json \
+            --open-anchors /tmp/open-anchors.json \
             --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}" \
             --author-enabled "$AUTHOR_ENABLED" \
             --pr-author "$PR_AUTHOR"
