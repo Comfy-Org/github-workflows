@@ -114,9 +114,12 @@ def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
 
     Still ``NEXT_RELABEL``: the next step IS a relabel, and an agent reading the
     contract marker should wait for the new round either way. Only the prose
-    differs, so nobody re-does by hand what already fired.
+    differs, so nobody re-does by hand what already fired. Written before the
+    relabel runs (a later job; it can fail or be cancelled by a push), hence the
+    "if no new round starts" fallback rather than a promise.
     """
-    return f"Nothing — the round is being re-run automatically ({relabel(label)}). Once only; if it is wrong again, re-run it by hand."
+    return (f"Nothing — the round is being re-run automatically ({relabel(label)}). Once only; "
+            "if no new round starts, or it is wrong again, re-run it by hand.")
 
 
 # The default-label texts. cursor-approve.yml has no `review_label` input, so

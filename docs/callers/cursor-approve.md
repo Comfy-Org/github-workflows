@@ -97,20 +97,27 @@ judging a commit the PR has moved past, so `decide_gate` withholds with "the PR
 head moved while the review ran" — a whole panel spent, and until now a human
 had to notice the card and re-apply the label by hand.
 
-decide now does it itself: it removes and re-adds the review label, **once per
-PR**, and the card says so instead of asking you to. The next step stays
+The workflow now does it itself: it removes and re-adds the review label, **once
+per PR**, and the card says so instead of asking you to. The next step stays
 `relabel` on the contract marker, so an agent reading it waits for the new round
-either way.
+either way. decide only decides; the relabel is the run's LAST job
+(`Re-run the round (head moved)`), after the Blocking gate, Panel integrity and
+completion jobs, because the label events it fires cancel whatever of the run is
+still going in the caller's `cancel-in-progress` group.
 
 It fires only when a fresh round would actually decide differently — the head
 moved (a base retarget alongside it rides along). Every other transient cause
 leaves the head where it was, and the gate's same-SHA `dup` check would skip the
 re-run, so those still ask for a human. The budget is counted off the PR's own
 reviews — each retry's standing block carries `<!-- cursor-review-auto-retry -->`
-and still counts once dismissed — so it holds across rounds and across runs. An
-unreadable review list, a failed relabel, or a caller with neither
-`APPROVER_TOKEN` nor `bot_app_id` (a `GITHUB_TOKEN`-applied label fires no run)
-all fall back to the hand-recovery the card describes.
+and still counts once dismissed — so it holds across rounds and across runs; a
+retry whose block did not post is never fired, since nothing would count it. An
+unreadable review list or approver login, a round already at `max_rounds` (the
+re-run would cap out), or a caller with neither `APPROVER_TOKEN` nor
+`bot_app_id` (a `GITHUB_TOKEN`-applied label fires no run) all fall back to the
+hand-recovery the card describes. A relabel that fails (or a push that cancels
+the run first) turns that job red or never runs it; the card's "if no new round
+starts, re-run it by hand" covers both.
 
 Whichever token the caller configures needs **label write** on the repo.
 

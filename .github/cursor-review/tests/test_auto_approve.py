@@ -3241,23 +3241,24 @@ def retried_block(rid, login=APPROVER):
 
 class AutoRetryTest(unittest.TestCase):
     """BE-19526: a round the head outran re-runs itself once, instead of leaving
-    a standing block for a human to clear by relabelling."""
+    a standing block for a human to clear by relabelling. decide decides and
+    sets `auto_retry`; the workflow's last job relabels (cmd_auto_retry)."""
 
     OTHER_SHA = "b" * 40
 
     def run_decide(self, head=OTHER_SHA, reviews=(), judge="ok", delivered="true",
-                   base_ref="main", live_base="main", label_fail=False, reviews_fail=False,
-                   can_relabel="true"):
+                   base_ref="main", live_base="main", reviews_fail=False, review_post_error="",
+                   can_relabel="true", round_="2", max_rounds="5", approver=APPROVER, omit_can_relabel=False):
         self.reviews_posted, self.labels, self.card_writes = [], [], []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
+                if review_post_error:
+                    raise RuntimeError(review_post_error)
                 self.reviews_posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "DELETE"] or (args[:3] == ["api", "-X", "POST"]
                                                        and args[3].endswith("/labels")):
-                if label_fail:
-                    raise RuntimeError("gh api failed: HTTP 403")
                 self.labels.append((args[2], args[3], payload))
                 return "{}"
             if args[:3] == ["api", "-X", "PUT"]:
@@ -3282,12 +3283,13 @@ class AutoRetryTest(unittest.TestCase):
             open(out, "w").close()
             args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
                                       commit_sha=SHA, judge_status=judge, delivered=delivered,
-                                      ungated="0", approver_login=APPROVER, reviewed_diff=dpath,
+                                      ungated="0", approver_login=approver, reviewed_diff=dpath,
                                       base_ref=base_ref, poster_login=POSTER, defer_approval="",
                                       author_enabled="", pr_author="someone", card="true",
-                                      round="2", max_rounds="5", review_label="cursor-review",
-                                      can_relabel=can_relabel,
+                                      round=round_, max_rounds=max_rounds, review_label="cursor-review",
                                       run_url="https://github.com/o/r/actions/runs/1")
+            if not omit_can_relabel:
+                args.can_relabel = can_relabel
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_severities", lambda *a, **k: []), \
@@ -3295,7 +3297,15 @@ class AutoRetryTest(unittest.TestCase):
                     mock.patch.object(AA, "emit", lambda *a: None), \
                     mock.patch("builtins.print", lambda *a, **k: None):
                 rc = AA.cmd_decide(args)
-            return rc, read_outputs(out).get("approve_gate")
+            self.outputs = read_outputs(out)
+            return rc, self.outputs.get("approve_gate")
+
+    def retried(self):
+        return self.outputs.get("auto_retry") == "true"
+
+    def assert_hand_recovery(self, body):
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
 
     # -- what is eligible --------------------------------------------------
 
@@ -3315,26 +3325,27 @@ class AutoRetryTest(unittest.TestCase):
 
     def test_spent_counts_this_identity_s_marked_blocks_only(self):
         reviews = [retried_block(1), retried_block(2, login="someone-else"),
-                   own_change_request(3), {"id": 4}, "not-a-dict"]
+                   own_change_request(3), {"id": 4}, "not-a-dict",
+                   {"id": 5, "user": {"login": None}, "body": AA.AUTO_RETRY_MARKER}]  # a ghost reviewer
         self.assertEqual(AA.auto_retries_spent(reviews, APPROVER), 1)
         self.assertEqual(AA.auto_retries_spent(reviews, ""), 0)
         self.assertEqual(AA.auto_retries_spent([], APPROVER), 0)
 
     # -- the round re-runs itself ------------------------------------------
 
-    def test_a_moved_head_removes_and_re_adds_the_label(self):
+    def test_a_moved_head_asks_the_workflow_to_relabel(self):
         rc, gate = self.run_decide()
         self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
-        self.assertEqual([(a[0], a[1]) for a in self.labels],
-                         [("DELETE", "repos/o/r/issues/1/labels/cursor-review"),
-                          ("POST", "repos/o/r/issues/1/labels")])
-        self.assertEqual(self.labels[1][2], {"labels": ["cursor-review"]})
+        self.assertTrue(self.retried())
+        # decide itself never relabels: that would cancel this run's own checks.
+        self.assertEqual(self.labels, [])
 
     def test_the_block_carries_the_retry_marker_and_says_it_is_automatic(self):
         self.run_decide()
         body = self.reviews_posted[0]["body"]
         self.assertIn(AA.AUTO_RETRY_MARKER, body)
         self.assertIn("re-run automatically", body)
+        self.assertIn("if no new round starts", body)
         self.assertNotIn("**Next step:** Re-run the round: remove and re-add", body)
 
     def test_the_card_still_reports_relabel_so_agents_wait_for_the_new_round(self):
@@ -3347,48 +3358,126 @@ class AutoRetryTest(unittest.TestCase):
 
     def test_a_retarget_alongside_the_move_rides_along(self):
         self.run_decide(live_base="other")
-        self.assertEqual(len(self.labels), 2)
+        self.assertTrue(self.retried())
 
     # -- the ceiling -------------------------------------------------------
 
     def test_the_budget_is_one_per_pr(self):
         self.run_decide(reviews=[retried_block(5)])
-        self.assertEqual(self.labels, [])
-        body = self.reviews_posted[0]["body"]
-        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
-        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+        self.assertFalse(self.retried())
+        self.assert_hand_recovery(self.reviews_posted[0]["body"])
 
     def test_an_unreadable_review_list_spends_the_budget_rather_than_looping(self):
         self.run_decide(reviews_fail=True)
-        self.assertEqual(self.labels, [])
+        self.assertFalse(self.retried())
         self.assertNotIn(AA.AUTO_RETRY_MARKER, self.reviews_posted[0]["body"])
+
+    def test_an_unknown_approver_login_spends_the_budget(self):
+        # No login matches no marked block, which would read "no retries yet" forever.
+        self.assertFalse(AA.auto_retry_budget_left(
+            argparse.Namespace(can_relabel="true", approver_login=" ", round="1", max_rounds="5",
+                               repo="o/r", pr_number="1"), [AA.REASON_HEAD_MOVED]))
+
+    def test_the_last_allowed_round_is_not_retried(self):
+        # The re-run's own round-cap would skip its panel: the retry buys nothing.
+        self.run_decide(round_="5", max_rounds="5")
+        self.assertFalse(self.retried())
+        self.assert_hand_recovery(self.reviews_posted[0]["body"])
+
+    def test_round_cap_room(self):
+        for round_, max_rounds, want in (("4", "5", True), ("5", "5", False), ("9", "0", True),
+                                         ("", "5", False), ("x", "5", False)):
+            with self.subTest(round=round_, max_rounds=max_rounds):
+                self.assertEqual(AA.round_cap_leaves_room(
+                    argparse.Namespace(round=round_, max_rounds=max_rounds)), want)
+
+    # -- no marked block, no retry -----------------------------------------
+
+    def test_a_failed_block_post_never_retries(self):
+        # Without the marker nothing counts this retry, so it would re-fire on
+        # every later moved head.
+        self.run_decide(review_post_error="gh api failed: HTTP 502")
+        self.assertFalse(self.retried())
+        self.assertNotIn("re-run automatically", self.card_writes[0])
+        self.assertIn("Re-run the round: remove and re-add", self.card_writes[0])
+
+    def test_an_own_pr_rejection_never_retries(self):
+        self.run_decide(review_post_error="Can not request changes on your own pull request")
+        self.assertFalse(self.retried())
+        self.assertNotIn("re-run automatically", self.card_writes[0])
 
     # -- what is never retried ---------------------------------------------
 
     def test_a_same_head_transient_cause_is_not_retried(self):
         # The head never moved, so a re-run would hit the gate's same-SHA dedupe.
         self.run_decide(head=SHA, judge="error")
-        self.assertEqual(self.labels, [])
+        self.assertFalse(self.retried())
 
     def test_a_structural_cause_is_not_retried(self):
         self.run_decide(head=SHA, delivered="false")
-        self.assertEqual(self.labels, [])
-
-    # -- failure is never fatal --------------------------------------------
-
-    def test_a_failed_relabel_leaves_the_decision_alone(self):
-        rc, gate = self.run_decide(label_fail=True)
-        self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
-        self.assertEqual(self.labels, [])
-        self.assertIn(AA.AUTO_RETRY_MARKER, self.reviews_posted[0]["body"])
+        self.assertFalse(self.retried())
 
     def test_the_github_token_fallback_never_relabels(self):
         # A GITHUB_TOKEN-applied label fires no run: the retry would start nothing.
         self.run_decide(can_relabel="false")
-        self.assertEqual(self.labels, [])
-        body = self.reviews_posted[0]["body"]
-        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
-        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+        self.assertFalse(self.retried())
+        self.assert_hand_recovery(self.reviews_posted[0]["body"])
+
+    def test_only_an_explicit_can_relabel_true_retries(self):
+        for value in ("", "0", "no", "yes"):
+            with self.subTest(can_relabel=value):
+                self.run_decide(can_relabel=value)
+                self.assertFalse(self.retried())
+        self.run_decide(omit_can_relabel=True)
+        self.assertFalse(self.retried())
+
+    # -- the relabel itself (the workflow's auto-retry job) ----------------
+
+    def run_auto_retry(self, label="cursor-review", fail=None):
+        """`fail` maps a method to the errors its successive calls raise."""
+        self.calls, fails = [], {k: list(v) for k, v in (fail or {}).items()}
+
+        def fake_gh(args, payload=None):
+            self.calls.append((args[2], args[3], payload))
+            errs = fails.get(args[2])
+            if errs:
+                raise RuntimeError(errs.pop(0))
+            return "{}"
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", review_label=label)
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch("builtins.print", lambda *a, **k: None):
+            return AA.cmd_auto_retry(args)
+
+    def test_auto_retry_removes_and_re_adds_the_label(self):
+        self.assertEqual(self.run_auto_retry(), 0)
+        self.assertEqual(self.calls, [("DELETE", "repos/o/r/issues/1/labels/cursor-review", None),
+                                      ("POST", "repos/o/r/issues/1/labels", {"labels": ["cursor-review"]})])
+
+    def test_auto_retry_defaults_an_empty_label(self):
+        self.run_auto_retry(label="")
+        self.assertEqual(self.calls[0][1], "repos/o/r/issues/1/labels/cursor-review")
+
+    def test_auto_retry_quotes_the_label_as_one_path_segment(self):
+        self.run_auto_retry(label="ci/review #1?")
+        self.assertEqual(self.calls[0][1], "repos/o/r/issues/1/labels/ci%2Freview%20%231%3F")
+        self.assertEqual(self.calls[1][2], {"labels": ["ci/review #1?"]})
+
+    def test_auto_retry_tolerates_a_label_already_off(self):
+        self.assertEqual(self.run_auto_retry(fail={"DELETE": ["gh api failed: HTTP 404 Label does not exist"]}), 0)
+        self.assertEqual([c[0] for c in self.calls], ["DELETE", "POST"])
+
+    def test_auto_retry_stops_on_any_other_delete_failure(self):
+        self.assertEqual(self.run_auto_retry(fail={"DELETE": ["gh api failed: HTTP 403"]}), 1)
+        self.assertEqual([c[0] for c in self.calls], ["DELETE"])
+
+    def test_auto_retry_tries_the_re_add_twice(self):
+        self.assertEqual(self.run_auto_retry(fail={"POST": ["gh api failed: HTTP 502"]}), 0)
+        self.assertEqual([c[0] for c in self.calls], ["DELETE", "POST", "POST"])
+
+    def test_auto_retry_fails_red_when_the_label_cannot_be_restored(self):
+        self.assertEqual(self.run_auto_retry(fail={"POST": ["HTTP 502", "HTTP 502"]}), 1)
+        self.assertEqual([c[0] for c in self.calls], ["DELETE", "POST", "POST"])
 
     # -- the mirrored constant ---------------------------------------------
 

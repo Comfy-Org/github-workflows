@@ -3135,6 +3135,9 @@ jobs:
       approve_gate: ${{ steps.approve.outputs.approve_gate }}
       # `delta` or `full`, written by the same `decide`; empty when it never ran.
       approve_scope_effective: ${{ steps.approve.outputs.approve_scope_effective }}
+      # BE-19526: `true` when decide left a marked block and the `auto-retry`
+      # job should relabel; see that job.
+      auto_retry: ${{ steps.approve.outputs.auto_retry }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -4579,3 +4582,120 @@ jobs:
             "$STATUS" \
             "$TITLE" \
             "$MSG"
+
+  auto-retry:
+    # BE-19526: re-run a round the head outran, once per PR. `Auto-approve
+    # decision` decides it and leaves the marked standing block and the card;
+    # this job only does the relabel, and runs LAST on purpose. Removing and
+    # re-adding the label fires `unlabeled`/`labeled` events that land in the
+    # documented caller's `cancel-in-progress` group (and this reusable's own
+    # `trigger` slot), cancelling whatever of THIS run is still going — so every
+    # job that reports on the round (the Blocking gate and Panel integrity
+    # checks, the completion DM) must be done first. `needs:` them all, with
+    # `!cancelled()` so a skipped or red one does not skip the retry; a push that
+    # cancels this run before it gets here leaves the card's "if no new round
+    # starts, re-run it by hand" as the recovery.
+    name: Re-run the round (head moved)
+    needs: [post-review, panel-integrity, blocking-gate, notify-complete]
+    if: ${{ !cancelled() && needs.post-review.outputs.auto_retry == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ inputs.bot_app_id != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: Remove and re-add the review label
+        env:
+          # The token decide held (same precedence), never GITHUB_TOKEN: a
+          # GITHUB_TOKEN-applied label fires no workflow run. decide only sets
+          # `auto_retry` when one of these two is configured.
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          REVIEW_LABEL: ${{ inputs.review_label }}
+        run: |
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+          else
+            echo "::error::No APPROVER_TOKEN or bot App token, so the round cannot be re-run (a GITHUB_TOKEN label fires no run). Re-run it by hand."
+            exit 1
+          fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" auto-retry \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --review-label "$REVIEW_LABEL"

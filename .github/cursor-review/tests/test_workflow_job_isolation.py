@@ -298,7 +298,10 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         holders = {
             name for name, body in self.jobs.items() if references_bot_key(body)
         }
-        self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap"})
+        # `auto-retry` (BE-19526): the round's relabel, which must fire runs, so
+        # never GITHUB_TOKEN. It checks out only this repo's pinned assets.
+        self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap",
+                                   "auto-retry"})
 
     def test_only_credential_free_jobs_follow_the_runs_on_input(self):
         # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected

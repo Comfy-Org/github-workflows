@@ -459,6 +459,12 @@ class PanelIntegrityJobTest(unittest.TestCase):
                     )
             self.assertTrue(hits, f"`{PANEL_JOB}` no longer reports ${var}")
 
+    # Jobs that need this one for ORDERING only. `auto-retry` (BE-19526)
+    # relabels the PR, which cancels whatever of the run is still going, so it
+    # must run after this check has reported — but under `!cancelled()`, so a
+    # red or skipped check never stops it. Pinned below, not just allowed.
+    ORDERING_ONLY = ("auto-retry",)
+
     def test_it_gates_nothing(self):
         # Advisory: red here must not stop the review from posting, or a short
         # panel would cost the PR the findings it DID produce.
@@ -466,6 +472,11 @@ class PanelIntegrityJobTest(unittest.TestCase):
             if name == PANEL_JOB:
                 continue
             needs = job_scalar(lines, "needs") or ""
+            if name in self.ORDERING_ONLY:
+                cond = job_scalar(lines, "if") or ""
+                self.assertIn("!cancelled()", cond, f"`{name}` must run whatever `{PANEL_JOB}` concluded")
+                self.assertNotIn(PANEL_JOB, cond, f"`{name}` must not read `{PANEL_JOB}`'s result")
+                continue
             self.assertNotIn(
                 PANEL_JOB,
                 needs,
