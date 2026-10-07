@@ -316,7 +316,8 @@ on:
           APPROVES (pinned to the reviewed commit) when every finding is at or
           below that severity, and REQUESTS CHANGES when any finding is above
           it. Any other value fails the run. No approval when the judge did not
-          adjudicate, a panel reviewer did not complete, the review did not land
+          adjudicate, a panel reviewer did not complete (beyond what
+          `approve_max_failed_reviewers` tolerates), the review did not land
           as threads, the head moved or the base was retargeted mid-run, an
           earlier critical/high thread is still open, or the reviewed diff is
           empty (every changed path excluded by diff_excludes / the
@@ -338,6 +339,45 @@ on:
         type: string
         required: false
         default: ''
+      approve_authors:
+        description: >-
+          Per-author opt-in for auto-approve. A comma- or space-separated list
+          of GitHub logins (case-insensitive; a leading `@` is ignored). ''
+          (default) → every author, the behaviour before this input existed.
+          Otherwise a PR whose author (`pull_request.user.login`) is not listed
+          gets auto-approve OFF: `approve_gate` is `off`, no APPROVE or
+          REQUEST_CHANGES is posted (the decision note says "auto-approve not
+          enabled for author <login>"), and the panel still reviews and posts
+          its threads. `Dismiss stale auto-approval` still withdraws an earlier
+          marked approval as usual. No effect unless `approve_max_severity` is
+          set. Pass a repo variable (e.g. `vars.CURSOR_APPROVE_AUTHORS`) to
+          change it without a PR — and note it is read from the caller at the
+          PR's head, like `approve_max_severity`, so it is no stronger than
+          push access either.
+        type: string
+        required: false
+        default: ''
+      approve_scope:
+        description: >-
+          What an auto-approve round after the first gates on. `delta`
+          (default) → a finding above `approve_max_severity` blocks only when it
+          sits inside a hunk of the verified incremental block (the changes
+          since the last reviewed commit), re-raises an earlier finding whose
+          thread is still unresolved (named in `repeat_of`, or on the path and
+          line of an earlier round's still-open thread), or is High/Critical
+          anywhere in the reviewed diff. Every other finding is still posted, as a thread
+          marked "Outside this round's changes: not blocking auto-approve",
+          and is never auto-resolved. Round 1, an incremental block that was
+          unavailable, discarded or empty (a pure rebase), one naming a path
+          that cannot be parsed, an unknown prior-review ledger, an
+          unreadable list of earlier open threads and an explicitly empty
+          value all fail closed to `full`. `full` → every finding counts, wherever it
+          sits (the behaviour before this input existed). The panel reviews
+          the full diff either way. No effect unless `approve_max_severity` is
+          set; any other value fails the decision step.
+        type: string
+        required: false
+        default: delta
       defer_approval:
         description: >-
           For a caller that runs cursor-approve's per-axis approval after this
@@ -352,6 +392,22 @@ on:
         type: boolean
         required: false
         default: false
+      approve_max_failed_reviewers:
+        description: >-
+          How many panel reviewers may ERROR (status `error`: the cell ran but
+          failed, timed out, or never uploaded) before auto-approve withholds its
+          decision. 0 (default) → any reviewer that did not complete withholds,
+          as before. N → up to N errored reviewers are tolerated and the round
+          is decided normally (the decision names them, e.g. "approved with
+          1/6 reviewers errored: <model>:edge-case"), but it is still withheld
+          when more than N errored, a reviewer has any other status, the panel
+          metadata is missing, or a review type (`adversarial` or `edge-case`)
+          has no reviewer that completed. Applies to the decision `defer_approval`
+          hands to cursor-approve too. No effect unless `approve_max_severity`
+          is set.
+        type: number
+        required: false
+        default: 0
       max_rounds:
         description: >-
           Cap on review rounds per PR. Before the panel starts, the run counts
@@ -420,13 +476,15 @@ on:
           auto-approve decision was APPROVE — posted, unless `defer_approval`
           left it to cursor-approve), `fail` (REQUEST_CHANGES, or an
           open thread above the threshold withheld approval), `untrusted` (the
-          judge was degraded, a panel cell failed, the review was not delivered,
+          judge was degraded, a panel cell failed beyond what
+          `approve_max_failed_reviewers` tolerates, the review was not delivered,
           the head moved — or no round was delivered by this run at all, e.g. a
           skipped or already-reviewed event), `capped` (the `max_rounds` cap was
           hit this run, or the PR carries `needs-human-review` while
           `max_rounds` or `approve_max_severity` is set), `off`
-          (`approve_max_severity` is empty and the cap was not hit).
-        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || inputs.approve_max_severity == '' && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
+          (`approve_max_severity` is empty, or `approve_authors` does not list
+          the PR's author, and the cap was not hit).
+        value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') && 'capped' || (inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off' || jobs.post-review.outputs.approve_gate || 'untrusted' }}
       round:
         description: >-
           The 1-based number of the review round this run delivered, counted
@@ -443,6 +501,17 @@ on:
           there is no cap (including a value the cap step rejected as not a
           whole number). Pairs with `round` for a "round R of M" display.
         value: ${{ jobs.round-cap.outputs.max_rounds || (inputs.max_rounds > 0 && inputs.max_rounds) || 0 }}
+      approve_scope_effective:
+        description: >-
+          The scope this run's auto-approve decision actually gated under:
+          `delta` only when `approve_scope` was `delta` and the round did not
+          fall back to `full` (round 1, an unavailable, discarded or empty
+          incremental block, an unparseable path, an unknown ledger, an
+          unreadable list of earlier open threads); `full` otherwise, including
+          when no decision ran or the round withdrew it (`untrusted`/`capped`). Pass it to cursor-approve's
+          `approve_scope` so a deferred approval resolves threads under the
+          same rule this round's decide used.
+        value: ${{ jobs.post-review.outputs.approve_scope_effective || 'full' }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -531,7 +600,46 @@ jobs:
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
+      approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
     steps:
+      - name: Resolve the auto-approve author opt-in
+        # approve_authors, resolved ONCE here so the workflow-level
+        # `approve_gate` output (which must say `off` on every event, round or
+        # not) and `Auto-approve decision` read the same answer. Runs on every
+        # event, before any skip below. `false` when a non-empty list does not
+        # name the PR author — including a list that names nobody (`,`, `@`):
+        # a restriction that evaluates empty fails closed. An empty (or
+        # all-whitespace) list is everyone. No PR author (a non-PR event) leaves
+        # the output unset, so `approve_gate` keeps its "no round" meaning.
+        id: author
+        env:
+          APPROVE_AUTHORS: ${{ inputs.approve_authors }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -f  # the list is caller text: no glob expansion of its words
+          if [ -z "$(printf '%s' "$APPROVE_AUTHORS" | tr -d '[:space:]')" ]; then
+            echo "approve_authors is empty — no author restriction."
+            echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$PR_AUTHOR" ]; then
+            echo "No PR author on this event — approve_authors not evaluated."
+            exit 0
+          fi
+          author="$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')"
+          listed=false
+          for login in $(printf '%s' "$APPROVE_AUTHORS" | tr ',' ' '); do
+            login="$(printf '%s' "${login#@}" | tr '[:upper:]' '[:lower:]')"
+            [ -n "$login" ] || continue
+            if [ "$login" = "$author" ]; then listed=true; fi
+          done
+          if [ "$listed" = true ]; then
+            echo "approve_author_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approve_authors does not list the PR author '$PR_AUTHOR' — auto-approve is off for this PR."
+            echo "approve_author_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check trigger label
         id: check
         env:
@@ -1060,6 +1168,13 @@ jobs:
       # should report. Written with `!= 'false'` rather than read straight
       # through so the skipped-step empty string reads as `true`, not `''`.
       incremental_subset: ${{ steps.incremental.outputs.incremental_subset != 'false' }}
+      # What the incremental block IS, for approve_scope (auto-approve.py
+      # resolve_scope): `none` (no usable last-reviewed SHA — round 1, or a re-run
+      # on the same head), `built` (verified; EMPTY on a pure rebase),
+      # `unavailable` (a later round whose block could not be built) or
+      # `discarded` (the fail-safe threw it away). A skipped step reads as
+      # `unavailable`, which fails closed to `full`.
+      incremental_state: ${{ steps.incremental.outputs.incremental_state || 'unavailable' }}
       # The merge base THIS round's reviewed diff was taken against — the exact left
       # tree `check-pr-size` resolves `BASE_SHA...HEAD_SHA` to. Consumed by `post-review`
       # (BE-15598), which writes it into the consolidated review's round sentinel so the
@@ -1431,12 +1546,15 @@ jobs:
           # let the fail-safe below append 'false' over it — same last-value-wins
           # append the raw-count fallback above uses.
           echo "incremental_subset=true" >> "$GITHUB_OUTPUT"
+          # Same last-value-wins append for approve_scope's view of the block.
+          echo "incremental_state=unavailable" >> "$GITHUB_OUTPUT"
           # Every "can't build one" case below leaves the block EMPTY and
           # `incremental_subset` true: nothing was discarded, there was simply
           # nothing to prioritize, and the panel reviews the full diff as it
           # does on round 1. Only the fail-safe at the bottom writes `false`.
           if [ -z "$LAST_REVIEWED_SHA" ] || [ "$LAST_REVIEWED_SHA" = "$HEAD_SHA" ]; then
             echo "No usable last-reviewed SHA — skipping the incremental diff block."
+            echo "incremental_state=none" >> "$GITHUB_OUTPUT"
           elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
             echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
           elif [ -z "$LAST_REVIEWED_MERGE_BASE" ]; then
@@ -1484,6 +1602,7 @@ jobs:
             # runs on the full diff alone, which is always correct.
             if SUBSET_OUT="$(python3 "$INCREMENTAL_PY" check --new "$NEW_PATCH" --full "$FULL_PATCH")"; then
               echo "Incremental block verified as a subset of the reviewed diff."
+              echo "incremental_state=built" >> "$GITHUB_OUTPUT"
             else
               FOREIGN="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^foreign=//p')"
               NEW_LINES="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^new_lines=//p')"
@@ -1491,6 +1610,7 @@ jobs:
               : > "$NEW_PATCH"
               echo "::warning::Incremental diff discarded: it was not a subset of the reviewed diff (${FOREIGN:-unknown} foreign file(s), ${NEW_LINES:-unknown} vs ${FULL_LINES:-unknown} lines)."
               echo "incremental_subset=false" >> "$GITHUB_OUTPUT"
+              echo "incremental_state=discarded" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -2922,8 +3042,10 @@ jobs:
     # `diff-size` for its `merge_base_sha` alone (BE-15598) — the round sentinel this
     # job writes has to record the merge base THIS round's reviewed diff was taken
     # against. Already a transitive dependency (consolidate → review → diff-size), so
-    # this adds no ordering, only the outputs.
-    needs: [consolidate, ledger, diff-size]
+    # this adds no ordering, only the outputs. `round-cap` likewise (diff-size
+    # already `needs:` it), for the round number on the status card decide
+    # writes (BE-19489).
+    needs: [gate, consolidate, ledger, diff-size, round-cap]
     # `!cancelled()` rather than `always()`, for the same reason
     # `over-cap-comment` documents at its own `if:`: the documented caller sets
     # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
@@ -3011,6 +3133,8 @@ jobs:
       # empty when auto-approve is off (the workflow-level output then says
       # `off`) or the step died before deciding (it then says `untrusted`).
       approve_gate: ${{ steps.approve.outputs.approve_gate }}
+      # `delta` or `full`, written by the same `decide`; empty when it never ran.
+      approve_scope_effective: ${{ steps.approve.outputs.approve_scope_effective }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -3204,6 +3328,13 @@ jobs:
           LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
           # … and the consolidate job's (did the JUDGE get prior-round context).
           LEDGER_DOWNLOAD_JUDGE: ${{ steps.meta.outputs.ledger_download }}
+          # approve_scope: post-review.py marks the threads auto-approve will not
+          # count, from the same inputs `Auto-approve decision` passes below.
+          # Empty for an author approve_authors does not list: no decision is
+          # taken for them, so no thread may claim it is "not blocking" one.
+          APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}
+          APPROVE_SCOPE: ${{ inputs.approve_scope }}
+          INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
@@ -3270,6 +3401,12 @@ jobs:
           # as "shown" and wave the re-raise through on exactly the degraded run
           # $LEDGER_NOTE already banners above.
           LEDGER_FLAGS=(--ledger /tmp/ledger/ledger.json)
+          # --open-anchors-out: the earlier rounds' open threads, read before this
+          # review posts; `Auto-approve decision` gates on that same snapshot, and
+          # without it (an unreadable thread list) fails closed to `full`.
+          SCOPE_FLAGS=(--approve-threshold "$APPROVE_THRESHOLD" --approve-scope "$APPROVE_SCOPE"
+                       --incremental /tmp/pr-diff-new.patch --incremental-state "$INCREMENTAL_STATE"
+                       --open-anchors-out /tmp/open-anchors.json)
           if [ "$JUDGE_LEDGER_OK" != "true" ]; then
             LEDGER_FLAGS+=(--no-judge-ledger)
           fi
@@ -3290,6 +3427,7 @@ jobs:
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
+              "${SCOPE_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             # No JUDGE_ERROR is read here on purpose: this branch passes --notice with
@@ -3310,6 +3448,7 @@ jobs:
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
+              "${SCOPE_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
@@ -3371,6 +3510,18 @@ jobs:
           # it in the review so a later retarget is caught from live state.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           DEFER_APPROVAL: ${{ inputs.defer_approval }}
+          APPROVE_SCOPE: ${{ inputs.approve_scope }}
+          INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
+          MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
+          # approve_authors, resolved by `gate`: `false` → decide posts nothing
+          # and reports `off` for this author.
+          AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # For the cursor-approve status card decide writes every round
+          # (BE-19489): round-cap's count is the heading's "round R of M".
+          ROUND: ${{ needs.round-cap.outputs.next_round }}
+          MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3402,15 +3553,30 @@ jobs:
             --reviewed-diff /tmp/pr-diff.patch \
             --base-ref "$BASE_REF" \
             --poster-login "$POSTER" \
-            --defer-approval "$DEFER_APPROVAL"
+            --defer-approval "$DEFER_APPROVAL" \
+            --approve-scope "$APPROVE_SCOPE" \
+            --incremental /tmp/pr-diff-new.patch \
+            --incremental-state "$INCREMENTAL_STATE" \
+            --ledger /tmp/ledger/ledger.json \
+            --open-anchors /tmp/open-anchors.json \
+            --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}" \
+            --author-enabled "$AUTHOR_ENABLED" \
+            --pr-author "$PR_AUTHOR" \
+            --card true \
+            --round "$ROUND" \
+            --max-rounds "$MAX_ROUNDS" \
+            --run-url "$RUN_URL" \
+            --review-label "$REVIEW_LABEL"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
     # `dismiss_stale_reviews_on_push: false` keeps an approval valid for every
     # later commit, so when what was reviewed changes the bot withdraws its own
-    # auto-approve APPROVALS. A request-changes stays: a push under a
+    # auto-approve APPROVALS. A request-changes stays on a push: a push under a
     # label-triggered caller starts no new round, so only a later round's own
-    # review may supersede the veto. Only reviews carrying the auto-approve
+    # review may supersede the veto. It is withdrawn only once no round is
+    # coming: the PR carries `skip-cursor-review` or `needs-human-review`, or
+    # `approve_max_severity` is empty (`--threshold`). Only reviews carrying the auto-approve
     # marker and authored by the approver identity are touched. Independent of
     # `gate`: it must run on a push whether or not a panel runs. Checks out no
     # PR code.
@@ -3433,7 +3599,8 @@ jobs:
     # A third trigger is the `skip-cursor-review` veto label (auto-approve.py's
     # VETO_LABELS, read off the live PR): `gate` runs no round on a vetoed PR,
     # so a `labeled` event reaching this job is what withdraws EVERY marked
-    # approval, same head or not. Hence no `github.event.action` filter here.
+    # approval, same head or not — as does `needs-human-review`, the hand-off
+    # (BE-19492). Hence no `github.event.action` filter here.
     # Open PRs only: a title edit on a merged PR must not try a dismissal.
     name: Dismiss stale auto-approval
     if: >-
@@ -3539,6 +3706,9 @@ jobs:
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Non-empty only on a base retarget (`edited` with `changes.base`).
           BASE_FROM: ${{ github.event.changes.base.ref.from }}
+          # Empty = auto-approve is off: its standing requests for changes are
+          # withdrawn, since no round will ever approve over them.
+          THRESHOLD: ${{ inputs.approve_max_severity }}
         run: |
           # Same identity precedence as `Auto-approve decision`, so the login
           # whose reviews are dismissed is the login that posted them.
@@ -3575,6 +3745,7 @@ jobs:
             --pr-number "$PR_NUMBER" \
             --approver-login "$LOGIN" \
             --head-sha "$EVENT_HEAD_SHA" \
+            --threshold "$THRESHOLD" \
             "${ALL[@]}"
 
   panel-integrity:

@@ -1,0 +1,12 @@
+diff --git a/app/handler.py b/app/handler.py
+index 1111111..2222222 100644
+--- a/app/handler.py
++++ b/app/handler.py
+@@ -10,3 +10,5 @@ def handle(event):
+     value = event["value"]
++    if value is None:
++        return None
+     return value * 2
+ 
+@@ -40,0 +43,1 @@ def other():
++    log("added")

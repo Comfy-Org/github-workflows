@@ -25,7 +25,9 @@ the context axes (business, design, completeness) are not available yet.
    writes the **status card** — one PR comment, found by
    `<!-- cursor-approve-card -->` and edited in place — with every axis
    pending. When cursor-review reports `approve_gate == 'capped'` it writes
-   "Round limit reached, needs a human" instead.
+   "Round limit reached, needs a human" instead. (cursor-review's decide has
+   already written the card for this round; see
+   [the status card contract](#the-status-card-contract).)
 3. Each axis runs only when `approve_gate == 'pass'`, after the start phase: a
    read-only checkout of the PR head, one `cursor-agent` call over
    `.github/cursor-approve/`'s prompt, and one `axis-<name>` artifact holding
@@ -48,6 +50,92 @@ the context axes (business, design, completeness) are not available yet.
 Every model-supplied string on the card goes through post-review.py's
 `neutralize_mentions` plus markdown/HTML escaping, so a summary cannot add a
 heading, fire a mention or forge the card marker.
+
+## The status card contract
+
+The card is written on **every completed round** for a PR auto-approve applies
+to (`approve_max_severity` set and the author passes `approve_authors`),
+whatever the outcome, and edited in place each time, so it always shows the
+latest round and the commit it reviewed. An author `approve_authors` does not
+list gets no card.
+
+cursor-review's own `decide` writes it first, every round. That job is the one
+that has the round's gating findings, their threads and `decide_gate`'s
+reasons in hand, and it runs on every outcome, while this workflow's phases run
+only when the caller's `if:` lets a `pass` (or `capped`) through. Callers need
+no new wiring for the not-approved outcomes. On a `pass` this workflow's start
+phase then overwrites the card with the axes table, and its decide phase with
+the verdicts. Both workflows write as the `APPROVER_TOKEN` identity, which is
+how they find the same comment; pass the same `APPROVER_TOKEN` to both.
+
+The three lines at the top of the card are a **stable contract** for agents.
+Read them from the start of the comment body; they are never renamed:
+
+```text
+<!-- cursor-approve-card -->
+<!-- cursor-approve-state: pass|changes_requested|no_decision|capped -->
+<!-- cursor-approve-next: none|resolve_then_relabel|relabel|human -->
+```
+
+| State | Written by | Card says | `next` | Next-step line |
+|---|---|---|---|---|
+| `pass` | cursor-review decide, then this workflow's start phase | Approved (or passed the severity gate, axes pending), then the axes table | `none` | none |
+| `changes_requested` | cursor-review decide | "Not approved: N finding(s) above `<threshold>` gate this round", one line per gating finding (severity, `file:line`, thread link, why it gated: inside this round's changes, a live re-raise, High/Critical anywhere, or `full` scope), or the earlier open threads that held it | `resolve_then_relabel` | Fix or reply to the gating threads, resolve them, then start a new round: remove and re-add the `cursor-review` label. |
+| `no_decision` | cursor-review decide | "No decision this round", with `decide_gate`'s reasons verbatim (e.g. "2/6 panel reviewers did not complete") | `relabel` for a transient cause (a reviewer or the judge errored, the head or base moved, the PR could not be read); `human` for a structural one (the findings did not land as threads, the reviewed diff is empty) | Re-run the round: remove and re-add the `cursor-review` label. / A human is needed: <cause>. |
+| `capped` | cursor-review decide, or this workflow's start phase | Needs a human (`needs-human-review`, or the round limit) | `human` | A human is needed: the bot withdraws its own request for changes on this hand-off, so a human's review decides this PR — if one still shows, its withdrawal failed (see the run log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the round count. |
+
+The decide phase maps its outcome onto the same contract: `approved` →
+`pass`/`none`; `not_approved` (an axis was red, missing, or too many yellow) →
+`changes_requested`/`relabel`; `superseded` and `error` → `no_decision`/`relabel`;
+`needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
+`no_decision`/`human`. Every card also shows the reviewed commit SHA.
+
+A `no_decision` round (and a `changes_requested` one held only by an earlier
+round's open thread) also leaves a **standing REQUEST_CHANGES** as the approver
+identity, with the reasons and the next step, so resolving every thread does
+not make an unapproved PR look done. The next no-decision round replaces it;
+the next approval withdraws it — cursor-review's own, or, under
+`defer_approval`, its passing decide and this workflow's decide phase. A
+`capped` round posts none and withdraws any earlier one.
+
+This workflow's **decide phase leaves the same block when it withholds** —
+`not_approved`, `error` and `superseded` — with the card's
+reasons and next step and the reviewed-SHA marker, posted before the older
+blocks are dismissed so they never stack. Under `defer_approval` the passing
+cursor-review round has already dismissed every earlier block, so without this
+a red axis would leave the PR with no approval and nothing blocking it.
+`own_pr` posts none, nor does an approval. A `superseded` decide
+that finishes after a newer run approved the live head posts none either: as
+the approver's latest review it would override that approval.
+
+**A hand-off withdraws the block instead.** Once no round will approve the PR,
+no approving round would ever withdraw a block either, and it would hold the
+merge until someone dismissed it by hand. So the bot's own marked, unedited
+request for changes is withdrawn — a human's, or one someone edited, never is —
+when:
+
+- the PR carries `needs-human-review` (the round limit, or a human): by
+  cursor-review's `capped` decide, by this workflow's start phase on a `capped`
+  gate (the round-cap path, where no decide runs) and its `needs_human`
+  outcome, and by cursor-review's **Dismiss stale auto-approval** job on the
+  next PR event;
+- the PR carries `skip-cursor-review`: by this workflow's `vetoed` outcome and
+  by that job;
+- the caller clears cursor-review's `approve_max_severity`: by that job, on the
+  next PR event, once none of the bot's approvals still stands.
+
+The label is re-read after the reviews are listed, so a run that finishes late
+never withdraws a block a newer round posted after the label came off. A
+withdrawal that fails turns its step red; the card is still written.
+
+The card then names what clears the PR: a human's review. Removing
+`needs-human-review` only resets the round count for the next round.
+
+The next-step line names cursor-review's `review_label` input (default
+`cursor-review`) on the cards cursor-review writes; a value that is not a plain
+label name is not echoed, and the line says "the review label" instead. This
+workflow has no such input, so its own start and decide cards always say
+`cursor-review`.
 
 ## Prerequisites
 
@@ -126,6 +214,7 @@ jobs:
       max_rounds: ${{ needs.cursor-review.outputs.max_rounds }}
       approve_max_severity: low
       poster_login: github-actions[bot]  # `<app-slug>[bot]` if cursor-review runs with bot_app_id
+      approve_scope: ${{ needs.cursor-review.outputs.approve_scope_effective }}
     secrets:
       APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 ```
@@ -136,6 +225,12 @@ phase's decide resolves cursor-review's at-or-below-threshold threads only when
 be the login cursor-review posts findings under — `<app-slug>[bot]` when
 cursor-review runs with `bot_app_id`, else `github-actions[bot]`. A wrong login
 resolves nothing, so a "require conversation resolution" ruleset still blocks.
+Pass `approve_scope` from cursor-review's `approve_scope_effective` output, not
+a literal: under cursor-review's default `approve_scope: delta`, a round marks
+findings outside its changes as non-gating, and only when that round really
+gated under `delta` may those marked threads stop blocking the resolution of
+the others. Omitted, it is `full` and any open above-threshold thread — marked
+or not — leaves every thread open for a human.
 
 Pass secrets explicitly to the axes — never `secrets: inherit` — so each axis
 receives `CURSOR_API_KEY` and nothing else. `always()` on the decide job makes a
@@ -160,6 +255,7 @@ fails to withdraw it skips them, which decide reads as "no result".
 | `approve_gate` | `''` | cursor-review's `approve_gate` output; `capped` makes the start card say a human is needed. |
 | `approve_max_severity` | `''` | Decide phase: the same threshold cursor-review runs with. With `poster_login`, an approval that stands auto-resolves cursor-review's own at-or-below-threshold threads exactly as cursor-review's own approval does. Empty → no thread is resolved. |
 | `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. |
+| `approve_scope` | `full` | Decide phase: cursor-review's `approve_scope_effective` output. `delta` → an open above-threshold thread that round marked non-gating (*Outside this round's changes*) does not block resolving the at-or-below-threshold threads, exactly as cursor-review's own decide treats it; the marked thread itself is never resolved. `full` (or empty) → any open above-threshold thread, marked or not, blocks all resolution. Any other value warns and resolves as `full`. |
 
 ## Axis inputs
 

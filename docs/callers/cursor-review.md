@@ -125,7 +125,10 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 | `approve_max_severity` | `''` (off) | `medium`, `low` or `nit`: after each round the bot **approves** (pinned to the reviewed commit) when every finding is at or below that severity, and **requests changes** when any is above it. See [auto-approve](#auto-approve). |
+| `approve_authors` | `''` (everyone) | Per-author opt-in for auto-approve: a comma- or space-separated list of GitHub logins (case-insensitive, leading `@` ignored). A PR whose author is not listed gets auto-approve **off** — `approve_gate` is `off`, no APPROVE or REQUEST_CHANGES is posted, the decision note says *auto-approve not enabled for author `<login>`* — while the panel still reviews and posts its threads and the approver withdraws its own earlier approvals and dismisses its own REQUEST_CHANGES, since narrowing the list moves no head SHA. Empty means every author; a non-empty list that names nobody (`,`, `@`) fails closed and auto-approves no one. See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
+| `approve_scope` | `delta` | What an auto-approve round after the first gates on. `delta`: a finding above `approve_max_severity` blocks only when it sits inside a hunk of the verified incremental block (the changes since the last reviewed commit), re-raises an earlier finding whose thread is still unresolved (the judge names that thread in `repeat_of`, or the finding sits on the path and line of an earlier round's thread that is still open — so a re-raise of an unanswered thread gates without a `repeat_of`), or is High/Critical anywhere in the reviewed diff. Every other finding is still posted, as a thread marked *Outside this round's changes: not blocking auto-approve*, and is never auto-resolved — it stays open for a human (and still counts for the `blocking` gate). Round 1, an incremental block that was unavailable or discarded, an empty one (a pure rebase, or no new-side hunk), one naming a path that cannot be parsed, an unknown prior-review ledger, and a list of earlier open threads that could not be read all fail closed to `full`; so does an explicitly empty value (only the input's own default picks `delta`). The decision note states the scope used, the gating vs non-gating counts, and why each gating finding gated. `full`: every finding counts wherever it sits (the behaviour before this input). The panel reviews the full diff either way. No effect without `approve_max_severity`. |
 | `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
+| `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 
@@ -510,22 +513,79 @@ jobs:
       APPROVER_TOKEN: ${{ secrets.CURSOR_APPROVER_TOKEN }}
 ```
 
+**Trying it on a few authors first.** `approve_authors` limits auto-approve to
+the PR authors it lists (comma- or space-separated logins; empty, the default,
+means everyone). Pass it from a repo variable too, e.g.
+`approve_authors: ${{ vars.CURSOR_APPROVE_AUTHORS }}`. For anyone else the round
+runs and posts its threads exactly as before, but no review event is submitted,
+`approve_gate` reports `off`, and the step summary says *auto-approve not enabled
+for author `<login>`*. It is read from the caller at the PR's head like
+`approve_max_severity`, so it narrows who is approved; it is not a security
+boundary (see the trust model below).
+
 After `Post review` lands, `auto-approve.py decide` submits one of:
 
 - **APPROVE**, pinned to the reviewed commit, when every finding is at or below
   the threshold;
 - **REQUEST_CHANGES** when any finding is above it, or has an unrecognised
   severity;
-- **nothing** when the round can't be trusted: the judge did not adjudicate, a
-  panel reviewer did not complete, the review did not land as threads (or some
+- **no decision** when the round can't be trusted: the judge did not adjudicate, a
+  panel reviewer did not complete (beyond what `approve_max_failed_reviewers`
+  tolerates — see below), the review did not land as threads (or some
   finding reached the review body only), the head moved or the base was
   retargeted mid-run, the PR state
   could not be read, an earlier round's thread above the threshold is still
   open, or the **reviewed diff is empty** — every changed path was stripped by
   `diff_excludes` or the generated-file classifier (or the change is a pure
   rename / mode / binary change with no content hunk), so zero findings means
-  nobody looked, not that the change is clean. A "nothing" round also **withdraws** the bot's own earlier approvals, so
-  a round-1 approval does not keep counting through a degraded re-run.
+  nobody looked, not that the change is clean. A no-decision round also **withdraws** the bot's own earlier approvals, so
+  a round-1 approval does not keep counting through a degraded re-run, and
+  posts one **standing REQUEST_CHANGES** carrying the reasons verbatim and the
+  next step (re-run the round by removing and re-adding the `review_label`
+  label — `cursor-review` by default — or — when the cause would recur, e.g. the findings did not land as
+  threads or the reviewed diff is empty — a human is needed). Without it, a PR
+  whose threads all get resolved would look done although nothing approved it.
+  The next no-decision round replaces it (it never stacks); the next round that
+  approves — or, under `defer_approval`, that passes, and cursor-approve's
+  approval after it — dismisses it. A `capped` round (`needs-human-review`)
+  posts none and **withdraws** any earlier one: the label hands the PR to a
+  human, no round will approve it, so a human's own review decides it.
+  The same holds once auto-approve stops deciding the PR for good — it is
+  labelled `skip-cursor-review` or `needs-human-review`, or `approve_max_severity`
+  is cleared: the **Dismiss stale auto-approval** job (below) withdraws the
+  bot's standing blocks then, so none is left to dismiss by hand.
+
+Whatever the outcome, `decide` then writes the **cursor-approve status card**
+(one PR comment, edited in place each round; see
+[cursor-approve.md](cursor-approve.md#the-status-card-contract)) — except for
+an author `approve_authors` does not list, who gets no card. It is written as
+the decide identity (`APPROVER_TOKEN`'s user when set), so pass the same
+`APPROVER_TOKEN` to cursor-approve or its phases will start a second card.
+
+**Tolerating an errored reviewer.** By default a single panel cell that errors
+(one model having a bad minute) withholds the whole decision, and since a push
+does not start a new round on a label-triggered caller, the PR then waits for a
+human. `approve_max_failed_reviewers: N` lets the round be decided with up to N
+cells whose status is `error`. It never tolerates more than that, and a round is
+still withheld when:
+
+- more than N reviewers errored;
+- a cell has any status other than `ok` or `error` (missing, unknown), or is
+  not an object at all;
+- the panel metadata is missing or empty;
+- a review type — `adversarial` or `edge-case` — has **no** reviewer that
+  completed (checked whenever N > 0, errors or not). Some cells of one type may
+  error within N, but never all of them, so nothing is approved with a whole
+  pass missing.
+
+`error` is not purely an infrastructure signal: a cell counts as `error` until
+the reviewer reports finishing, so one that the PR's own content stalled or
+derailed lands there too. N is therefore also how many reviewers a PR could
+silence and still be decided; keep it small relative to the panel.
+
+A decision taken over tolerated errors says so, e.g. ``Approved: every finding is
+at or below `low` (approved with 1/6 reviewers errored: gpt-x:edge-case)``. The
+same gate feeds `defer_approval`, so cursor-approve's axes see it too.
 
 **Resolving the bot's own nits on approval.** A ruleset that requires every
 conversation resolved would otherwise hold an approval hostage to the Low / Nit
@@ -605,12 +665,21 @@ approver identity changed, or the approver's secrets are not available to the
 run (`APPROVER_TOKEN` / `BOT_APP_PRIVATE_KEY` on a Dependabot PR) — the job goes
 **red** rather than passing unchecked; dismiss it by hand.
 
-A request-changes is left in place — a push does not start a new panel under the
-label-triggered caller, so only the next round (re-apply the label) supersedes it.
+A request-changes is left in place on a push — a push does not start a new panel
+under the label-triggered caller, so only the next round (re-apply the label)
+supersedes it. The job withdraws the bot's own marked, unedited request-changes
+only once no round is coming to: the PR carries `skip-cursor-review` or
+`needs-human-review` (either label also withdraws every one of the bot's
+approvals, and is re-read after the reviews are listed), or
+`approve_max_severity` is empty (then only once none of the bot's approvals
+still stands, which the newer request-changes is outranking). A human's
+request-changes, and a bot review someone edited, are never touched; a failed
+withdrawal turns the job red.
 
 **The dismissal is not gated on `approve_max_severity`.** Unsetting the variable
 is the kill switch for *new* approvals; the next push still withdraws any
-approval already on a PR. On a repo that never approved, the job lists the
+approval already on a PR, and the next event of any kind withdraws its standing
+request-changes. On a repo that never approved, the job lists the
 reviews, finds none of its own, and does nothing. It does key on the approver
 identity, though: change `APPROVER_TOKEN` / `bot_app_id` while approvals are
 live and the old identity's approvals can no longer be dismissed — the job goes
@@ -726,9 +795,9 @@ jobs:
 |---|---|
 | `pass` | The auto-approve decision was APPROVE (posted, unless `defer_approval` left it to cursor-approve). |
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
-| `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
+| `untrusted` | The judge was degraded, a panel cell failed (beyond what `approve_max_failed_reviewers` tolerates), the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
-| `off` | `approve_max_severity` is empty (and the cap was not hit). |
+| `off` | `approve_max_severity` is empty, or `approve_authors` does not list the PR's author (and the cap was not hit). |
 
 Two more outputs carry the count, for a "round R of M" display:
 
@@ -736,3 +805,9 @@ Two more outputs carry the count, for a "round R of M" display:
 |---|---|
 | `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing is not counted). If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
 | `max_rounds` | The effective cap: the `max_rounds` input as applied, or `0` for no cap. A value the cap step rejects as not a whole number reports `0`, because it is not applied. |
+
+One more, for [cursor-approve](cursor-approve.md) under `defer_approval: true`:
+
+| Output | Value |
+|---|---|
+| `approve_scope_effective` | The scope this run's auto-approve decision actually gated under: `delta` only when `approve_scope` is `delta` and the round did not fail closed to `full` (round 1, an unavailable, discarded or empty incremental block, an unparseable path, an unknown ledger, an unreadable list of earlier open threads); `full` otherwise, including when no decision ran or the round withdrew it (`untrusted`/`capped`). Pass it as cursor-approve's `approve_scope`, so its deferred approval auto-resolves threads under the same non-gating rule this round's decide used. |

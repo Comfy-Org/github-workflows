@@ -61,6 +61,12 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
           id
           isResolved
           isOutdated
+          # Where the thread sits on the current head: auto-approve.py matches an
+          # approve_scope `delta` finding against an earlier round's open thread
+          # by path and line, so a re-raise the judge gave no repeat_of still gates.
+          path
+          line
+          startLine
           comments(first: 1) {
             nodes {
               # fullDatabaseId (BigInt, serialized as a String) alongside

@@ -27,7 +27,7 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/`, `README.md` and `catalog-drift.py`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/`, `README.md` and `catalog-drift.py`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes — **or the cursor-approve family**: `cursor-approve.yml`, `cursor-axis-base.yml`, the five `axis-*.yml`, or `cursor-approve/**` (minus its `tests/` and `README.md`). Those reusables are passed as `COMPANION_FILES`, so their pins move with cursor-review's (see below) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` (minus its `tests/` and `README.md`, which no caller executes) | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` (minus its `tests/`, `README.md` and `schema_drift.py`, which no caller executes) | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
@@ -152,14 +152,34 @@ and the same never-hand-bump-one-alone rule applies.
 
 A caller pinning **two** github-workflows reusables in the same file is a
 special case: the `uses:` pin rewrite and the `# main @ <short>` comment rewrite
-are both address-restricted to the line calling THIS fleet's `WORKFLOW_FILE`, so
+are both address-restricted to the lines calling THIS fleet's reusables, so
 a sibling fleet's pin and annotation are left untouched rather than stamped with
 this fleet's SHA (BE-4523). The legacy `# github-workflows#NN` / already-converted
 `github-workflows main (<short>)` markers name a SHA but not which reusable they
 annotate, so they are refreshed only when the file is provably ours alone;
-otherwise they are left as found and the run logs a warning. Inert for every
-caller today (all call exactly one reusable); it exists so a caller that starts
-calling two cannot be corrupted.
+otherwise they are left as found and the run logs a warning.
+
+"This fleet's reusables" is `WORKFLOW_FILE` plus any **`COMPANION_FILES`** the
+entrypoint passes (BE-19438) — reusables that ship as one family and are pinned
+beside it in the same caller file. The cursor-review fleet passes the
+cursor-approve family (`cursor-approve.yml`, `cursor-axis-base.yml` and the
+`axis-*.yml` workflows): a caller that runs cursor-review and cursor-approve from
+one file pins all of them plus several `workflows_ref:` inputs, and they all have
+to move together. Before companions existed that file read as multi-reusable, so
+only cursor-review's `uses:` moved while every `workflows_ref:` did (that input
+carries no workflow name, so it is never address-restricted) — a split pin on
+cursor-approve and the axes. Now a companion never makes a file multi-reusable:
+cursor-review plus companions is "ours alone", every pin and every marker moves,
+and the pre-rewrite address gate and post-rewrite assertion both cover the
+companions. When a genuine sibling (say `groom.yml`) also shares the file, the
+address names the whole family, so the companions still move and the sibling
+does not. The one residual: a genuine sibling that carries its OWN
+`workflows_ref:` would have that input moved to this fleet's SHA, because a
+line-wise rewrite cannot tell whose input it is. No caller does that today.
+A second, cosmetic one in the same sibling case: an unattributed
+`# github-workflows main (<sha>)` marker is left as found even on a family pin
+line that DID move (only the `# main @` note is address-scoped), so it can name
+the SHA that pin no longer uses until the file is ours alone again.
 
 ## Preflight
 

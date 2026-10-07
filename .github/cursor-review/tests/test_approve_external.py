@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -38,7 +39,7 @@ class FakeGitHub:
         if args[:2] == ["api", "graphql"]:
             # list_reviews reads through GraphQL (for `lastEditedAt`).
             nodes = [{"fullDatabaseId": str(r["id"]), "databaseId": r["id"], "state": r.get("state"),
-                      "body": r.get("body"), "lastEditedAt": None, "submittedAt": None, "url": "",
+                      "body": r.get("body"), "lastEditedAt": r.get("lastEditedAt"), "submittedAt": None, "url": "",
                       "author": {"__typename": "User", "login": (r.get("user") or {}).get("login", "")}}
                      for r in self.reviews]
             return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
@@ -61,8 +62,18 @@ def prior_approval(sha="c" * 40, rid=42):
             "body": aa.APPROVE_MARKER + f"\n<!-- cursor-review-auto-approve:sha={sha} -->"}
 
 
+def handoff_reviews():
+    """The bot's own standing block (77), a human's REQUEST_CHANGES (78), and a
+    bot block someone edited (79): a hand-off withdraws only the first."""
+    marked = aa.APPROVE_MARKER + "\nNo decision this round."
+    return [{"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN}, "body": marked},
+            {"id": 78, "state": "CHANGES_REQUESTED", "user": {"login": "a-human"}, "body": marked},
+            {"id": 79, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN}, "body": marked,
+             "lastEditedAt": "2026-01-01T00:00:00Z"}]
+
+
 class ApproveExternal(unittest.TestCase):
-    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster=""):
+    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster="", **extra):
         if event is None:
             event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,7 +83,7 @@ class ApproveExternal(unittest.TestCase):
             out = os.path.join(tmp, "out")
             args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
                                       approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9",
-                                      threshold=threshold, poster_login=poster)
+                                      threshold=threshold, poster_login=poster, **extra)
             self.resolve_calls = []
             with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
@@ -95,24 +106,118 @@ class ApproveExternal(unittest.TestCase):
         self.assertIn("Approved, see the [cursor-approve card](https://github.com/o/r/pull/1#issuecomment-9).", review["body"])
         self.assertEqual(fake.dismissed, [])
 
-    def test_one_red_posts_nothing_and_withdraws_prior_approval(self):
-        fake = FakeGitHub(reviews=[prior_approval()])
-        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
-        self.assertEqual((rc, outcome), (0, "not_approved"))
-        self.assertEqual(fake.posted, [])
-        self.assertEqual(fake.dismissed, ["42"])
+    def test_an_approval_withdraws_a_standing_request_for_changes(self):
+        # BE-19489: a no-decision round left a standing REQUEST_CHANGES; the
+        # deferred approval that finally lands withdraws it.
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.APPROVED_LATER_MESSAGE])
 
-    def test_missing_axis_posts_nothing(self):
+    def test_a_red_axis_posts_a_standing_request_for_changes(self):
+        # BE-19489 under defer_approval: the passing cursor-review round already
+        # dismissed every earlier block, so withholding here must leave one.
         fake = FakeGitHub()
-        rc, outcome = self.run_cmd(fake, {"correctness": "green"}, event="APPROVE")
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"}, threshold="low")
         self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        review = fake.posted[0]
+        self.assertEqual(review["commit_id"], SHA)
+        self.assertIn(aa.APPROVE_MARKER, review["body"])
+        self.assertIn(f"<!-- cursor-review-auto-approve:sha={SHA} -->", review["body"])
+        card = aa._load_card()
+        # The card's own reasons and next step, word for word.
+        self.assertEqual(card.decide_reasons("not_approved", {"reasons": []}), ["no decision was reached"])
+        self.assertIn("- no decision was reached", review["body"])
+        self.assertIn(f"**Next step:** {card.DECIDE_NEXT_TEXT['not_approved']}", review["body"])
+        self.assertIn("_Threshold: `low`", review["body"])
+
+    def test_the_block_carries_the_axis_reasons_sanitized(self):
+        fake = FakeGitHub()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "decision.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"event": "NONE", "verdicts": {"correctness": "red", "conformance": "green"},
+                           "reasons": ["red on correctness @team <!-- x -->"]}, f)
+            args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
+                                      approver_login=LOGIN, base_ref="main", card_url="", threshold="",
+                                      poster_login="")
+            with mock.patch.object(aa, "gh", fake), \
+                    mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.join(tmp, "out"), "GITHUB_STEP_SUMMARY": ""}):
+                self.assertEqual(aa.cmd_approve_external(args), 0)
+        body = fake.posted[0]["body"]
+        self.assertIn("red on correctness", body)
+        self.assertNotIn("<!-- x", body)
+        self.assertNotRegex(body, r"@(?!\u200b)")
+        self.assertNotIn("_Threshold", body)  # no threshold given → no threshold line
+
+    def test_vetoed_and_own_pr_post_no_block(self):
+        fake = FakeGitHub(labels=[aa.SKIP_REVIEW_LABEL])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "vetoed"))
         self.assertEqual(fake.posted, [])
 
-    def test_head_moved_posts_nothing(self):
-        fake = FakeGitHub(head="d" * 40, reviews=[prior_approval()])
+        class OwnPR(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "POST"]:
+                    self.posted.append(payload)
+                    raise RuntimeError("gh api failed: Can not approve your own pull request")
+                return super().__call__(args, payload)
+
+        fake = OwnPR()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "own_pr"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+
+    def test_a_newer_approval_landing_during_the_post_takes_the_block_back(self):
+        fake = FakeGitHub(head="d" * 40)
+        with mock.patch.object(aa, "own_approval_on", side_effect=[False, True]):
+            rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual(fake.dismiss_messages, [aa.NEWER_APPROVAL_MESSAGE])
+
+    def test_a_late_superseded_decide_does_not_veto_a_newer_approval(self):
+        newer = "d" * 40
+        fake = FakeGitHub(head=newer, reviews=[prior_approval(sha=newer, rid=43)])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "superseded"))
         self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, [])
+
+    def test_a_non_approval_leaves_a_standing_request_for_changes(self):
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        # Replaced, not stacked: the new block (555) is posted, then the old one goes.
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.STANDING_REPLACED_MESSAGE])
+
+    def test_one_red_blocks_and_withdraws_prior_approval(self):
+        fake = FakeGitHub(reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_missing_axis_blocks(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "green"}, event="APPROVE")
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+
+    def test_head_moved_approves_nothing_and_blocks(self):
+        fake = FakeGitHub(head="d" * 40, reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
         self.assertEqual(fake.dismissed, ["42"])
 
     def test_head_moved_during_post_withdraws(self):
@@ -121,11 +226,60 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "superseded"))
         self.assertEqual(fake.dismissed, ["555"])
 
-    def test_needs_human_review_label_posts_nothing(self):
-        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL])
+    def test_needs_human_review_label_approves_nothing_and_withdraws_the_block(self):
+        # BE-19492: the hand-off means no round will approve, so no approving
+        # round would ever withdraw a block either — it goes now, and none is
+        # posted. A human's REQUEST_CHANGES and an edited bot one stay.
+        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "needs_human"))
         self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["needs_human"][0]])
+
+    def test_needs_human_review_outranks_a_moved_head(self):
+        # A superseded outcome posts a block; a PR handed to a human keeps none.
+        for kwargs in ({"labels": [aa.HUMAN_REVIEW_LABEL], "head": "d" * 40},
+                       {"labels_after": [aa.HUMAN_REVIEW_LABEL], "head_after": "d" * 40}):
+            with self.subTest(**{k: v for k, v in kwargs.items() if k.startswith("labels")}):
+                fake = FakeGitHub(reviews=handoff_reviews(), **kwargs)
+                rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+                self.assertEqual((rc, outcome), (0, "needs_human"))
+                self.assertNotIn("REQUEST_CHANGES", [p["event"] for p in fake.posted])
+                self.assertEqual(fake.dismissed[-1:], ["77"])
+
+    def test_a_label_gone_before_the_withdrawal_keeps_the_block(self):
+        # Re-confirmed after the listing: a newer round may have posted it once
+        # the label came off.
+        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL], labels_after=[], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome, fake.posted, fake.dismissed), (0, "needs_human", [], []))
+
+    def test_needs_human_review_landing_during_the_post_withdraws_approval_and_blocks(self):
+        fake = FakeGitHub(labels_after=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "needs_human"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+        self.assertEqual(fake.dismissed, ["555", "77"])
+
+    def test_a_veto_withdraws_the_standing_block_too(self):
+        fake = FakeGitHub(labels=[aa.SKIP_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "vetoed"))
+        self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["vetoed"][0]])
+
+    def test_a_handoff_block_that_cannot_be_withdrawn_is_red(self):
+        class Refuses(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "PUT"]:
+                    raise RuntimeError("gh api: HTTP 403")
+                return super().__call__(args, payload)
+
+        fake = Refuses(labels=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (1, "needs_human"))
 
     # --- the skip-cursor-review veto, re-read live at decide time ---
 
@@ -177,7 +331,7 @@ class ApproveExternal(unittest.TestCase):
             fake = FakeGitHub(pr_override={"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": labels})
             rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
             self.assertEqual((rc, outcome), (1, "error"), labels)
-            self.assertEqual(fake.posted, [], labels)
+            self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"], labels)
 
     def test_skip_label_match_is_exact(self):
         fake = FakeGitHub(labels=["skip-cursor-review-later", "no-skip-cursor-review"])
@@ -185,11 +339,11 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assertEqual(len(fake.posted), 1)
 
-    def test_label_read_failure_posts_nothing(self):
+    def test_label_read_failure_approves_nothing_and_blocks(self):
         fake = FakeGitHub(read_error=True, reviews=[prior_approval()])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (1, "error"))
-        self.assertEqual(fake.posted, [])
+        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
         self.assertEqual(fake.dismissed, ["42"])
 
     def test_missing_label_list_fails_closed(self):
@@ -201,7 +355,7 @@ class ApproveExternal(unittest.TestCase):
             fake = FakeGitHub(pr_override=pr)
             rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
             self.assertEqual((rc, outcome), (1, "error"), labels)
-            self.assertEqual(fake.posted, [], labels)
+            self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"], labels)
 
     def test_skip_label_applied_during_post_withdraws(self):
         fake = FakeGitHub(labels_after=[aa.SKIP_REVIEW_LABEL])
@@ -274,6 +428,43 @@ class ApproveExternal(unittest.TestCase):
         with mock.patch.object(aa, "gh", fake):
             self.assertEqual(aa.cmd_withdraw(args), 2)
 
+    def test_withdraw_on_a_capped_gate_also_withdraws_the_block(self):
+        # BE-19492: the round cap labelled the PR and no decide ran to do it.
+        # The gate is the caller's word: without the live label, nothing goes.
+        for gate, labels, dismissed in (("capped", [aa.HUMAN_REVIEW_LABEL], ["77"]), ("capped", [], []),
+                                        ("pass", [aa.HUMAN_REVIEW_LABEL], []), ("", [aa.HUMAN_REVIEW_LABEL], [])):
+            with self.subTest(gate=gate, labels=labels):
+                fake = FakeGitHub(reviews=handoff_reviews(), labels=labels)
+                args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate=gate)
+                with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+                    self.assertEqual(aa.cmd_withdraw(args), 0)
+                self.assertEqual(fake.dismissed, dismissed)
+
+    def test_withdraw_is_red_when_the_block_cannot_be_withdrawn(self):
+        class Refuses(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "PUT"]:
+                    raise RuntimeError("gh api: HTTP 403")
+                return super().__call__(args, payload)
+
+        # Red, and the start card still runs: its step does not need this one
+        # to succeed (`!cancelled()`), only the identity it resolved.
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate="capped")
+        with mock.patch.object(aa, "gh", Refuses(reviews=handoff_reviews(), labels=[aa.HUMAN_REVIEW_LABEL])), \
+                mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+            self.assertEqual(aa.cmd_withdraw(args), 1)
+        path = os.path.join(HERE, "..", "..", "workflows", "cursor-approve.yml")
+        with open(path, encoding="utf-8") as f:
+            step = re.search(r"- name: Write the start card\n(?:\s+#.*\n)*\s+if: (.*)\n", f.read()).group(1)
+        self.assertIn("!cancelled()", step)
+        self.assertIn("steps.login.outputs.login != ''", step)
+
+    def test_the_start_phase_passes_the_gate_to_withdraw(self):
+        path = os.path.join(HERE, "..", "..", "workflows", "cursor-approve.yml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('--approver-login "$LOGIN" --approve-gate "$APPROVE_GATE"', text)
+
     # --- the bot's own at-or-below-threshold threads, as cursor-review's decide ---
 
     def test_approve_resolves_the_posters_threads(self):
@@ -281,7 +472,20 @@ class ApproveExternal(unittest.TestCase):
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
                                    threshold="Low", poster="cr-bot[bot]")
         self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA)])
+        self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA, False)])
+
+    def test_approve_scope_reaches_the_resolver_as_honour_non_gating(self):
+        # Only cursor-review's `approve_scope_effective` == delta honours the
+        # non-gating marker; absent, empty, `full` or an unknown value do not.
+        for extra, honour in (({}, False), ({"approve_scope": ""}, False), ({"approve_scope": "full"}, False),
+                              ({"approve_scope": "bogus"}, False), ({"approve_scope": "delta"}, True),
+                              ({"approve_scope": "DELTA"}, True)):
+            with self.subTest(extra=extra):
+                with mock.patch("builtins.print"):
+                    rc, outcome = self.run_cmd(FakeGitHub(), {"correctness": "green", "conformance": "green"},
+                                               threshold="low", poster="cr-bot[bot]", **extra)
+                self.assertEqual((rc, outcome), (0, "approved"))
+                self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA, honour)])
 
     def test_none_resolves_nothing(self):
         fake = FakeGitHub()
