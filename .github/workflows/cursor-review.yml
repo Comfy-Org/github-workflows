@@ -367,8 +367,9 @@ on:
           reviewed diff. Every other finding is still posted, as a thread
           marked "Outside this round's changes: not blocking auto-approve",
           and is never auto-resolved. Round 1, an incremental block that was
-          unavailable or discarded, and an unknown prior-review ledger all
-          fail closed to `full`. `full` → every finding counts, wherever it
+          unavailable, discarded or empty (a pure rebase), one naming a path
+          that cannot be parsed, an unknown prior-review ledger and an
+          explicitly empty value all fail closed to `full`. `full` → every finding counts, wherever it
           sits (the behaviour before this input existed). The panel reviews
           the full diff either way. No effect unless `approve_max_severity` is
           set; any other value fails the decision step.

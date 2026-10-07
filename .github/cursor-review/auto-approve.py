@@ -272,20 +272,34 @@ HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 def validate_scope(value: str) -> str:
-    scope = (value or SCOPE_DELTA).strip().lower()
+    # Empty is `full`, not `delta`: an explicitly empty flag (a caller passing an
+    # unset `${{ vars.X }}`) must not widen the gate. The workflow input's own
+    # `default:` is the only place `delta` is chosen. Strip BEFORE defaulting, so
+    # a whitespace-only value (a `${{ vars.X }}` holding a newline) is empty too.
+    scope = (value or "").strip().lower() or SCOPE_FULL
     if scope not in ALLOWED_SCOPES:
         raise ValueError(f"approve_scope must be one of {', '.join(ALLOWED_SCOPES)}, got {value!r}")
     return scope
 
 
-def hunk_ranges(patch_text: str) -> dict:
-    """{path: [(first, last), ...]} of every new-side hunk in a unified diff."""
+def hunk_ranges(patch_text: str):
+    """{path: [(first, last), ...]} of every new-side hunk in a unified diff.
+
+    None when ANY section's path cannot be read (git C-quotes a path carrying a
+    quote, backslash, control or non-ASCII byte, and parse_paths rejects it):
+    dropping that section would record no range for a path the round DID change,
+    so every non-severe finding in it would fail open as non-gating. A rename's
+    `rename from`/`rename to` lines are C-quoted the same way but returned
+    verbatim by section_paths, so a path that still opens with `"` (which git
+    never leaves unquoted) is unreadable too: keyed raw, it would match no
+    finding's decoded path.
+    """
     inc = _load_incremental_diff()
     ranges = {}
     for header, lines in inc.split_sections(patch_text or ""):
         paths = inc.section_paths(header, lines)
-        if not paths:
-            continue
+        if not paths or any(not p or p.startswith('"') for p in paths):
+            return None
         for line in lines:
             m = HUNK_RE.match(line)
             if m:
@@ -327,7 +341,15 @@ def resolve_scope(requested: str, incremental_state: str, incremental_text, ledg
     status = (ledger or {}).get("status") if isinstance(ledger, dict) else None
     if status not in ("ok", "empty"):
         return {**full, "note": f"the prior-review ledger is {status or 'unknown'}, so the round fails closed to `full`"}
-    return {"scope": SCOPE_DELTA, "note": "", "ranges": hunk_ranges(incremental_text), "live": live_thread_urls(ledger)}
+    ranges = hunk_ranges(incremental_text)
+    if ranges is None:
+        return {**full, "note": "the incremental block names a path that could not be parsed, so the round fails closed to `full`"}
+    if not ranges:
+        # An empty delta (a pure rebase) would make every non-severe finding
+        # non-gating at once, and the rebase that produced it is also what marks
+        # the earlier threads outdated — so the open-thread backstop cannot see them.
+        return {**full, "note": "the incremental block has no new-side hunk (e.g. a pure rebase), so the round fails closed to `full`"}
+    return {"scope": SCOPE_DELTA, "note": "", "ranges": ranges, "live": live_thread_urls(ledger)}
 
 
 def gating_reason(finding, scope: dict):
@@ -351,7 +373,9 @@ def gating_reason(finding, scope: dict):
     except (TypeError, ValueError):
         return "no usable line anchor"
     path = finding.get("file")
-    for first, last in scope.get("ranges", {}).get(path, ()) if isinstance(path, str) else ():
+    if not isinstance(path, str) or not path:
+        return "no usable file anchor"
+    for first, last in scope.get("ranges", {}).get(path, ()):
         if first <= line <= last:
             return "inside this round's changes"
     return None
@@ -562,10 +586,23 @@ def _trusted_decision(threshold: str, findings: list, open_thread_severities: li
     return APPROVE, GATE_PASS, [f"every finding is at or below `{threshold}`", *note], []
 
 
+SCOPE_NOTE_PREFIX = "approve_scope `"
+
+
+def scope_note_of(reasons: list) -> str:
+    """The scope note decide_gate appended to `reasons`, or "" when it has none.
+
+    Matched by its prefix, not inferred from len(reasons): the untrusted path
+    returns several trust reasons and no note, and none of those is a scope line.
+    """
+    last = reasons[-1] if len(reasons) > 1 else ""
+    return last if isinstance(last, str) and last.startswith(SCOPE_NOTE_PREFIX) else ""
+
+
 def scope_note(scope: dict, gating: int, non_gating_count: int, blocking: list) -> str:
     """The decision note's scope line: which scope, how many gated, and why."""
     scope = scope or {}
-    text = f"approve_scope `{scope.get('scope') or SCOPE_FULL}`: {gating} gating, {non_gating_count} non-gating finding(s) above the threshold"
+    text = f"{SCOPE_NOTE_PREFIX}{scope.get('scope') or SCOPE_FULL}`: {gating} gating, {non_gating_count} non-gating finding(s) above the threshold"
     if scope.get("note"):
         text += f" ({scope['note']})"
     if scope.get("scope") == SCOPE_DELTA and blocking:
@@ -728,6 +765,7 @@ RESOLVED = "resolved"
 SKIP_HUMAN = "skipped-human"
 SKIP_UNBADGED = "skipped-unbadged"
 SKIP_ABOVE = "skipped-above-threshold"
+SKIP_NON_GATING = "skipped-non-gating"  # a delta round marked it: left for a human
 NOT_OURS = "not-ours"  # resolved already, or not a thread the poster started
 
 REPLY_MUTATION = """
@@ -793,9 +831,14 @@ def classify_thread(thread: dict, poster_login: str, threshold: str, gate=None):
     first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
     if not poster_login or author_login(first).lower() != poster_login.lower():
         return NOT_OURS, None
-    severity = thread_severity(first.get("body") or "")
+    body = first.get("body") or ""
+    severity = thread_severity(body)
     if severity is None:
         return SKIP_UNBADGED, None
+    if is_non_gating_thread(body):
+        # Explicit, not via the threshold: a later, looser threshold must not
+        # clear the thread the docs promise "stays open for a human".
+        return SKIP_NON_GATING, severity
     if above_threshold(severity, threshold):
         return SKIP_ABOVE, severity
     if not only_poster_spoke(thread, poster_login):
@@ -816,8 +859,13 @@ def only_poster_spoke(thread: dict, poster_login: str) -> bool:
     )
 
 
-def plan_thread_resolution(threads: list, poster_login: str, threshold: str):
+def plan_thread_resolution(threads: list, poster_login: str, threshold: str, honour_non_gating: bool = False):
     """([(thread, severity)] to resolve, {verdict: count}). Pure.
+
+    `honour_non_gating` is True only for a round that gated under `delta` — the
+    same `delta and marked` condition decide_gate's open-thread check uses. Under
+    `full`, or from a caller that resolved no scope at all, a marked thread above
+    the threshold blocks like any other.
 
     All-or-nothing on the PR's state: if ANY live (unresolved, non-outdated)
     cursor-review thread is above the threshold or unbadged, the PR is not
@@ -826,7 +874,7 @@ def plan_thread_resolution(threads: list, poster_login: str, threshold: str):
     threads read after the approval, for any caller that reaches here.
     """
     gate = _load_gate_unresolved()
-    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0}
+    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, SKIP_NON_GATING: 0}
     blocked = False
     plan = []
     for thread in threads:
@@ -834,10 +882,11 @@ def plan_thread_resolution(threads: list, poster_login: str, threshold: str):
             first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
             body = first.get("body") or ""
             live = thread_severity(body)
-            # A thread a delta-scoped round marked non-gating did not hold the
-            # approval back, so it does not hold the others' resolution back
-            # either. It is never resolved itself (SKIP_ABOVE below).
-            if (live is None or above_threshold(live, threshold)) and not is_non_gating_thread(body):
+            # Under `delta`, a thread a delta-scoped round marked non-gating did not
+            # hold the approval back, so it does not hold the others' resolution
+            # back either. It is never resolved itself (SKIP_NON_GATING below).
+            exempt = honour_non_gating and is_non_gating_thread(body)
+            if (live is None or above_threshold(live, threshold)) and not exempt:
                 blocked = True
         verdict, severity = classify_thread(thread, poster_login, threshold, gate)
         if verdict == NOT_OURS:
@@ -878,14 +927,16 @@ def still_eligible(thread_id: str, poster_login: str) -> bool:
     return not node.get("isResolved") and only_poster_spoke(node, poster_login)
 
 
-def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str) -> dict:
+def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str,
+                             honour_non_gating: bool = False) -> dict:
     """Reply to and resolve the poster's own at-or-below-threshold threads.
 
     Call ONLY after an APPROVE has been posted and the head re-checked. Every
     failure is logged and skipped: nothing here is fatal, and nothing here undoes
     the approval. Returns the counts it logged (plus ``failed``).
     """
-    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, "failed": 0, "deferred": 0}
+    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, SKIP_NON_GATING: 0,
+              "failed": 0, "deferred": 0}
     if not poster_login:
         emit("Auto-resolve: skipped — no cursor-review poster login was passed.")
         return counts
@@ -893,7 +944,7 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
     try:
         gate = _load_gate_unresolved()
         threads = list(gate.iter_threads(owner, name, int(pr)))
-        plan, planned = plan_thread_resolution(threads, poster_login, threshold)
+        plan, planned = plan_thread_resolution(threads, poster_login, threshold, honour_non_gating)
     except (Exception, SystemExit) as e:  # noqa: BLE001 - never fatal: the APPROVE has landed
         print(f"::warning::Auto-resolve: could not read this PR's review threads, so none were resolved: {e or 'thread query failed'}")
         return counts
@@ -936,7 +987,7 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
             print(f"::warning::Auto-resolve: resolved thread {thread_id} but could not reply on it: {e}")
     emit(f"Auto-resolve: resolved {counts[RESOLVED]}, skipped-human {counts[SKIP_HUMAN]}, "
          f"skipped-unbadged {counts[SKIP_UNBADGED]}, skipped-above-threshold {counts[SKIP_ABOVE]}, "
-         f"failed {counts['failed']}, deferred {counts['deferred']}.")
+         f"skipped-non-gating {counts[SKIP_NON_GATING]}, failed {counts['failed']}, deferred {counts['deferred']}.")
     return counts
 
 
@@ -966,8 +1017,8 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
                 line = str(line) if isinstance(line, int) and not isinstance(line, bool) else "?"
                 path = f.get("file") if isinstance(f.get("file"), str) else "?"
                 lines.append(f"- **{sev}** — {render_code_ref(path[:300], line)}")
-    if len(reasons) > 1:
-        lines.append(f"\n_Scope: {reasons[-1]}._")
+    if scope_note_of(reasons):
+        lines.append(f"\n_Scope: {scope_note_of(reasons)}._")
     lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
 
@@ -993,6 +1044,9 @@ def cmd_decide(args) -> int:
         requested_scope = validate_scope(getattr(args, "approve_scope", "") or "")
     except ValueError as e:
         print(f"::error::{e}")
+        # Same as max_failed_reviewers above: a mid-PR edit must not leave an
+        # earlier round's approval satisfying branch protection.
+        withdraw_own_approvals(args)
         return 2
     # Every decision input is validated above, so a caller misconfiguration
     # fails red the same way whoever opened the PR.
@@ -1060,8 +1114,8 @@ def cmd_decide(args) -> int:
             max_failed,
         )
     set_output("approve_gate", gate)
-    if len(reasons) > 1:
-        emit(f"ℹ️ **Auto-approve scope** — {reasons[-1]}.")
+    if scope_note_of(reasons):
+        emit(f"ℹ️ **Auto-approve scope** — {scope_note_of(reasons)}.")
     if event == NONE:
         emit(f"ℹ️ **Auto-approve: no decision** — {'; '.join(reasons)}.")
         return withdraw_own_approvals(args)
@@ -1142,7 +1196,7 @@ def cmd_decide(args) -> int:
         # Only here: the APPROVE is posted AND the head/base re-check passed.
         # Never fatal, never undoes the approval (see resolve_eligible_threads).
         resolve_eligible_threads(args.repo, args.pr_number, getattr(args, "poster_login", "") or "",
-                                 threshold, args.commit_sha)
+                                 threshold, args.commit_sha, scope.get("scope") == SCOPE_DELTA)
     return 0
 
 
