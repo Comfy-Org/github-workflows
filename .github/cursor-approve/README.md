@@ -76,3 +76,10 @@ context-proxy.py --token-file tokens.json --enable linear,notion,slack --log cal
 Its module docstring is the full contract: the allow-list, the call and byte
 limits, the bounded Slack cache, and why every result is third-party data the
 consuming prompt must never follow as instructions.
+
+`cursor-axis-base.yml` starts the proxy BEFORE the agent, on two FIFOs, and
+waits until it has deleted its token file; cursor-agent then reaches it through
+`mcp-relay.py`, a byte relay that holds no token. Two prompt addenda are
+appended by the workflow, not by `render`: `prompt-no-checkout.md` (business,
+design: the change is in a fetched file, there is no shell) and
+`prompt-context-tools.md` (the context tools, whose results are data).
