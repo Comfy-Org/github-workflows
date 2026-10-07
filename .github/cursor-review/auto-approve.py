@@ -539,7 +539,7 @@ def cmd_decide(args) -> int:
         # timeout) may have written an APPROVE anyway; the withdrawal lists live
         # reviews, so it catches that one too.
         set_output("approve_gate", GATE_UNTRUSTED)
-        print(f"::error::Could not submit the {event} review: {e}")
+        print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
         return 1
 
@@ -565,7 +565,7 @@ def cmd_decide(args) -> int:
         try:
             dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
         except RuntimeError as e:
-            print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         return 0
@@ -836,7 +836,12 @@ def cmd_dismiss_stale(args) -> int:
     # a reader investigating a mass withdrawal is the one it would misdirect.
     if not live_head:
         cause = annotation_cause(read_error, "no head in the response")
-        live_head, live_base = args.head_sha, None
+        # A read that SUCCEEDED but carried no head may still carry a usable base;
+        # keep it, so an off-base approval is still withdrawn. Only a failed read
+        # leaves nothing to compare the base against.
+        live_head = args.head_sha
+        if read_error is not None:
+            live_base = None
         if not live_head and not args.all_approvals:
             # A retarget needs no head to do its job, so it is not blocked by the
             # absence of one; every other mode compares against it and cannot run.
@@ -846,9 +851,10 @@ def cmd_dismiss_stale(args) -> int:
               + ("withdrawing every marked approval regardless of head, because --all-approvals is set. The "
                  "base check is moot on a retarget, which withdraws them all anyway."
                  if args.all_approvals else
-                 f"judging staleness against the event's head {args.head_sha!r}, without the base check, for "
-                 "this run. A queued or redelivered event can therefore withdraw an approval that is valid for "
-                 "the head as it stands now."))
+                 f"judging staleness against the event's head {args.head_sha!r}, "
+                 + ("with the base check against the live base" if live_base else "without the base check")
+                 + ", for this run. A queued or redelivered event can therefore withdraw an approval that is "
+                 "valid for the head as it stands now."))
     elif not live_base:
         # The same guard as the head, on the other axis. An empty live base is NOT
         # None, and `_stale_approvals` treats "" as a real base that no recorded
