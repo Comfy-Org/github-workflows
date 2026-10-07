@@ -499,6 +499,16 @@ on:
           there is no cap (including a value the cap step rejected as not a
           whole number). Pairs with `round` for a "round R of M" display.
         value: ${{ jobs.round-cap.outputs.max_rounds || (inputs.max_rounds > 0 && inputs.max_rounds) || 0 }}
+      approve_scope_effective:
+        description: >-
+          The scope this run's auto-approve decision actually gated under:
+          `delta` only when `approve_scope` was `delta` and the round did not
+          fall back to `full` (round 1, an unavailable, discarded or empty
+          incremental block, an unparseable path, an unknown ledger); `full`
+          otherwise, including when no decision ran. Pass it to cursor-approve's
+          `approve_scope` so a deferred approval resolves threads under the
+          same rule this round's decide used.
+        value: ${{ jobs.post-review.outputs.approve_scope_effective || 'full' }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -3023,6 +3033,8 @@ jobs:
       # empty when auto-approve is off (the workflow-level output then says
       # `off`) or the step died before deciding (it then says `untrusted`).
       approve_gate: ${{ steps.approve.outputs.approve_gate }}
+      # `delta` or `full`, written by the same `decide`; empty when it never ran.
+      approve_scope_effective: ${{ steps.approve.outputs.approve_scope_effective }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce

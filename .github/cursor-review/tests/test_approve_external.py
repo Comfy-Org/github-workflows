@@ -62,7 +62,7 @@ def prior_approval(sha="c" * 40, rid=42):
 
 
 class ApproveExternal(unittest.TestCase):
-    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster=""):
+    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster="", **extra):
         if event is None:
             event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,7 +72,7 @@ class ApproveExternal(unittest.TestCase):
             out = os.path.join(tmp, "out")
             args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
                                       approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9",
-                                      threshold=threshold, poster_login=poster)
+                                      threshold=threshold, poster_login=poster, **extra)
             self.resolve_calls = []
             with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
@@ -281,7 +281,20 @@ class ApproveExternal(unittest.TestCase):
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
                                    threshold="Low", poster="cr-bot[bot]")
         self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA)])
+        self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA, False)])
+
+    def test_approve_scope_reaches_the_resolver_as_honour_non_gating(self):
+        # Only cursor-review's `approve_scope_effective` == delta honours the
+        # non-gating marker; absent, empty, `full` or an unknown value do not.
+        for extra, honour in (({}, False), ({"approve_scope": ""}, False), ({"approve_scope": "full"}, False),
+                              ({"approve_scope": "bogus"}, False), ({"approve_scope": "delta"}, True),
+                              ({"approve_scope": "DELTA"}, True)):
+            with self.subTest(extra=extra):
+                with mock.patch("builtins.print"):
+                    rc, outcome = self.run_cmd(FakeGitHub(), {"correctness": "green", "conformance": "green"},
+                                               threshold="low", poster="cr-bot[bot]", **extra)
+                self.assertEqual((rc, outcome), (0, "approved"))
+                self.assertEqual(self.resolve_calls, [("o/r", "1", "cr-bot[bot]", "low", SHA, honour)])
 
     def test_none_resolves_nothing(self):
         fake = FakeGitHub()
