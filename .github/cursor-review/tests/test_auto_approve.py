@@ -169,7 +169,14 @@ class MaxFailedReviewersTest(unittest.TestCase):
         # Decides in BOTH directions: a High still requests changes.
         event, reasons, blocking = decide(panel=panel, max_failed=1, findings=[finding("high")])
         self.assertEqual((event, len(blocking)), (AA.REQUEST_CHANGES, 1))
-        self.assertIn("decided with 1/6 reviewers errored: m1:edge-case", reasons[0])
+        self.assertIn("above `medium` (with 1/6 reviewers errored: m1:edge-case)", reasons[0])
+
+    def test_a_no_decision_note_claims_no_decision(self):
+        panel = panel_with(("m1", "edge-case"))
+        event, reasons, _ = decide(panel=panel, max_failed=1, threads=["high"])
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("earlier round (with 1/6 reviewers errored: m1:edge-case)", reasons[0])
+        self.assertNotIn("decided", reasons[0])
 
     def test_a_clean_panel_carries_no_note(self):
         event, reasons, _ = decide(panel=PANEL_FULL, max_failed=1)
@@ -197,6 +204,14 @@ class MaxFailedReviewersTest(unittest.TestCase):
         # must not approve over a pass that never ran.
         panel = PANEL_OK + [{"model": "m2", "review_type": "adversarial", "status": "error"}]
         self.assertEqual(decide(panel=panel, max_failed=1)[0], AA.NONE)
+
+    def test_an_all_ok_panel_missing_a_review_type_withholds_once_tolerant(self):
+        # No cell errored, but there is no edge-case pass: the floor holds under
+        # any N > 0. N = 0 keeps the original rule (only `ok` is checked).
+        event, reasons, _ = decide(panel=PANEL_OK, max_failed=1)
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("no completed `edge-case` review", reasons[0])
+        self.assertEqual(decide(panel=PANEL_OK)[0], AA.APPROVE)
 
     def test_a_non_error_bad_status_is_never_tolerated(self):
         for status in (None, "", "unknown", "skipped", "OK", "Error"):
@@ -240,7 +255,7 @@ class MaxFailedReviewersTest(unittest.TestCase):
     def test_parse(self):
         for value, want in (("", 0), (None, 0), ("0", 0), (" 1 ", 1), ("2", 2), (3, 3), ("1.0", 1)):
             self.assertEqual(AA.parse_max_failed_reviewers(value), want, value)
-        for value in ("-1", "1.5", "one", "inf", "nan"):
+        for value in ("-1", "1.5", "one", "inf", "nan", "1e2", "1_0", "+3", "0.99999999999999999"):
             with self.assertRaises(ValueError, msg=value):
                 AA.parse_max_failed_reviewers(value)
 
@@ -1320,6 +1335,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                 self.assertEqual(self.run_decide(panel=panel_with(("m1", "edge-case")), max_failed=value),
                                  (2, "untrusted"))
                 self.assertEqual(self.posted, [])
+
+    def test_an_invalid_max_failed_reviewers_withdraws_an_earlier_approval(self):
+        earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                   "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
+        self.assertEqual(self.run_decide(max_failed="x", reviews=[earlier]), (2, "untrusted"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
 
     def test_fail(self):
         self.assertEqual(self.run_decide(findings=[finding("critical")]), (0, "fail"))

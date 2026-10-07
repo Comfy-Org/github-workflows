@@ -403,8 +403,14 @@ still withheld when:
   not an object at all;
 - the panel metadata is missing or empty;
 - a review type — `adversarial` or `edge-case` — has **no** reviewer that
-  completed. Errors on both cells of one review type are never tolerated, so
-  nothing is approved with a whole pass missing.
+  completed (checked whenever N > 0, errors or not). Some cells of one type may
+  error within N, but never all of them, so nothing is approved with a whole
+  pass missing.
+
+`error` is not purely an infrastructure signal: a cell counts as `error` until
+the reviewer reports finishing, so one that the PR's own content stalled or
+derailed lands there too. N is therefore also how many reviewers a PR could
+silence and still be decided; keep it small relative to the panel.
 
 A decision taken over tolerated errors says so, e.g. ``Approved: every finding is
 at or below `low` (approved with 1/6 reviewers errored: gpt-x:edge-case)``. The
@@ -609,7 +615,7 @@ jobs:
 |---|---|
 | `pass` | The auto-approve decision was APPROVE (posted, unless `defer_approval` left it to cursor-approve). |
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
-| `untrusted` | The judge was degraded, a panel cell failed, the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
+| `untrusted` | The judge was degraded, a panel cell failed (beyond what `approve_max_failed_reviewers` tolerates), the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
 | `off` | `approve_max_severity` is empty (and the cap was not hit). |
 

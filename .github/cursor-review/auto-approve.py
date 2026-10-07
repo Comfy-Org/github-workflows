@@ -377,17 +377,15 @@ def validate_threshold(value: str) -> str:
 def parse_max_failed_reviewers(value) -> int:
     """`approve_max_failed_reviewers` as a non-negative int; '' → 0 (the strict rule).
 
-    Like parse_max_rounds: a `type: number` input can render as `1` or `1.0`, so
-    an integral float is accepted, and anything else is a ValueError.
+    A `type: number` input can render as `1` or `1.0`, so digits with an
+    all-zero fraction are accepted; anything else (`1e2`, `1_0`, `+3`, `1.5`) is
+    a ValueError.
     """
     raw = str(value if value is not None else "").strip() or "0"
-    try:
-        number = float(raw)
-    except ValueError:
-        number = math.nan
-    if not math.isfinite(number) or not number.is_integer() or number < 0:
+    match = re.fullmatch(r"([0-9]+)(?:\.0+)?", raw)
+    if not match:
         raise ValueError(f"approve_max_failed_reviewers must be a non-negative whole number, got {value!r}")
-    return int(number)
+    return int(match.group(1))
 
 
 def _label_part(value) -> str:
@@ -405,11 +403,13 @@ def panel_gate(panel: list, max_failed: int = 0):
     """(withhold_reason or None, tolerated_cells). Pure.
 
     max_failed=0 is the original rule exactly: any cell not `ok` withholds.
+    Above 0, every review type must also keep a completed cell — checked even
+    when no cell errored, so an all-`ok` panel missing a whole pass is withheld.
     """
     if not panel:
         return "no panel metadata", []
     bad = [c for c in panel if not isinstance(c, dict) or c.get("status") != "ok"]
-    if not bad:
+    if not bad and max_failed <= 0:
         return None, []
     incomplete = f"{len(bad)}/{len(panel)} panel reviewers did not complete"
     tolerable = [c for c in bad if isinstance(c, dict) and c.get("status") == TOLERABLE_CELL_STATUS]
@@ -524,8 +524,8 @@ def decide_gate(
 
     event, gate, reasons, blocking = _trusted_decision(threshold, findings, open_thread_severities, scope, noted)
     if tolerated:
-        verb = "approved" if event == APPROVE else "decided"
-        reasons[0] += (f" ({verb} with {len(tolerated)}/{len(panel)} reviewers errored: "
+        verb = "approved " if event == APPROVE else ""
+        reasons[0] += (f" ({verb}with {len(tolerated)}/{len(panel)} reviewers errored: "
                        f"{', '.join(_cell_label(c) for c in tolerated)})")
     return event, gate, reasons, blocking
 
@@ -981,6 +981,9 @@ def cmd_decide(args) -> int:
         max_failed = parse_max_failed_reviewers(getattr(args, "max_failed_reviewers", ""))
     except ValueError as e:
         print(f"::error::{e}")
+        # The caller most likely edited this input mid-PR: fail closed, so an
+        # earlier round's approval does not keep satisfying branch protection.
+        withdraw_own_approvals(args)
         return 2
     with open(args.findings, encoding="utf-8") as f:
         data = json.load(f)
