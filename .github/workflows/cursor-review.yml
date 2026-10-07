@@ -1972,8 +1972,12 @@ jobs:
             # `blocking: true`) — and every extra id is another full
             # cursor-agent pass over the diff. 12 is far above any real panel
             # (the built-in list is 3) and far below the cap.
-            if ! printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -e \
-                 'type == "array" and length > 0 and length <= 12 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))' > /dev/null; then
+            # Slurped (-s) and held to exactly ONE document: jq reads a stream,
+            # so `["a"] ["b"]` or `null ["a"]` would otherwise pass on its last
+            # value and normalize to two lines, not the one array the matrix
+            # needs.
+            if ! printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -e -s \
+                 'length == 1 and (.[0] | type == "array" and length > 0 and length <= 12 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$")))' > /dev/null; then
               # Echo the rejected value with newlines stripped and truncated.
               # This input is caller-settable, and a caller wiring it to a
               # variable makes it settable with no PR at all, so a raw
@@ -1984,7 +1988,7 @@ jobs:
               echo "::error::panel_models must be a JSON array of 1-12 Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $SAFE_OVERRIDE"
               exit 1
             fi
-            printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c 'unique' > /tmp/models.json
+            printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c -s '.[0] | unique' > /tmp/models.json
             echo "panel_models override in effect: $(cat /tmp/models.json)"
           else
             # Logged in BOTH branches so the run says which list produced the
