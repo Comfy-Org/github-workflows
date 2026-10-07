@@ -403,7 +403,11 @@ class StaleReviewTest(unittest.TestCase):
         # No approver identity in this run: every stale marked approval is unactionable.
         self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), ["cursor-approver:1", "old-approver:2"])
 
-    def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main"):
+    def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main",
+                    labels=None):
+        # `labels=None` is a real PR's empty label list; pass a malformed value
+        # (a number, a nameless label) to exercise the unreadable-labels path.
+        labels = [] if labels is None else labels
         puts = []
 
         def fake_gh(args, payload=None):
@@ -415,11 +419,13 @@ class StaleReviewTest(unittest.TestCase):
                 puts.append((args[3], payload["message"]))
                 return "{}"
             # The live PR: head NEW, even when the event that started the run carried an older one.
-            return json.dumps({"head": {"sha": NEW}, "base": {"ref": live_base}})
+            return json.dumps({"head": {"sha": NEW}, "base": {"ref": live_base}, "labels": labels})
 
         args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals,
                                   head_sha=OLD)
-        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+        self.printed, self.emitted = [], []
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", self.emitted.append), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             return AA.cmd_dismiss_stale(args), puts
 
     def test_push_keeps_an_on_head_approval(self):
@@ -461,6 +467,55 @@ class StaleReviewTest(unittest.TestCase):
         rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main")], login="")
         self.assertEqual((rc, puts), (0, []))
 
+    VETO = [{"name": "skip-cursor-review"}]
+
+    def test_the_veto_label_withdraws_every_marked_approval(self):
+        # The gate runs no round on a vetoed PR, so the `labeled` event's
+        # dismissal is the only thing that withdraws an approval already standing.
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"), self.review(2)], labels=self.VETO)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(p[0] for p in puts),
+                         ["repos/o/r/pulls/1/reviews/1/dismissals", "repos/o/r/pulls/1/reviews/2/dismissals"])
+        self.assertTrue(all(m == AA.SKIP_REVIEW_WITHDRAWN_MESSAGE for _, m in puts))
+        self.assertTrue(any("`skip-cursor-review`" in line and "cursor-approver" in line for line in self.emitted))
+
+    def test_the_veto_label_matches_case_insensitively(self):
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main")], labels=[{"name": "Skip-Cursor-Review"}])
+        self.assertEqual((rc, [m for _, m in puts]), (0, [AA.SKIP_REVIEW_WITHDRAWN_MESSAGE]))
+
+    def test_the_veto_message_wins_over_a_retarget(self):
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"), self.review(2)], all_approvals=True,
+                                    labels=self.VETO)
+        self.assertEqual((rc, len(puts)), (0, 2))
+        self.assertTrue(all(m == AA.SKIP_REVIEW_WITHDRAWN_MESSAGE for _, m in puts))
+
+    def test_an_unrelated_label_changes_nothing(self):
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"), self.review(2)],
+                                    labels=[{"name": "cursor-review"}])
+        self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/2/dismissals", AA.STALE_MESSAGE)]))
+        self.assertFalse(any("::warning::" in line for line in self.printed))
+
+    def test_another_identitys_on_head_approval_on_a_vetoed_pr_goes_red(self):
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"),
+                                     self.review(2, login="old-approver", sha=NEW, base="main")], labels=self.VETO)
+        self.assertEqual((rc, [p[0] for p in puts]), (1, ["repos/o/r/pulls/1/reviews/1/dismissals"]))
+        self.assertTrue(any(line.startswith("::error::") and "old-approver:2" in line for line in self.printed))
+
+    def test_the_veto_leaves_an_unedited_unmarked_human_approval(self):
+        rc, puts = self.run_dismiss([self.review(1, marker=False), self.review(2, login="a-human", marker=False)],
+                                    labels=self.VETO)
+        self.assertEqual((rc, puts), (0, []))
+
+    def test_unreadable_labels_warn_and_fall_through_to_head_and_base(self):
+        # Not red and no mass withdrawal: the job runs on every event, and the
+        # next one redoes the check.
+        for labels in (7, [{"name": 3}], [{"name": "skip-cursor-review"}, "skip-cursor-review"]):
+            with self.subTest(labels=labels):
+                rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"), self.review(2)], labels=labels)
+                self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/2/dismissals", AA.STALE_MESSAGE)]))
+                self.assertTrue(any(line.startswith("::warning::") and "skip-cursor-review" in line
+                                    for line in self.printed))
+
 
 class DismissJobTriggerTest(unittest.TestCase):
     """The workflow half of dismissal: when the job runs at all."""
@@ -481,6 +536,8 @@ class DismissJobTriggerTest(unittest.TestCase):
     def test_runs_on_every_action_of_an_open_pr(self):
         # Any event sharing a concurrency slot can cancel an in-flight
         # dismissal, so none may be filtered out by action — only closed PRs.
+        # It is also the guard for the veto label: `labeled` must keep reaching
+        # the job, or applying `skip-cursor-review` withdraws nothing.
         self.assertNotIn("github.event.action", self.cond)
         self.assertIn("github.event.pull_request.state == 'open'", self.cond)
 
@@ -676,8 +733,10 @@ class DismissStaleHeadTest(unittest.TestCase):
             # A real payload carries a base alongside the head, so the fixture does
             # too — without it `live_base` is "" on every path and the off-base
             # comparison is dead in this whole class. `live_base=""` is the
-            # half-shapeless response, exercised deliberately below.
-            return json.dumps({} if live is None else {"head": {"sha": live}, "base": {"ref": live_base}})
+            # half-shapeless response, exercised deliberately below. Likewise its
+            # (empty) labels, whose absence `dismiss-stale` warns about.
+            return json.dumps({} if live is None else {"head": {"sha": live}, "base": {"ref": live_base},
+                                                       "labels": []})
 
         args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
                                   approver_login="cursor-approver", all_approvals=all_approvals)
@@ -749,6 +808,14 @@ class DismissStaleHeadTest(unittest.TestCase):
         # would miss it.
         self.run_dismiss(None, NEW, [self.approval(1, NEW)])
         self.assertTrue(any("no head in the response" in line for line in self.warnings()), self.printed)
+
+    def test_a_veto_needs_no_head(self):
+        # Like a retarget: a read that carried the veto label but no head still
+        # withdraws everything, rather than going red for want of a comparison.
+        raw = json.dumps({"base": {"ref": "main"}, "labels": [{"name": "skip-cursor-review"}]})
+        rc, dismissed = self.run_dismiss(None, "", [self.approval(1, NEW), self.approval(2, OLD)], raw=raw)
+        self.assertEqual((rc, len(dismissed)), (0, 2))
+        self.assertTrue(any("because the PR carries `skip-cursor-review`" in line for line in self.printed))
 
     def test_a_head_that_read_cleanly_warns_about_nothing(self):
         self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])

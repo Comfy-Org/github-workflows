@@ -457,7 +457,9 @@ runs next redoes a dismissal that a cancelled run left undone:
 - an approval recorded against a base other than the current one — a retarget
   (`edited`). The head did not move but the diff did, so the on-head approval
   goes too. Each approval records the base it was reviewed against; one posted
-  before that record is reached only by the retarget's own `edited` run.
+  before that record is reached only by the retarget's own `edited` run;
+- the PR carries `skip-cursor-review` — every marked approval, same head or not;
+  re-apply the trigger label after removing the veto to earn a fresh one.
 
 If a stale marked approval belongs to a login this run cannot act as — the
 approver identity changed, or the approver's secrets are not available to the
