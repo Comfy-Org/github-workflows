@@ -45,6 +45,10 @@ import subprocess
 import sys
 
 CONSOLIDATED_MARKER = "## 🔍 Cursor Review — Consolidated panel"
+# The hidden marker on auto-approve.py's "Resolved by auto-approve" reply. Kept
+# here beside CONSOLIDATED_MARKER so build-ledger.py, which already imports this
+# module, reads the same string auto-approve.py writes.
+AUTO_RESOLVE_MARKER = "<!-- cursor-review-auto-resolve -->"
 
 QUERY = """
 query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
@@ -105,7 +109,13 @@ def run_graphql(owner: str, name: str, pr: int, cursor):
     # "from the start"; subsequent pages pass the opaque string cursor via -f.
     args += ["-F", "cursor=null"] if cursor is None else ["-f", f"cursor={cursor}"]
 
-    result = subprocess.run(args, capture_output=True, text=True)
+    try:
+        # Bounded: auto-approve.py runs this after its APPROVE has landed, and a
+        # stalled page there must not hang the job until timeout-minutes.
+        result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("GraphQL query timed out after 120s", file=sys.stderr)
+        raise SystemExit(2)
     if result.returncode != 0:
         # A query failure must not silently pass the gate — exit 2 (distinct
         # from the "found unresolved" exit 1) so the check fails loudly.

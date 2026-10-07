@@ -1033,28 +1033,52 @@ class AutoResolvePlanTest(unittest.TestCase):
         self.assertEqual(self.plan([thread("t", "low")], poster="")[0], [])
 
 
+def graphql_fake(log, threads, fail_on=(), live=None):
+    """A `gh api graphql` stand-in for the resolver's three calls. The re-read
+    answers from `live[tid]` when given (the thread as it is NOW), else from the
+    planned snapshot. Each call is logged as (kind, thread id, body)."""
+    by_id = {t["id"]: t for t in threads}
+    live = live or {}
+
+    def fake(args):
+        query = args[3]
+        tid = next(a.split("=", 1)[1] for a in args if a.startswith("threadId="))
+        if "addPullRequestReviewThreadReply" in query:
+            kind = "reply"
+        elif "resolveReviewThread" in query:
+            kind = "resolve"
+        else:
+            kind = "recheck"
+        body = next((a.split("=", 1)[1] for a in args if a.startswith("body=")), None)
+        log.append((kind, tid, body))
+        if (kind, tid) in fail_on:
+            raise RuntimeError("HTTP 502")
+        if (kind, tid, "errors") in fail_on:
+            return json.dumps({"errors": [{"message": "nope"}]})
+        if (kind, tid, "null") in fail_on:
+            return "null"
+        if kind == "recheck":
+            now = live.get(tid, by_id.get(tid, {}))
+            return json.dumps({"data": {"node": {"isResolved": now.get("isResolved", False),
+                                                 "participants": now.get("participants")}}})
+        return json.dumps({"data": {}})
+    return fake
+
+
 class AutoResolveCommandTest(unittest.TestCase):
     """cmd_decide: resolution only on a standing APPROVE; failures never fatal."""
 
     def run_decide(self, threads, findings=(), heads=(SHA, SHA), fail_on=(), poster=POSTER,
-                   thread_error=None, labels_after=()):
+                   thread_error=None, labels_after=(), live=None):
         heads = iter(heads)
         self.mutations = []
         self.writes = []
         reads = []
+        fake_graphql = graphql_fake(self.mutations, threads, fail_on, live)
 
         def fake_gh(args, payload=None):
             if args[:2] == ["api", "graphql"]:
-                query = args[3]
-                tid = next(a.split("=", 1)[1] for a in args if a.startswith("threadId="))
-                kind = "reply" if "addPullRequestReviewThreadReply" in query else "resolve"
-                body = next((a.split("=", 1)[1] for a in args if a.startswith("body=")), None)
-                self.mutations.append((kind, tid, body))
-                if (kind, tid) in fail_on:
-                    raise RuntimeError("HTTP 502")
-                if (kind, tid, "errors") in fail_on:
-                    return json.dumps({"errors": [{"message": "nope"}]})
-                return json.dumps({"data": {}})
+                return fake_graphql(args)
             if args[:3] == ["api", "-X", "POST"]:
                 self.writes.append("POST")
                 return json.dumps({"id": 99})
@@ -1091,12 +1115,13 @@ class AutoResolveCommandTest(unittest.TestCase):
                     mock.patch.object(AA, "emit", lambda *a: None):
                 return AA.cmd_decide(args)
 
-    def test_approval_replies_then_resolves_each_eligible_thread(self):
+    def test_approval_rechecks_resolves_then_replies_on_each_eligible_thread(self):
         rc = self.run_decide([thread("T1", "low"), thread("T2", "nit"), thread("H", "low", author="alice")])
         self.assertEqual(rc, 0)
         self.assertEqual([(k, t) for k, t, _ in self.mutations],
-                         [("reply", "T1"), ("resolve", "T1"), ("reply", "T2"), ("resolve", "T2")])
-        reply = self.mutations[0][2]
+                         [("recheck", "T1"), ("resolve", "T1"), ("reply", "T1"),
+                          ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2")])
+        reply = self.mutations[2][2]
         self.assertIn(AA.AUTO_RESOLVE_MARKER, reply)
         self.assertIn("Resolved by auto-approve: Low finding, at or below the `low` threshold, "
                       f"on commit {SHA[:7]}.", reply)
@@ -1124,9 +1149,56 @@ class AutoResolveCommandTest(unittest.TestCase):
                              fail_on={("resolve", "T1"), ("reply", "T2", "errors")})
         self.assertEqual(rc, 0)
         self.assertEqual(self.writes, ["POST"])  # the approval stands, nothing dismissed
+        # A failed resolve posts NO reply: a reply from the approver would make
+        # the still-open thread look human-touched to every later round.
         self.assertEqual([(k, t) for k, t, _ in self.mutations],
-                         [("reply", "T1"), ("resolve", "T1"), ("reply", "T2"),
-                          ("reply", "T3"), ("resolve", "T3")])
+                         [("recheck", "T1"), ("resolve", "T1"),
+                          ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2"),
+                          ("recheck", "T3"), ("resolve", "T3"), ("reply", "T3")])
+
+    def test_a_human_reply_after_the_snapshot_stops_that_thread(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "low")],
+                             live={"T1": thread("T1", "low", repliers=["alice"])})
+        self.assertEqual(rc, 0)
+        self.assertEqual([(k, t) for k, t, _ in self.mutations],
+                         [("recheck", "T1"), ("recheck", "T2"), ("resolve", "T2"), ("reply", "T2")])
+
+    def test_a_thread_resolved_since_the_snapshot_is_left_alone(self):
+        rc = self.run_decide([thread("T1", "low")], live={"T1": thread("T1", "low", resolved=True)})
+        self.assertEqual([(k, t) for k, t, _ in self.mutations], [("recheck", "T1")])
+        self.assertEqual(rc, 0)
+
+    def test_a_non_object_graphql_body_is_not_fatal(self):
+        rc = self.run_decide([thread("T1", "low"), thread("T2", "low")],
+                             fail_on={("recheck", "T1", "null")})
+        self.assertEqual((rc, self.writes), (0, ["POST"]))
+        self.assertIn(("resolve", "T2"), [(k, t) for k, t, _ in self.mutations])
+
+    def test_consecutive_failures_stop_the_loop(self):
+        threads = [thread(f"T{i}", "low") for i in range(6)]
+        rc = self.run_decide(threads, fail_on={("resolve", f"T{i}") for i in range(6)})
+        self.assertEqual(rc, 0)
+        self.assertEqual([t for k, t, _ in self.mutations if k == "resolve"],
+                         [f"T{i}" for i in range(AA.MAX_CONSECUTIVE_FAILURES)])
+
+    def test_a_success_resets_the_failure_streak(self):
+        threads = [thread(f"T{i}", "low") for i in range(6)]
+        rc = self.run_decide(threads, fail_on={("resolve", "T0"), ("resolve", "T1"), ("resolve", "T3"),
+                                               ("resolve", "T4")})
+        self.assertEqual(rc, 0)
+        self.assertEqual([t for k, t, _ in self.mutations if k == "resolve"], [f"T{i}" for i in range(6)])
+
+    def test_one_round_resolves_at_most_the_cap(self):
+        threads = [thread(f"T{i}", "low") for i in range(AA.MAX_AUTO_RESOLVE + 5)]
+        self.run_decide(threads)
+        self.assertEqual(sum(1 for k, _, _ in self.mutations if k == "resolve"), AA.MAX_AUTO_RESOLVE)
+
+    def test_an_unloadable_thread_module_is_not_fatal(self):
+        def boom():
+            raise RuntimeError("gate-unresolved.py missing")
+        with mock.patch.object(AA, "_load_gate_unresolved", boom), mock.patch.object(AA, "emit", lambda *a: None):
+            counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
+        self.assertEqual(counts["resolved"], 0)
 
     def test_unreadable_threads_are_not_fatal(self):
         rc = self.run_decide([], thread_error=SystemExit(2))
@@ -1138,15 +1210,16 @@ class AutoResolveCommandTest(unittest.TestCase):
 
     def test_counts_are_logged(self):
         lines = []
+        threads = [thread("T1", "low"), thread("H", "low", repliers=["alice"]),
+                   thread("U", None, outdated=True), thread("M", "medium", outdated=True)]
+        fake = graphql_fake([], threads)
         with mock.patch.object(AA, "emit", lines.append), \
                 mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
-                mock.patch.object(GATE, "iter_threads", lambda *a: iter([
-                    thread("T1", "low"), thread("H", "low", repliers=["alice"]),
-                    thread("U", None, outdated=True), thread("M", "medium", outdated=True)])), \
-                mock.patch.object(AA, "gh", lambda *a, **k: json.dumps({"data": {}})):
+                mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)), \
+                mock.patch.object(AA, "gh", lambda args, payload=None: fake(args)):
             counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
         self.assertEqual(counts, {"resolved": 1, "skipped-human": 1, "skipped-unbadged": 1,
-                                  "skipped-above-threshold": 1, "failed": 0})
+                                  "skipped-above-threshold": 1, "failed": 0, "deferred": 0})
         self.assertIn("resolved 1, skipped-human 1, skipped-unbadged 1, skipped-above-threshold 1", lines[-1])
 
 
@@ -1159,7 +1232,14 @@ class AutoResolveWiringTest(unittest.TestCase):
         step = src[src.index("auto-approve.py\" decide"):]
         step = step[: step.index("\n\n")]
         self.assertIn('--poster-login "$POSTER"', step)
-        self.assertIn('POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"', src)
+        # Keyed on the token Post review used, not on the slug alone.
+        self.assertIn('if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; '
+                      'else POSTER="github-actions[bot]"; fi', src)
+
+    def test_auto_resolve_marker_matches_the_ledgers(self):
+        # build-ledger.py reads gate-unresolved's copy to keep this reply out of
+        # its answer count; the two must never drift.
+        self.assertEqual(AA.AUTO_RESOLVE_MARKER, GATE.AUTO_RESOLVE_MARKER)
 
     def test_thread_query_fetches_what_the_resolver_needs(self):
         for field in ("participants: comments(first: 100)", "totalCount", "__typename", "\n          id\n"):

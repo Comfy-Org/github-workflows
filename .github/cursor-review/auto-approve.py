@@ -90,11 +90,13 @@ On a trusted round:
 
 After an APPROVE that survived the post-write head/base re-check — and only
 then — the poster's own threads (``--poster-login``) whose badge is at or below
-the threshold, and in which no other account has commented, get a reply from the
-approver identity (``AUTO_RESOLVE_MARKER``) and are resolved, so a ruleset that
-requires resolved conversations does not hold the approval hostage to nits. If
-any live thread is above the threshold or unbadged, nothing is resolved. A
-failure on one thread is logged and skipped; it never undoes the approval.
+the threshold, and in which no other account has commented, are resolved and
+then get a reply from the approver identity (``AUTO_RESOLVE_MARKER``), so a
+ruleset that requires resolved conversations does not hold the approval hostage
+to nits. If any live thread is above the threshold or unbadged, nothing is
+resolved. Each thread is re-read just before it is resolved; at most
+``MAX_AUTO_RESOLVE`` per round, stopping after ``MAX_CONSECUTIVE_FAILURES`` in a
+row. A failure on one thread is logged and skipped; it never undoes the approval.
 
 An untrusted round (or an open blocking thread) also WITHDRAWS this identity's
 own earlier marked approvals, wherever they are pinned: GitHub counts a
@@ -418,6 +420,8 @@ def open_thread_severities(repo: str, pr: int) -> list:
     return out
 
 
+# Mirrors gate-unresolved.AUTO_RESOLVE_MARKER, which build-ledger.py reads to keep
+# this reply out of its answer count (a test pins the two equal).
 AUTO_RESOLVE_MARKER = "<!-- cursor-review-auto-resolve -->"
 RESOLVED = "resolved"
 SKIP_HUMAN = "skipped-human"
@@ -437,6 +441,30 @@ mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } }
 }
 """
+# One thread's live state, re-read just before it is resolved: the plan was
+# built from a snapshot taken a whole page-walk (and every earlier thread's
+# mutations) ago, and a human reply in that window must still stop it.
+THREAD_RECHECK_QUERY = """
+query($threadId: ID!) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      isResolved
+      participants: comments(first: 100) {
+        totalCount
+        nodes { author { __typename login } }
+      }
+    }
+  }
+}
+"""
+# A bound on one round's writes, like every other list here: resolveReviewThread
+# and the reply are content-creating calls under GitHub's secondary rate limit,
+# and the job's timeout-minutes covers the review post too. The rest wait for
+# the next approving round.
+MAX_AUTO_RESOLVE = 30
+# Consecutive failures that end the loop: past this it is a missing permission
+# or a rate limit, and every further call only extends the block.
+MAX_CONSECUTIVE_FAILURES = 3
 
 
 def author_login(node) -> str:
@@ -469,15 +497,22 @@ def classify_thread(thread: dict, poster_login: str, threshold: str, gate=None):
         return SKIP_UNBADGED, None
     if above_threshold(severity, threshold):
         return SKIP_ABOVE, severity
-    participants = thread.get("participants") or {}
-    nodes = participants.get("nodes") or []
-    # Every comment must be visible to prove nobody else spoke: a missing page,
-    # a short page or a deleted (null) author all leave the thread for a person.
-    if not nodes or participants.get("totalCount") != len(nodes) or any(
-        author_login(n).lower() != poster_login.lower() for n in nodes
-    ):
+    if not only_poster_spoke(thread, poster_login):
         return SKIP_HUMAN, severity
     return RESOLVED, severity
+
+
+def only_poster_spoke(thread: dict, poster_login: str) -> bool:
+    """True when every comment in `thread` is visibly `poster_login`'s.
+
+    Every comment must be visible to prove nobody else spoke: a missing page, a
+    short page or a deleted (null) author all leave the thread for a person.
+    """
+    participants = (thread or {}).get("participants") or {}
+    nodes = participants.get("nodes") or []
+    return bool(poster_login) and bool(nodes) and participants.get("totalCount") == len(nodes) and all(
+        author_login(n).lower() == poster_login.lower() for n in nodes
+    )
 
 
 def plan_thread_resolution(threads: list, poster_login: str, threshold: str):
@@ -522,9 +557,20 @@ def _graphql(query: str, **variables) -> dict:
     for key, value in variables.items():
         args += ["-f", f"{key}={value}"]
     data = json.loads(gh(args))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"GraphQL returned a non-object body: {type(data).__name__}")
     if data.get("errors"):
         raise RuntimeError(f"GraphQL errors: {data['errors']}")
     return data
+
+
+def still_eligible(thread_id: str, poster_login: str) -> bool:
+    """Re-read one thread right before resolving it: still unresolved, and
+    still nobody but the poster has spoken in it. Raises on a failed read."""
+    node = (_graphql(THREAD_RECHECK_QUERY, threadId=thread_id).get("data") or {}).get("node")
+    if not isinstance(node, dict):
+        raise RuntimeError("thread re-read returned no node")
+    return not node.get("isResolved") and only_poster_spoke(node, poster_login)
 
 
 def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str) -> dict:
@@ -534,35 +580,58 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
     failure is logged and skipped: nothing here is fatal, and nothing here undoes
     the approval. Returns the counts it logged (plus ``failed``).
     """
-    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, "failed": 0}
+    counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, "failed": 0, "deferred": 0}
     if not poster_login:
         emit("Auto-resolve: skipped — no cursor-review poster login was passed.")
         return counts
-    gate = _load_gate_unresolved()
     owner, _, name = repo.partition("/")
     try:
+        gate = _load_gate_unresolved()
         threads = list(gate.iter_threads(owner, name, int(pr)))
         plan, planned = plan_thread_resolution(threads, poster_login, threshold)
-    except (RuntimeError, SystemExit, ValueError, KeyError, TypeError) as e:
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - never fatal: the APPROVE has landed
         print(f"::warning::Auto-resolve: could not read this PR's review threads, so none were resolved: {e or 'thread query failed'}")
         return counts
     counts.update(planned)
     counts[RESOLVED] = 0
-    for thread, severity in plan:
+    if len(plan) > MAX_AUTO_RESOLVE:
+        counts["deferred"] = len(plan) - MAX_AUTO_RESOLVE
+        plan = plan[:MAX_AUTO_RESOLVE]
+    streak = 0
+    for index, (thread, severity) in enumerate(plan):
+        if streak >= MAX_CONSECUTIVE_FAILURES:
+            counts["deferred"] += len(plan) - index
+            print(f"::warning::Auto-resolve: stopped after {streak} consecutive failures; "
+                  f"{len(plan) - index} eligible thread(s) left for the next approving round.")
+            break
         thread_id = thread.get("id") or ""
         try:
             if not thread_id:
                 raise RuntimeError("thread has no node id")
-            _graphql(REPLY_MUTATION, threadId=thread_id, body=resolve_reply(severity, threshold, commit_sha))
+            if not still_eligible(thread_id, poster_login):
+                counts[SKIP_HUMAN] += 1
+                streak = 0
+                continue
+            # Resolve FIRST, reply second. The reply is from the approver
+            # identity, so a reply left on a thread whose resolve then failed
+            # would make it SKIP_HUMAN forever (or, approver == poster, be
+            # duplicated every round). A resolved thread is never re-planned,
+            # so a failed reply costs only the explanation.
             _graphql(RESOLVE_MUTATION, threadId=thread_id)
-        except (RuntimeError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - never fatal: the APPROVE has landed
             counts["failed"] += 1
+            streak += 1
             print(f"::warning::Auto-resolve: could not resolve thread {thread_id or '?'}: {e}")
             continue
+        streak = 0
         counts[RESOLVED] += 1
+        try:
+            _graphql(REPLY_MUTATION, threadId=thread_id, body=resolve_reply(severity, threshold, commit_sha))
+        except Exception as e:  # noqa: BLE001 - the thread is already resolved
+            print(f"::warning::Auto-resolve: resolved thread {thread_id} but could not reply on it: {e}")
     emit(f"Auto-resolve: resolved {counts[RESOLVED]}, skipped-human {counts[SKIP_HUMAN]}, "
          f"skipped-unbadged {counts[SKIP_UNBADGED]}, skipped-above-threshold {counts[SKIP_ABOVE]}, "
-         f"failed {counts['failed']}.")
+         f"failed {counts['failed']}, deferred {counts['deferred']}.")
     return counts
 
 

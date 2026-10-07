@@ -107,6 +107,7 @@ def _load_gate_unresolved():
 
 gate_unresolved = _load_gate_unresolved()
 CONSOLIDATED_MARKER = gate_unresolved.CONSOLIDATED_MARKER
+AUTO_RESOLVE_MARKER = gate_unresolved.AUTO_RESOLVE_MARKER
 
 # post-review.py renders every inline finding as "<emoji> **<Label>** — <body>".
 # Recovering the severity from that badge is reading back our own structured
@@ -281,6 +282,14 @@ BOT_USER_TYPE = "Bot"
 # thread to "answered" — that would let any passer-by spend the judge's repeat
 # budget and bury real findings. GitHub returns NONE/CONTRIBUTOR for outsiders.
 MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
+def _is_auto_resolve(comment: dict) -> bool:
+    """auto-approve.py's own "Resolved by auto-approve" reply. Posted under the
+    approver identity — often a maintainer account — it gives no technical reason,
+    so it is never an ANSWER: counting it would spend the judge's repeat budget on
+    the bot answering its own finding."""
+    return AUTO_RESOLVE_MARKER in ((comment or {}).get("body") or "")
 
 # The shape a demoted finding's re-raise lineage may have in the sentinel (BE-12534).
 # Duplicated from post-review.py's REPEAT_URL_PATTERN / REPEAT_URL_MAX_CHARS rather
@@ -692,8 +701,11 @@ def _resolve_lineage(url, by_id: dict, replies_by_root: dict, round_by_review: d
     answering = [
         reply
         for reply in replies_by_root.get(comment_id, [])
-        if (pr_author and ((reply.get("user") or {}).get("login") or "") == pr_author)
-        or (reply.get("author_association") or "") in MAINTAINER_ASSOCIATIONS
+        if not _is_auto_resolve(reply)
+        and (
+            (pr_author and ((reply.get("user") or {}).get("login") or "") == pr_author)
+            or (reply.get("author_association") or "") in MAINTAINER_ASSOCIATIONS
+        )
     ]
     # The most recent answer is the author's CURRENT position, the same rule
     # MAX_REPLIES_PER_ENTRY keeps the tail of a hot thread for.
@@ -1033,6 +1045,7 @@ def build_ledger(
                     pr_author and ((r.get("user") or {}).get("login") or "") == pr_author
                 ),
                 "is_maintainer": (r.get("author_association") or "") in MAINTAINER_ASSOCIATIONS,
+                "is_auto_resolve": _is_auto_resolve(r),
                 "text": _truncate(r.get("body") or "", max_body),
             }
             for r in chain
@@ -1043,7 +1056,9 @@ def build_ledger(
         # repeat slots and pushes genuine findings past the cap. Third-party
         # replies stay in the ledger (the judge reads them); they just don't
         # count as the finding having been addressed.
-        answered_count = sum(1 for r in replies if r["is_pr_author"] or r["is_maintainer"])
+        answered_count = sum(
+            1 for r in replies if (r["is_pr_author"] or r["is_maintainer"]) and not r["is_auto_resolve"]
+        )
         dropped_replies = 0
         if len(replies) > MAX_REPLIES_PER_ENTRY:
             dropped_replies = len(replies) - MAX_REPLIES_PER_ENTRY
@@ -1477,7 +1492,9 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
             )
         for reply in entry["replies"]:
             who = _defang_fences(reply["author"]) or "unknown"
-            if reply["is_pr_author"]:
+            if reply.get("is_auto_resolve"):
+                tag = " (auto-approve resolving at or below its threshold — NOT an answer)"
+            elif reply["is_pr_author"]:
                 tag = " (PR author)"
             elif reply["is_maintainer"]:
                 tag = " (maintainer)"
