@@ -390,7 +390,7 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   the threshold;
 - **REQUEST_CHANGES** when any finding is above it, or has an unrecognised
   severity;
-- **nothing** when the round can't be trusted: the judge did not adjudicate, a
+- **no decision** when the round can't be trusted: the judge did not adjudicate, a
   panel reviewer did not complete (beyond what `approve_max_failed_reviewers`
   tolerates — see below), the review did not land as threads (or some
   finding reached the review body only), the head moved or the base was
@@ -399,8 +399,24 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   open, or the **reviewed diff is empty** — every changed path was stripped by
   `diff_excludes` or the generated-file classifier (or the change is a pure
   rename / mode / binary change with no content hunk), so zero findings means
-  nobody looked, not that the change is clean. A "nothing" round also **withdraws** the bot's own earlier approvals, so
-  a round-1 approval does not keep counting through a degraded re-run.
+  nobody looked, not that the change is clean. A no-decision round also **withdraws** the bot's own earlier approvals, so
+  a round-1 approval does not keep counting through a degraded re-run, and
+  posts one **standing REQUEST_CHANGES** carrying the reasons verbatim and the
+  next step (re-run the round by removing and re-adding the `cursor-review`
+  label, or — when the cause would recur, e.g. the findings did not land as
+  threads or the reviewed diff is empty — a human is needed). Without it, a PR
+  whose threads all get resolved would look done although nothing approved it.
+  The next no-decision round replaces it (it never stacks); the next round that
+  approves — or, under `defer_approval`, that passes, and cursor-approve's
+  approval after it — dismisses it. A `capped` round (`needs-human-review`)
+  posts none: the label already hands the PR to a human.
+
+Whatever the outcome, `decide` then writes the **cursor-approve status card**
+(one PR comment, edited in place each round; see
+[cursor-approve.md](cursor-approve.md#the-status-card-contract)) — except for
+an author `approve_authors` does not list, who gets no card. It is written as
+the decide identity (`APPROVER_TOKEN`'s user when set), so pass the same
+`APPROVER_TOKEN` to cursor-approve or its phases will start a second card.
 
 **Tolerating an errored reviewer.** By default a single panel cell that errors
 (one model having a bad minute) withholds the whole decision, and since a push

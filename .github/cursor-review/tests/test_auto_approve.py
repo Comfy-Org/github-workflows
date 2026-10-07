@@ -1097,7 +1097,8 @@ class PostWriteRaceTest(unittest.TestCase):
         approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
                     "commit_id": SHA, "body": AA.APPROVE_MARKER}
         rc, writes = self.run_decide([SHA], judge_status="error", reviews=[approval])
-        self.assertEqual((rc, writes), (0, ["PUT"]))
+        # ...then leaves its standing request for changes (BE-19489).
+        self.assertEqual((rc, writes), (0, ["PUT", "POST"]))
 
     def test_excluded_only_pr_posts_nothing_and_withdraws(self):
         # Round 1 approved real content; a later round over an all-excluded diff
@@ -1105,13 +1106,15 @@ class PostWriteRaceTest(unittest.TestCase):
         approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
                     "commit_id": SHA, "body": AA.APPROVE_MARKER}
         rc, writes = self.run_decide([SHA], reviews=[approval], diff="")
-        self.assertEqual((rc, writes), (0, ["PUT"]))
+        # The POST is the standing request for changes (BE-19489), not an approval.
+        self.assertEqual((rc, writes), (0, ["PUT", "POST"]))
 
     def test_unreadable_threads_fail_closed(self):
         def boom(*a):
             raise SystemExit(2)  # gate-unresolved's run_graphql on a query failure
         rc, writes = self.run_decide([SHA], threads=boom)
-        self.assertEqual((rc, writes), (0, []))
+        # No approval; only the standing request for changes (BE-19489).
+        self.assertEqual((rc, writes), (0, ["POST"]))
 
     def test_unreadable_head_after_post_withdraws(self):
         rc, writes = self.run_decide([SHA, RuntimeError("timeout")])
@@ -1143,7 +1146,8 @@ class PostWriteRaceTest(unittest.TestCase):
 
     def test_base_retargeted_before_decide_posts_nothing(self):
         rc, writes = self.run_decide([(SHA, "release")])
-        self.assertEqual((rc, writes), (0, []))
+        # No approval; only the standing request for changes (BE-19489).
+        self.assertEqual((rc, writes), (0, ["POST"]))
 
     def test_approval_records_the_reviewed_base(self):
         body = AA.render_body(AA.APPROVE, ["ok"], "medium", [], SHA, "main")
@@ -1332,7 +1336,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     def test_max_failed_reviewers_reaches_the_gate(self):
         panel = panel_with(("m1", "edge-case"))
         self.assertEqual(self.run_decide(panel=panel), (0, "untrusted"))
-        self.assertEqual(self.posted, [])
+        # Only the no-decision round's standing request for changes (BE-19489).
+        self.assertEqual([p["event"] for p in self.posted], [AA.REQUEST_CHANGES])
         self.assertEqual(self.run_decide(panel=panel, max_failed="1"), (0, "pass"))
         self.assertEqual([p["event"] for p in self.posted], [AA.APPROVE])
         self.assertIn("approved with 1/6 reviewers errored: m1:edge-case", self.posted[0]["body"])
@@ -1892,6 +1897,7 @@ class AutoResolveCommandTest(unittest.TestCase):
                     mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
                     mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
                     mock.patch.object(GATE, "iter_threads", fake_iter), \
+                    mock.patch.object(AA, "dismiss_own_change_requests", lambda *a, **k: 0), \
                     mock.patch.object(AA, "emit", lambda *a: None):
                 return AA.cmd_decide(args)
 
@@ -2293,7 +2299,7 @@ class ApproveAuthorsTest(unittest.TestCase):
         self.assertIn("AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}", step)
         self.assertIn('--author-enabled "$AUTHOR_ENABLED"', step)
         self.assertIn('--pr-author "$PR_AUTHOR"', step)
-        self.assertIn("needs: [gate, consolidate, ledger, diff-size]", src)
+        self.assertIn("needs: [gate, consolidate, ledger, diff-size, round-cap]", src)
         # No "not blocking auto-approve" marks for an author no decision is taken for.
         self.assertIn("APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}", src)
 
@@ -2320,6 +2326,225 @@ class AutoResolveWiringTest(unittest.TestCase):
         for field in ("participants: comments(first: 100)", "totalCount", "__typename", "\n          id\n"):
             with self.subTest(field=field):
                 self.assertIn(field, GATE.QUERY)
+
+
+
+CARD = AA._load_card()
+APPROVER = "cursor-approver"
+
+
+def own_change_request(rid, edited=False):
+    """A standing REQUEST_CHANGES an earlier auto-approve round left."""
+    return {"id": rid, "user": {"login": APPROVER}, "state": "CHANGES_REQUESTED",
+            "body": AA.APPROVE_MARKER + "\nblock", "edited": edited}
+
+
+class StatusCardAndStandingBlockTest(unittest.TestCase):
+    """BE-19489: decide writes the status card on every outcome for an opted-in
+    author, and a no-decision round leaves a standing REQUEST_CHANGES that the
+    next NONE replaces and an approving round withdraws."""
+
+    def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
+                   reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
+                   head=SHA, card="true"):
+        self.reviews_posted, self.dismissed, self.card_writes = [], [], []
+
+        def fake_gh(args, payload=None):
+            if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
+                self.reviews_posted.append(payload)
+                return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "PUT"]:
+                self.dismissed.append((int(args[3].split("/")[-2]), payload["message"]))
+                return "{}"
+            if args[:3] == ["api", "-X", "PATCH"] or (args[:3] == ["api", "-X", "POST"] and "/comments" in args[3]):
+                self.card_writes.append((args[2], args[3], payload["body"]))
+                return json.dumps({"id": 7, "html_url": "https://github.com/o/r/pull/1#issuecomment-7"})
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([list(comments)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
+            return json.dumps({"head": {"sha": head}, "base": {"ref": "main"},
+                               "labels": [{"name": n} for n in labels]})
+
+        def fake_threads(repo, pr, sink=None):
+            if sink is not None:
+                sink.extend(threads)
+            return [(t["severity"], t.get("non_gating", False)) for t in threads]
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": list(panel)}, f)
+            with open(dpath, "w") as f:
+                f.write(diff)
+            open(out, "w").close()
+            args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status=judge, delivered=delivered,
+                                      ungated="0", approver_login=APPROVER, reviewed_diff=dpath,
+                                      base_ref="main", poster_login=POSTER, defer_approval=defer,
+                                      author_enabled=author_enabled, pr_author="someone",
+                                      card=card, round="2", max_rounds="5",
+                                      run_url="https://github.com/o/r/actions/runs/1")
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", fake_threads), \
+                    mock.patch.object(AA, "resolve_eligible_threads", lambda *a: None), \
+                    mock.patch.object(AA, "emit", lambda *a: None), \
+                    mock.patch("builtins.print", lambda *a, **k: None):
+                rc = AA.cmd_decide(args)
+            return rc, read_outputs(out).get("approve_gate")
+
+    def card_body(self):
+        self.assertEqual(len(self.card_writes), 1, self.card_writes)
+        return self.card_writes[0][2]
+
+    def assert_markers(self, body, state, nxt):
+        lines = body.splitlines()
+        self.assertEqual(lines[:3], [CARD.CARD_MARKER, f"<!-- cursor-approve-state: {state} -->",
+                                     f"<!-- cursor-approve-next: {nxt} -->"])
+        self.assertIn(f"Reviewed commit: `{SHA}`", body)
+
+    # -- no decision -------------------------------------------------------
+
+    def test_no_decision_posts_a_standing_request_for_changes_with_reason_and_next_step(self):
+        rc, gate = self.run_decide(judge="error")
+        self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+        body = self.reviews_posted[0]["body"]
+        self.assertEqual(self.reviews_posted[0]["commit_id"], SHA)
+        self.assertIn(AA.APPROVE_MARKER, body)
+        self.assertRegex(body, AA.REVIEWED_SHA_RE)
+        self.assertIn("- the judge did not adjudicate this round (status=error)", body)
+        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+
+    def test_no_decision_card_has_markers_reasons_verbatim_and_next_step(self):
+        panel = panel_with(("m1", "edge-case"), ("m2", "adversarial"))
+        self.run_decide(panel=panel)
+        body = self.card_body()
+        self.assert_markers(body, "no_decision", "relabel")
+        self.assertIn("**No decision this round, so this PR is not approved.**", body)
+        _, _, reasons, _ = AA.decide_gate("low", [], panel, "ok", True, SHA, SHA, [])
+        self.assertEqual(reasons, ["2/6 panel reviewers did not complete"])
+        for r in reasons:
+            self.assertIn(f"- {r}", body)  # verbatim, not markdown-escaped
+        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+        self.assertIn("Cursor approve · round 2 of 5 · `aaaaaaa`", body)
+
+    def test_structural_no_decision_names_the_cause_and_asks_for_a_human(self):
+        for kwargs, cause in (({"delivered": "false"}, "the findings did not land as resolvable threads"),
+                              ({"diff": ""}, "the reviewed diff is empty")):
+            with self.subTest(cause=cause):
+                self.run_decide(**kwargs)
+                body = self.card_body()
+                self.assert_markers(body, "no_decision", "human")
+                self.assertIn(f"**Next step:** A human is needed: {cause}", body)
+                self.assertIn("A human is needed:", self.reviews_posted[0]["body"])
+
+    def test_a_repeated_no_decision_replaces_the_block_and_the_card(self):
+        old_card = {"id": 7, "user": {"login": APPROVER}, "body": CARD.CARD_MARKER + "\nround 1"}
+        self.run_decide(judge="error", reviews=[own_change_request(5), own_change_request(6, edited=True)],
+                        comments=[old_card])
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+        # The older unedited block goes; the new one (99) and an edited one stay.
+        self.assertEqual(self.dismissed, [(5, AA.STANDING_REPLACED_MESSAGE)])
+        # The second round edits the same card comment rather than adding one.
+        self.assertEqual([(m, u) for m, u, _ in self.card_writes], [("PATCH", "repos/o/r/issues/comments/7")])
+
+    def test_an_unlisted_author_gets_no_block_and_no_card(self):
+        rc, gate = self.run_decide(judge="error", author_enabled="false")
+        self.assertEqual((rc, gate), (0, AA.GATE_OFF))
+        self.assertEqual((self.reviews_posted, self.card_writes), ([], []))
+
+    def test_capped_posts_no_new_request_for_changes(self):
+        self.run_decide(labels=["needs-human-review"])
+        self.assertEqual(self.reviews_posted, [])
+        body = self.card_body()
+        self.assert_markers(body, "capped", "human")
+        self.assertIn("needs-human-review", body)
+
+    def test_no_card_without_the_card_flag(self):
+        self.run_decide(judge="error", card="")
+        self.assertEqual(self.card_writes, [])
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+
+    # -- a later approving round withdraws the block ------------------------
+
+    def test_a_later_passing_round_withdraws_the_block(self):
+        rc, gate = self.run_decide(reviews=[own_change_request(5)])
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.APPROVE])
+        self.assertEqual(self.dismissed, [(5, AA.APPROVED_LATER_MESSAGE)])
+        body = self.card_body()
+        self.assert_markers(body, "pass", "none")
+        self.assertNotIn("Next step", body)
+
+    def test_a_deferred_passing_round_withdraws_the_block(self):
+        rc, gate = self.run_decide(reviews=[own_change_request(5)], defer="true")
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual(self.reviews_posted, [])
+        self.assertEqual([rid for rid, _ in self.dismissed], [5])
+        self.assert_markers(self.card_body(), "pass", "none")
+
+    # -- request changes ----------------------------------------------------
+
+    def test_request_changes_card_lists_each_gating_finding_with_its_thread(self):
+        thread_row = {"severity": "high", "non_gating": False, "path": "f.go", "line": 1, "start_line": None,
+                      "url": "https://github.com/o/r/pull/1#discussion_r42"}
+        self.run_decide(findings=[finding("high")], threads=[thread_row])
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+        body = self.card_body()
+        self.assert_markers(body, "changes_requested", "resolve_then_relabel")
+        self.assertIn("**Not approved: 1 finding(s) above `low` gate this round.**", body)
+        self.assertIn("- **high** — `f.go:1` — [thread](https://github.com/o/r/pull/1#discussion_r42) — gated: above `low`", body)
+        self.assertIn("**Next step:** Fix or reply to the gating threads, resolve them, then start a new round: "
+                      "remove and re-add the `cursor-review` label.", body)
+
+    def test_an_open_earlier_thread_is_changes_requested_with_a_standing_block(self):
+        open_high = {"severity": "high", "non_gating": False, "path": "g.go", "line": 9, "start_line": None,
+                     "url": "https://github.com/o/r/pull/1#discussion_r43"}
+        rc, gate = self.run_decide(threads=[open_high])
+        self.assertEqual(gate, AA.GATE_FAIL)
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+        body = self.card_body()
+        self.assert_markers(body, "changes_requested", "resolve_then_relabel")
+        self.assertIn("[thread](https://github.com/o/r/pull/1#discussion_r43)", body)
+
+    def test_workflow_passes_the_card_inputs(self):
+        src = open(WORKFLOW_PATH, encoding="utf-8").read()
+        step = src[src.index("- name: Auto-approve decision"):]
+        step = step[: step.index("\n\n  dismiss-stale-approval:")]
+        for needle in ("--card true", '--round "$ROUND"', '--max-rounds "$MAX_ROUNDS"', '--run-url "$RUN_URL"',
+                       "ROUND: ${{ needs.round-cap.outputs.next_round }}",
+                       "MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}"):
+            self.assertIn(needle, step)
+
+
+class NoDecisionNextTest(unittest.TestCase):
+    def test_transient_causes_relabel(self):
+        for reason in ("the judge did not adjudicate this round (status=error)",
+                       "2/6 panel reviewers did not complete", "the PR head moved while the review ran",
+                       "could not read the PR state (boom)"):
+            self.assertEqual(AA.no_decision_next([reason])[0], CARD.NEXT_RELABEL, reason)
+
+    def test_structural_causes_need_a_human(self):
+        for reason in (AA.REASON_NOT_DELIVERED, f"3 {AA.REASON_UNGATED_TAIL}", AA.REASON_EMPTY_DIFF):
+            nxt, text = AA.no_decision_next(["the PR head moved while the review ran", reason])
+            self.assertEqual(nxt, CARD.NEXT_HUMAN, reason)
+            self.assertTrue(text.startswith("A human is needed: "))
+
+
+class ThreadUrlTest(unittest.TestCase):
+    def test_url_from_the_first_comment_id(self):
+        self.assertEqual(AA.thread_url("o/r", "1", {"fullDatabaseId": "3000000000"}),
+                         "https://github.com/o/r/pull/1#discussion_r3000000000")
+        self.assertEqual(AA.thread_url("o/r", "1", {"fullDatabaseId": "x y"}), "")
+
+    def test_finding_matches_its_thread_by_path_and_line_range(self):
+        threads = [{"path": "f.go", "line": 9, "start_line": 5, "severity": "high", "url": "u1"},
+                   {"path": "f.go", "line": 9, "start_line": 5, "severity": "medium", "url": "u2"}]
+        self.assertEqual(AA.thread_for({"file": "f.go", "line": 6, "severity": "medium"}, threads)["url"], "u2")
+        self.assertEqual(AA.thread_for({"file": "f.go", "line": 6, "severity": "bogus"}, threads)["url"], "u1")
+        self.assertIsNone(AA.thread_for({"file": "f.go", "line": 10, "severity": "high"}, threads))
 
 
 if __name__ == "__main__":
@@ -2353,6 +2578,7 @@ class ApproveExternalResolveScopeTest(unittest.TestCase):
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
                     mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)), \
+                    mock.patch.object(AA, "dismiss_own_change_requests", lambda *a, **k: 0), \
                     mock.patch.object(AA, "emit", lambda *a: None), \
                     mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
                 rc = AA.cmd_approve_external(args)

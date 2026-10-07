@@ -19,6 +19,19 @@ round:
     The per-axis verdicts from ``aggregate.py decide``, the overall result and
     the rule applied — or "Superseded by a newer commit" when the head moved.
 
+cursor-review's ``auto-approve.py decide`` writes it too, through
+``render_round`` and ``upsert``, on every round it decides for an author
+auto-approve applies to (BE-19489): ``pass``, ``changes_requested``,
+``no_decision`` and ``capped`` alike. Only that job has the round's gating
+findings, its threads and ``decide_gate``'s reasons in hand, and it runs
+whatever the outcome, while every phase here runs only after a ``pass`` (or a
+``capped``) the caller's ``if:`` let through. On a ``pass`` the start phase
+then overwrites it with the axes table, as before.
+
+Every card carries two machine-readable markers on the lines right after
+``CARD_MARKER`` — ``STATE_MARKER`` and ``NEXT_MARKER`` — a stable contract
+for agents, documented in docs/callers/cursor-approve.md.
+
 Every model-supplied string (an axis summary, a reason that echoes one) goes
 through ``sanitize`` — post-review.py's ``neutralize_mentions`` plus escaping of
 every character that could open markdown or HTML — so a summary cannot add a
@@ -49,6 +62,45 @@ OUTCOME_HUMAN = "needs_human"
 OUTCOME_VETOED = "vetoed"
 OUTCOME_OWN_PR = "own_pr"
 OUTCOME_ERROR = "error"
+
+# The machine-readable contract (docs/callers/cursor-approve.md). Values are
+# never renamed: agents key on them.
+STATE_PASS = "pass"
+STATE_CHANGES = "changes_requested"
+STATE_NO_DECISION = "no_decision"
+STATE_CAPPED = "capped"
+STATES = (STATE_PASS, STATE_CHANGES, STATE_NO_DECISION, STATE_CAPPED)
+NEXT_NONE = "none"
+NEXT_RESOLVE = "resolve_then_relabel"
+NEXT_RELABEL = "relabel"
+NEXT_HUMAN = "human"
+NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_HUMAN)
+STATE_MARKER = "<!-- cursor-approve-state: {} -->"
+NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
+
+RELABEL = "remove and re-add the `cursor-review` label"
+NEXT_RESOLVE_TEXT = f"Fix or reply to the gating threads, resolve them, then start a new round: {RELABEL}."
+NEXT_RELABEL_TEXT = f"Re-run the round: {RELABEL}."
+NEXT_HUMAN_CAPPED_TEXT = "A human is needed: review the PR, then remove the `needs-human-review` label to reset the round count."
+
+# How approve-external's outcome maps onto the contract on the decide card.
+DECIDE_STATES = {
+    OUTCOME_APPROVED: (STATE_PASS, NEXT_NONE),
+    OUTCOME_NOT_APPROVED: (STATE_CHANGES, NEXT_RELABEL),
+    OUTCOME_SUPERSEDED: (STATE_NO_DECISION, NEXT_RELABEL),
+    OUTCOME_HUMAN: (STATE_CAPPED, NEXT_HUMAN),
+    OUTCOME_VETOED: (STATE_NO_DECISION, NEXT_HUMAN),
+    OUTCOME_OWN_PR: (STATE_NO_DECISION, NEXT_HUMAN),
+    OUTCOME_ERROR: (STATE_NO_DECISION, NEXT_RELABEL),
+}
+DECIDE_NEXT_TEXT = {
+    OUTCOME_NOT_APPROVED: f"Address the axis verdicts above, push, then start a new round: {RELABEL}.",
+    OUTCOME_SUPERSEDED: f"A newer commit needs its own round: {RELABEL}.",
+    OUTCOME_HUMAN: NEXT_HUMAN_CAPPED_TEXT,
+    OUTCOME_VETOED: "A human is needed: the PR carries `skip-cursor-review`.",
+    OUTCOME_OWN_PR: "A human is needed: the approver cannot approve its own PR.",
+    OUTCOME_ERROR: f"Re-run the round: {RELABEL}.",
+}
 
 # Markdown/HTML-significant characters, backslash-escaped. `<` alone would be
 # enough to kill a forged `<!-- cursor-approve-card -->`; the rest stop a
@@ -118,14 +170,30 @@ def _run_link(run_url: str) -> str:
     return "workflow run"
 
 
+def card_head(state: str, next_step: str) -> list:
+    """The card marker, then the two contract markers. An unknown value is a
+    bug here, never something to publish: agents act on these."""
+    if state not in STATES or next_step not in NEXTS:
+        raise ValueError(f"unknown card state/next: {state!r}/{next_step!r}")
+    return [CARD_MARKER, STATE_MARKER.format(state), NEXT_MARKER.format(next_step)]
+
+
+def _reviewed_line(sha: str, run_url: str) -> str:
+    reviewed = f"`{sha}`" if SHA_RE.fullmatch(sha or "") else "unknown"
+    return f"_Reviewed commit: {reviewed} · {_run_link(run_url)}_"
+
+
 def render_start(round_no, max_rounds, sha: str, axes: list, approve_gate: str, run_url: str) -> str:
-    lines = [CARD_MARKER, heading(round_no, max_rounds, sha), ""]
-    if approve_gate == "capped":
+    capped = approve_gate == "capped"
+    lines = card_head(STATE_CAPPED if capped else STATE_PASS, NEXT_HUMAN if capped else NEXT_NONE)
+    lines += [heading(round_no, max_rounds, sha), ""]
+    if capped:
         lines.append("**Round limit reached, needs a human.**")
+        lines += ["", f"**Next step:** {NEXT_HUMAN_CAPPED_TEXT}"]
     else:
         lines += ["| Axis | Verdict | Confidence | Summary |", "|---|---|---|---|"]
         lines += [f"| {axis} | ⏳ pending | | |" for axis in axes]
-    lines += ["", f"_{_run_link(run_url)}_"]
+    lines += ["", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
 
 
@@ -137,9 +205,12 @@ def _confidence(value) -> str:
 
 def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome: str,
                   max_yellow: str, run_url: str) -> str:
-    lines = [CARD_MARKER, heading(round_no, max_rounds, sha), ""]
+    state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_RELABEL))
+    next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_RELABEL_TEXT)
+    lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), ""]
     if outcome == OUTCOME_SUPERSEDED:
-        lines += ["**Superseded by a newer commit.**", "", f"_{_run_link(run_url)}_"]
+        lines += ["**Superseded by a newer commit.**", "", f"**Next step:** {next_text}",
+                  "", _reviewed_line(sha, run_url)]
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None
     detail = detail if isinstance(detail, dict) else {}
@@ -169,8 +240,69 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
             why = [sanitize(r, 300) for r in why]
         lines.append("**Result: ❌ Not approved.**")
         lines += [f"- {r}" for r in why]
+        lines += ["", f"**Next step:** {next_text}"]
     limit = _int_or_q(max_yellow)
-    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report. {_run_link(run_url)}_"]
+    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report. {_run_link(run_url)}_",
+              "", _reviewed_line(sha, "")]
+    return "\n".join(lines) + "\n"
+
+
+def reason_text(text) -> str:
+    """One of decide_gate's reasons, rendered VERBATIM (backticks and all).
+
+    These are auto-approve.py's own sentences, not model output: what they
+    interpolate is a count, a threshold word, a `_label_part`-filtered panel
+    label or `gh` stderr. So they are not markdown-escaped like an axis summary
+    (that would print `\\`low\\``); they are folded to one line, mentions are
+    neutralized, and `<` is entity-escaped so nothing can open an HTML comment
+    and forge a marker.
+    """
+    text = " ".join(str(text or "").split())
+    if len(text) > 500:
+        text = text[:499].rstrip() + "…"
+    return neutralize_mentions(text).replace("<", "&lt;")
+
+
+def _gating_row(finding: dict) -> str:
+    """One gating finding: severity, file:line, thread link and why it gated.
+    Severity/file/line are model output, filtered exactly as auto-approve.py's
+    review body filters them; `url` and `why` are built by auto-approve.py."""
+    sev = finding.get("severity")
+    sev = sev.strip().lower() if isinstance(sev, str) else ""
+    sev = sev if sev in ("critical", "high", "medium", "low", "nit") else "unknown"
+    line = finding.get("line")
+    line = str(line) if isinstance(line, int) and not isinstance(line, bool) else "?"
+    path = finding.get("file") if isinstance(finding.get("file"), str) else "?"
+    # `<` could start a forged contract marker inside the code span's raw text.
+    ref = _load_post_review().render_code_ref(path[:300].replace("<", "‹"), line)
+    url = finding.get("url") or ""
+    link = f"[thread]({url})" if re.fullmatch(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./#-]+", url) else "no thread found"
+    why = reason_text(finding.get("why") or "")
+    return f"- **{sev}** — {ref} — {link}" + (f" — gated: {why}" if why else "")
+
+
+def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, headline: str,
+                 reasons: list, next_text: str, run_url: str, gating=None, threshold: str = "") -> str:
+    """The card cursor-review's decide writes for the round it just decided.
+
+    `headline` and `next_text` are auto-approve.py's fixed sentences; `reasons`
+    are decide_gate's, verbatim; `gating` is the findings (or open threads)
+    that held the approval back, each a dict with severity/file/line/url/why.
+    """
+    lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), "", f"**{headline}**"]
+    rows = [_gating_row(f) for f in (gating or [])[:20] if isinstance(f, dict)]
+    if rows:
+        lines += ["", *rows]
+        if len(gating) > 20:
+            lines.append(f"- … and {len(gating) - 20} more (see the review)")
+    clean = [reason_text(r) for r in (reasons or []) if isinstance(r, str) and r.strip()]
+    if clean:
+        lines += ["", "Reasons (from the auto-approve decision):", *[f"- {r}" for r in clean]]
+    if next_step != NEXT_NONE and next_text:
+        lines += ["", f"**Next step:** {next_text}"]
+    if threshold in ("medium", "low", "nit"):
+        lines += ["", f"_Threshold: `{threshold}` (this repo's `approve_max_severity`)._"]
+    lines += ["", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
 
 

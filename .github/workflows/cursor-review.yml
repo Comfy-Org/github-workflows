@@ -2947,8 +2947,10 @@ jobs:
     # `diff-size` for its `merge_base_sha` alone (BE-15598) — the round sentinel this
     # job writes has to record the merge base THIS round's reviewed diff was taken
     # against. Already a transitive dependency (consolidate → review → diff-size), so
-    # this adds no ordering, only the outputs.
-    needs: [gate, consolidate, ledger, diff-size]
+    # this adds no ordering, only the outputs. `round-cap` likewise (diff-size
+    # already `needs:` it), for the round number on the status card decide
+    # writes (BE-19489).
+    needs: [gate, consolidate, ledger, diff-size, round-cap]
     # `!cancelled()` rather than `always()`, for the same reason
     # `over-cap-comment` documents at its own `if:`: the documented caller sets
     # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
@@ -3420,6 +3422,11 @@ jobs:
           # and reports `off` for this author.
           AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # For the cursor-approve status card decide writes every round
+          # (BE-19489): round-cap's count is the heading's "round R of M".
+          ROUND: ${{ needs.round-cap.outputs.next_round }}
+          MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3459,7 +3466,11 @@ jobs:
             --open-anchors /tmp/open-anchors.json \
             --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}" \
             --author-enabled "$AUTHOR_ENABLED" \
-            --pr-author "$PR_AUTHOR"
+            --pr-author "$PR_AUTHOR" \
+            --card true \
+            --round "$ROUND" \
+            --max-rounds "$MAX_ROUNDS" \
+            --run-url "$RUN_URL"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with

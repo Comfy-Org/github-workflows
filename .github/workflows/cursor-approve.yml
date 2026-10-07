@@ -12,7 +12,9 @@ name: Cursor approve
 #                    approval must not stand while the axes judge — then
 #                    writes the status card (every axis pending, or "Round
 #                    limit reached" when cursor-review reported
-#                    approve_gate == capped).
+#                    approve_gate == capped). cursor-review's decide has
+#                    already written the card for this round, on every
+#                    outcome; this overwrites it on the outcomes it runs for.
 #   phase: decide  — after them: downloads the axis-* artifacts of THIS run,
 #                    runs .github/cursor-approve/aggregate.py decide (each axis
 #                    read only from its own axis-<name> artifact, and only for

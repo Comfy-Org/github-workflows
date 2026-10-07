@@ -95,6 +95,25 @@ class ApproveExternal(unittest.TestCase):
         self.assertIn("Approved, see the [cursor-approve card](https://github.com/o/r/pull/1#issuecomment-9).", review["body"])
         self.assertEqual(fake.dismissed, [])
 
+    def test_an_approval_withdraws_a_standing_request_for_changes(self):
+        # BE-19489: a no-decision round left a standing REQUEST_CHANGES; the
+        # deferred approval that finally lands withdraws it.
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.APPROVED_LATER_MESSAGE])
+
+    def test_a_non_approval_leaves_a_standing_request_for_changes(self):
+        block = {"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN},
+                 "body": aa.APPROVE_MARKER + "\nNo decision this round."}
+        fake = FakeGitHub(reviews=[block])
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertEqual(fake.dismissed, [])
+
     def test_one_red_posts_nothing_and_withdraws_prior_approval(self):
         fake = FakeGitHub(reviews=[prior_approval()])
         rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
