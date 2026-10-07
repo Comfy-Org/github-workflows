@@ -327,7 +327,7 @@ diff the workflow fetches from the GitHub API.)
 | Input | Default | Meaning |
 |---|---|---|
 | `commit_sha` | — (required) | The PR head to judge; checked out read-only with full history. |
-| `model` | `claude-opus-5-thinking-xhigh` | Cursor model id (cursor-review's judge model). |
+| `model` | `claude-opus-5-5-xhigh` | Cursor model id (cursor-review's judge model). |
 | `runs_on` | `"ubuntu-latest"` | JSON-encoded `runs-on`, as in cursor-review. |
 
 ## Base inputs
@@ -339,7 +339,7 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 |---|---|---|
 | `axis` | — (required) | Which axis prompt to render. |
 | `commit_sha` | — (required) | As above. |
-| `model` | `claude-opus-5-thinking-xhigh` | As above. |
+| `model` | `claude-opus-5-5-xhigh` | As above. |
 | `runs_on` | `"ubuntu-latest"` | As above. |
 | `checkout` | `false` | Full read-only checkout of the PR head (`persist-credentials: false`). |
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |

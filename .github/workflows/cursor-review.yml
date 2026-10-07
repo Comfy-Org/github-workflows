@@ -121,7 +121,7 @@ on:
           recorded quality gap, while `max` cost ~10% of every run's spend.
         type: string
         required: false
-        default: claude-opus-5-thinking-xhigh
+        default: claude-opus-5-5-xhigh
       diff_size_cap:
         description: >-
           Max counted changed lines. PRs over the cap are skipped — too large
@@ -2004,7 +2004,7 @@ jobs:
               # a PUBLIC repo's run log. Same reason the `Require a pinned
               # workflows_ref` step below strips before echoing.
               SAFE_OVERRIDE="$(printf '%s' "$PANEL_MODELS_OVERRIDE" | tr -d '\n\r' | cut -c1-200)"
-              echo "::error::panel_models must be a JSON array of 1-12 Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $SAFE_OVERRIDE"
+              echo "::error::panel_models must be a JSON array of 1-12 Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-5-xhigh\"]); got: $SAFE_OVERRIDE"
               exit 1
             fi
             printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c -s '.[0] | unique' > /tmp/models.json

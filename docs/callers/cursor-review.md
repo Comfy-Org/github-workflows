@@ -110,7 +110,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 
 | Input | Default | Notes |
 |---|---|---|
-| `judge_model` | `claude-opus-5-thinking-xhigh` | Consolidates the panel into one review. |
+| `judge_model` | `claude-opus-5-5-xhigh` | Consolidates the panel into one review. |
 | `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight checks each one exists in the live catalog — existence only, not ZDR). Use for per-repo experiments such as a reasoning-tier A/B — and prefer wiring it to a **variable** rather than a literal, see [Running a model experiment](#running-a-model-experiment). |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. Under `blocking: true` it is also not green: an unreviewed PR cannot pass the gate. |

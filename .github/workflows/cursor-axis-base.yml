@@ -51,7 +51,7 @@ on:
         required: true
       model:
         type: string
-        default: claude-opus-5-thinking-xhigh
+        default: claude-opus-5-5-xhigh
       runs_on:
         type: string
         default: '"ubuntu-latest"'
