@@ -4,12 +4,17 @@
 Five reviewers each judge one axis of a PR (business, design, correctness,
 completeness, conformance) and answer with one JSON object:
 ``{"verdict": "red"|"yellow"|"green", "confidence": 0..1, "summary": "..."}``.
-Two subcommands, both pure — nothing here writes to GitHub:
+Three subcommands, all pure — nothing here writes to GitHub:
 
 ``render``
     Print the prompt for one axis: ``prompt-common.md`` followed by
     ``prompt-<axis>.md``, with every ``{{placeholder}}`` substituted. An unknown
     axis exits 2.
+
+``extract``
+    Pull the one JSON object out of a model's raw reply (cursor-axis-base.yml
+    runs this before uploading) and stamp it with ``--commit-sha``, the commit
+    the axis judged; zero or several candidates exit 1.
 
 ``decide``
     Read ``<axis>.json`` for each expected axis from a directory and print one
@@ -17,7 +22,8 @@ Two subcommands, both pure — nothing here writes to GitHub:
     the per-axis detail in ``axes``, and the ``reasons``. The rules, in order:
 
     1. any expected axis missing, unparsable, with a verdict outside
-       red/yellow/green, or a confidence outside 0..1 → ``NONE`` (the round is
+       red/yellow/green, a confidence outside 0..1, or (with ``--commit-sha``)
+       a stamped commit other than that one → ``NONE`` (the round is
        untrusted: withhold the approval, never veto);
     2. any ``red`` → ``NONE``, naming the red axes;
     3. more ``yellow`` axes than ``--max-yellow-axes`` → ``NONE``;
@@ -50,6 +56,8 @@ SUMMARY_LIMIT = 1200
 # An axis output is one small JSON object; the cap is what decide will read of
 # a model-written file before calling it untrusted.
 MAX_OUTPUT_BYTES = 64 * 1024
+# The raw model reply extract reads; a longer one is rejected, not truncated.
+MAX_RAW_BYTES = 4 * MAX_OUTPUT_BYTES
 
 APPROVE = "APPROVE"
 NONE = "NONE"
@@ -128,8 +136,12 @@ def parse_axes(value: str) -> list:
 
 
 def parse_max_yellow(value) -> int:
+    # A `type: number` input can render as `0` or `0.0` (auto-approve.py's
+    # parse_max_rounds handles the same), so an integral float is accepted;
+    # `1.5`, `inf` and `nan` are not silently truncated.
     try:
-        n = int(str(value).strip())
+        number = float(str(value).strip())
+        n = int(number) if math.isfinite(number) and number.is_integer() else -1
     except ValueError:
         n = -1
     if not 0 <= n <= MAX_YELLOW_LIMIT:
@@ -191,8 +203,12 @@ def validate_output(data):
     return verdict, confidence, summary
 
 
-def load_output(path: str):
-    """Parse one axis output file; raise ValueError on anything unusable."""
+def load_output(path: str, commit_sha: str = ""):
+    """Parse one axis output file; raise ValueError on anything unusable.
+
+    With `commit_sha`, the output must also carry that exact `commit_sha` (which
+    `extract` stamps from the axis job's own input), so a verdict about any other
+    commit is untrusted rather than counted."""
     # This file is model-written and untrusted. O_NONBLOCK so a FIFO at this
     # path cannot block the open, and every check runs against the DESCRIPTOR via
     # fstat rather than the path via stat: a path-level stat followed by a
@@ -248,9 +264,12 @@ def load_output(path: str):
     # headroom than the scanner, which is an interpreter and build detail -- so
     # the contract is made structural rather than left resting on it.
     try:
-        return validate_output(data)
+        result = validate_output(data)
     except RecursionError:
         raise ValueError("the output is nested too deeply to validate") from None
+    if commit_sha and data.get("commit_sha") != commit_sha:
+        raise ValueError(f"the output judged commit {_short(data.get('commit_sha'))}, not {commit_sha[:7]}")
+    return result
 
 
 def decide(outputs: dict, axes: list, max_yellow: int):
@@ -286,6 +305,74 @@ def decide(outputs: dict, axes: list, max_yellow: int):
     return {"event": event, "verdicts": verdicts, "axes": detail, "reasons": reasons}
 
 
+VERDICT_KEY_RE = re.compile(r'"verdict"\s*:')
+
+
+def extract_object(raw: str):
+    """The ONE JSON object carrying a ``verdict`` in a model's raw reply.
+
+    The reply may wrap it in prose or a code fence. Every top-level ``{...}``
+    that parses is a candidate; zero or several with a ``verdict`` key raise
+    ValueError — two answers in one reply is ambiguity, and this path fails
+    closed on ambiguity rather than picking one.
+
+    Two more ambiguities fail closed. A duplicate key ANYWHERE in the reply:
+    the object holding it is rejected, so the scan would otherwise go on to
+    find a ``verdict`` nested inside it. And a ``"verdict":`` key anywhere but
+    in the one candidate: a wrapper that failed to parse (trailing comma, smart
+    quote) is skipped one byte at a time, so the scan resumes INSIDE it and
+    could take a nested verdict for the answer the wrapper plainly gives.
+    """
+    decoder = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+    found, i = [], 0
+    while True:
+        i = raw.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, i)
+        except _DuplicateKeyError as e:
+            raise ValueError(str(e)) from None
+        except (ValueError, RecursionError):
+            i += 1
+            continue
+        if isinstance(obj, dict) and "verdict" in obj:
+            found.append(obj)
+        i = end
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one JSON object with a verdict, found {len(found)}")
+    keys = len(VERDICT_KEY_RE.findall(raw))
+    if keys != 1:
+        raise ValueError(f"expected exactly one \"verdict\" key in the reply, found {keys}")
+    return found[0]
+
+
+def cmd_extract(args) -> int:
+    try:
+        if not SHA_RE.fullmatch(args.commit_sha or ""):
+            raise ValueError(f"--commit-sha must be a full commit SHA, got {args.commit_sha!r}")
+        # Bytes, and one past the cap: a silent truncation could cut a second
+        # verdict off and make an ambiguous reply look like a single answer.
+        with open(args.raw, "rb") as f:
+            data = f.read(MAX_RAW_BYTES + 1)
+        if len(data) > MAX_RAW_BYTES:
+            raise ValueError(f"the reply is larger than {MAX_RAW_BYTES} bytes")
+        obj = extract_object(data.decode("utf-8", errors="replace"))
+        validate_output(obj)
+    except (OSError, ValueError) as e:
+        print(f"::error::{e}", file=sys.stderr)
+        return 1
+    # The commit this axis job judged, from its own input — never the model's.
+    obj["commit_sha"] = args.commit_sha
+    text = json.dumps(obj)
+    if len(text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        print(f"::error::the output is larger than {MAX_OUTPUT_BYTES} bytes", file=sys.stderr)
+        return 1
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    return 0
+
+
 def cmd_render(args) -> int:
     values = {name: getattr(args, name) for name in PLACEHOLDERS}
     try:
@@ -317,10 +404,17 @@ def cmd_decide(args) -> int:
     except ValueError as e:
         print(f"::error::{e}", file=sys.stderr)
         return 2
+    if args.commit_sha and not SHA_RE.fullmatch(args.commit_sha):
+        print(f"::error::--commit-sha must be a full commit SHA, got {args.commit_sha!r}", file=sys.stderr)
+        return 2
     outputs = {}
     for axis in axes:
+        # --artifact-dirs: each axis is read ONLY from its own `axis-<axis>`
+        # artifact directory (download-artifact without merge-multiple), so a
+        # differently named artifact holding `<axis>.json` is never picked up.
+        parts = (f"axis-{axis}", f"{axis}.json") if args.artifact_dirs else (f"{axis}.json",)
         try:
-            outputs[axis] = load_output(os.path.join(args.outputs_dir, f"{axis}.json"))
+            outputs[axis] = load_output(os.path.join(args.outputs_dir, *parts), args.commit_sha)
         except ValueError as e:
             outputs[axis] = e
         # The per-axis boundary is the last place the "every decision exits 0"
@@ -343,7 +437,15 @@ def main(argv=None) -> int:
     d.add_argument("--outputs-dir", required=True)
     d.add_argument("--axes", default=",".join(AXES))
     d.add_argument("--max-yellow-axes", default="0")
+    d.add_argument("--commit-sha", default="")
+    d.add_argument("--artifact-dirs", action="store_true")
+    x = sub.add_parser("extract")
+    x.add_argument("--raw", required=True)
+    x.add_argument("--out", required=True)
+    x.add_argument("--commit-sha", required=True)
     args = parser.parse_args(argv)
+    if args.cmd == "extract":
+        return cmd_extract(args)
     return cmd_render(args) if args.cmd == "render" else cmd_decide(args)
 
 

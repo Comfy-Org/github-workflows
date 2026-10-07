@@ -1,0 +1,43 @@
+name: Cursor axis (conformance)
+
+# The conformance axis of cursor-approve: a thin wrapper over cursor-axis-base.yml
+# with a full read-only checkout of the PR head. Declares ONLY CURSOR_API_KEY —
+# an axis never sees another axis's credentials (a test enforces this).
+# Run it only after a cursor-review round passed; see
+# docs/callers/cursor-approve.md for the caller.
+#
+# Inputs (passed through): commit_sha, model, runs_on.
+# Secrets: CURSOR_API_KEY.
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5-thinking-xhigh
+      runs_on:
+        type: string
+        default: '"ubuntu-latest"'
+    secrets:
+      CURSOR_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    uses: ./.github/workflows/cursor-axis-base.yml
+    permissions:
+      contents: read
+    with:
+      axis: conformance
+      checkout: true
+      commit_sha: ${{ inputs.commit_sha }}
+      model: ${{ inputs.model }}
+      runs_on: ${{ inputs.runs_on }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}

@@ -466,5 +466,128 @@ class RenderHardeningTest(unittest.TestCase):
         self.assertIn("::error::", err)
 
 
+
+class Extract(unittest.TestCase):
+    def setUp(self):
+        import importlib.util as u
+        spec = u.spec_from_file_location("aggregate_x", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "aggregate.py"))
+        self.agg = u.module_from_spec(spec)
+        spec.loader.exec_module(self.agg)
+
+    def test_one_object_in_prose_and_fence(self):
+        raw = 'Here you go:\n```json\n{"verdict": "green", "confidence": 0.8, "summary": "ok {x}"}\n```\n'
+        self.assertEqual(self.agg.extract_object(raw)["verdict"], "green")
+
+    def test_zero_or_two_objects_fail(self):
+        with self.assertRaises(ValueError):
+            self.agg.extract_object("no json here {")
+        with self.assertRaises(ValueError):
+            self.agg.extract_object('{"verdict": "green"} {"verdict": "red"}')
+
+    def test_duplicate_key_anywhere_fails_closed(self):
+        # The outer object is rejected for its duplicate key; the nested green
+        # must not then become the single candidate.
+        raw = '{"verdict": "red", "verdict": "red", "note": {"verdict": "green", "confidence": 1, "summary": "ok"}}'
+        with self.assertRaises(ValueError):
+            self.agg.extract_object(raw)
+
+    def test_nested_verdict_in_broken_wrapper_fails_closed(self):
+        raw = '{"verdict": "red", "note": {"verdict": "green", "confidence": 1, "summary": "ok"},}'
+        with self.assertRaises(ValueError):
+            self.agg.extract_object(raw)
+
+    def test_nested_verdict_in_valid_object_fails_closed(self):
+        raw = '{"verdict": "green", "confidence": 1, "summary": "ok", "note": {"verdict": "red"}}'
+        with self.assertRaises(ValueError):
+            self.agg.extract_object(raw)
+
+    def test_escaped_verdict_in_summary_is_not_a_key(self):
+        raw = '{"verdict": "green", "confidence": 1, "summary": "no \\"verdict\\": here"}'
+        self.assertEqual(self.agg.extract_object(raw)["verdict"], "green")
+
+
+SHA = "a" * 40
+
+
+class ExtractCli(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.raw = os.path.join(self._tmp.name, "raw.txt")
+        self.out = os.path.join(self._tmp.name, "out.json")
+
+    def extract(self, content, sha=SHA):
+        with open(self.raw, "wb") as f:
+            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+        return run(["extract", "--raw", self.raw, "--out", self.out, "--commit-sha", sha])
+
+    def test_stamps_the_judged_commit(self):
+        code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok", "commit_sha": "b"}')
+        self.assertEqual(code, 0, err)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["commit_sha"], SHA)
+
+    def test_rejects_a_bad_commit_sha(self):
+        code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok"}', sha="main")
+        self.assertEqual(code, 1)
+        self.assertIn("--commit-sha", err)
+
+    def test_reply_past_the_cap_is_rejected_not_truncated(self):
+        first = '{"verdict": "green", "confidence": 1, "summary": "ok"}'
+        pad = " " * (AG.MAX_RAW_BYTES - len(first))
+        code, _, err = self.extract(first + pad + '{"verdict": "red", "confidence": 1, "summary": "no"}')
+        self.assertEqual(code, 1)
+        self.assertIn("larger than", err)
+        self.assertFalse(os.path.exists(self.out))
+
+
+class CommitBindingTest(DecideCase):
+    def test_matching_commit_approves(self):
+        self.write_all(**{a: {"verdict": "green", "confidence": 1, "summary": "", "commit_sha": SHA} for a in AG.AXES})
+        self.assertEqual(self.decide("--commit-sha", SHA)["event"], AG.APPROVE)
+
+    def test_other_or_missing_commit_is_untrusted(self):
+        overrides = {a: {"verdict": "green", "confidence": 1, "summary": "", "commit_sha": SHA} for a in AG.AXES}
+        overrides["correctness"] = {"verdict": "green", "confidence": 1, "summary": "", "commit_sha": "b" * 40}
+        overrides["conformance"] = {"verdict": "green", "confidence": 1, "summary": ""}
+        self.write_all(**overrides)
+        result = self.decide("--commit-sha", SHA)
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("error", result["axes"]["correctness"])
+        self.assertIn("error", result["axes"]["conformance"])
+
+    def test_malformed_commit_sha_exits_2(self):
+        code, _, err = run(["decide", "--outputs-dir", self.dir, "--commit-sha", "main"])
+        self.assertEqual(code, 2)
+
+
+class ArtifactDirsTest(DecideCase):
+    def test_reads_only_each_axis_own_artifact_dir(self):
+        axes = ("correctness", "conformance")
+        for axis in axes:
+            os.makedirs(os.path.join(self.dir, f"axis-{axis}"))
+            with open(os.path.join(self.dir, f"axis-{axis}", f"{axis}.json"), "w", encoding="utf-8") as f:
+                json.dump({"verdict": "green", "confidence": 1, "summary": ""}, f)
+        self.assertEqual(self.decide("--axes", ",".join(axes), "--artifact-dirs")["event"], AG.APPROVE)
+
+    def test_a_flat_or_misnamed_artifact_is_missing(self):
+        self.write_all(axes=("correctness", "conformance"))  # flat <axis>.json files
+        os.makedirs(os.path.join(self.dir, "axis-correctness-extra"))
+        with open(os.path.join(self.dir, "axis-correctness-extra", "correctness.json"), "w", encoding="utf-8") as f:
+            json.dump({"verdict": "green", "confidence": 1, "summary": ""}, f)
+        result = self.decide("--axes", "correctness,conformance", "--artifact-dirs")
+        self.assertEqual(result["event"], AG.NONE)
+
+
+class MaxYellowFloatTest(DecideCase):
+    def test_integral_float_is_accepted(self):
+        self.write_all()
+        self.assertEqual(self.decide("--max-yellow-axes", "0.0")["event"], AG.APPROVE)
+
+    def test_fractional_is_rejected(self):
+        code, _, _ = run(["decide", "--outputs-dir", self.dir, "--max-yellow-axes", "1.5"])
+        self.assertEqual(code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

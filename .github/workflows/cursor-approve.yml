@@ -1,0 +1,322 @@
+name: Cursor approve
+
+# Decide-and-approve half of cursor-approve: run the axis workflows (e.g.
+# axis-correctness.yml, axis-conformance.yml) only after a cursor-review round
+# passed (`approve_gate == 'pass'`), then call this TWICE:
+#
+#   phase: start   — before the axis jobs (they `needs:` it): withdraws this
+#                    identity's own approvals — cursor-review's decide has
+#                    ALREADY approved when it reports approve_gate == pass, and
+#                    that approval must not stand while the axes judge — then
+#                    writes the status card (every axis pending, or "Round
+#                    limit reached" when cursor-review reported
+#                    approve_gate == capped).
+#   phase: decide  — after them: downloads the axis-* artifacts of THIS run,
+#                    runs .github/cursor-approve/aggregate.py decide (each axis
+#                    read only from its own axis-<name> artifact, and only for
+#                    the commit_sha it stamped), posts the approval through
+#                    .github/cursor-review/auto-approve.py approve-external
+#                    (head and base re-read, reviewed-SHA marker, own stale
+#                    approvals withdrawn, never over needs-human-review)
+#                    and rewrites the card with the verdicts.
+#
+# No job here checks out PR code; the only checkout is this repo at
+# workflows_ref, for the scripts.
+#
+# Inputs:
+#   workflows_ref    REQUIRED, no default: the same commit SHA as the uses: pin
+#                    (checked against job.workflow_sha).
+#   phase            start | decide
+#   commit_sha       the PR head the axes judged (cursor-review's reviewed head)
+#   axes             comma-separated axes the caller ran, e.g. correctness,conformance
+#   max_yellow_axes  0..3 (default 0), strictly below the number of axes
+#   round            cursor-review's `round` output
+#   max_rounds       cursor-review's `max_rounds` output
+#   approve_gate     cursor-review's `approve_gate` output (start phase)
+#   approve_max_severity  cursor-review's threshold (decide phase); with
+#                    poster_login, an approval auto-resolves cursor-review's
+#                    own at-or-below-threshold threads, as cursor-review does
+#   poster_login     the login cursor-review posts findings under
+#                    (`<app-slug>[bot]` under its GitHub App, else
+#                    github-actions[bot]); empty = resolve nothing
+# Secrets:
+#   APPROVER_TOKEN   token of the approving identity. Empty → warn and exit 0;
+#                    there is deliberately no fallback to an App or GITHUB_TOKEN.
+#
+# Caller example: docs/callers/cursor-approve.md.
+
+on:
+  workflow_call:
+    inputs:
+      workflows_ref:
+        description: >-
+          Commit SHA of Comfy-Org/github-workflows to load the scripts from —
+          the SAME SHA as the uses: pin. Required; deliberately no default.
+        type: string
+        required: true
+      phase:
+        type: string
+        required: true
+      commit_sha:
+        type: string
+        required: true
+      axes:
+        type: string
+        required: true
+      max_yellow_axes:
+        type: number
+        default: 0
+      round:
+        type: string
+        default: ''
+      max_rounds:
+        type: string
+        default: ''
+      approve_gate:
+        type: string
+        default: ''
+      approve_max_severity:
+        type: string
+        default: ''
+      poster_login:
+        type: string
+        default: ''
+    secrets:
+      APPROVER_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+  CURSOR_APPROVE_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-approve
+
+jobs:
+  approve:
+    name: 'cursor-approve (${{ inputs.phase }})'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check the approver token
+        id: token
+        env:
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PHASE: ${{ inputs.phase }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$PHASE" in
+            start|decide) ;;
+            *) echo "::error::phase must be start or decide, got '$PHASE'"; exit 1 ;;
+          esac
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::cursor-approve runs on a pull_request(_target) event only"; exit 1
+          fi
+          if [ -z "$APPROVER_TOKEN" ]; then
+            echo "::warning::APPROVER_TOKEN is empty — cursor-approve posts no card and no approval (there is no fallback identity)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-approve scripts
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Resolve the approver login
+        id: login
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+        # Captured, not inlined into the echo: `echo "login=$(...)"` discards the
+        # substitution's exit status, so a token that cannot read GET /user would
+        # write `login=` and every later step would match no card and no review.
+        run: |
+          login="$(gh api user --jq .login)"
+          if [ -z "$login" ]; then
+            echo "::error::could not resolve the APPROVER_TOKEN identity (GET /user returned no login)"; exit 1
+          fi
+          echo "login=$login" >> "$GITHUB_OUTPUT"
+
+      - name: Withdraw approvals while the axes run
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'start'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" withdraw --repo "$REPO" \
+            --pr-number "$PR_NUMBER" --approver-login "$LOGIN"
+
+      - name: Write the start card
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'start'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          AXES: ${{ inputs.axes }}
+          ROUND: ${{ inputs.round }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          APPROVE_GATE: ${{ inputs.approve_gate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 "$CURSOR_APPROVE_ASSETS/card.py" start --repo "$REPO" --pr-number "$PR_NUMBER" \
+            --login "$LOGIN" --commit-sha "$COMMIT_SHA" --axes "$AXES" --round "$ROUND" \
+            --max-rounds "$MAX_ROUNDS" --approve-gate "$APPROVE_GATE" --run-url "$RUN_URL"
+
+      - name: Download the axis verdicts
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+        # A failed axis uploaded nothing; that is "no result", not an error here.
+        # No merge-multiple: each artifact lands in its own axis-<name>/ directory
+        # and decide reads <axis>.json ONLY from there (--artifact-dirs), so an
+        # artifact under any other name cannot supply or overwrite a verdict.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: axis-*
+          path: ${{ runner.temp }}/axes
+
+      - name: Decide
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+        env:
+          AXES: ${{ inputs.axes }}
+          MAX_YELLOW: ${{ inputs.max_yellow_axes }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/axes"
+          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" decide --outputs-dir "$RUNNER_TEMP/axes" \
+            --artifact-dirs --commit-sha "$COMMIT_SHA" \
+            --axes "$AXES" --max-yellow-axes "$MAX_YELLOW" > "$RUNNER_TEMP/decision.json"
+          cat "$RUNNER_TEMP/decision.json"
+
+      - name: Find the card
+        id: card
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          AXES: ${{ inputs.axes }}
+          ROUND: ${{ inputs.round }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 "$CURSOR_APPROVE_ASSETS/card.py" ensure --repo "$REPO" --pr-number "$PR_NUMBER" \
+            --login "$LOGIN" --commit-sha "$COMMIT_SHA" --axes "$AXES" --round "$ROUND" \
+            --max-rounds "$MAX_ROUNDS" --run-url "$RUN_URL"
+
+      - name: Approve or withhold
+        id: approve
+        # always(): a failed Decide leaves no readable decision, which
+        # approve-external treats as "not approved" — and that withdraws any
+        # earlier approval instead of leaving it standing.
+        if: always() && steps.token.outputs.present == 'true' && inputs.phase == 'decide' && steps.login.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          AXES: ${{ inputs.axes }}
+          CARD_URL: ${{ steps.card.outputs.card_url }}
+          # The base the axes diffed: the same event payload they rendered from.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # Both empty by default: no thread is auto-resolved.
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          POSTER: ${{ inputs.poster_login }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" approve-external --repo "$REPO" \
+            --pr-number "$PR_NUMBER" --commit-sha "$COMMIT_SHA" --axes "$AXES" \
+            --decision "$RUNNER_TEMP/decision.json" --approver-login "$LOGIN" \
+            --base-ref "$BASE_REF" --card-url "$CARD_URL" \
+            --threshold "$THRESHOLD" --poster-login "$POSTER"
+
+      - name: Write the decide card
+        if: always() && steps.token.outputs.present == 'true' && inputs.phase == 'decide' && steps.login.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          AXES: ${{ inputs.axes }}
+          ROUND: ${{ inputs.round }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          MAX_YELLOW: ${{ inputs.max_yellow_axes }}
+          OUTCOME: ${{ steps.approve.outputs.outcome || 'error' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 "$CURSOR_APPROVE_ASSETS/card.py" decide --repo "$REPO" --pr-number "$PR_NUMBER" \
+            --login "$LOGIN" --commit-sha "$COMMIT_SHA" --axes "$AXES" --round "$ROUND" \
+            --max-rounds "$MAX_ROUNDS" --decision "$RUNNER_TEMP/decision.json" \
+            --outcome "$OUTCOME" --max-yellow-axes "$MAX_YELLOW" --run-url "$RUN_URL"

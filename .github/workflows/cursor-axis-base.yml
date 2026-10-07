@@ -1,0 +1,205 @@
+name: Cursor axis (base)
+
+# Shared body of every cursor-approve axis workflow (axis-correctness.yml,
+# axis-conformance.yml, ...). Not called by consumers directly: each axis is a
+# thin wrapper that declares ONLY the secrets that axis needs, so an axis can
+# never see another axis's credentials. See docs/callers/cursor-approve.md.
+#
+# Inputs:
+#   axis        one of business/design/correctness/completeness/conformance
+#   commit_sha  the PR head the axis judges (the commit cursor-review reviewed)
+#   model       Cursor model id (default: cursor-review's judge model)
+#   runs_on     JSON-encoded runs-on, parsed with fromJSON like cursor-review's
+#   checkout    true → full read-only checkout of the PR head at commit_sha
+#   mcp_config  RESERVED for the context axes: a JSON mcpServers object.
+#               Unused here; must be empty.
+#   no_shell    RESERVED for the context axes. Unused here; must be false.
+# Secrets:
+#   CURSOR_API_KEY
+#
+# Output: one artifact, `axis-<axis>`, holding `<axis>.json` — exactly one JSON
+# object `{"verdict", "confidence", "summary", "commit_sha"}` (commit_sha is
+# stamped from this job's input, not taken from the model). A failing run uploads nothing,
+# which cursor-approve.yml's decide phase reads as "no result" and never approves.
+#
+# The scripts and prompts load from THIS repo at `job.workflow_sha` — the
+# commit the caller's `uses:` resolved to, computed by the runner — so a PR can
+# never rewrite the prompt judging it, and no caller-supplied ref is needed.
+
+on:
+  workflow_call:
+    inputs:
+      axis:
+        type: string
+        required: true
+      commit_sha:
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5-thinking-xhigh
+      runs_on:
+        type: string
+        default: '"ubuntu-latest"'
+      checkout:
+        type: boolean
+        default: false
+      mcp_config:
+        description: RESERVED for the context axes; must be empty for now.
+        type: string
+        default: ''
+      no_shell:
+        description: RESERVED for the context axes; must be false for now.
+        type: boolean
+        default: false
+    secrets:
+      CURSOR_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Same pin as cursor-review.yml's (a test keeps them equal); consumed by
+  # .github/cursor-review/install-cursor-cli.sh.
+  CURSOR_CLI_VERSION: 2026.09.10-fd3934a
+  CURSOR_CLI_SHA256: 27997c8391ad853a5a732b1845db8ef82a8ba6afb0f7829cc739464f8966e96e
+  CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_approve_assets/.github/cursor-review
+  CURSOR_APPROVE_ASSETS: ${{ github.workspace }}/_cursor_approve_assets/.github/cursor-approve
+
+jobs:
+  axis:
+    name: 'axis: ${{ inputs.axis }}'
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          MODEL: ${{ inputs.model }}
+          MCP_CONFIG: ${{ inputs.mcp_config }}
+          NO_SHELL: ${{ inputs.no_shell }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          case "$AXIS" in
+            business|design|correctness|completeness|conformance) ;;
+            *) echo "::error::unknown axis '$AXIS'"; exit 1 ;;
+          esac
+          if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit_sha must be a full 40-hex SHA"; exit 1
+          fi
+          if ! printf '%s' "$MODEL" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
+            echo "::error::model must be a Cursor model id"; exit 1
+          fi
+          if [ -n "$MCP_CONFIG" ] || [ "$NO_SHELL" = "true" ]; then
+            echo "::error::mcp_config and no_shell are reserved for the context axes and not implemented yet"; exit 1
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::an axis runs on a pull_request(_target) event only"; exit 1
+          fi
+          # Same rule as cursor-review.yml's gate: a fork PR never gets a
+          # checkout plus a --trust agent run with CURSOR_API_KEY in its env
+          # (under pull_request_target it would). Failing uploads no verdict,
+          # which decide reads as "no result" and never approves.
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error::PR is from a fork ($HEAD_REPO != $BASE_REPO); the axes do not run on fork PRs"; exit 1
+          fi
+          # actions/checkout with ref '' takes the default branch — mutable
+          # scripts under a pinned uses:. job.workflow_sha is '' only below
+          # runner v2.334.0; fail closed rather than load from main.
+          if ! printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_sha is empty or malformed (Actions runner older than v2.334.0?); refusing to load the axis prompts from a mutable ref"
+            exit 1
+          fi
+
+      - name: Load cursor-approve assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ job.workflow_sha }}
+          path: _cursor_approve_assets
+          persist-credentials: false
+
+      - name: Check out the PR head (read-only)
+        if: inputs.checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Render prompt
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO: ${{ github.repository }}
+          CHECKOUT: ${{ inputs.checkout }}
+        run: |
+          mkdir -p pr
+          # The PR's own text, as data the prompt points at. Kept outside the
+          # checkout's tracked tree (under .git) so it never shows in a diff.
+          ctx_dir="pr/.git"
+          [ -d "$ctx_dir" ] || ctx_dir="pr"
+          ctx="$ctx_dir/cursor-approve-context.md"
+          { printf '# %s\n\n' "$PR_TITLE"; printf '%s\n' "$PR_BODY"; } > "$ctx"
+          merge_base="$BASE_SHA"
+          if [ "$CHECKOUT" = "true" ]; then
+            merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
+          fi
+          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
+            --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
+            --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
+            --base-ref "$BASE_REF" --context-file "${ctx#pr/}" \
+            > "$RUNNER_TEMP/axis-prompt.txt"
+
+      - name: Install Cursor agent CLI
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
+
+      - name: Run the axis
+        working-directory: pr
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          cursor-agent --print --trust --model "$MODEL" \
+            < "$RUNNER_TEMP/axis-prompt.txt" \
+            > "$RUNNER_TEMP/axis-raw.txt" 2> "$RUNNER_TEMP/axis-stderr.txt" \
+            && rc=0 || rc=$?
+          echo "cursor-agent exit code: $rc"
+          head -c 2000 "$RUNNER_TEMP/axis-stderr.txt"
+          exit "$rc"
+
+      - name: Extract the verdict
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/axis-out"
+          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" extract --commit-sha "$COMMIT_SHA" \
+            --raw "$RUNNER_TEMP/axis-raw.txt" --out "$RUNNER_TEMP/axis-out/$AXIS.json"
+          cat "$RUNNER_TEMP/axis-out/$AXIS.json"
+
+      - name: Upload the verdict
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: axis-${{ inputs.axis }}
+          path: ${{ runner.temp }}/axis-out/${{ inputs.axis }}.json
+          if-no-files-found: error
+          retention-days: 7
