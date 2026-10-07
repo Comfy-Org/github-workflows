@@ -2233,14 +2233,17 @@ class DeferApprovalTest(unittest.TestCase):
         retargeted = {"head": {"sha": SHA}, "base": {"ref": "dev"}}
         labelled = {"head": {"sha": SHA}, "base": {"ref": "main"},
                     "labels": [{"name": AA.HUMAN_REVIEW_LABEL}]}
-        for pr, want in ((moved, AA.GATE_UNTRUSTED), (retargeted, AA.GATE_UNTRUSTED),
-                         (labelled, AA.GATE_CAPPED), ("not a dict", AA.GATE_UNTRUSTED)):
+        moved_and_labelled = dict(labelled, head={"sha": "b" * 40})
+        for pr, want, blocked in ((moved, AA.GATE_UNTRUSTED, True), (retargeted, AA.GATE_UNTRUSTED, True),
+                                  (labelled, AA.GATE_CAPPED, False), ("not a dict", AA.GATE_UNTRUSTED, True),
+                                  (moved_and_labelled, AA.GATE_UNTRUSTED, False)):
             with self.subTest(pr=pr):
                 rc, gate = self.run_decide("true", pr_reads=[pr])
                 # The defer path dismissed every earlier block and cursor-approve
                 # will not run on a non-pass gate, so an untrusted downgrade must
-                # leave a standing block of its own; capped posts none.
-                blocks = [] if want == AA.GATE_CAPPED else [("POST", AA.REQUEST_CHANGES)]
+                # leave a standing block of its own; a hand-off posts none, even
+                # when the head also moved (the label outranks the move).
+                blocks = [("POST", AA.REQUEST_CHANGES)] if blocked else []
                 self.assertEqual((rc, gate, [(m, p["event"]) for m, _, p in self.writes if m == "POST"]),
                                  (0, want, blocks))
 

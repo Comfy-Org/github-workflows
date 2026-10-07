@@ -1746,14 +1746,17 @@ def defer_to_cursor_approve(args, reason: str, result=None) -> int:
     except (RuntimeError, ValueError):
         head_now = base_now = None  # unknown → treat as moved
         labelled_now = False
-    if head_now != args.commit_sha or base_now != args.base_ref:
+    moved = head_now != args.commit_sha or base_now != args.base_ref
+    # Hand-off ranked ahead of a move, as on the posting path: an untrusted
+    # result makes cmd_decide post a block, and a PR handed to a human keeps none.
+    if labelled_now:
+        withdraw_decision(GATE_UNTRUSTED if moved else GATE_CAPPED)
+        result["gate"] = GATE_CAPPED
+        emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
+    elif moved:
         withdraw_decision(GATE_UNTRUSTED)
         result["gate"], result["why"] = GATE_UNTRUSTED, "the PR head or base moved after the round was decided"
         emit("ℹ️ **Auto-approve: deferred round superseded** — the PR head or base moved.")
-    elif labelled_now:
-        withdraw_decision(GATE_CAPPED)
-        result["gate"] = GATE_CAPPED
-        emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
     return rc
 
 
