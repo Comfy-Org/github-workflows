@@ -530,7 +530,10 @@ A request-changes is left in place on a push — a push does not start a new pan
 under the label-triggered caller, so only the next round (re-apply the label)
 supersedes it. The job withdraws the bot's own marked, unedited request-changes
 only once no round is coming to: the PR carries `skip-cursor-review` or
-`needs-human-review`, or `approve_max_severity` is empty. A human's
+`needs-human-review` (either label also withdraws every one of the bot's
+approvals, and is re-read after the reviews are listed), or
+`approve_max_severity` is empty (then only once none of the bot's approvals
+still stands, which the newer request-changes is outranking). A human's
 request-changes, and a bot review someone edited, are never touched; a failed
 withdrawal turns the job red.
 

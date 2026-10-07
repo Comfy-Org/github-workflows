@@ -1408,7 +1408,7 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
     would block the merge until dismissed by hand. The card says so.
     """
     if gate == GATE_CAPPED:
-        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
+        rc = withdraw_handed_off_change_requests(args, HUMAN_REVIEW_MESSAGE, HUMAN_REVIEW_LABEL)
         write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
                          reasons, _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
         return rc
@@ -1635,16 +1635,18 @@ def cmd_decide(args) -> int:
         head_now = base_now = None  # unknown → treat as moved: withdraw rather than leave it
         labelled_now = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
-    if moved or (event == APPROVE and labelled_now):
+    if moved or labelled_now:
         withdraw_decision(GATE_UNTRUSTED if moved else GATE_CAPPED)
         why = "the PR head or base moved" if moved else f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"
+        # By the id just posted, not a re-list: the reviews listing can lag the
+        # POST, and would then withdraw nothing while claiming otherwise.
         try:
-            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
+            dismiss(args.repo, args.pr_number, posted["id"], HUMAN_REVIEW_MESSAGE if labelled_now else STALE_MESSAGE)
         except RuntimeError as e:
             print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
-        if moved:
+        if not labelled_now:
             # The review just dismissed was this round's only verdict: without a
             # standing block the PR would carry neither approval nor veto.
             reasons_moved = [f"{why} while the {event} review was being posted"]
@@ -1653,22 +1655,13 @@ def cmd_decide(args) -> int:
             write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
                              reasons_moved, next_text, threshold)
             return rc
-        # The withdrawn approval may have been the only thing superseding an
-        # earlier block, and a PR handed to a human keeps none (card_for_none).
-        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
+        # Handed to a human (checked ahead of a move, which would re-post the
+        # block): the withdrawn review may have been the only thing superseding
+        # an earlier block, and a PR handed to a human keeps none (card_for_none).
+        rc = withdraw_handed_off_change_requests(args, HUMAN_REVIEW_MESSAGE, HUMAN_REVIEW_LABEL,
+                                                 older_than=posted["id"])
         write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
-                         [why], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
-        return rc
-    if labelled_now:
-        # A REQUEST_CHANGES that raced the hand-off: the PR is a human's now,
-        # and no round will withdraw this one either.
-        withdraw_decision(GATE_CAPPED)
-        emit(f"ℹ️ **Auto-approve: REQUEST_CHANGES withdrawn** — the PR was labelled `{HUMAN_REVIEW_LABEL}` "
-             "while it was being posted.")
-        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
-        write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
-                         [f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"], _card_text("NEXT_HUMAN_CAPPED_TEXT"),
-                         threshold)
+                         [f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
         return rc
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     if event == APPROVE:
@@ -1777,6 +1770,45 @@ def dismiss_own_change_requests(args, message: str = "", older_than=None) -> int
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not list reviews to withdraw an earlier request for changes: {annotation_cause(e, 'unknown error')}")
         return 1
+    return _dismiss_change_requests(args, ids, message)
+
+
+def withdraw_handed_off_change_requests(args, message: str, label: str = "", reviews=None, older_than=None) -> int:
+    """A hand-off's withdrawal (BE-19492): this identity's own marked
+    REQUEST_CHANGES, once no round is coming to supersede them.
+
+    List FIRST, then confirm `label` is still on the live PR: every listed
+    block was posted before that confirmation, so a run that read the label
+    and finishes late cannot sweep a block a newer round posted after the
+    label came off (a re-added label is a hand-off again). An unconfirmable
+    label withdraws nothing and is red, since the block may wrongly stand."""
+    if not (args.approver_login or "").strip():
+        return 0
+    try:
+        if reviews is None:
+            reviews = list_reviews(args.repo, args.pr_number)
+        ids = own_change_requests(reviews, args.approver_login, older_than)
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not list reviews to withdraw an earlier request for changes: {annotation_cause(e, 'unknown error')}")
+        return 1
+    if not ids:
+        return 0
+    if label:
+        try:
+            pr = read_pr(args.repo, args.pr_number)
+            readable = live_labels_readable(pr)
+        except (RuntimeError, ValueError) as e:
+            pr, readable = None, False
+            cause = annotation_cause(e, "unknown error")
+        else:
+            cause = "the PR payload carries no label list"
+        if not readable:
+            print(f"::warning::Could not confirm `{label}` is still on the PR ({cause}) — leaving this identity's "
+                  "request for changes standing; the next event redoes the check.")
+            return 1
+        if not has_label(pr, label):
+            emit(f"Auto-approve: `{label}` is no longer on the PR — leaving the request for changes to the next round.")
+            return 0
     return _dismiss_change_requests(args, ids, message)
 
 
@@ -2124,8 +2156,12 @@ def cmd_dismiss_stale(args) -> int:
             print(f"::warning::The live labels of {args.repo}#{args.pr_number} are not a list of named labels — "
                   f"could not check for {', '.join(f'`{label}`' for label in VETO_LABELS)} this run; judging "
                   "staleness by head and base only. The next event redoes the check.")
-    withdraw_all = args.all_approvals or vetoed is not None
-    why_all = f"the PR carries `{vetoed}`" if vetoed else "--all-approvals is set"
+    # So does `needs-human-review`: an approval must not outlive the hand-off
+    # (cmd_decide), and withdrawing the block below would otherwise let an
+    # older on-head approval count again.
+    handed_off = vetoed or (HUMAN_REVIEW_LABEL if human_review else None)
+    withdraw_all = args.all_approvals or handed_off is not None
+    why_all = f"the PR carries `{handed_off}`" if handed_off else "--all-approvals is set"
     # An empty base is not None either: it would match no recorded base and
     # dismiss every marked approval. No base → skip the base check, as below,
     # where the skip is also ANNOUNCED.
@@ -2181,15 +2217,16 @@ def cmd_dismiss_stale(args) -> int:
         print(f"::error::Could not list reviews to dismiss stale auto-approvals: {annotation_cause(e, 'unknown error')}")
         return 1
     head = None if withdraw_all else live_head
-    if vetoed:
-        # Takes precedence over the retarget wording: the veto is why every
+    if handed_off:
+        # Takes precedence over the retarget wording: the label is why every
         # approval goes, whether or not the base also moved.
-        message = SKIP_REVIEW_WITHDRAWN_MESSAGE
-        emit(f"Auto-approve: the PR carries `{vetoed}` — withdrawing every marked approval by "
+        message = SKIP_REVIEW_WITHDRAWN_MESSAGE if vetoed else HUMAN_REVIEW_MESSAGE
+        emit(f"Auto-approve: the PR carries `{handed_off}` — withdrawing every marked approval by "
              f"{args.approver_login or '(approver unavailable)'}.")
     ids = stale_reviews_to_dismiss(reviews, args.approver_login, head, live_base)
     others = unactionable_stale_approvals(reviews, args.approver_login, head, live_base)
     failed = []
+    withdrawn = set()
     for rid in ids:
         try:
             dismiss(args.repo, args.pr_number, rid, message)
@@ -2197,6 +2234,8 @@ def cmd_dismiss_stale(args) -> int:
             # Collapsed per id: these are joined into an ::error:: annotation, and
             # each carries `gh`'s multi-line stderr.
             failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
+        else:
+            withdrawn.add(rid)
     emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login or '(approver unavailable)'}.")
     if others:
         # Red, not clean: a stale approval this identity cannot touch still counts.
@@ -2207,7 +2246,8 @@ def cmd_dismiss_stale(args) -> int:
         # Red, not a warning: a stale approval that stays valid is the exact
         # failure this job exists to prevent.
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
-    blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review)
+    approval_stands = any(rid not in withdrawn for rid in own_approvals(reviews, args.approver_login))
+    blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review, approval_stands)
     return 1 if failed or others or blocks_failed else 0
 
 
@@ -2215,7 +2255,15 @@ THRESHOLD_OFF_MESSAGE = ("cursor-review auto-approve is off for this repo (`appr
                          "earlier request for changes withdrawn.")
 
 
-def withdraw_handed_off_blocks(args, reviews: list, vetoed, human_review: bool) -> int:
+def own_approvals(reviews: list, approver_login: str) -> list:
+    """Ids of `approver_login`'s own marked APPROVALS (stale or not)."""
+    login = (approver_login or "").strip().lower()
+    return [r["id"] for r in reviews
+            if login and r.get("state") == "APPROVED" and APPROVE_MARKER in (r.get("body") or "")
+            and (r.get("user") or {}).get("login", "").lower() == login]
+
+
+def withdraw_handed_off_blocks(args, reviews: list, vetoed, human_review: bool, approval_stands: bool = False) -> int:
     """dismiss-stale's other half (BE-19492): withdraw this identity's own
     marked REQUEST_CHANGES once auto-approve has stopped deciding the PR.
 
@@ -2226,16 +2274,25 @@ def withdraw_handed_off_blocks(args, reviews: list, vetoed, human_review: bool) 
     approving round is coming to withdraw it, and it would block the merge
     until someone dismissed it by hand. `--threshold` absent (None) checks
     the labels only. Red when a dismissal fails, like a stale approval.
+
+    A label is re-confirmed after `reviews` was listed (see
+    withdraw_handed_off_change_requests). Both labels withdrew every approval
+    above; the kill switch does not, so while one of this identity's
+    approvals still stands the block stays: dismissing the newer review would
+    let that older approval count again.
     """
     if vetoed:
-        message = SKIP_REVIEW_WITHDRAWN_MESSAGE
-    elif human_review:
-        message = HUMAN_REVIEW_MESSAGE
-    elif getattr(args, "threshold", None) is not None and not args.threshold.strip():
-        message = THRESHOLD_OFF_MESSAGE
-    else:
+        return withdraw_handed_off_change_requests(args, SKIP_REVIEW_WITHDRAWN_MESSAGE, vetoed, reviews)
+    if human_review:
+        return withdraw_handed_off_change_requests(args, HUMAN_REVIEW_MESSAGE, HUMAN_REVIEW_LABEL, reviews)
+    if getattr(args, "threshold", None) is None or args.threshold.strip():
         return 0
-    return _dismiss_change_requests(args, own_change_requests(reviews, args.approver_login), message)
+    if approval_stands:
+        if own_change_requests(reviews, args.approver_login):
+            emit("Auto-approve: `approve_max_severity` is empty, but an approval by this identity still stands — "
+                 "leaving its newer request for changes, which a dismissal would let that approval outrank.")
+        return 0
+    return _dismiss_change_requests(args, own_change_requests(reviews, args.approver_login), THRESHOLD_OFF_MESSAGE)
 
 
 def last_unlabeled_at(timeline: list, label: str):
@@ -2572,8 +2629,10 @@ EXTERNAL_BLOCK_OUTCOMES = ("not_approved", "error", "superseded")
 # and withdraw this identity's earlier ones, as cursor-review's capped round
 # and dismiss-stale's veto do.
 EXTERNAL_HANDOFF_MESSAGES = {
-    "needs_human": f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
-    "vetoed": f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
+    "needs_human": (f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
+                    HUMAN_REVIEW_LABEL),
+    "vetoed": (f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
+               SKIP_REVIEW_LABEL),
 }
 EXTERNAL_BLOCK_HEADLINE = "cursor-approve did not approve this round, so this PR is not approved."
 
@@ -2605,7 +2664,8 @@ def external_block(args, outcome: str, decision, why: str, live_head: str = "") 
     (EXTERNAL_HANDOFF_MESSAGES) withdraws the earlier blocks instead.
     """
     if outcome in EXTERNAL_HANDOFF_MESSAGES:
-        return dismiss_own_change_requests(args, EXTERNAL_HANDOFF_MESSAGES[outcome])
+        message, label = EXTERNAL_HANDOFF_MESSAGES[outcome]
+        return withdraw_handed_off_change_requests(args, message, label)
     if outcome not in EXTERNAL_BLOCK_OUTCOMES:
         return 0
     card = _load_card()
@@ -2668,16 +2728,18 @@ def cmd_approve_external(args) -> int:
     # The veto is PR-wide, so it outranks `superseded`: that path withdraws only
     # what is stale against the live head, and would leave an approval already
     # standing on the live head in place on a vetoed PR.
+    # The hand-off outranks it too: a superseded outcome posts a block, which
+    # a PR handed to a human must not keep (BE-19492).
     if vetoed:
         outcome, why = "vetoed", f"the PR is labelled `{SKIP_REVIEW_LABEL}`"
+    elif human_review:
+        outcome, why = "needs_human", f"the PR is labelled `{HUMAN_REVIEW_LABEL}`"
     elif live_head != args.commit_sha:
         outcome, why = "superseded", f"the PR head moved from {args.commit_sha[:7]} to {live_head[:7] or '?'}"
     elif live_base != args.base_ref:
         # Same head, different base: the axes diffed against a base the PR no
         # longer targets, so their verdicts are about a diff nobody reviewed.
         outcome, why = "superseded", "the PR base changed since the axes ran"
-    elif human_review:
-        outcome, why = "needs_human", f"the PR is labelled `{HUMAN_REVIEW_LABEL}`"
     elif not external_decision_approves(decision, axes):
         outcome, why = "not_approved", "the axes did not approve"
     else:
@@ -2734,13 +2796,13 @@ def cmd_approve_external(args) -> int:
         labelled_now = vetoed_now = labels_unreadable = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
     if moved or labelled_now or vetoed_now or labels_unreadable:
-        # Veto first, as before the POST: it is PR-wide.
+        # Veto, then hand-off, first, as before the POST.
         if vetoed_now:
             outcome, message = "vetoed", SKIP_REVIEW_MESSAGE
-        elif moved:
-            outcome, message = "superseded", STALE_MESSAGE
         elif labelled_now:
             outcome, message = "needs_human", HUMAN_REVIEW_MESSAGE
+        elif moved:
+            outcome, message = "superseded", STALE_MESSAGE
         else:
             outcome, message = "error", LABELS_UNREADABLE_MESSAGE
         set_output("outcome", outcome)
@@ -2810,13 +2872,15 @@ def cmd_withdraw(args) -> int:
     With ``--approve-gate capped`` it also withdraws this identity's standing
     REQUEST_CHANGES (BE-19492): when the round cap is what labelled the PR, no
     `decide` ran to do it, and no round will approve a PR handed to a human.
-    Not fatal — a failure here must not skip the start card after it."""
+    The gate is the caller's word, so the label is re-read off the live PR
+    first. A failure is red, but the start card still runs (its `if:`)."""
     if not (args.approver_login or "").strip():
         print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
         return 2
     rc = withdraw_own_approvals(args, AXES_PENDING_MESSAGE)
     if (getattr(args, "approve_gate", "") or "").strip() == GATE_CAPPED:
-        dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
+        if withdraw_handed_off_change_requests(args, HUMAN_REVIEW_MESSAGE, HUMAN_REVIEW_LABEL):
+            rc = 1
     return rc
 
 

@@ -542,11 +542,13 @@ class StaleReviewTest(unittest.TestCase):
         self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), ["cursor-approver:1", "old-approver:2"])
 
     def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main",
-                    labels=None, threshold=None, put_error=None):
+                    labels=None, threshold=None, put_error=None, labels_after=None):
         # `labels=None` is a real PR's empty label list; pass a malformed value
         # (a number, a nameless label) to exercise the unreadable-labels path.
+        # `labels_after` answers every PR read after the first.
         labels = [] if labels is None else labels
         puts = []
+        reads = []
 
         def fake_gh(args, payload=None):
             if args[:2] == ["api", "graphql"]:
@@ -559,7 +561,9 @@ class StaleReviewTest(unittest.TestCase):
                 puts.append((args[3], payload["message"]))
                 return "{}"
             # The live PR: head NEW, even when the event that started the run carried an older one.
-            return json.dumps({"head": {"sha": NEW}, "base": {"ref": live_base}, "labels": labels})
+            now = labels_after if reads and labels_after is not None else labels
+            reads.append(args)
+            return json.dumps({"head": {"sha": NEW}, "base": {"ref": live_base}, "labels": now})
 
         args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals,
                                   head_sha=OLD)
@@ -694,10 +698,31 @@ class HandedOffBlockTest(unittest.TestCase):
         # The approval goes too, as before.
         self.assertIn(("repos/o/r/pulls/1/reviews/1/dismissals", AA.SKIP_REVIEW_WITHDRAWN_MESSAGE), puts)
 
-    def test_needs_human_review_withdraws_the_block_but_not_an_on_head_approval(self):
+    def test_needs_human_review_withdraws_the_block_and_an_on_head_approval(self):
+        # The approval goes first: withdrawing only the newer block would let
+        # an on-head approval count again on a PR handed to a human.
         rc, puts = self.run_dismiss(self.mixed() + [self.review(1, sha=NEW, base="main")],
                                     labels=[{"name": "needs-human-review"}], threshold="low")
-        self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/3/dismissals", AA.HUMAN_REVIEW_MESSAGE)]))
+        self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/1/dismissals", AA.HUMAN_REVIEW_MESSAGE),
+                                          ("repos/o/r/pulls/1/reviews/3/dismissals", AA.HUMAN_REVIEW_MESSAGE)]))
+
+    def test_a_label_gone_after_the_listing_keeps_the_block(self):
+        # The label is re-read AFTER the reviews were listed: a newer round may
+        # have posted that block once the label came off.
+        for label in ({"name": "needs-human-review"}, {"name": "skip-cursor-review"}):
+            with self.subTest(label=label["name"]):
+                rc, puts = self.run_dismiss([self.block(3)], labels=[label], labels_after=[], threshold="low")
+                self.assertEqual((rc, puts), (0, []))
+
+    def test_an_empty_threshold_keeps_the_block_while_an_approval_stands(self):
+        # The kill switch withdraws no approval, so the block it would dismiss
+        # is what keeps the on-head approval from counting.
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main"), self.block(3)], threshold="")
+        self.assertEqual((rc, puts), (0, []))
+        # A stale one is withdrawn first, and then nothing stands.
+        rc, puts = self.run_dismiss([self.review(1), self.block(3)], threshold="")
+        self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/1/dismissals",
+                                                          "repos/o/r/pulls/1/reviews/3/dismissals"]))
 
     def test_an_empty_threshold_withdraws_the_block(self):
         for threshold in ("", "  "):
@@ -1402,22 +1427,36 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def test_label_applied_during_the_post_withdraws_an_earlier_block_too(self):
         # BE-19492: the dismissed approval no longer supersedes it, and no round
-        # is coming to.
+        # is coming to. The third read re-confirms the label after the listing.
         block = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
                  "body": AA.APPROVE_MARKER + "\nblock"}
-        self.assertEqual(self.run_decide(labels_after=["needs-human-review"], reviews=[block]), (0, "capped"))
+        self.assertEqual(self.run_decide(labels_after=["needs-human-review"], reviews=[block],
+                                         heads=(SHA, SHA, SHA)), (0, "capped"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/99/dismissals",
                                        "repos/o/r/pulls/1/reviews/5/dismissals"])
 
     def test_label_applied_during_a_request_changes_withdraws_it(self):
         # BE-19492: the PR is a human's now, so the block just posted goes with
-        # the hand-off (the listing returns it, as GitHub's would).
-        posted = {"id": 99, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
-                  "body": AA.APPROVE_MARKER + "\nchanges"}
-        rc, gate = self.run_decide(findings=[finding("critical")], labels_after=["needs-human-review"],
-                                   reviews=[posted])
+        # the hand-off — by the id the POST returned, so a listing that has not
+        # caught up yet (none here) cannot leave it standing.
+        rc, gate = self.run_decide(findings=[finding("critical")], labels_after=["needs-human-review"])
         self.assertEqual((rc, gate, self.writes), (0, "capped", ["repos/o/r/pulls/1/reviews/99/dismissals"]))
         self.assertEqual([p["event"] for p in self.posted], ["REQUEST_CHANGES"])
+
+    def test_a_move_and_the_label_during_the_post_posts_no_new_block(self):
+        # The hand-off outranks the move: re-posting a block there would leave
+        # a PR handed to a human blocked until dismissed by hand.
+        block = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+                 "body": AA.APPROVE_MARKER + "\nblock"}
+        for findings in ((), [finding("critical")]):
+            with self.subTest(findings=findings):
+                self.posted = []
+                rc, gate = self.run_decide(findings=findings, labels_after=["needs-human-review"], reviews=[block],
+                                           heads=(SHA, "b" * 40, "b" * 40))
+                self.assertEqual((rc, gate), (0, "untrusted"))
+                self.assertEqual(len(self.posted), 1)  # the round's own review, no standing block after it
+                self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/99/dismissals",
+                                               "repos/o/r/pulls/1/reviews/5/dismissals"])
 
     def test_pass(self):
         self.assertEqual(self.run_decide(), (0, "pass"))
@@ -1991,6 +2030,7 @@ class AutoResolveCommandTest(unittest.TestCase):
                     mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
                     mock.patch.object(GATE, "iter_threads", fake_iter), \
                     mock.patch.object(AA, "dismiss_own_change_requests", lambda *a, **k: 0), \
+                    mock.patch.object(AA, "withdraw_handed_off_change_requests", lambda *a, **k: 0), \
                     mock.patch.object(AA, "emit", lambda *a: None):
                 return AA.cmd_decide(args)
 
@@ -2637,7 +2677,7 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.assertEqual(self.reviews_posted, [])
         self.assertEqual(self.dismissed, [(5, AA.HUMAN_REVIEW_MESSAGE)])
         # The card's next step names what actually clears the PR.
-        self.assertIn("request for changes is withdrawn", self.card_body())
+        self.assertIn("withdraws its own request for changes on this hand-off", self.card_body())
         body = self.card_body()
         self.assert_markers(body, "capped", "human")
         self.assertIn("needs-human-review", body)

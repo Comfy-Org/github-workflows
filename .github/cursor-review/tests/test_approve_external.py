@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -234,7 +235,25 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "needs_human"))
         self.assertEqual(fake.posted, [])
         self.assertEqual(fake.dismissed, ["77"])
-        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["needs_human"]])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["needs_human"][0]])
+
+    def test_needs_human_review_outranks_a_moved_head(self):
+        # A superseded outcome posts a block; a PR handed to a human keeps none.
+        for kwargs in ({"labels": [aa.HUMAN_REVIEW_LABEL], "head": "d" * 40},
+                       {"labels_after": [aa.HUMAN_REVIEW_LABEL], "head_after": "d" * 40}):
+            with self.subTest(**{k: v for k, v in kwargs.items() if k.startswith("labels")}):
+                fake = FakeGitHub(reviews=handoff_reviews(), **kwargs)
+                rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+                self.assertEqual((rc, outcome), (0, "needs_human"))
+                self.assertNotIn("REQUEST_CHANGES", [p["event"] for p in fake.posted])
+                self.assertEqual(fake.dismissed[-1:], ["77"])
+
+    def test_a_label_gone_before_the_withdrawal_keeps_the_block(self):
+        # Re-confirmed after the listing: a newer round may have posted it once
+        # the label came off.
+        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL], labels_after=[], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome, fake.posted, fake.dismissed), (0, "needs_human", [], []))
 
     def test_needs_human_review_landing_during_the_post_withdraws_approval_and_blocks(self):
         fake = FakeGitHub(labels_after=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
@@ -249,7 +268,7 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "vetoed"))
         self.assertEqual(fake.posted, [])
         self.assertEqual(fake.dismissed, ["77"])
-        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["vetoed"]])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["vetoed"][0]])
 
     def test_a_handoff_block_that_cannot_be_withdrawn_is_red(self):
         class Refuses(FakeGitHub):
@@ -411,25 +430,34 @@ class ApproveExternal(unittest.TestCase):
 
     def test_withdraw_on_a_capped_gate_also_withdraws_the_block(self):
         # BE-19492: the round cap labelled the PR and no decide ran to do it.
-        for gate, dismissed in (("capped", ["77"]), ("pass", []), ("", [])):
-            with self.subTest(gate=gate):
-                fake = FakeGitHub(reviews=handoff_reviews())
+        # The gate is the caller's word: without the live label, nothing goes.
+        for gate, labels, dismissed in (("capped", [aa.HUMAN_REVIEW_LABEL], ["77"]), ("capped", [], []),
+                                        ("pass", [aa.HUMAN_REVIEW_LABEL], []), ("", [aa.HUMAN_REVIEW_LABEL], [])):
+            with self.subTest(gate=gate, labels=labels):
+                fake = FakeGitHub(reviews=handoff_reviews(), labels=labels)
                 args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate=gate)
                 with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
                     self.assertEqual(aa.cmd_withdraw(args), 0)
                 self.assertEqual(fake.dismissed, dismissed)
 
-    def test_withdraw_stays_green_when_the_block_cannot_be_withdrawn(self):
+    def test_withdraw_is_red_when_the_block_cannot_be_withdrawn(self):
         class Refuses(FakeGitHub):
             def __call__(self, args, payload=None):
                 if args[:3] == ["api", "-X", "PUT"]:
                     raise RuntimeError("gh api: HTTP 403")
                 return super().__call__(args, payload)
 
+        # Red, and the start card still runs: its step does not need this one
+        # to succeed (`!cancelled()`), only the identity it resolved.
         args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate="capped")
-        with mock.patch.object(aa, "gh", Refuses(reviews=handoff_reviews())), \
+        with mock.patch.object(aa, "gh", Refuses(reviews=handoff_reviews(), labels=[aa.HUMAN_REVIEW_LABEL])), \
                 mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
-            self.assertEqual(aa.cmd_withdraw(args), 0)
+            self.assertEqual(aa.cmd_withdraw(args), 1)
+        path = os.path.join(HERE, "..", "..", "workflows", "cursor-approve.yml")
+        with open(path, encoding="utf-8") as f:
+            step = re.search(r"- name: Write the start card\n(?:\s+#.*\n)*\s+if: (.*)\n", f.read()).group(1)
+        self.assertIn("!cancelled()", step)
+        self.assertIn("steps.login.outputs.login != ''", step)
 
     def test_the_start_phase_passes_the_gate_to_withdraw(self):
         path = os.path.join(HERE, "..", "..", "workflows", "cursor-approve.yml")

@@ -235,7 +235,9 @@ jobs:
             --pr-number "$PR_NUMBER" --approver-login "$LOGIN" --approve-gate "$APPROVE_GATE"
 
       - name: Write the start card
-        if: steps.token.outputs.present == 'true' && inputs.phase == 'start'
+        # !cancelled(): a red withdrawal above must not skip the card; it only
+        # needs the identity the login step resolved.
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' && steps.login.outputs.login != '' && inputs.phase == 'start' }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           LOGIN: ${{ steps.login.outputs.login }}

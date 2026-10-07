@@ -3504,7 +3504,8 @@ jobs:
     # A third trigger is the `skip-cursor-review` veto label (auto-approve.py's
     # VETO_LABELS, read off the live PR): `gate` runs no round on a vetoed PR,
     # so a `labeled` event reaching this job is what withdraws EVERY marked
-    # approval, same head or not. Hence no `github.event.action` filter here.
+    # approval, same head or not — as does `needs-human-review`, the hand-off
+    # (BE-19492). Hence no `github.event.action` filter here.
     # Open PRs only: a title edit on a merged PR must not try a dismissal.
     name: Dismiss stale auto-approval
     if: >-

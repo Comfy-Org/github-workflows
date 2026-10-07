@@ -116,8 +116,12 @@ NEXT_RESOLVE_TEXT = next_resolve_text()
 NEXT_RELABEL_TEXT = next_relabel_text()
 # The hand-off withdraws the bot's own requests for changes (BE-19492), so a
 # human's review is what clears the PR; the label only resets the round count.
-NEXT_HUMAN_CAPPED_TEXT = ("A human is needed: the bot's request for changes is withdrawn, so a human's review "
-                          "decides this PR. Removing the `needs-human-review` label resets the round count.")
+# Not stated as done: every caller writes this card whether or not that
+# withdrawal succeeded (a failed one turns the run red instead).
+NEXT_HUMAN_CAPPED_TEXT = ("A human is needed: the bot withdraws its own request for changes on this hand-off, so a "
+                          "human's review decides this PR — if one still shows, its withdrawal failed (see the run "
+                          "log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the "
+                          "round count.")
 
 # How approve-external's outcome maps onto the contract on the decide card.
 DECIDE_STATES = {
