@@ -1953,7 +1953,19 @@ jobs:
         # `-xhigh` come from the same spend review. The `panel_models` input
         # overrides this list per caller for A/B experiments.
         env:
-          PANEL_MODELS_OVERRIDE: ${{ inputs.panel_models }}
+          # Falls back to a VARIABLE when the caller passes no input, so the
+          # panel list is settable in ONE place for the whole fleet with no
+          # caller edit. `vars` inside a reusable resolves against the CALLER's
+          # repo and org — same as CURSOR_REVIEW_DM_EMAIL_MAP further down — so
+          # an org-level CURSOR_PANEL_MODELS reaches every enrolled repo, and a
+          # repo-level one of the same name overrides it for that repo alone.
+          # Unset at both levels is '' → the built-in list below. An explicit
+          # `panel_models` input still wins, so a caller pinning its own list is
+          # unaffected.
+          PANEL_MODELS_OVERRIDE: ${{ inputs.panel_models || vars.CURSOR_PANEL_MODELS }}
+          # Which of the two won, for the log line below. With two sources the
+          # effective list alone no longer says where to go change it.
+          PANEL_MODELS_INPUT: ${{ inputs.panel_models }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -1989,7 +2001,12 @@ jobs:
               exit 1
             fi
             printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c -s '.[0] | unique' > /tmp/models.json
-            echo "panel_models override in effect: $(cat /tmp/models.json)"
+            if [ -n "$(printf '%s' "$PANEL_MODELS_INPUT" | tr -d '[:space:]')" ]; then
+              SRC="panel_models input"
+            else
+              SRC="CURSOR_PANEL_MODELS variable"
+            fi
+            echo "panel_models override in effect (from the $SRC): $(cat /tmp/models.json)"
           else
             # Logged in BOTH branches so the run says which list produced the
             # review. A caller driving panel_models from a variable makes the
@@ -1997,7 +2014,7 @@ jobs:
             # line a mid-experiment deletion is indistinguishable in the log
             # from one that was never set — the panel quietly reverts and the
             # rounds either side of it look the same.
-            echo "panel_models not set — using the built-in list: $(jq -c . /tmp/models.json)"
+            echo "panel_models not set (no input, no CURSOR_PANEL_MODELS variable) — using the built-in list: $(jq -c . /tmp/models.json)"
           fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 

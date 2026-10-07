@@ -134,20 +134,29 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 
 ## Running a model experiment
 
-`panel_models` replaces the built-in panel list. Wire it to a **variable**
-rather than a literal, so a reasoning-tier or model-version A/B needs no PR and
-no SHA-bump across the fleet:
+**No caller change is needed.** The reusable reads the variable
+`CURSOR_PANEL_MODELS` itself, so setting it is the whole operation:
 
-```yaml
-    with:
-      panel_models: ${{ vars.CURSOR_PANEL_MODELS }}
+```bash
+# one repo
+gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
+  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
+
+# or the whole fleet at once (visibility must include private repos)
+gh variable set CURSOR_PANEL_MODELS --org <org> --visibility all \
+  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
 ```
 
-An unset variable is exactly today's behaviour — the reusable reads empty as
-"use the built-in list" — so the wiring is inert until you set it, and deleting
-the variable (or every variable) falls back rather than failing. The run log
-names which list is in effect either way, so a deletion mid-experiment is
-visible instead of looking like a round that was never overridden.
+`vars` inside a reusable workflow resolves against the **caller's** repo and
+org, so an org-level value reaches every enrolled caller, and a repo-level value
+of the same name wins for that repo alone. Unset at both levels, the panel runs
+the built-in list — so the mechanism is inert until you use it, and `gh variable
+delete` is the revert. The run log names which source is in effect on every
+round, so a deletion mid-experiment is visible rather than looking like a round
+that was never overridden.
+
+The `panel_models` **input** still exists and takes precedence, for a caller
+that wants to pin its own list regardless of what any variable says.
 
 **Any override forfeits drift coverage, variable included.**
 `catalog-drift.py` parses the panel pins out of the heredoc in
@@ -156,25 +165,16 @@ auditing the built-in list while the panel runs yours. A variable is not in the
 tracked tree at all — no review, no grep, no diff. Watch the catalog yourself
 for the duration of an experiment.
 
-What the variable buys over a literal is therefore not auditing — it is the
-revert, and where the fallback lands. Unset, the panel runs the built-in list,
-which *is* the drift-audited one, so an experiment ends with a `gh variable
-delete` and reverts back into coverage. A caller literal **is** the fallback:
-there is nothing to delete, it needs a PR plus a fleet SHA bump to change, and
-it holds its snapshot unaudited while the shared default moves on without it.
-So prefer the variable, and treat a set variable as temporary by default.
+So treat a set variable as temporary, and once a list has proven itself, move it
+into the built-in heredoc and delete the variable — that puts it back under
+drift coverage for everyone.
 
-A **repo** variable overrides an **org** variable of the same name, so one repo
-can trial a list the rest of the org is not on, and the org value can be set
-later without touching any caller. Note what an org-level value means: it
-retargets every enrolled caller at once, and panel composition then lives in
-mutable state outside the SHA-pinned tree every caller otherwise pins, with the
-run log as the only record of which models judged a given PR.
-
-```bash
-gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
-  --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
-```
+Two further consequences of the variable being caller-side, worth knowing rather
+than discovering: an **org** value retargets every enrolled caller at once, and
+any caller repo's admin can set a **repo** value to narrow the panel judging
+their own PRs — with no PR, no CODEOWNERS review and the run log as the only
+record. That write is repo-admin, who can already swap the pin or delete the
+caller outright, so it is not a new trust boundary; it is a quieter one.
 
 Two things to get right:
 

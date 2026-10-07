@@ -37,50 +37,12 @@ jobs:
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
       workflows_ref: eef55d3565eef918d29cdfc076bbfb51d12a8e32
-      # Panel model override, as a VARIABLE so a reasoning-tier A/B needs no PR
-      # and no fleet bump — set it, watch a few rounds, unset it to revert. The
-      # reusable's `panel_models` treats empty as "use the built-in list", so an
-      # unset variable is exactly today's behaviour; a repo variable overrides an
-      # org one of the same name, so this can be set org-wide later without
-      # touching this file.
-      #
-      # The trade-off this buys, stated plainly: panel composition becomes
-      # mutable state OUTSIDE the SHA-pinned tree the header above argues for.
-      # While the variable is set, nothing in review, CODEOWNERS or git records
-      # which models judged a PR — the run log is the only trace — and anyone
-      # with variable write can narrow the panel to one cheap model. At ORG
-      # level it retargets every enrolled caller at once. That write is
-      # admin-only, not open to anyone who can push, which is why a variable is
-      # acceptable here at all; keep it repo-level while experimenting, and
-      # delete it rather than leaving a stale list in force.
-      #
-      # The value is a JSON array of CURSOR CATALOG ids — tier suffix and all
-      # (`claude-opus-5-thinking-xhigh`, not `claude-opus-5`). It is deliberately
-      # NOT the org's `CLAUDE_MODEL_*` variables: those hold Anthropic API slugs,
-      # which the preflight's live-catalog check would reject. Keep the two
-      # namespaces apart.
-      #
-      # Preflight checks that every id EXISTS in the live catalog and fails loud
-      # before any cell spends, so a typo costs nothing. It does NOT check ZDR
-      # eligibility — an id on a catalog line reading `NO ZDR` matches like any
-      # other, and `catalog-drift.py` (which does detect NO-ZDR) parses the
-      # built-in heredoc and never sees an overridden list. Confirm ZDR yourself
-      # before setting this.
-      #
-      # The documented first experiment is a SINGLE-model tier drop: the
-      # Anthropic cell from `-max` to `-xhigh` (the judge already made that move
-      # in #243 on spend grounds), with the other two cells held fixed so the
-      # result is attributable:
-      #   gh variable set CURSOR_PANEL_MODELS \
-      #     --repo Comfy-Org/github-workflows \
-      #     --body '["gpt-5.6-sol-max","claude-opus-5-thinking-xhigh","kimi-k3-high"]'
-      #
-      # `judge_model` is deliberately NOT wired the same way. Its input carries a
-      # real default that catalog-drift.py parses out of cursor-review.yml, and a
-      # caller passing an explicitly-empty value gets '' rather than that default
-      # — so the override would have to restate the default here and drift from
-      # it. Changing that belongs in the reusable, not in a caller.
-      panel_models: ${{ vars.CURSOR_PANEL_MODELS }}
+      # No `panel_models:` here on purpose. The reusable now reads the
+      # CURSOR_PANEL_MODELS variable itself, resolved against this repo and the
+      # org, so wiring the same variable through an input would be redundant.
+      # Set the variable to run a panel experiment; see
+      # docs/callers/cursor-review.md "Running a model experiment" for the
+      # catalog-id and ZDR caveats.
       # No vendored/generated content in this repo; defensive excludes only.
       # These live in extra_generated_globs, not diff_excludes: since BE-7633
       # diff_excludes leaves the reviewed diff but is still COUNTED against
