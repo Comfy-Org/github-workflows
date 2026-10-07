@@ -338,6 +338,24 @@ on:
         type: string
         required: false
         default: ''
+      approve_scope:
+        description: >-
+          What an auto-approve round after the first gates on. `delta`
+          (default) → a finding above `approve_max_severity` blocks only when it
+          sits inside a hunk of the verified incremental block (the changes
+          since the last reviewed commit), re-raises an earlier finding whose
+          thread is still unresolved, or is High/Critical anywhere in the
+          reviewed diff. Every other finding is still posted, as a thread
+          marked "Outside this round's changes: not blocking auto-approve",
+          and is never auto-resolved. Round 1, an incremental block that was
+          unavailable or discarded, and an unknown prior-review ledger all
+          fail closed to `full`. `full` → every finding counts, wherever it
+          sits (the behaviour before this input existed). The panel reviews
+          the full diff either way. No effect unless `approve_max_severity` is
+          set; any other value fails the decision step.
+        type: string
+        required: false
+        default: delta
       defer_approval:
         description: >-
           For a caller that runs cursor-approve's per-axis approval after this
@@ -1060,6 +1078,13 @@ jobs:
       # should report. Written with `!= 'false'` rather than read straight
       # through so the skipped-step empty string reads as `true`, not `''`.
       incremental_subset: ${{ steps.incremental.outputs.incremental_subset != 'false' }}
+      # What the incremental block IS, for approve_scope (auto-approve.py
+      # resolve_scope): `none` (no usable last-reviewed SHA — round 1, or a re-run
+      # on the same head), `built` (verified; EMPTY on a pure rebase),
+      # `unavailable` (a later round whose block could not be built) or
+      # `discarded` (the fail-safe threw it away). A skipped step reads as
+      # `unavailable`, which fails closed to `full`.
+      incremental_state: ${{ steps.incremental.outputs.incremental_state || 'unavailable' }}
       # The merge base THIS round's reviewed diff was taken against — the exact left
       # tree `check-pr-size` resolves `BASE_SHA...HEAD_SHA` to. Consumed by `post-review`
       # (BE-15598), which writes it into the consolidated review's round sentinel so the
@@ -1431,12 +1456,15 @@ jobs:
           # let the fail-safe below append 'false' over it — same last-value-wins
           # append the raw-count fallback above uses.
           echo "incremental_subset=true" >> "$GITHUB_OUTPUT"
+          # Same last-value-wins append for approve_scope's view of the block.
+          echo "incremental_state=unavailable" >> "$GITHUB_OUTPUT"
           # Every "can't build one" case below leaves the block EMPTY and
           # `incremental_subset` true: nothing was discarded, there was simply
           # nothing to prioritize, and the panel reviews the full diff as it
           # does on round 1. Only the fail-safe at the bottom writes `false`.
           if [ -z "$LAST_REVIEWED_SHA" ] || [ "$LAST_REVIEWED_SHA" = "$HEAD_SHA" ]; then
             echo "No usable last-reviewed SHA — skipping the incremental diff block."
+            echo "incremental_state=none" >> "$GITHUB_OUTPUT"
           elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
             echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
           elif [ -z "$LAST_REVIEWED_MERGE_BASE" ]; then
@@ -1484,6 +1512,7 @@ jobs:
             # runs on the full diff alone, which is always correct.
             if SUBSET_OUT="$(python3 "$INCREMENTAL_PY" check --new "$NEW_PATCH" --full "$FULL_PATCH")"; then
               echo "Incremental block verified as a subset of the reviewed diff."
+              echo "incremental_state=built" >> "$GITHUB_OUTPUT"
             else
               FOREIGN="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^foreign=//p')"
               NEW_LINES="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^new_lines=//p')"
@@ -1491,6 +1520,7 @@ jobs:
               : > "$NEW_PATCH"
               echo "::warning::Incremental diff discarded: it was not a subset of the reviewed diff (${FOREIGN:-unknown} foreign file(s), ${NEW_LINES:-unknown} vs ${FULL_LINES:-unknown} lines)."
               echo "incremental_subset=false" >> "$GITHUB_OUTPUT"
+              echo "incremental_state=discarded" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -3109,6 +3139,11 @@ jobs:
           LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
           # … and the consolidate job's (did the JUDGE get prior-round context).
           LEDGER_DOWNLOAD_JUDGE: ${{ steps.meta.outputs.ledger_download }}
+          # approve_scope: post-review.py marks the threads auto-approve will not
+          # count, from the same inputs `Auto-approve decision` passes below.
+          APPROVE_THRESHOLD: ${{ inputs.approve_max_severity }}
+          APPROVE_SCOPE: ${{ inputs.approve_scope }}
+          INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
@@ -3175,6 +3210,8 @@ jobs:
           # as "shown" and wave the re-raise through on exactly the degraded run
           # $LEDGER_NOTE already banners above.
           LEDGER_FLAGS=(--ledger /tmp/ledger/ledger.json)
+          SCOPE_FLAGS=(--approve-threshold "$APPROVE_THRESHOLD" --approve-scope "$APPROVE_SCOPE"
+                       --incremental /tmp/pr-diff-new.patch --incremental-state "$INCREMENTAL_STATE")
           if [ "$JUDGE_LEDGER_OK" != "true" ]; then
             LEDGER_FLAGS+=(--no-judge-ledger)
           fi
@@ -3195,6 +3232,7 @@ jobs:
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
+              "${SCOPE_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             # No JUDGE_ERROR is read here on purpose: this branch passes --notice with
@@ -3215,6 +3253,7 @@ jobs:
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
+              "${SCOPE_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
@@ -3276,6 +3315,8 @@ jobs:
           # it in the review so a later retarget is caught from live state.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           DEFER_APPROVAL: ${{ inputs.defer_approval }}
+          APPROVE_SCOPE: ${{ inputs.approve_scope }}
+          INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3307,7 +3348,11 @@ jobs:
             --reviewed-diff /tmp/pr-diff.patch \
             --base-ref "$BASE_REF" \
             --poster-login "$POSTER" \
-            --defer-approval "$DEFER_APPROVAL"
+            --defer-approval "$DEFER_APPROVAL" \
+            --approve-scope "$APPROVE_SCOPE" \
+            --incremental /tmp/pr-diff-new.patch \
+            --incremental-state "$INCREMENTAL_STATE" \
+            --ledger /tmp/ledger/ledger.json
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
