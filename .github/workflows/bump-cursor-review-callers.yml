@@ -48,6 +48,17 @@ name: Bump cursor-review callers
 # Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
+#
+# cursor-approve COMPANIONS (BE-19438). cursor-review's approve half —
+# cursor-approve.yml, its cursor-axis-base.yml and the axis-*.yml workflows — is
+# called from the SAME caller file as cursor-review.yml and loads its scripts from
+# the same `workflows_ref`. So this one fleet bumps the whole family: the bump step
+# passes them as COMPANION_FILES (every `uses:` of the family moves together, see
+# bump-callers.sh), and the `paths:` filter below watches their files and
+# .github/cursor-approve/**, because a change to any of them is just as
+# consumer-visible as a change to cursor-review.yml. There is deliberately no
+# separate cursor-approve fleet: two fleets pushing two bump branches against one
+# caller file is the split pin this change exists to close.
 
 on:
   workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
@@ -94,6 +105,28 @@ on:
       # (see the DELIBERATELY ABSENT note on WATCHED_EXEC below). A commit touching
       # only it is pure churn to every consumer, so it must not bump.
       - '!.github/cursor-review/catalog-drift.py'
+      # The cursor-approve family (BE-19438 — see the header). Each reusable a
+      # caller pins beside cursor-review.yml is listed by name rather than as an
+      # `axis-*.yml` glob: preflight.sh's WATCHED_ASSETS takes literal paths only,
+      # and must equal this filter (test_paths_contract.sh), so a glob here could
+      # not be mirrored. A new axis workflow is added here, in the three preflight
+      # lists below and in COMPANION_FILES, in one change. cursor-axis-base.yml is
+      # never pinned by a caller, but every axis calls it at the caller's SHA, so a
+      # change to it is a change to every axis.
+      - .github/workflows/cursor-approve.yml
+      - .github/workflows/cursor-axis-base.yml
+      - .github/workflows/axis-correctness.yml
+      - .github/workflows/axis-conformance.yml
+      - .github/workflows/axis-business.yml
+      - .github/workflows/axis-design.yml
+      - .github/workflows/axis-completeness.yml
+      # cursor-approve's scripts and prompts, loaded from the caller's pinned
+      # `workflows_ref` exactly as .github/cursor-review/** is…
+      - .github/cursor-approve/**
+      # …minus what no pinned caller executes — the same reasoning, and the same
+      # exclusions, as .github/cursor-review's tests/ and README.md above.
+      - '!.github/cursor-approve/tests/**'
+      - '!.github/cursor-approve/README.md'
       # wire-bot-identity.py is deliberately NOT excluded even though no caller
       # loads it from `workflows_ref`: the bump step below runs it out of
       # github.workspace (WIRE_BOT_SCRIPT) and writes its output INTO each
@@ -168,9 +201,22 @@ jobs:
           # stale re-run). What it does NOT supersede is the decommission probe:
           # these entries are still what notices either directory disappearing,
           # and preflight cross-checks that the pathspecs reach EVERY one of them.
+          # The cursor-approve family's workflow FILES are listed here too
+          # (BE-19438): WATCHED is one path, and every other `paths:` entry has to
+          # appear in this list. Each is decommission-checked like a directory, so
+          # retiring one of them means dropping it from all four lists (and from
+          # COMPANION_FILES) in the same commit, or the fleet stops bumping.
           WATCHED_ASSETS: |
             .github/cursor-review
             scripts/check-pr-size
+            .github/workflows/cursor-approve.yml
+            .github/workflows/cursor-axis-base.yml
+            .github/workflows/axis-correctness.yml
+            .github/workflows/axis-conformance.yml
+            .github/workflows/axis-business.yml
+            .github/workflows/axis-design.yml
+            .github/workflows/axis-completeness.yml
+            .github/cursor-approve
           # MIRRORS the `paths:` filter above, exclusions included — that is the
           # coupling, not a coincidence. Widen one and you widen the other in the
           # same change; test_paths_contract.sh fails the build otherwise.
@@ -182,6 +228,16 @@ jobs:
             :(exclude).github/cursor-review/README.md
             :(exclude).github/cursor-review/catalog-drift.py
             :(exclude)scripts/check-pr-size/*_test.go
+            .github/workflows/cursor-approve.yml
+            .github/workflows/cursor-axis-base.yml
+            .github/workflows/axis-correctness.yml
+            .github/workflows/axis-conformance.yml
+            .github/workflows/axis-business.yml
+            .github/workflows/axis-design.yml
+            .github/workflows/axis-completeness.yml
+            .github/cursor-approve
+            :(exclude).github/cursor-approve/tests
+            :(exclude).github/cursor-approve/README.md
           # Every file whose ABSENCE breaks a pinned caller at run time — not just
           # the entry points, and NOT confined to one directory: a review run loads
           # BOTH watched trees from the pinned ref. Neither directory can be the
@@ -231,6 +287,25 @@ jobs:
             scripts/check-pr-size/go.mod
             scripts/check-pr-size/main.go
             scripts/check-pr-size/size.go
+            .github/workflows/cursor-approve.yml
+            .github/workflows/cursor-axis-base.yml
+            .github/workflows/axis-correctness.yml
+            .github/workflows/axis-conformance.yml
+            .github/workflows/axis-business.yml
+            .github/workflows/axis-design.yml
+            .github/workflows/axis-completeness.yml
+            .github/cursor-approve/aggregate.py
+            .github/cursor-approve/card.py
+            .github/cursor-approve/context-proxy.py
+            .github/cursor-approve/mcp-relay.py
+            .github/cursor-approve/prompt-common.md
+            .github/cursor-approve/prompt-correctness.md
+            .github/cursor-approve/prompt-conformance.md
+            .github/cursor-approve/prompt-business.md
+            .github/cursor-approve/prompt-design.md
+            .github/cursor-approve/prompt-completeness.md
+            .github/cursor-approve/prompt-no-checkout.md
+            .github/cursor-approve/prompt-context-tools.md
           # Read-only ambient token, for the owed-bump probe's `actions: read`
           # history lookup only (BE-10008). Never a write credential: the
           # Cloud Code Bot token is minted after — and only if — this step says
@@ -274,4 +349,18 @@ jobs:
           # agents-md-integrity entrypoint never sets this, so bump-callers.sh
           # skips wiring there even if its roster somehow set the flag.
           WIRE_BOT_SCRIPT: ${{ github.workspace }}/.github/cursor-review/wire-bot-identity.py
+          # The reusables that ship with cursor-review.yml and are pinned beside it
+          # in the same caller file (BE-19438 — see the header). Without this the
+          # bumper reads such a file as calling a SIBLING fleet's reusable, moves
+          # only cursor-review.yml's `uses:` and every `workflows_ref:`, and ships
+          # a split pin. Keep it in step with the cursor-approve family's entries
+          # in the `paths:` filter above.
+          COMPANION_FILES: |
+            cursor-approve.yml
+            cursor-axis-base.yml
+            axis-correctness.yml
+            axis-conformance.yml
+            axis-business.yml
+            axis-design.yml
+            axis-completeness.yml
         run: bash .github/bump-callers/bump-callers.sh

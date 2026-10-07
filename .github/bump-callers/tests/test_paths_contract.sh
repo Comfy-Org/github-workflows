@@ -113,9 +113,13 @@ parse_push_paths() { # $1 = workflow file
 # no comment syntax, so such a line really is a watched path as far as
 # preflight.sh is concerned (where validate_path rejects it with an ::error::).
 # Stripping it here would hide that shape behind a green contract test.
-parse_preflight_env() { # $1 = workflow file, $2 = key
-  awk -v key="$2" '
-    /^      - name: Preflight/ { instep = 1; next }
+#
+# $3 optionally names a DIFFERENT step (by the start of its `- name:`), with the
+# same parsing; the companion check below reads COMPANION_FILES off the bump
+# step with it, so the two readers cannot drift apart.
+parse_preflight_env() { # $1 = workflow file, $2 = key, $3 = step name (default Preflight)
+  awk -v key="$2" -v step="${3:-Preflight}" '
+    index($0, "      - name: " step) == 1 { instep = 1; next }
     instep && /^      - name: / { instep = 0 }
     inblock {
       # Blank lines are part of the block; anything indented at or below the
@@ -813,6 +817,97 @@ ${pathspec_diag}"
     bad "${file}: the Preflight step has no \`GH_TOKEN: \${{ github.token }}\` env (parsed '${gh_token}') — the owed-bump probe's \`gh api\` calls would be unauthenticated, so it can never rule out an owed catch-up"
   fi
 done
+
+# --- companion reusables (BE-19438) -------------------------------------------
+# A fleet that passes COMPANION_FILES to bump-callers.sh moves those reusables'
+# pins together with its own, so their files are part of its watched surface:
+# a change to one has to TRIGGER a bump, or a caller pinning it drifts until some
+# unrelated change happens to fire the fleet. The paths/WATCHED mirror above
+# cannot see this coupling (COMPANION_FILES lives on the bump step, not the
+# preflight one), so assert it here, in both directions: every companion is a
+# real reusable named by the filter, and every reusable workflow the filter
+# names other than WATCHED is a companion — a filter entry with no companion
+# would trigger a bump that then refuses to move that reusable's pins.
+echo
+echo "== companion reusables match the trigger (BE-19438) =="
+COMPANION_FLEETS=0
+for path in "${FILES[@]}"; do
+  file="$(basename "$path")"
+  companions=()
+  while IFS= read -r c; do
+    [[ -n "$c" ]] && companions+=("$c")
+  done < <(parse_preflight_env "$path" COMPANION_FILES 'Bump SHA in caller repos' | tr -s '[:space:]' '\n')
+  (( ${#companions[@]} > 0 )) || continue
+  COMPANION_FLEETS=$((COMPANION_FLEETS+1))
+  filter=()
+  while IFS= read -r line; do [[ -n "$line" ]] && filter+=("$line"); done < <(parse_push_paths "$path")
+  watched="$(parse_preflight_env "$path" WATCHED)"
+  missing="" untracked=""
+  for c in "${companions[@]}"; do
+    cpath=".github/workflows/${c}"
+    if [[ "$(git -C "$REPO_ROOT" ls-files -z -- "$cpath" | tr -d '\0')" != "$cpath" ]]; then
+      untracked="${untracked}${untracked:+ }${c}"
+    fi
+    found=""
+    for p in "${filter[@]}"; do [[ "$p" == "$cpath" ]] && { found=1; break; }; done
+    [[ -n "$found" ]] || missing="${missing}${missing:+ }${c}"
+  done
+  if [[ -n "$untracked" ]]; then
+    bad "${file}: COMPANION_FILES names ${untracked} — not a tracked .github/workflows/ file. A companion no caller can be pinning to is a typo, and the bumper would silently treat the real reusable as a sibling"
+  else
+    ok "${file}: all ${#companions[@]} COMPANION_FILES are tracked reusable workflows"
+  fi
+  if [[ -n "$missing" ]]; then
+    bad "${file}: COMPANION_FILES ${missing} not in the \`paths:\` filter — a change to it moves every caller's pin of it yet starts no bump run. Add .github/workflows/<name> to the filter (and to WATCHED_ASSETS / WATCHED_PATHSPECS)"
+  else
+    ok "${file}: every companion is watched by the \`paths:\` filter"
+  fi
+  extra=""
+  for p in "${filter[@]}"; do
+    [[ "$p" == .github/workflows/*.yml && "$p" != "$watched" ]] || continue
+    found=""
+    for c in "${companions[@]}"; do [[ "$p" == ".github/workflows/${c}" ]] && { found=1; break; }; done
+    [[ -n "$found" ]] || extra="${extra}${extra:+ }${p}"
+  done
+  if [[ -n "$extra" ]]; then
+    bad "${file}: the \`paths:\` filter watches ${extra}, which is neither WATCHED nor a COMPANION_FILES entry — a change to it fires a bump that then reads its pins as a sibling fleet's and leaves them behind"
+  else
+    ok "${file}: every reusable workflow in the \`paths:\` filter is WATCHED or a companion"
+  fi
+done
+# The cursor-review fleet is the one this exists for; a parse that silently finds
+# no companions there would turn the whole section into a vacuous pass.
+if parse_preflight_env "${WORKFLOWS}/bump-cursor-review-callers.yml" COMPANION_FILES 'Bump SHA in caller repos' | grep -qx 'cursor-approve.yml'; then
+  ok "bump-cursor-review-callers.yml passes cursor-approve.yml as a companion (${COMPANION_FLEETS} companion fleet(s) checked)"
+else
+  bad "bump-cursor-review-callers.yml: could not read cursor-approve.yml out of its COMPANION_FILES — either the input was dropped (and its callers split-pin again) or the parser stopped reading it"
+fi
+
+# And the trigger itself, as Actions evaluates it (later entries override earlier
+# ones, `!` removes): a change to the approve half has to fire this fleet, while
+# a change only to what no pinned caller executes must not.
+echo
+echo "== cursor-review fleet triggers on the cursor-approve family (BE-19438) =="
+CR_FILTER="$(parse_push_paths "${WORKFLOWS}/bump-cursor-review-callers.yml")"
+cr_trigger_case() { # $1 = changed path, $2 = fires|quiet
+  local sel=1
+  uncovered_against_filter "$CR_FILTER" "$1" >/dev/null || sel=0
+  if [[ "$2" == fires && "$sel" == 1 ]] || [[ "$2" == quiet && "$sel" == 0 ]]; then
+    ok "a change to $1 alone: $2"
+  else
+    bad "a change to $1 alone should be '$2' for bump-cursor-review-callers.yml but is not"
+  fi
+}
+for f in cursor-approve.yml cursor-axis-base.yml axis-correctness.yml axis-conformance.yml axis-business.yml axis-design.yml axis-completeness.yml; do
+  cr_trigger_case ".github/workflows/${f}" fires
+done
+cr_trigger_case .github/cursor-approve/aggregate.py fires
+cr_trigger_case .github/cursor-approve/prompt-correctness.md fires
+cr_trigger_case .github/cursor-approve/tests/test_aggregate.py quiet
+cr_trigger_case .github/cursor-approve/README.md quiet
+# The pre-existing surface keeps its shape.
+cr_trigger_case .github/workflows/cursor-review.yml fires
+cr_trigger_case .github/cursor-review/tests/test_post_review.py quiet
 
 # --- parser self-test --------------------------------------------------------
 # The loop above only sees the shapes the real entrypoints happen to use, so the
