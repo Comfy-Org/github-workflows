@@ -74,14 +74,14 @@ Read them from the start of the comment body; they are never renamed:
 ```text
 <!-- cursor-approve-card -->
 <!-- cursor-approve-state: pass|changes_requested|no_decision|capped -->
-<!-- cursor-approve-next: none|resolve_then_relabel|relabel|human -->
+<!-- cursor-approve-next: none|resolve_then_relabel|relabel|dismiss_then_relabel|human -->
 ```
 
 | State | Written by | Card says | `next` | Next-step line |
 |---|---|---|---|---|
 | `pass` | cursor-review decide, then this workflow's start phase | Approved (or passed the severity gate, axes pending), then the axes table | `none` | none |
 | `changes_requested` | cursor-review decide | "Not approved: N finding(s) above `<threshold>` gate this round", one line per gating finding (severity, `file:line`, thread link, why it gated: inside this round's changes, a live re-raise, High/Critical anywhere, or `full` scope), or the earlier open threads that held it | `resolve_then_relabel` | Fix or reply to the gating threads, resolve them, then start a new round: remove and re-add the `cursor-review` label. |
-| `no_decision` | cursor-review decide | "No decision this round", with `decide_gate`'s reasons verbatim (e.g. "2/6 panel reviewers did not complete") | `relabel` for a transient cause (a reviewer or the judge errored, the head or base moved, the PR could not be read); `human` for a structural one (the findings did not land as threads, the reviewed diff is empty) | Re-run the round: remove and re-add the `cursor-review` label. / Nothing — the round is being re-run automatically (see below). / A human is needed: <cause>. |
+| `no_decision` | cursor-review decide | "No decision this round", with `decide_gate`'s reasons verbatim (e.g. "2/6 panel reviewers did not complete") | `relabel` when the head moved (the one transient cause a relabel alone clears); `dismiss_then_relabel` for a transient cause that left the head where it was (a reviewer or the judge errored, the PR could not be read, the base alone was retargeted); `human` for a structural one (the findings did not land as threads, the reviewed diff is empty) | Re-run the round: remove and re-add the `cursor-review` label. / Nothing — the round is being re-run automatically (see below). / Dismiss the consolidated Cursor Review on this commit, then re-run the round. / A human is needed: <cause>. |
 | `capped` | cursor-review decide, or this workflow's start phase | Needs a human (`needs-human-review`, or the round limit) | `human` | A human is needed: the bot withdraws its own request for changes on this hand-off, so a human's review decides this PR — if one still shows, its withdrawal failed (see the run log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the round count. |
 
 The decide phase maps its outcome onto the same contract: `approved` →
@@ -89,6 +89,19 @@ The decide phase maps its outcome onto the same contract: `approved` →
 `changes_requested`/`relabel`; `superseded` and `error` → `no_decision`/`relabel`;
 `needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
 `no_decision`/`human`. Every card also shows the reviewed commit SHA.
+
+### Why a relabel alone is not always enough (BE-19527)
+
+The gate's `dup` step skips any head that already carries a bot-posted
+consolidated review — and a *degraded* round posts one too. So for a round the
+head never moved under (a panel cell or the judge errored, the PR could not be
+read, the base alone was retargeted), removing and re-adding the label starts a
+run that no-ops, and the PR stays exactly where it was.
+
+Those rounds report `dismiss_then_relabel`, not `relabel`, and name the dup
+step's own escape hatch: dismiss that consolidated review first, then re-run.
+The distinction is on the contract marker, not only in the prose, because an
+agent following `relabel` there would start nothing too.
 
 ### The round re-runs itself when the head outran it (BE-19526)
 
@@ -124,7 +137,10 @@ Whichever token the caller configures needs **label write** on the repo.
 A `no_decision` round (and a `changes_requested` one held only by an earlier
 round's open thread) also leaves a **standing REQUEST_CHANGES** as the approver
 identity, with the reasons and the next step, so resolving every thread does
-not make an unapproved PR look done. The next no-decision round replaces it;
+not make an unapproved PR look done. It carries the verdict and the findings
+behind it and nothing else: the scope note and the threshold live on the card,
+which states both in more detail, so the two artifacts stop reading as one
+decision rendered twice. The next no-decision round replaces it;
 the next approval withdraws it — cursor-review's own, or, under
 `defer_approval`, its passing decide and this workflow's decide phase. A
 `capped` round posts none and withdraws any earlier one.

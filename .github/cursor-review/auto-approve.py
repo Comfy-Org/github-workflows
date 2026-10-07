@@ -1010,15 +1010,23 @@ def no_decision_next(reasons: list, label: str = ""):
 
     A structural cause — the findings did not land as threads, or the reviewed
     diff is empty — comes back the same on a re-run, so it names the cause and
-    asks for a human. Everything else (a reviewer or judge error, the head or
-    base moving, an unreadable PR) is transient: re-run the round.
+    asks for a human.
+
+    Of the transient ones, only a moved head can be cleared by a relabel alone:
+    the gate's `dup` step skips any head that already carries a bot-posted
+    consolidated review, and a degraded round posts one too, so re-applying the
+    label on an UNCHANGED head starts a run that no-ops (BE-19527). Those get
+    `dismiss_then_relabel` and the dup step's own escape hatch — dismiss that
+    review first — rather than advice that silently does nothing.
     """
     card = _load_card()
     causes = [cause for needle, cause in STRUCTURAL_CAUSES
               if any(isinstance(r, str) and needle in r for r in reasons or [])]
     if causes:
         return card.NEXT_HUMAN, f"A human is needed: {'; '.join(causes)}. A re-run would land the same way."
-    return card.NEXT_RELABEL, card.next_relabel_text(label)
+    if auto_retry_eligible(reasons):
+        return card.NEXT_RELABEL, card.next_relabel_text(label)
+    return card.NEXT_DISMISS, card.next_dismiss_text(label)
 
 
 # BE-19526. A round the head outran is a full panel spent on a commit the PR has
@@ -1428,9 +1436,14 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
                 line = str(line) if isinstance(line, int) and not isinstance(line, bool) else "?"
                 path = f.get("file") if isinstance(f.get("file"), str) else "?"
                 lines.append(f"- **{sev}** — {render_code_ref(path[:300], line)}")
-    if scope_note_of(reasons):
-        lines.append(f"\n_Scope: {scope_note_of(reasons)}._")
-    lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
+    # No scope note and no threshold line (BE-19527): the status card carries
+    # both, with a richer per-finding "why it gated" than this body ever had,
+    # and the headline above already names the threshold. Two renderings of one
+    # decision is what made the pair in the timeline read as duplicated. What
+    # stays is what a reader who only gets the email notification needs: the
+    # verdict and the findings that drove it. render_external_body, the axes
+    # path, has always been a headline plus a card link — this is the same
+    # trade, one step less far.
     return "\n".join(lines)
 
 
@@ -1460,8 +1473,8 @@ def render_standing_body(headline: str, reasons: list, next_text: str, threshold
     # is already markdown-safe (axis reasons sanitized as on the card).
     lines += [f"- {r if prerendered else reason_text(r)}" for r in reasons if isinstance(r, str) and r.strip()]
     lines.append(f"\n**Next step:** {next_text}")
-    if threshold in ALLOWED_THRESHOLDS:
-        lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
+    # No threshold line, for the same reason render_body drops it: the card
+    # states it, and a no-decision round was not a threshold call anyway.
     return "\n".join(lines)
 
 
@@ -1473,6 +1486,7 @@ CAPPED_HEADLINE = "Needs a human, so this PR is not approved."
 # loaded: a card.py that fails to import must cost only the card.
 CARD_PASS, CARD_CHANGES, CARD_NO_DECISION, CARD_CAPPED = "pass", "changes_requested", "no_decision", "capped"
 CARD_NEXT_NONE, CARD_NEXT_RESOLVE, CARD_NEXT_RELABEL, CARD_NEXT_HUMAN = "none", "resolve_then_relabel", "relabel", "human"
+CARD_NEXT_DISMISS = "dismiss_then_relabel"
 
 
 def _card_text(name: str, args=None) -> str:

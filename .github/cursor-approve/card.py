@@ -74,7 +74,13 @@ NEXT_NONE = "none"
 NEXT_RESOLVE = "resolve_then_relabel"
 NEXT_RELABEL = "relabel"
 NEXT_HUMAN = "human"
-NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_HUMAN)
+# BE-19527. A relabel alone is a NO-OP for a round whose head never moved: the
+# gate's `dup` step skips any head that already carries a bot-posted
+# consolidated review, and a degraded round posts one too. Its documented
+# escape hatch is to dismiss that review first — so this is its own next step,
+# not `relabel`, because an agent following `relabel` would start nothing.
+NEXT_DISMISS = "dismiss_then_relabel"
+NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_DISMISS, NEXT_HUMAN)
 STATE_MARKER = "<!-- cursor-approve-state: {} -->"
 NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
 
@@ -109,6 +115,12 @@ def next_relabel_text(label=DEFAULT_REVIEW_LABEL) -> str:
     return f"Re-run the round: {relabel(label)}."
 
 
+def next_dismiss_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    """The round that a relabel alone cannot re-run (BE-19527)."""
+    return ("Dismiss the consolidated Cursor Review on this commit (the gate skips a head that already has one), "
+            f"then re-run the round: {relabel(label)}.")
+
+
 def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
     """The relabel the workflow is doing itself (BE-19526).
 
@@ -128,6 +140,7 @@ RELABEL = relabel()
 NEXT_RESOLVE_TEXT = next_resolve_text()
 NEXT_RELABEL_TEXT = next_relabel_text()
 NEXT_AUTO_RETRY_TEXT = next_auto_retry_text()
+NEXT_DISMISS_TEXT = next_dismiss_text()
 # The hand-off withdraws the bot's own requests for changes (BE-19492), so a
 # human's review is what clears the PR; the label only resets the round count.
 # Not stated as done: every caller writes this card whether or not that
