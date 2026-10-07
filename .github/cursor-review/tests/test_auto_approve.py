@@ -177,14 +177,140 @@ OLD = "1" * 40
 NEW = "2" * 40
 
 
+def graphql_reviews(reviews, *, has_next=False, cursor=None):
+    """The GraphQL envelope `list_reviews` reads, built from REST-shaped stubs.
+
+    Lets every test below keep writing a review the way the REST payload spelled
+    it — and pins the two translations that payload does not have: the `[bot]`
+    suffix GraphQL drops, and `edited`.
+    """
+    nodes = []
+    for r in reviews:
+        login = (r.get("user") or {}).get("login", "")
+        bot = login.endswith("[bot]")
+        nodes.append({
+            "fullDatabaseId": str(r["id"]),
+            "databaseId": r["id"],
+            "state": r.get("state"),
+            "body": r.get("body"),
+            "lastEditedAt": "2026-10-06T12:00:00Z" if r.get("edited") else None,
+            "submittedAt": r.get("submitted_at"),
+            "url": r.get("html_url"),
+            "author": {"__typename": "Bot" if bot else "User",
+                       "login": login[: -len("[bot]")] if bot else login},
+        })
+    return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+        "nodes": nodes,
+    }}}}})
+
+
+class ReviewsListTest(unittest.TestCase):
+    """The GraphQL reviews list, which exists for `lastEditedAt` alone.
+
+    Each case here is a way the switch away from REST could have broken the
+    dismissal silently — the direction that exits green while withdrawing
+    nothing.
+    """
+
+    def list_reviews(self, *pages):
+        calls = []
+
+        def fake_gh(args, payload=None):
+            calls.append(args)
+            return pages[len(calls) - 1]
+
+        with mock.patch.object(AA, "gh", fake_gh):
+            return AA.list_reviews("o/r", "7"), calls
+
+    def test_a_bots_login_keeps_the_suffix_the_workflow_passes(self):
+        # --approver-login is "${APP_SLUG}[bot]" / "github-actions[bot]", while
+        # GraphQL answers "github-actions". Dropping this would compare the two
+        # and match nothing, for every PR, forever.
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 1, "user": {"login": "github-actions[bot]"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["user"]["login"], "github-actions[bot]")
+
+    def test_a_humans_login_is_untouched(self):
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 2, "user": {"login": "a-human"}, "state": "COMMENTED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["user"]["login"], "a-human")
+
+    def test_the_rest_id_survives_past_the_32_bit_range(self):
+        # Live review ids are already past 2^31-1, and the dismissal endpoint is
+        # REST, so the id this list carries has to be the full one.
+        big = 5434892948
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": big, "user": {"login": "x"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual(reviews[0]["id"], big)
+
+    def test_an_edit_is_reported_and_an_unedited_review_is_not(self):
+        reviews, _ = self.list_reviews(graphql_reviews([
+            {"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b", "edited": True},
+            {"id": 2, "user": {"login": "x"}, "state": "APPROVED", "body": "b"},
+        ]))
+        self.assertEqual([r["edited"] for r in reviews], [True, False])
+
+    def test_every_page_is_read(self):
+        reviews, calls = self.list_reviews(
+            graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                            has_next=True, cursor="CUR"),
+            graphql_reviews([{"id": 2, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}]),
+        )
+        self.assertEqual([r["id"] for r in reviews], [1, 2])
+        self.assertIn("cursor=null", " ".join(calls[0]))
+        self.assertIn("cursor=CUR", " ".join(calls[1]))
+
+    def test_a_page_with_no_cursor_to_follow_raises(self):
+        # hasNextPage with no cursor: neither re-request page one until the job
+        # times out, nor return the truncated list — reviews come back
+        # oldest-first, so the dropped page holds the newest approval.
+        page = graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                               has_next=True, cursor=None)
+        with self.assertRaises(ValueError):
+            self.list_reviews(page)
+
+    def test_a_cursor_that_does_not_advance_raises(self):
+        page = graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED", "body": "b"}],
+                               has_next=True, cursor="CUR")
+        with self.assertRaises(ValueError):
+            self.list_reviews(page, page)
+
+    def test_a_null_reviews_connection_raises(self):
+        with self.assertRaises(ValueError):
+            self.list_reviews(json.dumps({"data": {"repository": {"pullRequest": {"reviews": None}}}}))
+
+    def test_a_review_with_no_id_raises(self):
+        # Not a None carried into the dismissal URL, which 404s as a misleading
+        # "could not dismiss".
+        page = json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"fullDatabaseId": None, "databaseId": None, "state": "APPROVED", "body": "b",
+                       "lastEditedAt": None, "author": {"__typename": "User", "login": "x"}}],
+        }}}}})
+        with self.assertRaises(ValueError):
+            self.list_reviews(page)
+
+    def test_a_shapeless_response_raises_instead_of_listing_nothing(self):
+        # Both callers read an empty list as "nothing to dismiss" and exit green,
+        # so this has to reach their error paths instead.
+        with self.assertRaises(ValueError):
+            self.list_reviews(json.dumps({"data": {"repository": {"pullRequest": None}}}))
+
+
 class StaleReviewTest(unittest.TestCase):
-    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD, base=None):
+    def review(self, rid, login="cursor-approver", state="APPROVED", commit=None, marker=True, sha=OLD, base=None,
+               edited=False):
         # `commit_id` defaults to NEW on purpose: GitHub moves a still-valid
         # approval's commit_id to each new head, so only the SHA recorded in the
         # body says what was reviewed. `base=None` records no base (an approval
         # posted before the base was recorded).
         body = AA.render_body(AA.APPROVE, ["ok"], "low", [], sha, base or "") if marker else "ok"
-        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW, "body": body}
+        return {"id": rid, "user": {"login": login}, "state": state, "commit_id": commit or NEW,
+                "body": body, "edited": edited}
 
     def test_dismisses_own_marked_off_head_reviews(self):
         reviews = [
@@ -218,6 +344,44 @@ class StaleReviewTest(unittest.TestCase):
         reviews = [self.review(1, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
 
+    def test_an_edited_approval_is_stale_even_when_its_marker_says_head(self):
+        # The forge: a write-access user edits this identity's approval and
+        # rewrites the recorded SHA to the live head. Trusting the marker would
+        # keep that approval standing through every later push.
+        reviews = [self.review(1, sha=NEW, edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1])
+
+    def test_an_unedited_approval_on_head_still_stands(self):
+        # The other half: distrusting edits must not withdraw the approvals this
+        # workflow posts itself, which are never edited.
+        reviews = [self.review(1, sha=NEW)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
+
+    def test_an_edited_approval_with_its_marker_removed_is_still_dismissed(self):
+        # The cheaper forgery: delete the marker rather than rewrite the SHA.
+        # Gating on the marker first would take the approval out of every filter.
+        reviews = [self.review(1, marker=False, edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [1])
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1])
+
+    def test_an_unedited_unmarked_approval_is_still_untouched(self):
+        # e.g. a manual approval by a human APPROVER_TOKEN identity.
+        reviews = [self.review(1, marker=False)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [])
+
+    def test_another_logins_edited_unmarked_approval_is_not_unactionable(self):
+        # A human editing their own approval is not a stale auto-approval, so it
+        # must not turn the dismissal job red.
+        reviews = [self.review(1, login="a-human", marker=False, edited=True)]
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "cursor-approver", NEW), [])
+        self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), [])
+
+    def test_an_edited_change_request_is_still_not_dismissed(self):
+        # Only APPROVALS are this filter's business; an edited veto is someone
+        # tampering with a review that withholds merge, not one that grants it.
+        reviews = [self.review(1, state="CHANGES_REQUESTED", edited=True)]
+        self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", NEW), [])
+
     def test_none_head_selects_every_own_approval(self):
         reviews = [self.review(1, sha=NEW), self.review(2), self.review(3, state="CHANGES_REQUESTED")]
         self.assertEqual(AA.stale_reviews_to_dismiss(reviews, "cursor-approver", None), [1, 2])
@@ -243,10 +407,10 @@ class StaleReviewTest(unittest.TestCase):
         puts = []
 
         def fake_gh(args, payload=None):
-            if args[:2] == ["api", "--paginate"]:
+            if args[:2] == ["api", "graphql"]:
                 if list_error:
                     raise list_error
-                return json.dumps([reviews])
+                return graphql_reviews(reviews)
             if args[:2] == ["api", "-X"]:
                 puts.append((args[3], payload["message"]))
                 return "{}"
@@ -261,6 +425,12 @@ class StaleReviewTest(unittest.TestCase):
     def test_push_keeps_an_on_head_approval(self):
         rc, puts = self.run_dismiss([self.review(1, sha=NEW), self.review(2)])
         self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/2/dismissals"]))
+
+    def test_an_edited_on_head_approval_is_dismissed_end_to_end(self):
+        # Through the GraphQL list: the edit has to survive the translation to
+        # reach the staleness check, even with both markers forged to live state.
+        rc, puts = self.run_dismiss([self.review(1, sha=NEW, base="main", edited=True)])
+        self.assertEqual((rc, [p[0] for p in puts]), (0, ["repos/o/r/pulls/1/reviews/1/dismissals"]))
 
     def test_retarget_dismisses_the_on_head_approval_too(self):
         # `edited` with changes.base: the head did not move, the diff did.
@@ -331,6 +501,156 @@ class DismissJobTriggerTest(unittest.TestCase):
         self.assertIn('--base-ref "$BASE_REF"', text)
 
 
+class ShapelessPayloadTest(unittest.TestCase):
+    """No payload shape may reach a caller as a traceback.
+
+    `read_pr` and `list_reviews` are both read behind
+    `except (RuntimeError, ValueError)`. An AttributeError/TypeError/KeyError from
+    a malformed body escapes that, so it bypasses every announced degradation —
+    the exact outcome the announcements exist to prevent.
+    """
+
+    def read_pr_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA.read_pr("o/r", 1)
+
+    def head_base_with(self, body):
+        return AA.pr_head_base(self.read_pr_with(body))
+
+    def test_a_well_formed_payload_is_read(self):
+        self.assertEqual(self.head_base_with('{"head":{"sha":"abc"},"base":{"ref":"main"}}'), ("abc", "main"))
+
+    def test_a_non_object_payload_is_a_value_error(self):
+        # read_pr hands the whole payload to pr_head_base AND has_label, so the
+        # top-level guard belongs in the read, not in either consumer.
+        for body in ("null", "[]", '"s"', "7"):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.read_pr_with(body)
+
+    def test_a_nested_non_mapping_becomes_the_shapeless_value(self):
+        # A truthy non-mapping head/base would make `.get` raise AttributeError.
+        for body in ('{"head":"abc","base":3}', '{"head":[1],"base":["main"]}', '{"head":true}'):
+            with self.subTest(body=body):
+                self.assertEqual(self.head_base_with(body), ("", ""))
+
+    def test_a_non_string_sha_never_reaches_lower(self):
+        # It would survive `if not live_head` and then hit head_sha.lower().
+        self.assertEqual(self.head_base_with('{"head":{"sha":12345},"base":{"ref":null}}'), ("", ""))
+
+    def test_a_shapeless_payload_still_answers_has_label(self):
+        # The other consumer of the same read: it must not crash on a payload
+        # whose `labels` is not a list of objects.
+        for body in ('{"labels":"x"}', '{"labels":[null,"y"]}', "{}"):
+            with self.subTest(body=body):
+                self.assertFalse(AA.has_label(self.read_pr_with(body), AA.HUMAN_REVIEW_LABEL))
+
+    def list_reviews_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA.list_reviews("o/r", 1)
+
+    def test_a_non_object_body_is_a_value_error(self):
+        # `null`, an array or a string cannot answer `.get`; nor can a `data`,
+        # `repository` or `pullRequest` of the wrong shape. Each would otherwise
+        # escape as an AttributeError past both call sites, bypassing the
+        # announced degradation AND DISMISS_PERMISSION_HINT.
+        for body in ("null", "[]", '"s"', '{"message":"Not Found"}', '{"data":[]}',
+                     '{"data":{"repository":"x"}}', '{"data":{"repository":{"pullRequest":[1]}}}'):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.list_reviews_with(body)
+
+    def reviews_body(self, nodes):
+        return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes,
+        }}}}})
+
+    def good_node(self, **over):
+        node = json.loads(graphql_reviews([{"id": 1, "user": {"login": "x"}, "state": "APPROVED",
+                                            "body": AA.APPROVE_MARKER}]))["data"]["repository"][
+            "pullRequest"]["reviews"]["nodes"][0]
+        node.update(over)
+        return node
+
+    def test_a_non_object_review_is_a_value_error_not_a_silent_drop(self):
+        # Dropping it would be the one unannounced degradation: both callers read
+        # a missing review as "nothing to dismiss" and exit green, and the
+        # dropped node may be the newest approval.
+        for bad in ("abc", None, 7):
+            with self.subTest(node=bad), self.assertRaises(ValueError):
+                self.list_reviews_with(self.reviews_body([bad, self.good_node()]))
+
+    def test_a_non_list_nodes_field_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            self.list_reviews_with(self.reviews_body(5))
+
+    def test_wrong_shaped_review_fields_are_coerced_before_the_staleness_scan(self):
+        # `_stale_approvals` runs outside both callers' `try`, so a non-mapping
+        # author or a non-string body/state there would escape as a traceback.
+        node = self.good_node(author="mallory", body=5, state=["APPROVED"])
+        review = self.list_reviews_with(self.reviews_body([node]))[0]
+        self.assertEqual((review["user"], review["body"], review["state"]), ({"login": ""}, "", ""))
+        self.assertEqual(AA.stale_reviews_to_dismiss([review], "x", None), [])
+        node = self.good_node(author={"__typename": "User", "login": 9})
+        self.assertEqual(self.list_reviews_with(self.reviews_body([node]))[0]["user"], {"login": ""})
+
+    def test_a_non_numeric_review_id_is_a_value_error(self):
+        for rid in ({"x": 1}, [1], True, "abc"):
+            with self.subTest(rid=rid), self.assertRaises(ValueError):
+                self.list_reviews_with(self.reviews_body([self.good_node(fullDatabaseId=rid)]))
+
+    def test_a_non_list_labels_field_answers_has_label(self):
+        # A truthy non-iterable is the shape `or []` does not guard.
+        for body in ('{"labels":5}', '{"labels":true}', '{"labels":{"name":"needs-human-review"}}',
+                     '{"labels":[{"name":7}]}'):
+            with self.subTest(body=body):
+                self.assertFalse(AA.has_label(self.read_pr_with(body), AA.HUMAN_REVIEW_LABEL))
+
+    def paginate_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA._paginate("repos/o/r/issues/1/timeline?per_page=100")
+
+    def test_paginate_flattens_slurped_pages(self):
+        self.assertEqual(self.paginate_with("[[1, 2], [3], []]"), [1, 2, 3])
+        self.assertEqual(self.paginate_with("[]"), [])
+
+    def test_paginate_rejects_every_other_shape_as_a_value_error(self):
+        # Each would otherwise be a KeyError/TypeError past round-cap's fail-open
+        # handler — a red `round-cap` that skips the whole panel.
+        for body in ("null", '{"message":"x"}', '[{"message":"x"}]', "[[1], null]", "[[1], 7]", '"s"'):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.paginate_with(body)
+
+
+class AnnotationCauseTest(unittest.TestCase):
+    """One line, whatever the error carries — see `annotation_cause`."""
+
+    def test_no_error_uses_the_fallback(self):
+        self.assertEqual(AA.annotation_cause(None, "nothing came back"), "nothing came back")
+
+    def test_the_type_is_named_when_the_message_is_empty(self):
+        # str(RuntimeError()) is "", which would render a bare "()".
+        self.assertEqual(AA.annotation_cause(RuntimeError(), "x"), "RuntimeError")
+
+    def test_multiline_stderr_collapses_to_one_line(self):
+        got = AA.annotation_cause(RuntimeError("gh: HTTP 403\n::error::injected\nsee docs"), "x")
+        self.assertEqual(got, "RuntimeError: gh: HTTP 403 ::error::injected see docs")
+
+    def test_an_overlong_cause_is_clamped(self):
+        # A proxy's HTML error page is kilobytes; the failure lists join one cause
+        # per review id ahead of DISMISS_PERMISSION_HINT.
+        got = AA.annotation_cause(RuntimeError("<html>" + "x" * 5000), "x")
+        self.assertEqual(len(got), AA.ANNOTATION_CAUSE_MAX)
+        self.assertTrue(got.endswith("…"))
+        self.assertEqual(AA.annotation_cause(RuntimeError("short"), "x"), "RuntimeError: short")
+
+    def test_percent_is_escaped_so_the_runner_cannot_decode_a_newline_back_in(self):
+        # The runner percent-decodes %0A/%0D when it renders an annotation, so an
+        # encoded sequence would undo the collapsing. Escape `%` first.
+        got = AA.annotation_cause(RuntimeError("bad url http://x/a%0Ab%0D%0Ac"), "x")
+        self.assertNotIn("%0A", got)
+        self.assertNotIn("%0D", got)
+        self.assertIn("%250A", got)
+
+
 class DismissStaleHeadTest(unittest.TestCase):
     """`dismiss-stale` judges against the LIVE head, not the delivered event's.
 
@@ -340,28 +660,36 @@ class DismissStaleHeadTest(unittest.TestCase):
     approval. An unreadable head degrades to the event's, never to "".
     """
 
-    def run_dismiss(self, live, event_head, reviews):
+    def run_dismiss(self, live, event_head, reviews, live_base="main", all_approvals=False, raw=None):
         dismissed = []
 
         def fake_gh(args, payload=None):
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 dismissed.append(args[3])
                 return "{}"
-            if args[:2] == ["api", "--paginate"]:
-                return json.dumps([list(reviews)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
+            if raw is not None:
+                return raw  # valid JSON of the wrong shape
             if isinstance(live, Exception):
                 raise live
-            return json.dumps({} if live is None else {"head": {"sha": live}})
+            # A real payload carries a base alongside the head, so the fixture does
+            # too — without it `live_base` is "" on every path and the off-base
+            # comparison is dead in this whole class. `live_base=""` is the
+            # half-shapeless response, exercised deliberately below.
+            return json.dumps({} if live is None else {"head": {"sha": live}, "base": {"ref": live_base}})
 
         args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=event_head,
-                                  approver_login="cursor-approver", all_approvals=False)
-        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None):
+                                  approver_login="cursor-approver", all_approvals=all_approvals)
+        self.printed = []
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             rc = AA.cmd_dismiss_stale(args)
         return rc, dismissed
 
-    def approval(self, rid, sha):
+    def approval(self, rid, sha, base=""):
         return {"id": rid, "user": {"login": "cursor-approver"}, "state": "APPROVED",
-                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha)}
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha, base)}
 
     def test_a_replayed_older_event_does_not_dismiss_a_current_approval(self):
         # The race: the event carries OLD, the PR is really on NEW, and the approval
@@ -381,10 +709,132 @@ class DismissStaleHeadTest(unittest.TestCase):
     def test_an_unreadable_head_still_keeps_an_approval_the_event_head_matches(self):
         self.assertEqual(self.run_dismiss(RuntimeError("x"), NEW, [self.approval(1, NEW)]), (0, []))
 
+    def test_an_unreadable_head_never_falls_back_to_a_non_sha_event_head(self):
+        # The recorded marker is always lowercase 40-hex, so an abbreviated SHA or
+        # a ref name matches none and would withdraw every approval — exactly the
+        # reason "" is refused.
+        for event_head in (NEW[:7], "refs/heads/main", "z" * 40):
+            with self.subTest(event_head=event_head):
+                rc, dismissed = self.run_dismiss(RuntimeError("x"), event_head, [self.approval(1, NEW)])
+                self.assertEqual((rc, dismissed), (1, []))
+
+    def test_an_uppercase_event_head_is_still_a_usable_fallback(self):
+        self.assertEqual(self.run_dismiss(RuntimeError("x"), ("a" * 40).upper(),
+                                          [self.approval(1, "a" * 40)]), (0, []))
+
     def test_an_unreadable_head_with_no_event_head_goes_red(self):
         # Nothing to judge against: report it, never fall through to "" (which
         # would match no recorded SHA and dismiss everything).
         self.assertEqual(self.run_dismiss(RuntimeError("x"), "", [self.approval(1, NEW)]), (1, []))
+
+    def warnings(self):
+        return [line for line in self.printed if "::warning::" in line]
+
+    def test_a_degraded_head_read_is_announced_rather_than_silent(self):
+        # The dismissal below may be the right one or the replay this read exists to
+        # catch — unreadable means UNKNOWN. Exiting green on it without a word is
+        # what makes a wrongly withdrawn approval unattributable afterwards.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, OLD)])
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        self.assertTrue(any("live PR head" in line for line in self.warnings()), self.printed)
+
+    def test_a_degraded_read_names_its_cause_even_when_the_error_is_empty(self):
+        # str(RuntimeError()) is "", so the cause has to carry the type as well or
+        # the annotation reads "( )" and says nothing about what failed.
+        self.run_dismiss(RuntimeError(), NEW, [self.approval(1, NEW)])
+        self.assertTrue(any("RuntimeError" in line for line in self.warnings()), self.printed)
+
+    def test_a_shapeless_head_read_is_announced_too(self):
+        # The fallback that fires without raising, so an `except`-only diagnostic
+        # would miss it.
+        self.run_dismiss(None, NEW, [self.approval(1, NEW)])
+        self.assertTrue(any("no head in the response" in line for line in self.warnings()), self.printed)
+
+    def test_a_head_that_read_cleanly_warns_about_nothing(self):
+        self.run_dismiss(NEW, NEW, [self.approval(1, OLD)])
+        self.assertEqual(self.warnings(), [])
+
+    def test_a_multiline_read_error_is_collapsed_into_one_annotation(self):
+        # `gh` stderr is usually several lines. Interpolated raw, the tail falls out
+        # of the annotation, and a continuation line starting with `::` is re-parsed
+        # as a new workflow command — truncating this very diagnostic.
+        self.run_dismiss(RuntimeError("HTTP 403\n::error::injected\nsee https://docs"), NEW,
+                         [self.approval(1, NEW)])
+        warned = self.warnings()
+        self.assertEqual(len(warned), 1, self.printed)
+        self.assertNotIn("\n", warned[0])
+        self.assertIn("HTTP 403 ::error::injected see https://docs", warned[0])
+
+    def test_a_live_head_without_a_base_keeps_every_recorded_approval(self):
+        # The off-base twin of the shapeless-head bug, and the reason the head
+        # fallback is not the only announced degradation: "" is not None and no
+        # recorded base equals "", so an unguarded empty live base withdraws every
+        # approval that recorded one — on head, green, and unannounced.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")], live_base="")
+        self.assertEqual((rc, dismissed), (0, []))
+        self.assertTrue(any("no base ref" in line for line in self.warnings()), self.printed)
+
+    def test_a_headless_read_still_compares_the_base_it_did_return(self):
+        # The read SUCCEEDED but carried no head: the head falls back to the event's,
+        # but a usable base must not be discarded with it, or an off-base approval
+        # survives and the warning implies a base check skipped for no reason.
+        rc, dismissed = self.run_dismiss("", NEW, [self.approval(1, NEW, base="old-base")], live_base="main")
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("with the base check against the live base", warned)
+        self.assertNotIn("without the base check", warned)
+
+    def test_a_readable_base_still_dismisses_a_genuinely_retargeted_approval(self):
+        # The guard above skips the base check; it must not disable it.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="old-base")], live_base="main")
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_the_degraded_warning_does_not_name_a_head_when_all_approvals_is_set(self):
+        # `--all-approvals` ignores the head, so naming a SHA as the comparison
+        # basis would misdirect whoever investigates the mass withdrawal. The TAIL
+        # matters as much as the basis: withdrawing a head-valid approval is the
+        # deliberate purpose of a retarget, not a degradation to apologise for.
+        rc, dismissed = self.run_dismiss(RuntimeError("timeout"), NEW, [self.approval(1, NEW)],
+                                         all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("--all-approvals", warned)
+        self.assertNotIn(NEW, warned)
+        self.assertNotIn("valid for the head as it stands now", warned)
+        self.assertNotIn("without the base check, for this run", warned)
+
+    def test_a_retarget_still_withdraws_everything_with_no_event_head(self):
+        # `--all-approvals` needs no head to do its job, so the empty-head red gate
+        # must not block the one event where every approval MUST be withdrawn.
+        rc, dismissed = self.run_dismiss(RuntimeError("x"), "", [self.approval(1, NEW)], all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+
+    def test_a_missing_base_under_all_approvals_does_not_claim_a_head_comparison(self):
+        # "comparing on head alone" is false here: the head is discarded and every
+        # marked approval goes, so the base check was moot rather than skipped.
+        rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")],
+                                         live_base="", all_approvals=True)
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("--all-approvals", warned)
+        self.assertNotIn("comparing on head alone", warned)
+
+    def test_the_missing_base_warning_names_what_skipping_the_check_costs(self):
+        # The guard fails OPEN — an off-base approval survives — so the annotation
+        # has to say so rather than imply the run was complete.
+        self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="main")], live_base="")
+        self.assertTrue(any("SURVIVES" in line for line in self.warnings()), self.printed)
+
+    def test_json_that_is_not_an_object_degrades_instead_of_tracebacking(self):
+        # `null`, or the ARRAY the collection endpoint returns for an empty number:
+        # `.get` on either raises AttributeError, which nothing catches, so it
+        # would escape as a traceback and bypass the whole announced-degradation
+        # path — including the shapeless fallback that exists for exactly this.
+        for body in ("null", "[]", '"a string"'):
+            with self.subTest(body=body):
+                rc, dismissed = self.run_dismiss(None, NEW, [self.approval(1, NEW)], raw=body)
+                self.assertEqual((rc, dismissed), (0, []))
+                self.assertTrue(any("live PR head" in line for line in self.warnings()), self.printed)
 
     def test_a_shapeless_head_read_never_dismisses_everything(self):
         # read_head returning "" must not reach the filter: "" is not None, so it
@@ -402,18 +852,19 @@ class DismissStaleHeadTest(unittest.TestCase):
 class PostWriteRaceTest(unittest.TestCase):
     """A push between the head read and the POST must not leave our review standing."""
 
-    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: [], diff=DIFF):
+    def run_decide(self, heads, judge_status="ok", reviews=(), threads=lambda *a: [], diff=DIFF,
+                   post_response='{"id": 99}'):
         calls = []
         heads = iter(heads)
 
         def fake_gh(args, payload=None):
             calls.append((args, payload))
             if args[:2] == ["api", "-X"] and args[2] == "POST":
-                return json.dumps({"id": 99})
+                return post_response
             if args[:2] == ["api", "-X"] and args[2] == "PUT":
                 return "{}"
-            if args[:2] == ["api", "--paginate"]:
-                return json.dumps([list(reviews)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
             head = next(heads)
             if isinstance(head, Exception):
                 raise head
@@ -460,6 +911,18 @@ class PostWriteRaceTest(unittest.TestCase):
     def test_unreadable_head_after_post_withdraws(self):
         rc, writes = self.run_decide([SHA, RuntimeError("timeout")])
         self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+
+    def test_a_post_response_without_a_review_id_withdraws_and_goes_red(self):
+        # `gh` exited 0, so the APPROVE may well have landed — but with no id the
+        # race check cannot dismiss it. Each shape must reach the ambiguous-POST
+        # path (withdraw by listing live reviews, exit 1), not escape as a
+        # traceback after approve_gate already read `pass`.
+        approval = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                    "body": AA.APPROVE_MARKER}
+        for response in ("not json", "null", "[]", '{"node_id": "x"}', '{"id": null}'):
+            with self.subTest(response=response):
+                rc, writes = self.run_decide([SHA], reviews=[approval], post_response=response)
+                self.assertEqual((rc, writes), (1, ["POST", "PUT"]))
 
     def test_head_unchanged_keeps_the_approval(self):
         rc, writes = self.run_decide([SHA, SHA])
@@ -594,7 +1057,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None, reviews=()):
+                   labels_after=None, reviews=(), put_error=None):
         heads = iter(heads)
         reads = []
         writes = []
@@ -605,10 +1068,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                     raise RuntimeError(post_error)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
+                if put_error:
+                    raise RuntimeError(put_error)
                 writes.append(args[3])
                 return "{}"
-            if args[:2] == ["api", "--paginate"]:
-                return json.dumps([list(reviews)])
+            if args[:2] == ["api", "graphql"]:
+                return graphql_reviews(list(reviews))
             names = labels_after if reads and labels_after is not None else labels
             reads.append(args)
             return json.dumps({"head": {"sha": next(heads)}, "base": {"ref": "main"},
@@ -627,10 +1092,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                                       commit_sha=SHA, judge_status="ok", delivered="true",
                                       ungated="0", approver_login="cursor-approver",
                                       reviewed_diff=dpath, base_ref="main")
+            self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
-                    mock.patch.object(AA, "emit", lambda *a: None):
+                    mock.patch.object(AA, "emit", lambda *a: None), \
+                    mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
                 rc = AA.cmd_decide(args)
             self.writes = writes
             return rc, read_outputs(out).get("approve_gate")
@@ -666,6 +1133,25 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         self.assertEqual((rc, gate), (1, "untrusted"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
 
+    def errors(self):
+        return [line for line in self.printed if "::error::" in line]
+
+    def test_a_multiline_post_error_stays_one_annotation(self):
+        # `gh` stderr is several lines; raw, the tail falls out of the annotation
+        # and a continuation line starting with `::` is re-parsed as a command.
+        self.run_decide(findings=[finding("critical")], post_error="HTTP 502\n::error::injected\nsee docs")
+        self.assertEqual(len(self.errors()), 1, self.printed)
+        self.assertIn("HTTP 502 ::error::injected see docs", self.errors()[0])
+
+    def test_a_failed_withdrawal_keeps_its_permission_hint_in_the_annotation(self):
+        # The hint is appended AFTER the cause, so a multi-line cause would push
+        # the remediation out of the annotation entirely.
+        rc, _ = self.run_decide(heads=(SHA, "b" * 40), put_error="HTTP 403\nsee docs")
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.errors()), 1, self.printed)
+        self.assertNotIn("\n", self.errors()[0])
+        self.assertIn(AA.DISMISS_PERMISSION_HINT, self.errors()[0])
+
     def test_a_refused_self_approval_keeps_its_gate(self):
         # Not a broken round: the verdict stands, only the approver is the author.
         self.assertEqual(self.run_decide(post_error="Can not approve your own pull request"), (0, "pass"))
@@ -698,6 +1184,17 @@ class RoundCounterTest(unittest.TestCase):
             review(6, "2026-01-06T00:00:00Z", login="Cursor-Bot[bot]"),  # login is case-insensitive
         ]
         self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [1, 2, 6])
+
+    def test_a_non_round_banner_is_recognised_in_a_crlf_stored_body(self):
+        # GitHub stores bodies with CRLF line endings; the banners carry `\n`
+        # anchors, so an unnormalised match would count a round that reviewed
+        # nothing toward max_rounds.
+        failed = review(1, "2026-01-01T00:00:00Z",
+                        body=(MARKER + AA.NON_ROUND_BANNERS[0] + "details").replace("\n", "\r\n"))
+        empty = review(2, "2026-01-02T00:00:00Z",
+                       body=(MARKER + AA.NON_ROUND_BANNERS[1] + "details").replace("\n", "\r\n"))
+        real = review(3, "2026-01-03T00:00:00Z", body=(MARKER + "\nfindings").replace("\n", "\r\n"))
+        self.assertEqual([r["id"] for r in AA.round_reviews([failed, empty, real], BOT, None, MARKER)], [3])
 
     def test_unlabel_resets_the_count(self):
         reviews = [review(i, f"2026-01-0{i}T00:00:00Z") for i in range(1, 6)]
@@ -755,7 +1252,11 @@ class RoundCapCommandTest(unittest.TestCase):
         writes = []
 
         def fake_gh(args, payload=None):
-            path = next(a for a in args if a.startswith("repos/"))
+            graphql = args[:2] == ["api", "graphql"]
+            # The reviews list is a GraphQL read; key it by its REST path so a
+            # `fail` token such as "/reviews" still reaches it.
+            path = "repos/o/r/pulls/1/reviews?per_page=100" if graphql else next(
+                a for a in args if a.startswith("repos/"))
             method = args[2] if args[:2] == ["api", "-X"] else "GET"
             for f in fail:
                 # A trailing `$` anchors the match to the end of the path.
@@ -767,7 +1268,7 @@ class RoundCapCommandTest(unittest.TestCase):
             if "/timeline" in path:
                 return json.dumps([list(timeline)])
             if path.endswith("/reviews?per_page=100"):
-                return json.dumps([list(reviews)])
+                return graphql_reviews(list(reviews))
             if "/issues/1/comments" in path:
                 return json.dumps([list(comments)])
             if "/reviews/" in path and path.endswith("/comments?per_page=100"):

@@ -95,17 +95,17 @@ counting through a degraded re-run at the same head.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
-judge can steer the round to an approval. The recorded SHA shares that ceiling:
-a review body is mutable by anyone with repo WRITE access (and by the approver
-token itself), so rewriting the marker to the current head keeps a stale approval
-valid — a strictly higher privilege than planting text in a diff, and not one
-`commit_id` can cross-check, since GitHub has already moved that field to the
-same head. Treat the approval as an automated review signal, not as a substitute
-for a human reviewer, and read the caller guide's trust-model section before
-letting it satisfy a ruleset.
+judge can steer the round to an approval. The recorded SHA is mutable too — a
+review body can be edited by anyone with repo WRITE access (and by the approver
+token itself), and `commit_id` cannot cross-check it, since GitHub has already
+moved that field to the same head — so an EDITED approval is always treated as
+stale, whatever its markers say. Treat the approval as an automated review
+signal, not as a substitute for a human reviewer, and read the caller guide's
+trust-model section before letting it satisfy a ruleset.
 
-Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
-ever dismissed, so a human's review — or another bot's — is never touched.
+Only reviews authored by the approver login, and carrying ``APPROVE_MARKER`` or
+EDITED, are ever dismissed, so a human's review — or another bot's — is never
+touched.
 """
 
 import argparse
@@ -313,34 +313,53 @@ def recorded_base(body: str):
 
 
 def _stale_approvals(reviews: list, head_sha, live_base):
-    """(login, id) of every live marked APPROVAL that is stale.
+    """(login, id, marked) of every live auto-approve APPROVAL that is stale.
 
     Stale = not on `head_sha` (`None` selects every one, wherever pinned), or
-    recorded against a base other than `live_base` (`None` skips that check).
+    recorded against a base other than `live_base` (`None` skips that check), or
+    edited. An EDITED approval counts even with the marker gone (`marked` False):
+    deleting the marker is the cheaper forgery of the two, and without this it
+    would take the approval out of every filter here for good.
     """
     out = []
     for r in reviews:
         if r.get("state") != "APPROVED":
             continue
         body = r.get("body") or ""
-        if APPROVE_MARKER not in body:
+        marked = APPROVE_MARKER in body
+        if not marked and not r.get("edited"):
             continue
         # The SHA recorded in the body, NOT `commit_id` (see REVIEWED_SHA_RE). A
         # marked approval without a recorded SHA predates that record: treat it
         # as stale rather than trust a commit_id GitHub may have moved.
         match = REVIEWED_SHA_RE.search(body)
-        off_head = head_sha is None or not match or match.group(1) != head_sha.lower()
+        # An EDITED body is not evidence either. The recorded SHA (and base) is
+        # the only staleness anchor an approval has, and a user with write access
+        # can edit this identity's review and rewrite those markers to the live
+        # head and base — which would keep a stale approval standing through
+        # every later push. Nothing in this workflow edits its own review (the
+        # only write to one is the dismissal PUT), so an edit is always someone
+        # else's and the markers it carries cannot be trusted to say what was
+        # reviewed.
+        off_head = (head_sha is None or not match or bool(r.get("edited"))
+                    or match.group(1) != head_sha.lower())
         base = recorded_base(body)
         off_base = live_base is not None and base is not None and base != live_base
         if off_head or off_base:
             login = (r.get("user") or {}).get("login")
-            out.append((login if isinstance(login, str) else "", r["id"]))
+            out.append((login if isinstance(login, str) else "", r["id"], marked))
     return out
 
 
 def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha, live_base=None) -> list:
-    """Ids of this identity's stale auto-approve APPROVALS (see _stale_approvals)."""
-    return [rid for login, rid in _stale_approvals(reviews, head_sha, live_base)
+    """Ids of this identity's stale auto-approve APPROVALS (see _stale_approvals).
+
+    That includes an edited approval by this identity whose marker was removed.
+    It cannot be told apart from a manual approval the identity later edited, so
+    an APPROVER_TOKEN that is a human account loses that one too; an unedited
+    unmarked approval is still never touched.
+    """
+    return [rid for login, rid, _ in _stale_approvals(reviews, head_sha, live_base)
             if login.lower() == approver_login.lower()]
 
 
@@ -349,10 +368,11 @@ def unactionable_stale_approvals(reviews: list, approver_login: str, head_sha, l
 
     This run cannot dismiss them, so it must not report clean over them. An
     empty `approver_login` (the approver's secrets are not in this run) puts
-    every stale marked approval here.
+    every stale marked approval here. An unmarked one is not: by another login
+    it is a human's own approval that they edited, not an auto-approval.
     """
-    return [f"{login or '?'}:{rid}" for login, rid in _stale_approvals(reviews, head_sha, live_base)
-            if not approver_login or login.lower() != approver_login.lower()]
+    return [f"{login or '?'}:{rid}" for login, rid, marked in _stale_approvals(reviews, head_sha, live_base)
+            if marked and (not approver_login or login.lower() != approver_login.lower())]
 
 
 def gh(args: list, payload=None) -> str:
@@ -506,7 +526,14 @@ def cmd_decide(args) -> int:
                 {"commit_id": args.commit_sha, "event": event, "body": body},
             )
         )
-    except RuntimeError as e:
+        # The id is what the race check below dismisses by. A `gh` that exits 0
+        # with an unparseable body, `null`, or an object without an id would
+        # otherwise raise past this `except` AFTER the review may have landed —
+        # the job green on a `continue-on-error` step, nothing withdrawn. Treat
+        # it as the ambiguous POST it is (JSONDecodeError is a ValueError).
+        if not isinstance(posted, dict) or posted.get("id") is None:
+            raise ValueError(f"the review POST returned no review id ({type(posted).__name__})")
+    except (RuntimeError, ValueError) as e:
         # GitHub refuses an approval of your own PR (422). That is a property of
         # who authored the PR, not a broken review — report it, don't go red.
         if "own pull request" in str(e).lower():
@@ -519,7 +546,7 @@ def cmd_decide(args) -> int:
         # timeout) may have written an APPROVE anyway; the withdrawal lists live
         # reviews, so it catches that one too.
         set_output("approve_gate", GATE_UNTRUSTED)
-        print(f"::error::Could not submit the {event} review: {e}")
+        print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
         return 1
 
@@ -545,7 +572,7 @@ def cmd_decide(args) -> int:
         try:
             dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
         except RuntimeError as e:
-            print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         return 0
@@ -560,41 +587,200 @@ DISMISS_PERMISSION_HINT = (
 )
 
 
+def _str_field(pr: dict, section: str, key: str) -> str:
+    """``pr[section][key]`` when it is a string, else "".
+
+    The top level is an object by the time this is called, but the NESTED shapes
+    are still whatever the payload said. A truthy non-mapping `head`/`base` (a
+    string, a number, a list) makes `.get` raise AttributeError, and a non-string
+    `sha` survives an emptiness check only to reach `.lower()` in
+    `_stale_approvals` later. Both are outside every caller's
+    `except (RuntimeError, ValueError)`, so both escape as a traceback and bypass
+    the announced degradation this read exists to feed. Coerce instead: "" is the
+    shapeless value those fallbacks already handle and announce.
+    """
+    section_value = pr.get(section)
+    if not isinstance(section_value, dict):
+        return ""
+    value = section_value.get(key)
+    return value if isinstance(value, str) else ""
+
+
 def read_pr(repo: str, pr_number) -> dict:
     """The PR as it is now. One read serves head, base AND labels."""
-    return json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
+    pr = json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
+    if not isinstance(pr, dict):
+        # Valid JSON that is not an object: `null`, or the ARRAY the collection
+        # endpoint returns when the number is empty (argparse's `required=True`
+        # accepts `--pr-number ""`). Every consumer below calls `.get` on this,
+        # which raises AttributeError — outside every caller's
+        # `except (RuntimeError, ValueError)`, so it escapes as a traceback and
+        # bypasses the announced degradation that exists for exactly this.
+        raise ValueError(f"expected a PR object, got {type(pr).__name__}")
+    return pr
 
 
 def pr_head_base(pr: dict) -> tuple:
     """(head sha, base ref) of a PR payload — "" for either when it is shapeless."""
-    return (pr.get("head") or {}).get("sha", ""), (pr.get("base") or {}).get("ref", "")
+    return _str_field(pr, "head", "sha"), _str_field(pr, "base", "ref")
 
 
 def has_label(pr: dict, name: str) -> bool:
+    # A truthy non-list `labels` (a number, `true`) is not iterable, and the
+    # TypeError would escape every caller's `except (RuntimeError, ValueError)`.
+    labels = pr.get("labels")
     return any(
-        isinstance(label, dict) and (label.get("name") or "").lower() == name.lower()
-        for label in pr.get("labels") or []
+        isinstance(label, dict) and isinstance(label.get("name"), str)
+        and label["name"].lower() == name.lower()
+        for label in (labels if isinstance(labels, list) else [])
     )
 
 
+# The reviews list, read through GraphQL because REST has no field for the one
+# thing the staleness decision now turns on: whether a review's body was EDITED
+# after it was posted.
+REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          # Dismissal is a REST call, so this list carries the REST id.
+          # `fullDatabaseId` first for the same reason gate-unresolved.py reads
+          # it: live review ids are already past 2^31-1, which `databaseId` is
+          # typed for (`Int`). `databaseId` stays as the fallback.
+          fullDatabaseId
+          databaseId
+          state
+          body
+          # The whole reason this is not REST: null until someone edits the
+          # review.
+          lastEditedAt
+          # The round cap reads these two: `round_reviews` orders and windows
+          # the count on `submittedAt`, and the cap comment links the latest
+          # round by `url`. REST names them `submitted_at` and `html_url`.
+          submittedAt
+          url
+          # GraphQL reports a Bot's login WITHOUT the `[bot]` suffix that REST
+          # reports and that the workflow passes as --approver-login. The suffix
+          # is restored in `_review_node`; without it the identity comparison in
+          # `stale_reviews_to_dismiss` matches nothing, no stale approval is
+          # ever dismissed, and the job still exits green.
+          author { __typename login }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _review_node(node: dict) -> dict:
+    """One GraphQL review in the REST shape this module's readers expect.
+
+    Every field is coerced to the type its readers assume, or raises ValueError:
+    `_stale_approvals` runs outside its callers' `try`, so a wrong-shaped field
+    there would escape as a traceback instead of reaching the error path.
+    """
+    if not isinstance(node, dict):
+        # Not dropped: both callers read a missing review as "nothing to dismiss"
+        # and exit green, and the dropped one may be the newest approval.
+        raise ValueError(f"a review in the GraphQL response is not an object ({type(node).__name__})")
+    author = node.get("author")
+    author = author if isinstance(author, dict) else {}
+    login = author.get("login")
+    login = login if isinstance(login, str) else ""
+    if login and author.get("__typename") == "Bot":
+        login = f"{login}[bot]"
+    rid = node.get("fullDatabaseId")
+    if rid is None:
+        rid = node.get("databaseId")
+    if rid is None:
+        # Raise here rather than carry None into a dismissal URL, where it would
+        # surface as a misleading 404 "could not dismiss".
+        raise ValueError("a review in the GraphQL response has no database id")
+    if isinstance(rid, bool) or not isinstance(rid, (int, str)):
+        raise ValueError(f"a review in the GraphQL response has a non-numeric id ({type(rid).__name__})")
+    state, body = node.get("state"), node.get("body")
+    return {
+        "id": int(rid),
+        "user": {"login": login},
+        "state": state if isinstance(state, str) else "",
+        "body": body if isinstance(body, str) else "",
+        "edited": node.get("lastEditedAt") is not None,
+        "submitted_at": node.get("submittedAt"),
+        "html_url": node.get("url") or "",
+    }
+
+
 def list_reviews(repo: str, pr_number) -> list:
-    pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100"]))
-    return [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
+    """Every review on the PR, REST-shaped, plus `edited`.
+
+    A missing `pullRequest` or `reviews` connection, a page claiming more with
+    no new cursor to follow, and a review with no id all raise rather than return
+    a short list: both callers treat a missing review as "nothing to dismiss" and
+    exit green, and reviews come back oldest-first, so a truncated read drops
+    exactly the newest approval.
+    """
+    owner, _, name = repo.partition("/")
+    out = []
+    cursor = None
+    while True:
+        args = [
+            "api", "graphql",
+            "-f", f"query={REVIEWS_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"pr={int(pr_number)}",
+        ]
+        # Same -F/-f split as gate-unresolved.py: the first page needs a JSON
+        # null, later pages an opaque string cursor.
+        args += ["-F", "cursor=null"] if cursor is None else ["-f", f"cursor={cursor}"]
+        body = json.loads(gh(args))
+        # Valid JSON that is not an object (`null`, an array, a string) cannot
+        # answer `.get`, and the AttributeError would escape every caller's
+        # `except (RuntimeError, ValueError)` as a traceback — same contract as
+        # read_pr's top-level guard. Each nested level is checked for the same
+        # reason before it is indexed.
+        data = body.get("data") if isinstance(body, dict) else None
+        repository = data.get("repository") if isinstance(data, dict) else None
+        pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+        if not isinstance(pr, dict):
+            raise ValueError(f"no pullRequest in the GraphQL reviews response for {repo}#{pr_number}")
+        reviews = pr.get("reviews")
+        page = reviews.get("pageInfo") if isinstance(reviews, dict) else None
+        if not isinstance(page, dict):
+            raise ValueError(f"no reviews connection in the GraphQL response for {repo}#{pr_number}")
+        nodes = reviews.get("nodes") or []
+        if not isinstance(nodes, list):
+            raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} are not a list ({type(nodes).__name__})")
+        out += [_review_node(n) for n in nodes]
+        if not page.get("hasNextPage"):
+            return out
+        nxt = page.get("endCursor")
+        # No cursor, or the same one again: following it would loop on one page
+        # until the job times out; stopping would return a truncated list.
+        if not nxt or nxt == cursor:
+            raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} report another page with no new cursor")
+        cursor = nxt
 
 
 def withdraw_own_approvals(args) -> int:
-    """Dismiss every marked approval by this identity. Red if any could not be."""
+    """Dismiss every marked (or edited) approval by this identity. Red if any could not be."""
     try:
         ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, None)
     except (RuntimeError, ValueError) as e:
-        print(f"::error::Could not list reviews to withdraw an earlier auto-approval: {e}")
+        print(f"::error::Could not list reviews to withdraw an earlier auto-approval: {annotation_cause(e, 'unknown error')}")
         return 1
     failed = []
     for rid in ids:
         try:
             dismiss(args.repo, args.pr_number, rid, UNTRUSTED_MESSAGE)
         except RuntimeError as e:
-            failed.append(f"{rid}: {e}")
+            # Collapsed per id: these are joined into an ::error:: annotation, and
+            # each carries `gh`'s multi-line stderr.
+            failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
     if ids:
         emit(f"Auto-approve: withdrew {len(ids) - len(failed)}/{len(ids)} earlier approval(s) by {args.approver_login}.")
     if failed:
@@ -616,6 +802,35 @@ def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> No
     )
 
 
+ANNOTATION_CAUSE_MAX = 500
+
+
+def annotation_cause(error, fallback: str) -> str:
+    """One single-line cause for a ``::warning::``/``::error::`` annotation.
+
+    Workflow commands are line-oriented, and a `gh` failure carries its captured
+    stderr — usually several lines (an HTTP status plus a docs URL). Interpolated
+    raw, everything after the first newline falls out of the annotation into plain
+    log output, and a continuation line beginning with ``::`` is re-parsed as a
+    new workflow command — truncating the very diagnostic this emits. Collapse
+    the whitespace. The type is named because ``str(RuntimeError())`` is empty.
+    """
+    if not error:
+        return fallback
+    # Escape `%` FIRST — the standard `escapeData` ordering. The runner
+    # percent-decodes `%0A`/`%0D` when it RENDERS an annotation, so an encoded
+    # sequence in captured stderr (common in URLs echoed by API errors) would
+    # reintroduce the very line break collapsing just removed. Display-only:
+    # command parsing is per-line and happens before decoding.
+    text = f"{type(error).__name__}: {error}".replace("%", "%25")
+    text = " ".join(text.split()).rstrip(":")
+    # Bounded: `gh` captures stderr uncapped (a proxy's HTML error page is
+    # kilobytes), and the failure lists join one cause per review id before
+    # DISMISS_PERMISSION_HINT — which an over-long annotation would push out of
+    # what the renderer shows.
+    return text if len(text) <= ANNOTATION_CAUSE_MAX else text[:ANNOTATION_CAUSE_MAX - 1] + "…"
+
+
 def cmd_dismiss_stale(args) -> int:
     # On a retarget the head is unchanged, so an approval pinned to it is
     # exactly as stale as an off-head one: select every marked approval. That
@@ -635,6 +850,11 @@ def cmd_dismiss_stale(args) -> int:
     # next event redoes it from live state. The `or` matters as much as the
     # `except`: an empty string is not None, so it would match no recorded SHA
     # and dismiss every marked approval on the PR.
+    #
+    # Both degradations below are ANNOUNCED. They are the paths on which this job
+    # can still withdraw an approval that is valid for the PR's live state, and it
+    # exits green when it does, so a reader of a green run has no other way to
+    # learn that the comparison was not against the real head and base.
     try:
         live_head, live_base = pr_head_base(read_pr(args.repo, args.pr_number))
     except (RuntimeError, ValueError) as e:
@@ -642,19 +862,58 @@ def cmd_dismiss_stale(args) -> int:
     else:
         read_error = None
     # An empty base is not None either: it would match no recorded base and
-    # dismiss every marked approval. No base → skip the base check, as below.
+    # dismiss every marked approval. No base → skip the base check, as below,
+    # where the skip is also ANNOUNCED.
     live_base = live_base or None
+    # Every branch below states the consequence for the mode it is actually in:
+    # `--all-approvals` ignores the head and withdraws everything (see `head`
+    # below), so the non-retarget wording — a named SHA, a skipped base check, a
+    # wrongly withdrawn head-valid approval — is false on exactly that path, and
+    # a reader investigating a mass withdrawal is the one it would misdirect.
     if not live_head:
-        live_head, live_base = args.head_sha, None
-        if not live_head:
-            print(f"::error::Could not read the PR head to dismiss stale auto-approvals: {read_error or 'no head in the response'}")
+        cause = annotation_cause(read_error, "no head in the response")
+        # A read that SUCCEEDED but carried no head may still carry a usable base;
+        # keep it, so an off-base approval is still withdrawn. Only a failed read
+        # leaves nothing to compare the base against.
+        # Only a full SHA can stand in: the recorded marker is always lowercase
+        # 40-hex, so an abbreviated SHA or a ref name would match none of them
+        # and withdraw every marked approval — the same reason "" is refused.
+        live_head = args.head_sha.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha or "") else ""
+        if read_error is not None:
+            live_base = None
+        if not live_head and not args.all_approvals:
+            # A retarget needs no head to do its job, so it is not blocked by the
+            # absence of one; every other mode compares against it and cannot run.
+            fallback = (f"the event's head {args.head_sha!r} is not a full commit SHA to fall back to"
+                        if args.head_sha else "there is no event head to fall back to")
+            print(f"::error::Could not read the PR head to dismiss stale auto-approvals ({cause}), and {fallback}.")
             return 1
-        print(f"::warning::Could not read the live PR head ({read_error or 'no head in the response'}) — judging "
-              "staleness against the event's head, without the base check, for this run.")
+        print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — "
+              + ("withdrawing every marked approval regardless of head, because --all-approvals is set. The "
+                 "base check is moot on a retarget, which withdraws them all anyway."
+                 if args.all_approvals else
+                 f"judging staleness against the event's head {live_head!r}, "
+                 + ("with the base check against the live base" if live_base else "without the base check")
+                 + ", for this run. A queued or redelivered event can therefore withdraw an approval that is "
+                 "valid for the head as it stands now."))
+    elif not live_base:
+        # The same guard as the head, on the other axis. An empty live base is NOT
+        # None, and `_stale_approvals` treats "" as a real base that no recorded
+        # base equals — so letting it through withdraws every approval that
+        # recorded one, green and unannounced. Skip the base check instead, and say
+        # what skipping it costs rather than implying the run was complete.
+        live_base = None
+        print(f"::warning::Read the live head of {args.repo}#{args.pr_number} but no base ref — "
+              + ("withdrawing every marked approval, because --all-approvals is set; the base check is moot on "
+                 "a retarget."
+                 if args.all_approvals else
+                 "comparing on head alone for this run. An approval recorded against a DIFFERENT base "
+                 "therefore SURVIVES this run and keeps counting; the next event redoes the base check from "
+                 "live state."))
     try:
         reviews = list_reviews(args.repo, args.pr_number)
     except (RuntimeError, ValueError) as e:
-        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {e}")
+        print(f"::error::Could not list reviews to dismiss stale auto-approvals: {annotation_cause(e, 'unknown error')}")
         return 1
     head = None if args.all_approvals else live_head
     ids = stale_reviews_to_dismiss(reviews, args.approver_login, head, live_base)
@@ -664,7 +923,9 @@ def cmd_dismiss_stale(args) -> int:
         try:
             dismiss(args.repo, args.pr_number, rid, message)
         except RuntimeError as e:
-            failed.append(f"{rid}: {e}")
+            # Collapsed per id: these are joined into an ::error:: annotation, and
+            # each carries `gh`'s multi-line stderr.
+            failed.append(f"{rid}: {annotation_cause(e, 'unknown error')}")
     emit(f"Auto-approve: dismissed {len(ids) - len(failed)}/{len(ids)} stale review(s) by {args.approver_login or '(approver unavailable)'}.")
     if others:
         # Red, not clean: a stale approval this identity cannot touch still counts.
@@ -696,6 +957,17 @@ def _after(stamp, since) -> bool:
     return since is None or (isinstance(stamp, str) and stamp > since)
 
 
+def _lf(body) -> str:
+    """`body` with GitHub's stored CRLF line endings turned back into LF.
+
+    NON_ROUND_BANNERS carry `\n` anchors, and GitHub rewrites a stored body to
+    CRLF (post-review.py's `_normalize_review_body` exists for the same reason),
+    so an unnormalised body would match neither banner and count a round that
+    reviewed nothing.
+    """
+    return body.replace("\r\n", "\n") if isinstance(body, str) else ""
+
+
 def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
     """The consolidated reviews `poster_login` posted after `since`, oldest first.
 
@@ -709,7 +981,7 @@ def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
         if isinstance(r, dict)
         and ((r.get("user") or {}).get("login") or "").lower() == poster_login.lower()
         and (r.get("body") or "").startswith(marker)
-        and not any(b in (r.get("body") or "") for b in NON_ROUND_BANNERS)
+        and not any(b in _lf(r.get("body")) for b in NON_ROUND_BANNERS)
         and _after(r.get("submitted_at"), since)
     ]
     return sorted(out, key=lambda r: r.get("submitted_at") or "")
@@ -772,8 +1044,18 @@ def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: 
 
 
 def _paginate(path: str) -> list:
+    """Every item of a paginated list endpoint; ValueError on any other shape.
+
+    `--slurp` wraps each page in an outer array. A body that is not a list of
+    lists (`null`, an API error object, a page that is not an array) would
+    otherwise raise KeyError/TypeError past `cmd_round_cap`'s fail-open
+    `except (RuntimeError, ValueError)`, turning `round-cap` red and skipping
+    the panel that hangs off it.
+    """
     pages = json.loads(gh(["api", "--paginate", "--slurp", path]))
-    return [x for page in pages for x in page] if pages and isinstance(pages[0], list) else pages
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise ValueError(f"expected a list of pages from {path.split('?')[0]}, got {type(pages).__name__}")
+    return [x for page in pages for x in page]
 
 
 def open_thread_ids(repo: str, pr: int):
