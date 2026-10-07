@@ -76,11 +76,22 @@ NEXT_RELABEL = "relabel"
 NEXT_HUMAN = "human"
 # BE-19527. A relabel alone is a NO-OP for a round whose head never moved: the
 # gate's `dup` step skips any head that already carries a bot-posted
-# consolidated review, and a degraded round posts one too. Its documented
-# escape hatch is to dismiss that review first — so this is its own next step,
-# not `relabel`, because an agent following `relabel` would start nothing.
-NEXT_DISMISS = "dismiss_then_relabel"
-NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_DISMISS, NEXT_HUMAN)
+# consolidated review, and a degraded round posts one too.
+#
+# The first cut of this named the gate's own `state != "DISMISSED"` escape hatch
+# and called itself `dismiss_then_relabel`. That remedy does not exist:
+# post-review.py submits the consolidated review with `"event": "COMMENT"`, and
+# GitHub dismisses only APPROVED / CHANGES_REQUESTED reviews (422 otherwise, and
+# the UI offers no Dismiss control), so that branch of the filter is unreachable
+# for the one review it is matched against. It replaced an impossible remedy
+# with another one.
+#
+# What actually clears the dedupe is MOVING THE HEAD, so that is what this says.
+# An empty commit is enough. The relabel stays in the text because a label-gated
+# caller no-ops on `synchronize`: the push alone restarts the round only under
+# `run_without_label`.
+NEXT_PUSH = "push_then_relabel"
+NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_PUSH, NEXT_HUMAN)
 STATE_MARKER = "<!-- cursor-approve-state: {} -->"
 NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
 
@@ -115,10 +126,14 @@ def next_relabel_text(label=DEFAULT_REVIEW_LABEL) -> str:
     return f"Re-run the round: {relabel(label)}."
 
 
-def next_dismiss_text(label=DEFAULT_REVIEW_LABEL) -> str:
-    """The round that a relabel alone cannot re-run (BE-19527)."""
-    return ("Dismiss the consolidated Cursor Review on this commit (the gate skips a head that already has one), "
-            f"then re-run the round: {relabel(label)}.")
+def next_push_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    """The round that a relabel alone cannot re-run (BE-19527).
+
+    Moving the head is the only remedy the gate's dedupe actually honours; the
+    review it skips on cannot be dismissed (see NEXT_PUSH).
+    """
+    return ("Push a commit so the head moves — an empty one (`git commit --allow-empty`) is enough, since the gate "
+            f"skips a head that already carries a review — then re-run the round: {relabel(label)}.")
 
 
 def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
@@ -140,7 +155,7 @@ RELABEL = relabel()
 NEXT_RESOLVE_TEXT = next_resolve_text()
 NEXT_RELABEL_TEXT = next_relabel_text()
 NEXT_AUTO_RETRY_TEXT = next_auto_retry_text()
-NEXT_DISMISS_TEXT = next_dismiss_text()
+NEXT_PUSH_TEXT = next_push_text()
 # The hand-off withdraws the bot's own requests for changes (BE-19492), so a
 # human's review is what clears the PR; the label only resets the round count.
 # Not stated as done: every caller writes this card whether or not that
@@ -158,7 +173,7 @@ DECIDE_STATES = {
     OUTCOME_HUMAN: (STATE_CAPPED, NEXT_HUMAN),
     OUTCOME_VETOED: (STATE_NO_DECISION, NEXT_HUMAN),
     OUTCOME_OWN_PR: (STATE_NO_DECISION, NEXT_HUMAN),
-    OUTCOME_ERROR: (STATE_NO_DECISION, NEXT_RELABEL),
+    OUTCOME_ERROR: (STATE_NO_DECISION, NEXT_PUSH),
 }
 DECIDE_NEXT_TEXT = {
     OUTCOME_NOT_APPROVED: f"Address the axis verdicts above, push, then start a new round: {RELABEL}.",
@@ -166,7 +181,7 @@ DECIDE_NEXT_TEXT = {
     OUTCOME_HUMAN: NEXT_HUMAN_CAPPED_TEXT,
     OUTCOME_VETOED: "A human is needed: the PR carries `skip-cursor-review`.",
     OUTCOME_OWN_PR: "A human is needed: the approver cannot approve its own PR.",
-    OUTCOME_ERROR: f"Re-run the round: {RELABEL}.",
+    OUTCOME_ERROR: NEXT_PUSH_TEXT,
 }
 
 # Markdown/HTML-significant characters, backslash-escaped. `<` alone would be
@@ -272,8 +287,8 @@ def _confidence(value) -> str:
 
 def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome: str,
                   max_yellow: str, run_url: str) -> str:
-    state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_RELABEL))
-    next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_RELABEL_TEXT)
+    state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_PUSH))
+    next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_PUSH_TEXT)
     lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), ""]
     if outcome == OUTCOME_SUPERSEDED:
         lines += ["**Superseded by a newer commit.**", "", f"**Next step:** {next_text}",

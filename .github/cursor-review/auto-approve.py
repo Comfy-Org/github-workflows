@@ -1016,17 +1016,24 @@ def no_decision_next(reasons: list, label: str = ""):
     the gate's `dup` step skips any head that already carries a bot-posted
     consolidated review, and a degraded round posts one too, so re-applying the
     label on an UNCHANGED head starts a run that no-ops (BE-19527). Those get
-    `dismiss_then_relabel` and the dup step's own escape hatch — dismiss that
-    review first — rather than advice that silently does nothing.
+    `push_then_relabel` and the remedy that works — move the head, an empty
+    commit is enough — rather than advice that silently does nothing. NOT the
+    dup step's `state != "DISMISSED"` clause: the consolidated review is posted
+    as COMMENT, which GitHub will not dismiss, so that clause is unreachable.
     """
     card = _load_card()
     causes = [cause for needle, cause in STRUCTURAL_CAUSES
               if any(isinstance(r, str) and needle in r for r in reasons or [])]
     if causes:
         return card.NEXT_HUMAN, f"A human is needed: {'; '.join(causes)}. A re-run would land the same way."
-    if auto_retry_eligible(reasons):
+    if any(isinstance(r, str) and r == REASON_HEAD_MOVED for r in reasons or []):
+        # The head moved, so the next round reads a commit with no review on it
+        # and a relabel alone starts it. Deliberately NOT auto_retry_eligible():
+        # that is strictly narrower (every reason must also be retryable), so a
+        # head-moved round with a flaky judge alongside would be sent down the
+        # push path although the relabel would have worked.
         return card.NEXT_RELABEL, card.next_relabel_text(label)
-    return card.NEXT_DISMISS, card.next_dismiss_text(label)
+    return card.NEXT_PUSH, card.next_push_text(label)
 
 
 # BE-19526. A round the head outran is a full panel spent on a commit the PR has
@@ -1436,14 +1443,9 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
                 line = str(line) if isinstance(line, int) and not isinstance(line, bool) else "?"
                 path = f.get("file") if isinstance(f.get("file"), str) else "?"
                 lines.append(f"- **{sev}** — {render_code_ref(path[:300], line)}")
-    # No scope note and no threshold line (BE-19527): the status card carries
-    # both, with a richer per-finding "why it gated" than this body ever had,
-    # and the headline above already names the threshold. Two renderings of one
-    # decision is what made the pair in the timeline read as duplicated. What
-    # stays is what a reader who only gets the email notification needs: the
-    # verdict and the findings that drove it. render_external_body, the axes
-    # path, has always been a headline plus a card link — this is the same
-    # trade, one step less far.
+    if scope_note_of(reasons):
+        lines.append(f"\n_Scope: {scope_note_of(reasons)}._")
+    lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
 
 
@@ -1473,8 +1475,8 @@ def render_standing_body(headline: str, reasons: list, next_text: str, threshold
     # is already markdown-safe (axis reasons sanitized as on the card).
     lines += [f"- {r if prerendered else reason_text(r)}" for r in reasons if isinstance(r, str) and r.strip()]
     lines.append(f"\n**Next step:** {next_text}")
-    # No threshold line, for the same reason render_body drops it: the card
-    # states it, and a no-decision round was not a threshold call anyway.
+    if threshold in ALLOWED_THRESHOLDS:
+        lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
 
 
@@ -1486,7 +1488,7 @@ CAPPED_HEADLINE = "Needs a human, so this PR is not approved."
 # loaded: a card.py that fails to import must cost only the card.
 CARD_PASS, CARD_CHANGES, CARD_NO_DECISION, CARD_CAPPED = "pass", "changes_requested", "no_decision", "capped"
 CARD_NEXT_NONE, CARD_NEXT_RESOLVE, CARD_NEXT_RELABEL, CARD_NEXT_HUMAN = "none", "resolve_then_relabel", "relabel", "human"
-CARD_NEXT_DISMISS = "dismiss_then_relabel"
+CARD_NEXT_PUSH = "push_then_relabel"
 
 
 def _card_text(name: str, args=None) -> str:
@@ -1575,6 +1577,21 @@ def write_round_card(args, state: str, next_step: str, headline: str, reasons: l
         print(f"::warning::Could not write the cursor-approve status card: {annotation_cause(e, 'unknown error')}")
 
 
+def next_for_unchanged_head(args, head_moved: bool = False):
+    """(next marker, next-step text) for a no-decision path that runs AFTER
+    post-review.py posted the consolidated review at this exact SHA (BE-19527).
+
+    Unless the head has since moved, a relabel there is a no-op: the gate's
+    `dup` step skips any head already carrying that review, and it cannot be
+    dismissed (see card.NEXT_PUSH). Moving the head is the remedy that works.
+    """
+    label = _review_label(args)
+    if head_moved:
+        return CARD_NEXT_RELABEL, _card_text("next_relabel_text", args) or "Re-run the round."
+    return CARD_NEXT_PUSH, (_card_text("next_push_text", args)
+                            or "Push a commit so the head moves, then re-run the round.")
+
+
 def _review_label(args) -> str:
     """cursor-review's `review_label` (--review-label), for the next-step text."""
     return getattr(args, "review_label", "") or ""
@@ -1605,7 +1622,7 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
         try:
             nxt, next_text = no_decision_next(reasons, _review_label(args))
         except Exception:  # noqa: BLE001 — card.py unloadable: still post the block
-            nxt, next_text = CARD_NEXT_RELABEL, "Re-run the round."
+            nxt, next_text = CARD_NEXT_PUSH, "Push a commit so the head moves, then re-run the round."
         # BE-19526: the head outran the round, and this PR has a retry left —
         # say so on the block and the card, then fire it below. Decided BEFORE
         # the block is posted so the marker it is counted by is on it.
@@ -1761,10 +1778,10 @@ def cmd_decide(args) -> int:
             # and cursor-approve will not run on a non-`pass` gate, so without a
             # block here the PR would carry neither approval nor veto.
             why = [result.get("why") or "the deferred approval could not be stood behind"]
-            next_text = _card_text("next_relabel_text", args)
+            nxt, next_text = next_for_unchanged_head(args)
             if post_standing_change_request(args, NO_DECISION_HEADLINE, why, next_text, threshold):
                 rc = 1
-            write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
+            write_round_card(args, CARD_NO_DECISION, nxt, NO_DECISION_HEADLINE,
                              why, next_text, threshold)
         return rc
 
@@ -1812,9 +1829,9 @@ def cmd_decide(args) -> int:
         # A no-decision outcome like any other: leave the standing block (the
         # same POST may fail again; then it is red twice, and says so).
         why = [f"the {event} review could not be posted"]
-        next_text = _card_text("next_relabel_text", args)
+        nxt, next_text = next_for_unchanged_head(args)
         post_standing_change_request(args, NO_DECISION_HEADLINE, why, next_text, threshold)
-        write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE, why, next_text, threshold)
+        write_round_card(args, CARD_NO_DECISION, nxt, NO_DECISION_HEADLINE, why, next_text, threshold)
         return 1
 
     # Close the read → POST race. A push or retarget landing in that window fires
@@ -1849,9 +1866,12 @@ def cmd_decide(args) -> int:
             # The review just dismissed was this round's only verdict: without a
             # standing block the PR would carry neither approval nor veto.
             reasons_moved = [f"{why} while the {event} review was being posted"]
-            next_text = _card_text("next_relabel_text", args)
+            # Only a HEAD move frees the relabel; a retarget alone leaves this
+            # SHA carrying the consolidated review. An unreadable PR (head_now
+            # None) counts as unmoved: advise the remedy that works either way.
+            nxt, next_text = next_for_unchanged_head(args, head_moved=bool(head_now) and head_now != args.commit_sha)
             rc = post_standing_change_request(args, NO_DECISION_HEADLINE, reasons_moved, next_text, threshold)
-            write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
+            write_round_card(args, CARD_NO_DECISION, nxt, NO_DECISION_HEADLINE,
                              reasons_moved, next_text, threshold)
             return rc
         # Handed to a human (checked ahead of a move, which would re-post the

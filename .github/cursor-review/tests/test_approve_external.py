@@ -133,8 +133,7 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual(card.decide_reasons("not_approved", {"reasons": []}), ["no decision was reached"])
         self.assertIn("- no decision was reached", review["body"])
         self.assertIn(f"**Next step:** {card.DECIDE_NEXT_TEXT['not_approved']}", review["body"])
-        # The threshold is the card's now (BE-19527), not repeated on the block.
-        self.assertNotIn("_Threshold:", review["body"])
+        self.assertIn("_Threshold: `low`", review["body"])
 
     def test_the_block_carries_the_axis_reasons_sanitized(self):
         fake = FakeGitHub()

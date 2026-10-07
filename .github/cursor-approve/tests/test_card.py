@@ -128,8 +128,13 @@ class ContractMarkers(unittest.TestCase):
             "needs_human": ("capped", "human"),
             "vetoed": ("no_decision", "human"),
             "own_pr": ("no_decision", "human"),
-            "error": ("no_decision", "relabel"),
-            "something-else": ("no_decision", "relabel"),
+            # BE-19527: an axes error leaves the head exactly where it was,
+            # with cursor-review's consolidated review already on it, so a
+            # relabel is the gate's same-SHA no-op. An unknown outcome gets the
+            # same advice: the head's state is unknown, and moving it works
+            # either way.
+            "error": ("no_decision", "push_then_relabel"),
+            "something-else": ("no_decision", "push_then_relabel"),
         }
         for outcome, expected in cases.items():
             with self.subTest(outcome=outcome):
