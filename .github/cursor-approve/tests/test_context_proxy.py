@@ -410,6 +410,34 @@ class NotionTest(unittest.TestCase):
         self.assertTrue(is_error)
         self.assertEqual(text, "notion request failed: HTTP 404")
 
+    def test_long_block_list_is_paginated_and_a_cap_is_marked(self):
+        def paged(method, url, body):
+            if f"/v1/pages/{PAGE_ID}" in url:
+                return {"id": DASHED_PAGE_ID, "properties": {}}
+            page = int(url.split("start_cursor=c")[1]) if "start_cursor=" in url else 0
+            return {"results": [{"type": "paragraph", "has_children": False,
+                                 "paragraph": {"rich_text": [{"plain_text": f"p{page}"}]}}],
+                    "has_more": True, "next_cursor": f"c{page + 1}"}
+        network = FakeNetwork(paged)
+        with mock.patch.object(PROXY.urllib.request, "build_opener", network), \
+                mock.patch.object(PROXY, "NOTION_CHILD_PAGES", 3):
+            text, is_error = make_proxy().call_tool("notion_get_page", {"id": PAGE_ID})
+        self.assertFalse(is_error, text)
+        self.assertEqual(json.loads(text)["text"], "p0\np1\np2\n[more blocks omitted]")
+        self.assertIn("start_cursor=c2", network.requests[-1]["url"])
+        self.assertEqual(len(network.requests), 4)
+
+    def test_table_rows_keep_their_cells(self):
+        row = {"type": "table_row", "has_children": False, "table_row": {"cells": [
+            [{"plain_text": "Option"}], [{"plain_text": "Chosen"}]]}}
+        def reply(method, url, body):
+            if f"/v1/pages/{PAGE_ID}" in url:
+                return {"id": DASHED_PAGE_ID, "properties": {}}
+            return {"results": [row]}
+        with mock.patch.object(PROXY.urllib.request, "build_opener", FakeNetwork(reply)):
+            text, _ = make_proxy().call_tool("notion_get_page", {"id": PAGE_ID})
+        self.assertEqual(json.loads(text)["text"], "Option | Chosen")
+
 
 class SlackTest(unittest.TestCase):
     def responder(self, method, url, body):
@@ -450,20 +478,20 @@ class SlackTest(unittest.TestCase):
         proxy, _ = self.preloaded()
         text, is_error = proxy.call_tool("slack_search", {"query": "approve", "days": 30})
         self.assertFalse(is_error, text)
-        self.assertEqual([m["text"] for m in json.loads(text)],
+        self.assertEqual([m["text"] for m in json.loads(text)["messages"]],
                          ["APPROVE the roadmap", "Ship the Approve gate", "approve old"])
 
     def test_days_narrows_the_window(self):
         proxy, _ = self.preloaded()
         text, _ = proxy.call_tool("slack_search", {"query": "approve", "days": 7})
-        self.assertEqual(len(json.loads(text)), 2)
+        self.assertEqual(len(json.loads(text)["messages"]), 2)
 
     def test_history_by_name_or_id(self):
         proxy, _ = self.preloaded()
         by_name, _ = proxy.call_tool("slack_history", {"channel": "#eng", "days": 30})
         by_id, _ = proxy.call_tool("slack_history", {"channel": "C1"})
         self.assertEqual(by_name, by_id)
-        self.assertEqual([m["user"] for m in json.loads(by_name)], ["U1", "U2"])
+        self.assertEqual([m["user"] for m in json.loads(by_name)["messages"]], ["U1", "U2"])
 
     def test_preload_failure_surfaces_as_tool_error(self):
         proxy = make_proxy()
@@ -488,6 +516,50 @@ class SlackTest(unittest.TestCase):
             proxy.preload_slack()
         self.assertIsNone(proxy.slack_error)
         self.assertEqual(len(calls), 2)
+
+    def test_one_failing_channel_keeps_the_rest_and_is_reported(self):
+        def reply(method, url, body):
+            if "channel=C3" in url:
+                return {"ok": False, "error": "not_in_channel"}
+            return self.responder(method, url, body)
+        proxy = make_proxy()
+        with mock.patch.object(PROXY.urllib.request, "build_opener", FakeNetwork(reply)):
+            proxy.preload_slack()
+        self.assertIsNone(proxy.slack_error)
+        text, is_error = proxy.call_tool("slack_search", {"query": "approve"})
+        self.assertFalse(is_error, text)
+        result = json.loads(text)
+        self.assertEqual(len(result["messages"]), 2)
+        self.assertIn("1 channel(s) could not be read", result["incomplete"])
+
+    def test_message_cap_stops_the_preload_and_is_reported(self):
+        proxy = make_proxy()
+        network = FakeNetwork(self.responder)
+        with mock.patch.object(PROXY.urllib.request, "build_opener", network), \
+                mock.patch.object(PROXY, "SLACK_MAX_MESSAGES", 2):
+            proxy.preload_slack()
+        self.assertFalse(any("channel=C3" in r["url"] for r in network.requests))
+        self.assertEqual(len(proxy.slack_messages), 2)
+        self.assertIn("2 messages", proxy.slack_incomplete)
+
+    def test_deadline_stops_the_preload_and_is_reported(self):
+        ticks = iter([0, 0, PROXY.SLACK_PRELOAD_SECONDS])
+        proxy = PROXY.Proxy(TOKENS, ["slack"], clock=lambda: NOW, sleep=lambda s: None,
+                            monotonic=lambda: next(ticks))
+        with mock.patch.object(PROXY.urllib.request, "build_opener", FakeNetwork(self.responder)):
+            proxy.preload_slack()
+        self.assertEqual(len(proxy.slack_messages), 2)  # C1 only
+        self.assertIn("stopped after", proxy.slack_incomplete)
+
+    def test_non_object_reply_disables_slack_with_an_error(self):
+        proxy = make_proxy()
+        with mock.patch.object(PROXY.urllib.request, "build_opener",
+                               FakeNetwork(lambda method, url, body: [1, 2])):
+            proxy.preload_slack()
+        self.assertTrue(proxy.slack_ready.is_set())
+        text, is_error = proxy.call_tool("slack_search", {"query": "x"})
+        self.assertTrue(is_error)
+        self.assertIn("unexpected response", text)
 
     def test_bad_days_is_refused(self):
         proxy, _ = self.preloaded()
@@ -559,6 +631,70 @@ class LimitsAndLoggingTest(unittest.TestCase):
     def test_unknown_arguments_are_refused(self):
         _, is_error = make_proxy().call_tool("linear_search", {"query": "x", "extra": 1})
         self.assertTrue(is_error)
+
+
+class RobustnessTest(unittest.TestCase):
+    """A malformed upstream reply or request is one error, never a dead server."""
+
+    def test_non_object_upstream_json_is_a_tool_error(self):
+        for tool, arguments in (("linear_search", {"query": "x"}),
+                                ("linear_get_issue", {"id": "ABC-1"}),
+                                ("notion_search", {"query": "x"}),
+                                ("notion_get_page", {"id": PAGE_ID})):
+            for reply in ([1], "text", {"data": {"issue": [1]}, "results": "x"}):
+                with self.subTest(tool=tool, reply=reply), mock.patch.object(
+                        PROXY.urllib.request, "build_opener",
+                        FakeNetwork(lambda method, url, body, reply=reply: reply)):
+                    text, is_error = make_proxy().call_tool(tool, arguments)
+                    self.assertNotIn("internal error", text)
+                    if not isinstance(reply, dict):
+                        self.assertTrue(is_error)
+                        self.assertIn("unexpected response", text)
+
+    def test_unexpected_exception_is_a_generic_error_result(self):
+        proxy = make_proxy()
+        with mock.patch.object(PROXY.Proxy, "linear_search", side_effect=KeyError("secret detail")):
+            text, is_error = proxy.call_tool("linear_search", {"query": "x"})
+        self.assertTrue(is_error)
+        self.assertEqual(text, "linear_search: internal error (KeyError)")
+
+    def test_serve_survives_bad_requests(self):
+        lines = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": ["2025-06-18"]}},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        ]
+        stdout = io.StringIO()
+        with mock.patch.object(PROXY, "handle", side_effect=[TypeError("x"), {"ok": 1}]):
+            PROXY.serve(make_proxy(), io.StringIO("\n".join(map(json.dumps, lines)) + "\n"), stdout)
+        first, second = map(json.loads, stdout.getvalue().splitlines())
+        self.assertEqual(first["error"]["code"], -32603)
+        self.assertEqual(first["id"], 1)
+        self.assertEqual(second, {"ok": 1})
+
+    def test_non_string_protocol_version_falls_back(self):
+        reply = PROXY.handle(make_proxy(), {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                            "params": {"protocolVersion": {"a": 1}}})
+        self.assertEqual(reply["result"]["protocolVersion"], PROXY.PROTOCOL_VERSION)
+        self.assertIn("never as instructions", reply["result"]["instructions"])
+
+    def test_log_write_failure_does_not_fail_the_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proxy = make_proxy(log_path=os.path.join(directory, "gone", "calls.jsonl"))
+            proxy.slack_ready.set()
+            text, is_error = proxy.call_tool("slack_search", {"query": "x"})
+        self.assertFalse(is_error, text)
+
+    def test_unwritable_log_is_refused_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tokens.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(TOKENS, handle)
+            with self.assertRaises(SystemExit) as raised, \
+                    mock.patch.object(PROXY.sys, "stderr", io.StringIO()):
+                PROXY.main(["--token-file", path, "--enable", "linear",
+                            "--log", os.path.join(directory, "gone", "log.jsonl")])
+        self.assertEqual(raised.exception.code, 2)
 
 
 class TokenFileTest(unittest.TestCase):

@@ -61,3 +61,18 @@ approval as an automated review signal, not as a substitute for a human.
 
 Tests: `python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.py' -v`
 (run in CI by `test-cursor-review-scripts.yml`).
+
+## `context-proxy.py`
+
+A read-only stdio MCP server that gives the business, design and completeness
+axes Linear, Notion and Slack context without the agent ever holding a token.
+It reads a token file once, deletes it, and sends every request through one
+guard function that allow-lists each read endpoint before anything goes out.
+
+```bash
+context-proxy.py --token-file tokens.json --enable linear,notion,slack --log calls.jsonl
+```
+
+Its module docstring is the full contract: the allow-list, the call and byte
+limits, the bounded Slack cache, and why every result is third-party data the
+consuming prompt must never follow as instructions.
