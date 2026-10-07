@@ -529,6 +529,16 @@ class DismissStaleHeadTest(unittest.TestCase):
         self.assertEqual((rc, dismissed), (0, []))
         self.assertTrue(any("no base ref" in line for line in self.warnings()), self.printed)
 
+    def test_a_headless_read_still_compares_the_base_it_did_return(self):
+        # The read SUCCEEDED but carried no head: the head falls back to the event's,
+        # but a usable base must not be discarded with it, or an off-base approval
+        # survives and the warning implies a base check skipped for no reason.
+        rc, dismissed = self.run_dismiss("", NEW, [self.approval(1, NEW, base="old-base")], live_base="main")
+        self.assertEqual((rc, len(dismissed)), (0, 1))
+        warned = " ".join(self.warnings())
+        self.assertIn("with the base check against the live base", warned)
+        self.assertNotIn("without the base check", warned)
+
     def test_a_readable_base_still_dismisses_a_genuinely_retargeted_approval(self):
         # The guard above skips the base check; it must not disable it.
         rc, dismissed = self.run_dismiss(NEW, NEW, [self.approval(1, NEW, base="old-base")], live_base="main")
@@ -789,7 +799,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None, reviews=()):
+                   labels_after=None, reviews=(), put_error=None):
         heads = iter(heads)
         reads = []
         writes = []
@@ -800,6 +810,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                     raise RuntimeError(post_error)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
+                if put_error:
+                    raise RuntimeError(put_error)
                 writes.append(args[3])
                 return "{}"
             if args[:2] == ["api", "--paginate"]:
@@ -822,10 +834,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                                       commit_sha=SHA, judge_status="ok", delivered="true",
                                       ungated="0", approver_login="cursor-approver",
                                       reviewed_diff=dpath, base_ref="main")
+            self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_severities", lambda *a: []), \
-                    mock.patch.object(AA, "emit", lambda *a: None):
+                    mock.patch.object(AA, "emit", lambda *a: None), \
+                    mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
                 rc = AA.cmd_decide(args)
             self.writes = writes
             return rc, read_outputs(out).get("approve_gate")
@@ -860,6 +874,25 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         rc, gate = self.run_decide(findings=[finding("critical")], post_error="HTTP 502", reviews=[earlier])
         self.assertEqual((rc, gate), (1, "untrusted"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
+
+    def errors(self):
+        return [line for line in self.printed if "::error::" in line]
+
+    def test_a_multiline_post_error_stays_one_annotation(self):
+        # `gh` stderr is several lines; raw, the tail falls out of the annotation
+        # and a continuation line starting with `::` is re-parsed as a command.
+        self.run_decide(findings=[finding("critical")], post_error="HTTP 502\n::error::injected\nsee docs")
+        self.assertEqual(len(self.errors()), 1, self.printed)
+        self.assertIn("HTTP 502 ::error::injected see docs", self.errors()[0])
+
+    def test_a_failed_withdrawal_keeps_its_permission_hint_in_the_annotation(self):
+        # The hint is appended AFTER the cause, so a multi-line cause would push
+        # the remediation out of the annotation entirely.
+        rc, _ = self.run_decide(heads=(SHA, "b" * 40), put_error="HTTP 403\nsee docs")
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.errors()), 1, self.printed)
+        self.assertNotIn("\n", self.errors()[0])
+        self.assertIn(AA.DISMISS_PERMISSION_HINT, self.errors()[0])
 
     def test_a_refused_self_approval_keeps_its_gate(self):
         # Not a broken round: the verdict stands, only the approver is the author.
