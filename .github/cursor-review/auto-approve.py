@@ -451,6 +451,25 @@ DISMISS_PERMISSION_HINT = (
 )
 
 
+def _str_field(pr: dict, section: str, key: str) -> str:
+    """``pr[section][key]`` when it is a string, else "".
+
+    The top level is an object by the time this is called, but the NESTED shapes
+    are still whatever the payload said. A truthy non-mapping `head`/`base` (a
+    string, a number, a list) makes `.get` raise AttributeError, and a non-string
+    `sha` survives an emptiness check only to reach `.lower()` in
+    `_stale_approvals` later. Both are outside every caller's
+    `except (RuntimeError, ValueError)`, so both escape as a traceback and bypass
+    the announced degradation this read exists to feed. Coerce instead: "" is the
+    shapeless value those fallbacks already handle and announce.
+    """
+    section_value = pr.get(section)
+    if not isinstance(section_value, dict):
+        return ""
+    value = section_value.get(key)
+    return value if isinstance(value, str) else ""
+
+
 def read_pr(repo: str, pr_number) -> tuple:
     """(head sha, base ref) of the PR as it is now."""
     pr = json.loads(gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
@@ -462,12 +481,24 @@ def read_pr(repo: str, pr_number) -> tuple:
         # announced degradation below, including the shapeless-payload fallback
         # that exists for exactly this. Make it the shapeless read they handle.
         raise ValueError(f"expected a PR object, got {type(pr).__name__}")
-    return (pr.get("head") or {}).get("sha", ""), (pr.get("base") or {}).get("ref", "")
+    return _str_field(pr, "head", "sha"), _str_field(pr, "base", "ref")
 
 
 def list_reviews(repo: str, pr_number) -> list:
     pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100"]))
-    return [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
+    if not isinstance(pages, list):
+        # `--slurp` always yields an array of pages. Anything else — an error
+        # object such as {"message": ...}, `null`, a string — would reach a caller
+        # as `pages[0]` (KeyError) or as a value `_stale_approvals` iterates
+        # (TypeError) or calls `.get` on per character (AttributeError). None of
+        # those is a (RuntimeError, ValueError), so each escapes as a traceback
+        # past both call sites, bypassing the announced degradation AND
+        # DISMISS_PERMISSION_HINT. Same contract as read_pr's top-level guard.
+        raise ValueError(f"expected a list of review pages, got {type(pages).__name__}")
+    reviews = [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
+    # A review that is not an object cannot answer `.get` either; drop it rather
+    # than let it reach the filters.
+    return [r for r in reviews if isinstance(r, dict)]
 
 
 def withdraw_own_approvals(args) -> int:

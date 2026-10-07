@@ -331,6 +331,59 @@ class DismissJobTriggerTest(unittest.TestCase):
         self.assertIn('--base-ref "$BASE_REF"', text)
 
 
+class ShapelessPayloadTest(unittest.TestCase):
+    """No payload shape may reach a caller as a traceback.
+
+    `read_pr` and `list_reviews` are both read behind
+    `except (RuntimeError, ValueError)`. An AttributeError/TypeError/KeyError from
+    a malformed body escapes that, so it bypasses every announced degradation —
+    the exact outcome the announcements exist to prevent.
+    """
+
+    def read_pr_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA.read_pr("o/r", 1)
+
+    def test_a_well_formed_payload_is_read(self):
+        self.assertEqual(self.read_pr_with('{"head":{"sha":"abc"},"base":{"ref":"main"}}'), ("abc", "main"))
+
+    def test_a_non_object_payload_is_a_value_error(self):
+        for body in ("null", "[]", '"s"', "7"):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.read_pr_with(body)
+
+    def test_a_nested_non_mapping_becomes_the_shapeless_value(self):
+        # A truthy non-mapping head/base would make `.get` raise AttributeError.
+        for body in ('{"head":"abc","base":3}', '{"head":[1],"base":["main"]}', '{"head":true}'):
+            with self.subTest(body=body):
+                self.assertEqual(self.read_pr_with(body), ("", ""))
+
+    def test_a_non_string_sha_never_reaches_lower(self):
+        # It would survive `if not live_head` and then hit head_sha.lower().
+        self.assertEqual(self.read_pr_with('{"head":{"sha":12345},"base":{"ref":null}}'), ("", ""))
+
+    def list_reviews_with(self, body):
+        with mock.patch.object(AA, "gh", lambda *a, **k: body):
+            return AA.list_reviews("o/r", 1)
+
+    def test_pages_are_flattened(self):
+        self.assertEqual(self.list_reviews_with('[[{"id":1}],[{"id":2}]]'), [{"id": 1}, {"id": 2}])
+
+    def test_an_unpaginated_list_is_passed_through(self):
+        self.assertEqual(self.list_reviews_with('[{"id":1}]'), [{"id": 1}])
+
+    def test_a_non_list_body_is_a_value_error(self):
+        # `{"message": ...}` is what an API error looks like; pages[0] -> KeyError.
+        for body in ('{"message":"Not Found"}', "null", '"s"'):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.list_reviews_with(body)
+
+    def test_non_object_reviews_are_dropped_rather_than_iterated(self):
+        # A string would be iterated per character and `.get` called on each.
+        self.assertEqual(self.list_reviews_with('["abc",{"id":1},null]'), [{"id": 1}])
+        self.assertEqual(self.list_reviews_with('[["abc",{"id":2}]]'), [{"id": 2}])
+
+
 class AnnotationCauseTest(unittest.TestCase):
     """One line, whatever the error carries — see `annotation_cause`."""
 
