@@ -98,6 +98,20 @@ the next approval withdraws it — cursor-review's own, or, under
 `defer_approval`, its passing decide and this workflow's decide phase. A
 `capped` round posts none.
 
+This workflow's **decide phase leaves the same block when it withholds** —
+`not_approved`, `error`, `superseded` and `needs_human` — with the card's
+reasons and next step and the reviewed-SHA marker, posted before the older
+blocks are dismissed so they never stack. Under `defer_approval` the passing
+cursor-review round has already dismissed every earlier block, so without this
+a red axis would leave the PR with no approval and nothing blocking it.
+`vetoed` and `own_pr` post none, nor does an approval. A `superseded` decide
+that finishes after a newer run approved the live head posts none either: as
+the approver's latest review it would override that approval.
+
+The next-step line names cursor-review's `review_label` input (default
+`cursor-review`) on the cards cursor-review writes. This workflow has no such
+input, so its own start and decide cards always say `cursor-review`.
+
 ## Prerequisites
 
 | Requirement | Why |

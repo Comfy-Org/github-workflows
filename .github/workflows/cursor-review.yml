@@ -3470,7 +3470,8 @@ jobs:
             --card true \
             --round "$ROUND" \
             --max-rounds "$MAX_ROUNDS" \
-            --run-url "$RUN_URL"
+            --run-url "$RUN_URL" \
+            --review-label "$REVIEW_LABEL"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with

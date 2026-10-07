@@ -2346,7 +2346,7 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
 
     def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
                    reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
-                   head=SHA, card="true"):
+                   head=SHA, card="true", review_label=""):
         self.reviews_posted, self.dismissed, self.card_writes = [], [], []
 
         def fake_gh(args, payload=None):
@@ -2383,7 +2383,7 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                                       ungated="0", approver_login=APPROVER, reviewed_diff=dpath,
                                       base_ref="main", poster_login=POSTER, defer_approval=defer,
                                       author_enabled=author_enabled, pr_author="someone",
-                                      card=card, round="2", max_rounds="5",
+                                      card=card, round="2", max_rounds="5", review_label=review_label,
                                       run_url="https://github.com/o/r/actions/runs/1")
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -2509,13 +2509,24 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.assert_markers(body, "changes_requested", "resolve_then_relabel")
         self.assertIn("[thread](https://github.com/o/r/pull/1#discussion_r43)", body)
 
+    def test_the_next_step_names_the_callers_review_label(self):
+        self.run_decide(judge="error", review_label="ai-review")
+        self.assertIn("remove and re-add the `ai-review` label", self.card_body())
+        self.assertIn("remove and re-add the `ai-review` label", self.reviews_posted[0]["body"])
+        self.run_decide(findings=[finding("high")], review_label="ai-review")
+        self.assertIn("remove and re-add the `ai-review` label", self.card_body())
+        # Anything that is not a plain label name falls back to the default.
+        self.run_decide(judge="error", review_label="x` <!-- y -->")
+        self.assertIn("remove and re-add the `cursor-review` label", self.card_body())
+
     def test_workflow_passes_the_card_inputs(self):
         src = open(WORKFLOW_PATH, encoding="utf-8").read()
         step = src[src.index("- name: Auto-approve decision"):]
         step = step[: step.index("\n\n  dismiss-stale-approval:")]
         for needle in ("--card true", '--round "$ROUND"', '--max-rounds "$MAX_ROUNDS"', '--run-url "$RUN_URL"',
                        "ROUND: ${{ needs.round-cap.outputs.next_round }}",
-                       "MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}"):
+                       "MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}",
+                       '--review-label "$REVIEW_LABEL"'):
             self.assertIn(needle, step)
 
 

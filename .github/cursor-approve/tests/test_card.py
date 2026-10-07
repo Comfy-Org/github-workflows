@@ -178,6 +178,12 @@ class ContractMarkers(unittest.TestCase):
         self.assertEqual(markers(body), ("capped", "human"))
         self.assertIn(card.NEXT_HUMAN_CAPPED_TEXT, body)
 
+    def test_next_step_texts_take_the_review_label(self):
+        self.assertEqual(card.next_relabel_text("ai-review"), "Re-run the round: remove and re-add the `ai-review` label.")
+        self.assertIn("`ai-review`", card.next_resolve_text("ai-review"))
+        for bad in ("", "a`b", "<!-- x -->", "x" * 80, "@team"):
+            self.assertIn("`cursor-review`", card.next_relabel_text(bad), bad)
+
     def test_unknown_state_is_refused(self):
         with self.assertRaises(ValueError):
             card.render_round("1", "5", SHA, "maybe", card.NEXT_NONE, "x", [], "", RUN)

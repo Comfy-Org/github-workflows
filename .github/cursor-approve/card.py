@@ -78,9 +78,36 @@ NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_HUMAN)
 STATE_MARKER = "<!-- cursor-approve-state: {} -->"
 NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
 
-RELABEL = "remove and re-add the `cursor-review` label"
-NEXT_RESOLVE_TEXT = f"Fix or reply to the gating threads, resolve them, then start a new round: {RELABEL}."
-NEXT_RELABEL_TEXT = f"Re-run the round: {RELABEL}."
+DEFAULT_REVIEW_LABEL = "cursor-review"
+
+
+def safe_label(label) -> str:
+    """cursor-review's `review_label` for a next-step line, or the default.
+
+    A caller input, but it lands in a code span on a comment posted as the
+    approver: only a plain label name is echoed, never markdown or a marker.
+    """
+    label = str(label or "").strip()
+    return label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:/+-]{0,49}", label) else DEFAULT_REVIEW_LABEL
+
+
+def relabel(label=DEFAULT_REVIEW_LABEL) -> str:
+    return f"remove and re-add the `{safe_label(label)}` label"
+
+
+def next_resolve_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    return f"Fix or reply to the gating threads, resolve them, then start a new round: {relabel(label)}."
+
+
+def next_relabel_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    return f"Re-run the round: {relabel(label)}."
+
+
+# The default-label texts. cursor-approve.yml has no `review_label` input, so
+# its own phases always use these; cursor-review's decide passes its input.
+RELABEL = relabel()
+NEXT_RESOLVE_TEXT = next_resolve_text()
+NEXT_RELABEL_TEXT = next_relabel_text()
 NEXT_HUMAN_CAPPED_TEXT = "A human is needed: review the PR, then remove the `needs-human-review` label to reset the round count."
 
 # How approve-external's outcome maps onto the contract on the decide card.
@@ -224,27 +251,35 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         summary = sanitize(first_sentence(entry.get("summary")))
         lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {_confidence(entry.get('confidence'))} | {summary} |")
     lines.append("")
-    reasons = decision.get("reasons") if isinstance(decision, dict) else None
-    reasons = [r for r in reasons if isinstance(r, str)] if isinstance(reasons, list) else []
     if outcome == OUTCOME_APPROVED:
         lines.append("**Result: ✅ Approved.**")
     else:
-        why = {
-            OUTCOME_HUMAN: ["the PR is labelled `needs-human-review`"],
-            OUTCOME_VETOED: ["vetoed: the PR is labelled `skip-cursor-review`"],
-            OUTCOME_OWN_PR: ["the approver authored this PR"],
-            OUTCOME_ERROR: ["the approval could not be posted (see the workflow run)"],
-        }.get(outcome)
-        if why is None:
-            why = reasons if outcome == OUTCOME_NOT_APPROVED and reasons else ["no decision was reached"]
-            why = [sanitize(r, 300) for r in why]
         lines.append("**Result: ❌ Not approved.**")
-        lines += [f"- {r}" for r in why]
+        lines += [f"- {r}" for r in decide_reasons(outcome, decision)]
         lines += ["", f"**Next step:** {next_text}"]
     limit = _int_or_q(max_yellow)
     lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report. {_run_link(run_url)}_",
               "", _reviewed_line(sha, "")]
     return "\n".join(lines) + "\n"
+
+
+def decide_reasons(outcome: str, decision) -> list:
+    """The decide card's "not approved" reasons, markdown-ready. Also the body
+    of the standing REQUEST_CHANGES approve-external posts when it withholds,
+    so the two always say the same thing. Axis reasons echo model text and go
+    through `sanitize`; the fixed ones are this module's own."""
+    why = {
+        OUTCOME_HUMAN: ["the PR is labelled `needs-human-review`"],
+        OUTCOME_VETOED: ["vetoed: the PR is labelled `skip-cursor-review`"],
+        OUTCOME_OWN_PR: ["the approver authored this PR"],
+        OUTCOME_ERROR: ["cursor-approve could not complete its decision (see the workflow run)"],
+    }.get(outcome)
+    if why is not None:
+        return why
+    reasons = decision.get("reasons") if isinstance(decision, dict) else None
+    reasons = [r for r in reasons if isinstance(r, str)] if isinstance(reasons, list) else []
+    why = reasons if outcome == OUTCOME_NOT_APPROVED and reasons else ["no decision was reached"]
+    return [sanitize(r, 300) for r in why]
 
 
 def reason_text(text) -> str:

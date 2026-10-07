@@ -402,8 +402,8 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   nobody looked, not that the change is clean. A no-decision round also **withdraws** the bot's own earlier approvals, so
   a round-1 approval does not keep counting through a degraded re-run, and
   posts one **standing REQUEST_CHANGES** carrying the reasons verbatim and the
-  next step (re-run the round by removing and re-adding the `cursor-review`
-  label, or — when the cause would recur, e.g. the findings did not land as
+  next step (re-run the round by removing and re-adding the `review_label`
+  label — `cursor-review` by default — or — when the cause would recur, e.g. the findings did not land as
   threads or the reviewed diff is empty — a human is needed). Without it, a PR
   whose threads all get resolved would look done although nothing approved it.
   The next no-decision round replaces it (it never stacks); the next round that
