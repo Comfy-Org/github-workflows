@@ -11,16 +11,30 @@ name: Cursor axis (base)
 #   model       Cursor model id (default: cursor-review's judge model)
 #   runs_on     JSON-encoded runs-on, parsed with fromJSON like cursor-review's
 #   checkout    true → full read-only checkout of the PR head at commit_sha
-#   mcp_config  RESERVED for the context axes: a JSON mcpServers object.
-#               Unused here; must be empty.
-#   no_shell    RESERVED for the context axes. Unused here; must be false.
+#   context_sources  comma list of linear,notion,slack: the context-proxy.py
+#               tools this axis gets (business/design/completeness only). Empty
+#               → no MCP server at all.
+#   no_shell    true → deny cursor-agent's shell and file-write tools, and fail
+#               the job if the transcript shows one was called anyway. Required
+#               (with checkout false) for business and design.
 # Secrets:
 #   CURSOR_API_KEY
+#   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
+#               the context proxy. They are written to a 0600 file in their own
+#               step; the proxy reads and deletes it BEFORE the agent starts, so
+#               no token is ever in the agent step's env or reachable by it.
+#
+# Without a checkout (business, design) the workflow, not the agent, fetches the
+# change from the GitHub API at commit_sha's merge base: business gets the
+# changed-file list with line counts, design the diff truncated to 200 KB.
 #
 # Output: one artifact, `axis-<axis>`, holding `<axis>.json` — exactly one JSON
 # object `{"verdict", "confidence", "summary", "commit_sha"}` (commit_sha is
 # stamped from this job's input, not taken from the model). A failing run uploads nothing,
 # which cursor-approve.yml's decide phase reads as "no result" and never approves.
+# The agent's full stream-json transcript (plus the proxy's call log) goes to a
+# SEPARATE artifact, `transcript-axis-<axis>`, named so decide's `axis-*` download
+# never matches it.
 #
 # The scripts and prompts load from THIS repo at `job.workflow_sha` — the
 # commit the caller's `uses:` resolved to, computed by the runner — so a PR can
@@ -44,17 +58,23 @@ on:
       checkout:
         type: boolean
         default: false
-      mcp_config:
-        description: RESERVED for the context axes; must be empty for now.
+      context_sources:
+        description: Comma list of linear,notion,slack context-proxy tools; empty for none.
         type: string
         default: ''
       no_shell:
-        description: RESERVED for the context axes; must be false for now.
+        description: Deny cursor-agent's shell and file-write tools.
         type: boolean
         default: false
     secrets:
       CURSOR_API_KEY:
         required: true
+      LINEAR_KEY:
+        required: false
+      NOTION_TOKEN:
+        required: false
+      SLACK_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -80,8 +100,10 @@ jobs:
           AXIS: ${{ inputs.axis }}
           COMMIT_SHA: ${{ inputs.commit_sha }}
           MODEL: ${{ inputs.model }}
-          MCP_CONFIG: ${{ inputs.mcp_config }}
+          CONTEXT_SOURCES: ${{ inputs.context_sources }}
+          CHECKOUT: ${{ inputs.checkout }}
           NO_SHELL: ${{ inputs.no_shell }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REPO: ${{ github.repository }}
@@ -97,9 +119,28 @@ jobs:
           if ! printf '%s' "$MODEL" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
             echo "::error::model must be a Cursor model id"; exit 1
           fi
-          if [ -n "$MCP_CONFIG" ] || [ "$NO_SHELL" = "true" ]; then
-            echo "::error::mcp_config and no_shell are reserved for the context axes and not implemented yet"; exit 1
+          if ! printf '%s' "$CONTEXT_SOURCES" | grep -Eq '^((linear|notion|slack)(,(linear|notion|slack))*)?$'; then
+            echo "::error::context_sources must be a comma list of linear, notion, slack"; exit 1
           fi
+          if [ -n "$CONTEXT_SOURCES" ]; then
+            case "$AXIS" in
+              business|design|completeness) ;;
+              *) echo "::error::only the business, design and completeness axes get context tools"; exit 1 ;;
+            esac
+            # The wrappers skip public repos with a notice; this is the
+            # backstop. Company context must never meet a public PR.
+            if [ "$REPO_PRIVATE" != "true" ]; then
+              echo "::error::the context axes run on private repositories only"; exit 1
+            fi
+          fi
+          # Without a checkout the agent reads only what this workflow fetched;
+          # a shell would let it reach past that. Fail closed on a miswiring.
+          case "$AXIS" in
+            business|design)
+              if [ "$CHECKOUT" != "false" ] || [ "$NO_SHELL" != "true" ]; then
+                echo "::error::the $AXIS axis requires checkout false and no_shell true"; exit 1
+              fi ;;
+          esac
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::an axis runs on a pull_request(_target) event only"; exit 1
           fi
@@ -135,6 +176,35 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Fetch the change (no checkout)
+        if: ${{ !inputs.checkout && (inputs.axis == 'business' || inputs.axis == 'design') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The three-dot compare is the merge-base diff of exactly commit_sha,
+          # the same change the checkout axes review, even if the PR moved on.
+          mkdir -p pr
+          compare="repos/$REPO/compare/$BASE_SHA...$COMMIT_SHA"
+          if [ "$AXIS" = "business" ]; then
+            gh api --paginate "$compare?per_page=100" \
+              --jq '.files[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' \
+              > pr/changed-files.txt
+            echo "changed files: $(wc -l < pr/changed-files.txt)"
+          else
+            gh api -H 'Accept: application/vnd.github.diff' "$compare" > "$RUNNER_TEMP/pr-full.diff"
+            limit=204800
+            size="$(wc -c < "$RUNNER_TEMP/pr-full.diff")"
+            head -c "$limit" "$RUNNER_TEMP/pr-full.diff" > pr/pr.diff
+            if [ "$size" -gt "$limit" ]; then
+              printf '\n[diff truncated: showing %s of %s bytes]\n' "$limit" "$size" >> pr/pr.diff
+            fi
+            echo "diff bytes: $size"
+          fi
+
       - name: Render prompt
         env:
           AXIS: ${{ inputs.axis }}
@@ -146,6 +216,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
           CHECKOUT: ${{ inputs.checkout }}
+          CONTEXT_SOURCES: ${{ inputs.context_sources }}
         run: |
           mkdir -p pr
           # The PR's own text, as data the prompt points at. Kept outside the
@@ -158,33 +229,164 @@ jobs:
           if [ "$CHECKOUT" = "true" ]; then
             merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
           fi
-          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
-            --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
-            --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
-            --base-ref "$BASE_REF" --context-file "${ctx#pr/}" \
-            > "$RUNNER_TEMP/axis-prompt.txt"
+          {
+            python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
+              --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
+              --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
+              --base-ref "$BASE_REF" --context-file "${ctx#pr/}"
+            if [ "$CHECKOUT" != "true" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md"; fi
+            if [ -n "$CONTEXT_SOURCES" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-context-tools.md"; fi
+          } > "$RUNNER_TEMP/axis-prompt.txt"
 
       - name: Install Cursor agent CLI
         run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
+      - name: Write the context token file
+        # The ONLY step that sees LINEAR_KEY / NOTION_TOKEN / SLACK_TOKEN. It
+        # writes the enabled ones to a 0600 file and passes on nothing but the
+        # path; context-proxy.py reads and deletes that file before the agent
+        # starts. A missing secret just leaves that source unconfigured.
+        if: inputs.context_sources != ''
+        env:
+          CONTEXT_SOURCES: ${{ inputs.context_sources }}
+          LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          enabled = set(os.environ["CONTEXT_SOURCES"].split(","))
+          names = {"linear": "LINEAR_KEY", "notion": "NOTION_TOKEN", "slack": "SLACK_TOKEN"}
+          tokens = {s: os.environ.get(v, "") for s, v in names.items() if s in enabled and os.environ.get(v)}
+          path = os.path.join(os.environ["RUNNER_TEMP"], "cursor-approve-tokens.json")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as f:
+              json.dump(tokens, f)
+          print("context sources with a token:", ", ".join(sorted(tokens)) or "none")
+          PY
+
       - name: Run the axis
         working-directory: pr
+        # No LINEAR_KEY / NOTION_TOKEN / SLACK_TOKEN here, ever (a test enforces
+        # it): this step only knows where the proxy's token file WAS.
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           MODEL: ${{ inputs.model }}
+          CONTEXT_SOURCES: ${{ inputs.context_sources }}
+          NO_SHELL: ${{ inputs.no_shell }}
         run: |
           installed="$(cursor-agent --version)"
           if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
             echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
             exit 1
           fi
-          cursor-agent --print --trust --model "$MODEL" \
+          out="$RUNNER_TEMP/axis-transcript"
+          mkdir -p "$out"
+          token_file="$RUNNER_TEMP/cursor-approve-tokens.json"
+          fifo_dir=""
+          if [ -n "$CONTEXT_SOURCES" ]; then
+            # Start the proxy BEFORE the agent, on two FIFOs (opened read-write
+            # so neither open blocks), without CURSOR_API_KEY in its env. It
+            # reads and deletes the token file at startup; the agent is not
+            # started until that file is gone.
+            fifo_dir="$(mktemp -d)"
+            mkfifo -m 600 "$fifo_dir/in" "$fifo_dir/out"
+            set -m
+            env -u CURSOR_API_KEY python3 "$CURSOR_APPROVE_ASSETS/context-proxy.py" \
+              --token-file "$token_file" --enable "$CONTEXT_SOURCES" --log "$out/context-calls.jsonl" \
+              0<>"$fifo_dir/in" 1<>"$fifo_dir/out" 2>"$out/context-proxy-stderr.txt" &
+            proxy_pid=$!
+            set +m
+            for _ in $(seq 1 100); do
+              [ -e "$token_file" ] || break
+              kill -0 "$proxy_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            if [ -e "$token_file" ] || ! kill -0 "$proxy_pid" 2>/dev/null; then
+              rm -f -- "$token_file"
+              echo "::error::context-proxy.py did not start (or did not delete its token file); not starting the agent"
+              head -c 2000 "$out/context-proxy-stderr.txt"
+              exit 1
+            fi
+          fi
+          # Project-level Cursor config, as cursor-review writes it: replace any
+          # PR-authored .cursor/mcp.json or cli.json, so the proxy is the ONLY
+          # MCP server and the PR cannot widen the permissions below.
+          rm -rf -- .cursor
+          mkdir -m 700 .cursor
+          python3 - "$fifo_dir" <<'PY'
+          import json, os, sys
+          fifo_dir = sys.argv[1]
+          servers = {}
+          allow = []
+          if fifo_dir:
+              relay = os.path.join(os.environ["CURSOR_APPROVE_ASSETS"], "mcp-relay.py")
+              servers["context"] = {"type": "stdio", "command": sys.executable,
+                                    "args": [relay, f"{fifo_dir}/in", f"{fifo_dir}/out"]}
+              tools = {"linear": ("linear_search", "linear_get_issue"),
+                       "notion": ("notion_search", "notion_get_page"),
+                       "slack": ("slack_search", "slack_history")}
+              for source in os.environ["CONTEXT_SOURCES"].split(","):
+                  allow += [f"Mcp(context:{tool})" for tool in tools[source]]
+          deny = ["Shell(*)", "Write(**)"] if os.environ["NO_SHELL"] == "true" else []
+          for name, value in (("mcp.json", {"mcpServers": servers}),
+                              ("cli.json", {"permissions": {"allow": allow, "deny": deny}})):
+              with open(os.path.join(".cursor", name), "w", encoding="utf-8") as f:
+                  json.dump(value, f)
+          PY
+          cursor-agent --print --trust --approve-mcps --output-format stream-json --model "$MODEL" \
             < "$RUNNER_TEMP/axis-prompt.txt" \
-            > "$RUNNER_TEMP/axis-raw.txt" 2> "$RUNNER_TEMP/axis-stderr.txt" \
+            > "$out/transcript.jsonl" 2> "$out/stderr.txt" \
             && rc=0 || rc=$?
+          if [ -n "$fifo_dir" ]; then
+            kill -TERM -- "-$proxy_pid" 2>/dev/null || kill "$proxy_pid" 2>/dev/null || true
+          fi
           echo "cursor-agent exit code: $rc"
-          head -c 2000 "$RUNNER_TEMP/axis-stderr.txt"
-          exit "$rc"
+          head -c 2000 "$out/stderr.txt"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          # The final reply goes on to extraction; the whole transcript only to
+          # its own artifact. With no_shell, a shell or file-write tool call in
+          # the transcript means this cursor-agent did not enforce the deny
+          # list: fail rather than trust a verdict from an agent that had them.
+          python3 - "$out/transcript.jsonl" "$RUNNER_TEMP/axis-raw.txt" <<'PY'
+          import json, os, sys
+          forbidden = ("shellToolCall", "writeToolCall", "editToolCall", "deleteToolCall")
+          result, called = None, set()
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+              for line in f:
+                  try:
+                      event = json.loads(line)
+                  except ValueError:
+                      continue
+                  if not isinstance(event, dict):
+                      continue
+                  if event.get("type") == "result" and isinstance(event.get("result"), str):
+                      result = event["result"]
+                  call = event.get("tool_call")
+                  if event.get("type") == "tool_call" and isinstance(call, dict):
+                      called.update(k for k in call if k in forbidden)
+          if os.environ["NO_SHELL"] == "true" and called:
+              sys.exit(f"::error::no_shell is set but the agent called {', '.join(sorted(called))}; "
+                       "this cursor-agent version does not enforce the deny list")
+          if result is None:
+              sys.exit("::error::the cursor-agent transcript has no result event")
+          with open(sys.argv[2], "w", encoding="utf-8") as f:
+              f.write(result)
+          PY
+
+      - name: Remove the context token file
+        if: always() && inputs.context_sources != ''
+        run: rm -f -- "$RUNNER_TEMP/cursor-approve-tokens.json"
+
+      - name: Upload the transcript
+        # Its own artifact, never named axis-*: only the verdict JSON flows on.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: transcript-axis-${{ inputs.axis }}
+          path: ${{ runner.temp }}/axis-transcript/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Extract the verdict
         env:
