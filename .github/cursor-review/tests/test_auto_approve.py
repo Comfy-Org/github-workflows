@@ -9,7 +9,9 @@ approval could land on a PR nobody should have approved:
   changes, never approves;
 * an un-adjudicated (judge-degraded) round neither approves nor vetoes;
 * an incomplete panel, an undelivered review, a moved head or base, or an open
-  critical/high (or unbadged) thread from an earlier round withholds approval;
+  critical/high (or unbadged) thread from an earlier round withholds approval —
+  `approve_max_failed_reviewers` tolerates only up to N `error` cells, and never
+  a whole review type;
 * an empty reviewed diff (every path excluded) withholds approval and
   withdraws an earlier one;
 * dismissal touches only the approver's own marked reviews that are stale
@@ -46,10 +48,21 @@ def finding(sev):
     return {"file": "f.go", "line": 1, "severity": sev, "body": "x"}
 
 
+# The real shape: 3 models × both review types.
+PANEL_FULL = [{"model": m, "review_type": t, "status": "ok"}
+              for m in ("m1", "m2", "m3") for t in ("adversarial", "edge-case")]
+
+
+def panel_with(*errored, status="error"):
+    """PANEL_FULL with each (model, review_type) in `errored` set to `status`."""
+    return [dict(c, status=status) if (c["model"], c["review_type"]) in errored else dict(c) for c in PANEL_FULL]
+
+
 def decide(threshold="medium", findings=(), panel=PANEL_OK, judge="ok", delivered=True,
-           reviewed=SHA, live=SHA, threads=(), ungated=0, empty_diff=False, reviewed_base="main", live_base="main"):
+           reviewed=SHA, live=SHA, threads=(), ungated=0, empty_diff=False, reviewed_base="main", live_base="main",
+           max_failed=0):
     return AA.decide(threshold, list(findings), list(panel), judge, delivered, reviewed, live, list(threads), ungated,
-                     empty_diff, reviewed_base, live_base)
+                     empty_diff, reviewed_base, live_base, max_failed_reviewers=max_failed)
 
 
 class ThresholdTest(unittest.TestCase):
@@ -138,6 +151,130 @@ class DecideTest(unittest.TestCase):
         event, reasons, _ = decide(empty_diff=True)
         self.assertEqual(event, AA.NONE)
         self.assertIn("reviewed diff is empty", reasons[0])
+
+
+class MaxFailedReviewersTest(unittest.TestCase):
+    """approve_max_failed_reviewers: tolerate up to N `error` cells, never more."""
+
+    def test_default_zero_withholds_on_one_error(self):
+        event, reasons, _ = decide(panel=panel_with(("m1", "edge-case")))
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("1/6 panel reviewers did not complete", reasons[0])
+
+    def test_one_tolerated_error_decides_normally(self):
+        panel = panel_with(("m1", "edge-case"))
+        event, reasons, _ = decide(panel=panel, max_failed=1)
+        self.assertEqual(event, AA.APPROVE)
+        self.assertIn("approved with 1/6 reviewers errored: m1:edge-case", reasons[0])
+        # Decides in BOTH directions: a High still requests changes.
+        event, reasons, blocking = decide(panel=panel, max_failed=1, findings=[finding("high")])
+        self.assertEqual((event, len(blocking)), (AA.REQUEST_CHANGES, 1))
+        self.assertIn("above `medium` (with 1/6 reviewers errored: m1:edge-case)", reasons[0])
+
+    def test_a_no_decision_note_claims_no_decision(self):
+        panel = panel_with(("m1", "edge-case"))
+        event, reasons, _ = decide(panel=panel, max_failed=1, threads=["high"])
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("earlier round (with 1/6 reviewers errored: m1:edge-case)", reasons[0])
+        self.assertNotIn("decided", reasons[0])
+
+    def test_a_clean_panel_carries_no_note(self):
+        event, reasons, _ = decide(panel=PANEL_FULL, max_failed=1)
+        self.assertEqual(event, AA.APPROVE)
+        self.assertNotIn("errored", reasons[0])
+
+    def test_more_errors_than_tolerated_withholds(self):
+        panel = panel_with(("m1", "edge-case"), ("m2", "adversarial"))
+        self.assertEqual(decide(panel=panel, max_failed=1)[0], AA.NONE)
+        self.assertEqual(decide(panel=panel, max_failed=2)[0], AA.APPROVE)
+
+    def test_a_whole_review_type_errored_withholds(self):
+        # Both edge-case cells of a 2-model panel errored: within N, but no
+        # completed edge-case review is left.
+        panel = [c for c in panel_with(("m1", "edge-case"), ("m2", "edge-case")) if c["model"] != "m3"]
+        event, reasons, _ = decide(panel=panel, max_failed=2)
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("no completed `edge-case` review", reasons[0])
+        # And on the full panel, every edge-case cell errored under a generous N.
+        panel = panel_with(*[(m, "edge-case") for m in ("m1", "m2", "m3")])
+        self.assertEqual(decide(panel=panel, max_failed=5)[0], AA.NONE)
+
+    def test_a_review_type_absent_from_the_panel_withholds(self):
+        # PANEL_OK has no edge-case cell at all; tolerating an adversarial error
+        # must not approve over a pass that never ran.
+        panel = PANEL_OK + [{"model": "m2", "review_type": "adversarial", "status": "error"}]
+        self.assertEqual(decide(panel=panel, max_failed=1)[0], AA.NONE)
+
+    def test_an_all_ok_panel_missing_a_review_type_withholds_once_tolerant(self):
+        # No cell errored, but there is no edge-case pass: the floor holds under
+        # any N > 0. N = 0 keeps the original rule (only `ok` is checked).
+        event, reasons, _ = decide(panel=PANEL_OK, max_failed=1)
+        self.assertEqual(event, AA.NONE)
+        self.assertIn("no completed `edge-case` review", reasons[0])
+        self.assertEqual(decide(panel=PANEL_OK)[0], AA.APPROVE)
+
+    def test_a_non_error_bad_status_is_never_tolerated(self):
+        for status in (None, "", "unknown", "skipped", "OK", "Error"):
+            with self.subTest(status=status):
+                self.assertEqual(decide(panel=panel_with(("m1", "edge-case"), status=status), max_failed=3)[0],
+                                 AA.NONE)
+        missing = panel_with()
+        del missing[0]["status"]
+        self.assertEqual(decide(panel=missing, max_failed=3)[0], AA.NONE)
+
+    def test_a_non_dict_cell_is_never_tolerated(self):
+        for cell in (None, "error", ["error"], 0):
+            with self.subTest(cell=cell):
+                self.assertEqual(decide(panel=PANEL_FULL + [cell], max_failed=3)[0], AA.NONE)
+
+    def test_empty_panel_withholds(self):
+        event, reasons, _ = decide(panel=[], max_failed=3)
+        self.assertEqual((event, reasons[0]), (AA.NONE, "no panel metadata"))
+
+    def test_other_trust_failures_still_withhold(self):
+        panel = panel_with(("m1", "edge-case"))
+        self.assertEqual(decide(panel=panel, max_failed=1, judge="error")[0], AA.NONE)
+        self.assertEqual(decide(panel=panel, max_failed=1, delivered=False)[0], AA.NONE)
+
+    def test_composes_with_approve_scope(self):
+        # The errored-reviewer note stays on reasons[0]; the scope note keeps
+        # riding as the second reason, as approve_scope documents.
+        panel = panel_with(("m1", "edge-case"))
+        event, reasons, _ = AA.decide("medium", [], panel, "ok", True, SHA, SHA, [], 0, False, "main", "main",
+                                      scope={"scope": AA.SCOPE_FULL}, max_failed_reviewers=1)
+        self.assertEqual(event, AA.APPROVE)
+        self.assertIn("approved with 1/6 reviewers errored: m1:edge-case", reasons[0])
+        self.assertTrue(reasons[1].startswith("approve_scope `full`"))
+
+    def test_the_note_echoes_only_plain_tokens(self):
+        panel = panel_with(("m1", "edge-case"))
+        panel[1]["model"] = "@someone `x`\n"
+        _, reasons, _ = decide(panel=panel, max_failed=1)
+        self.assertIn("errored: ?:edge-case", reasons[0])
+
+    def test_parse(self):
+        for value, want in (("", 0), (None, 0), ("0", 0), (" 1 ", 1), ("2", 2), (3, 3), ("1.0", 1)):
+            self.assertEqual(AA.parse_max_failed_reviewers(value), want, value)
+        for value in ("-1", "1.5", "one", "inf", "nan", "1e2", "1_0", "+3", "0.99999999999999999"):
+            with self.assertRaises(ValueError, msg=value):
+                AA.parse_max_failed_reviewers(value)
+
+    def test_review_types_match_the_workflow_matrix(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn(f"review_type: [{', '.join(AA.PANEL_REVIEW_TYPES)}]", src)
+
+    def test_the_workflow_passes_the_input_to_decide(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            src = f.read()
+        declared = src[src.index("\n      approve_max_failed_reviewers:\n"):]
+        declared = declared[: declared.index("\n      max_rounds:\n")]
+        self.assertIn("type: number", declared)
+        self.assertIn("default: 0", declared)
+        step = src[src.index("- name: Auto-approve decision"):]
+        step = step[: step.index("\n\n  dismiss-stale-approval:")]
+        self.assertIn("MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}", step)
+        self.assertIn('--max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}"', step)
 
 
 class ReviewedDiffTest(unittest.TestCase):
@@ -1124,15 +1261,17 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None, reviews=(), put_error=None):
+                   labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None):
         heads = iter(heads)
         reads = []
         writes = []
+        self.posted = []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"]:
                 if post_error:
                     raise RuntimeError(post_error)
+                self.posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
                 if put_error:
@@ -1152,13 +1291,15 @@ class CmdDecideGateOutputTest(unittest.TestCase):
             out = os.path.join(d, "out")
             open(out, "w").close()
             with open(fpath, "w") as f:
-                json.dump({"findings": list(findings), "panel": PANEL_OK}, f)
+                json.dump({"findings": list(findings), "panel": list(panel)}, f)
             with open(dpath, "w") as f:
                 f.write(DIFF)
             args = argparse.Namespace(threshold=threshold, findings=fpath, repo="o/r", pr_number="1",
                                       commit_sha=SHA, judge_status="ok", delivered="true",
                                       ungated="0", approver_login="cursor-approver",
                                       reviewed_diff=dpath, base_ref="main")
+            if max_failed is not None:
+                args.max_failed_reviewers = max_failed
             self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -1179,6 +1320,27 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def test_pass(self):
         self.assertEqual(self.run_decide(), (0, "pass"))
+
+    def test_max_failed_reviewers_reaches_the_gate(self):
+        panel = panel_with(("m1", "edge-case"))
+        self.assertEqual(self.run_decide(panel=panel), (0, "untrusted"))
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.run_decide(panel=panel, max_failed="1"), (0, "pass"))
+        self.assertEqual([p["event"] for p in self.posted], [AA.APPROVE])
+        self.assertIn("approved with 1/6 reviewers errored: m1:edge-case", self.posted[0]["body"])
+
+    def test_an_invalid_max_failed_reviewers_fails_closed(self):
+        for value in ("-1", "x", "1.5"):
+            with self.subTest(value=value):
+                self.assertEqual(self.run_decide(panel=panel_with(("m1", "edge-case")), max_failed=value),
+                                 (2, "untrusted"))
+                self.assertEqual(self.posted, [])
+
+    def test_an_invalid_max_failed_reviewers_withdraws_an_earlier_approval(self):
+        earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                   "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
+        self.assertEqual(self.run_decide(max_failed="x", reviews=[earlier]), (2, "untrusted"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
 
     def test_fail(self):
         self.assertEqual(self.run_decide(findings=[finding("critical")]), (0, "fail"))

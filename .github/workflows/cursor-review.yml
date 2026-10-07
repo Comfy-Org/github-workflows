@@ -316,7 +316,8 @@ on:
           APPROVES (pinned to the reviewed commit) when every finding is at or
           below that severity, and REQUESTS CHANGES when any finding is above
           it. Any other value fails the run. No approval when the judge did not
-          adjudicate, a panel reviewer did not complete, the review did not land
+          adjudicate, a panel reviewer did not complete (beyond what
+          `approve_max_failed_reviewers` tolerates), the review did not land
           as threads, the head moved or the base was retargeted mid-run, an
           earlier critical/high thread is still open, or the reviewed diff is
           empty (every changed path excluded by diff_excludes / the
@@ -370,6 +371,22 @@ on:
         type: boolean
         required: false
         default: false
+      approve_max_failed_reviewers:
+        description: >-
+          How many panel reviewers may ERROR (status `error`: the cell ran but
+          failed, timed out, or never uploaded) before auto-approve withholds its
+          decision. 0 (default) → any reviewer that did not complete withholds,
+          as before. N → up to N errored reviewers are tolerated and the round
+          is decided normally (the decision names them, e.g. "approved with
+          1/6 reviewers errored: <model>:edge-case"), but it is still withheld
+          when more than N errored, a reviewer has any other status, the panel
+          metadata is missing, or a review type (`adversarial` or `edge-case`)
+          has no reviewer that completed. Applies to the decision `defer_approval`
+          hands to cursor-approve too. No effect unless `approve_max_severity`
+          is set.
+        type: number
+        required: false
+        default: 0
       max_rounds:
         description: >-
           Cap on review rounds per PR. Before the panel starts, the run counts
@@ -438,7 +455,8 @@ on:
           auto-approve decision was APPROVE — posted, unless `defer_approval`
           left it to cursor-approve), `fail` (REQUEST_CHANGES, or an
           open thread above the threshold withheld approval), `untrusted` (the
-          judge was degraded, a panel cell failed, the review was not delivered,
+          judge was degraded, a panel cell failed beyond what
+          `approve_max_failed_reviewers` tolerates, the review was not delivered,
           the head moved — or no round was delivered by this run at all, e.g. a
           skipped or already-reviewed event), `capped` (the `max_rounds` cap was
           hit this run, or the PR carries `needs-human-review` while
@@ -3317,6 +3335,7 @@ jobs:
           DEFER_APPROVAL: ${{ inputs.defer_approval }}
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
+          MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3352,7 +3371,8 @@ jobs:
             --approve-scope "$APPROVE_SCOPE" \
             --incremental /tmp/pr-diff-new.patch \
             --incremental-state "$INCREMENTAL_STATE" \
-            --ledger /tmp/ledger/ledger.json
+            --ledger /tmp/ledger/ledger.json \
+            --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
