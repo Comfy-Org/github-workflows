@@ -147,6 +147,11 @@ gh variable set CURSOR_PANEL_MODELS --org <org> --visibility all \
   --body '["gpt-5.6-sol-max","claude-opus-5-5-max","kimi-k3-high"]'
 ```
 
+These examples deliberately differ from the built-in list by exactly one axis:
+the Anthropic cell at `-max` instead of the pinned `-xhigh`, so pasting one
+actually runs an experiment rather than re-stating the default. Both ids are
+real catalog entries. Change one axis, not two — see below.
+
 `vars` inside a reusable workflow resolves against the **caller's** repo and
 org, so an org-level value reaches every enrolled caller, and a repo-level value
 of the same name wins for that repo alone. Unset at both levels, the panel runs

@@ -115,10 +115,12 @@ on:
       judge_model:
         description: >-
           Single judge model that adjudicates panel findings into one
-          consolidated review. Same model family as the panel's Anthropic cell,
-          one reasoning tier below `max`: the judge adjudicates a bounded text
-          payload with no tools, and ran at xhigh until 2026-07-18 with no
-          recorded quality gap, while `max` cost ~10% of every run's spend.
+          consolidated review. Currently the SAME pin as the panel's Anthropic
+          cell (`claude-opus-5-5-xhigh`) — it used to sit one reasoning tier
+          below it, until the cell itself moved to `-xhigh` on 2026-10-07. The
+          judge adjudicates a bounded text payload with no tools, and ran at
+          xhigh until 2026-07-18 with no recorded quality gap, while `max` cost
+          ~10% of every run's spend.
         type: string
         required: false
         default: claude-opus-5-5-xhigh
@@ -1934,18 +1936,25 @@ jobs:
         # validates every entry — so a bump only ever touches this one list.
         # Keep in sync with the README model table.
         #
-        # Three labs (Anthropic cell last checked 2026-10-07, others
-        # 2026-08-27). OpenAI: GPT-5.6 Sol is the 5.6-family coding flagship
+        # Three labs. OpenAI: GPT-5.6 Sol is the 5.6-family coding flagship
         # (Luna is the cost tier, Terra mid; the Codex line stops at 5.3).
-        # Anthropic: Opus 5.5 at the `xhigh` tier. Fable tops the catalog but
-        # every Fable entry is marked NO ZDR in Cursor and this panel reviews
-        # private-repo diffs, so that family stays excluded; no
-        # `claude-opus-5-5-*` line carries a NO-ZDR marker. Note 5.5 ships NO
-        # `-thinking-` variants — Opus 5 had both lines, 5.5 has only
-        # `claude-opus-5-5-<tier>`, so `claude-opus-5-thinking-max` has no
-        # literal counterpart here and the nearest is a plain tier id.
-        # Moonshot: Kimi K3 at the `high` tier — same model as the former
-        # `kimi-k3-max` pin, one reasoning notch lower; no NO-ZDR marker.
+        # Anthropic: Opus 5.5 at the `xhigh` tier — confirmed present and
+        # ZDR-eligible against the live catalog, which prints
+        # `claude-opus-5-5-xhigh - Claude Opus 5.5 1M Extra High` with no
+        # NO-ZDR marker (preflight log of run 37688671671). That is a positive
+        # read of the id's own line, not an inference from the family: an id
+        # with no marker is not thereby ZDR-eligible, and the preflight below
+        # only checks existence. Fable tops the catalog but every Fable entry
+        # IS marked NO ZDR, and this panel reviews private-repo diffs, so that
+        # family stays excluded. Note 5.5 ships NO `-thinking-` variants —
+        # Opus 5 had both lines, 5.5 has only `claude-opus-5-5-<tier>`, so
+        # `claude-opus-5-thinking-max` has no literal counterpart and the
+        # nearest is a plain tier id. That plain line IS the thinking model:
+        # Cursor labels non-thinking explicitly where it applies (every plain
+        # Haiku 5.5 entry reads "No Thinking") and no Opus 5.5 or Sonnet 5.5
+        # entry carries that marker. Moonshot: Kimi K3 at the `high` tier —
+        # same model as the former `kimi-k3-max` pin, one reasoning notch
+        # lower; no NO-ZDR marker.
         #
         # Gemini 3.1 Pro was removed 2026-08-27. Over 1,450 judge-kept
         # findings (172 PRs), its two cells were the sole raiser of 2.5% of
@@ -1959,6 +1968,16 @@ jobs:
         # is a default change, not an attribution experiment. The
         # `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
         # env block below — overrides this list for A/B experiments.
+        #
+        # Pins last checked 2026-08-27. This date is deliberately the OLDEST
+        # pin's audit, and deliberately the only `last checked` literal in the
+        # 40 lines above the heredoc: catalog-drift.py's `_LAST_CHECKED` does a
+        # plain `re.search` over that window and applies the FIRST date it
+        # finds to the WHOLE pin set. Putting a fresher per-lab date here — the
+        # Anthropic cell was re-audited 2026-10-07 — resets the staleness clock
+        # for every pin that was NOT re-audited, silently suppressing a finding
+        # that is already due. Keep this line last, keep it the oldest, and
+        # phrase any per-lab re-check so the regex cannot match it.
         env:
           # Falls back to a VARIABLE when the caller passes no input, so the
           # panel list is settable in ONE place for the whole fleet with no
