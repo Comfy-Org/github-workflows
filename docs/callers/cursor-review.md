@@ -119,6 +119,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 | `approve_max_severity` | `''` (off) | `medium`, `low` or `nit`: after each round the bot **approves** (pinned to the reviewed commit) when every finding is at or below that severity, and **requests changes** when any is above it. See [auto-approve](#auto-approve). |
+| `approve_authors` | `''` (everyone) | Per-author opt-in for auto-approve: a comma- or space-separated list of GitHub logins (case-insensitive, leading `@` ignored). A PR whose author is not listed gets auto-approve **off** — `approve_gate` is `off`, no APPROVE or REQUEST_CHANGES is posted, the decision note says *auto-approve not enabled for author `<login>`* — while the panel still reviews and posts its threads and the approver withdraws its own earlier approvals and dismisses its own REQUEST_CHANGES, since narrowing the list moves no head SHA. Empty means every author; a non-empty list that names nobody (`,`, `@`) fails closed and auto-approves no one. See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `approve_scope` | `delta` | What an auto-approve round after the first gates on. `delta`: a finding above `approve_max_severity` blocks only when it sits inside a hunk of the verified incremental block (the changes since the last reviewed commit), re-raises an earlier finding whose thread is still unresolved, or is High/Critical anywhere in the reviewed diff. Every other finding is still posted, as a thread marked *Outside this round's changes: not blocking auto-approve*, and is never auto-resolved — it stays open for a human (and still counts for the `blocking` gate). Round 1, an incremental block that was unavailable or discarded, an empty one (a pure rebase, or no new-side hunk), one naming a path that cannot be parsed, and an unknown prior-review ledger all fail closed to `full`; so does an explicitly empty value (only the input's own default picks `delta`). The decision note states the scope used, the gating vs non-gating counts, and why each gating finding gated. `full`: every finding counts wherever it sits (the behaviour before this input). The panel reviews the full diff either way. No effect without `approve_max_severity`. |
 | `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
 | `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
@@ -373,6 +374,16 @@ jobs:
       APPROVER_TOKEN: ${{ secrets.CURSOR_APPROVER_TOKEN }}
 ```
 
+**Trying it on a few authors first.** `approve_authors` limits auto-approve to
+the PR authors it lists (comma- or space-separated logins; empty, the default,
+means everyone). Pass it from a repo variable too, e.g.
+`approve_authors: ${{ vars.CURSOR_APPROVE_AUTHORS }}`. For anyone else the round
+runs and posts its threads exactly as before, but no review event is submitted,
+`approve_gate` reports `off`, and the step summary says *auto-approve not enabled
+for author `<login>`*. It is read from the caller at the PR's head like
+`approve_max_severity`, so it narrows who is approved; it is not a security
+boundary (see the trust model below).
+
 After `Post review` lands, `auto-approve.py decide` submits one of:
 
 - **APPROVE**, pinned to the reviewed commit, when every finding is at or below
@@ -617,7 +628,7 @@ jobs:
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
 | `untrusted` | The judge was degraded, a panel cell failed (beyond what `approve_max_failed_reviewers` tolerates), the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
-| `off` | `approve_max_severity` is empty (and the cap was not hit). |
+| `off` | `approve_max_severity` is empty, or `approve_authors` does not list the PR's author (and the cap was not hit). |
 
 Two more outputs carry the count, for a "round R of M" display:
 
