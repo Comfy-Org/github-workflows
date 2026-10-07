@@ -1697,8 +1697,8 @@ def thread(tid, sev="low", author=POSTER, repliers=(), resolved=False, outdated=
 class AutoResolvePlanTest(unittest.TestCase):
     """plan_thread_resolution: which threads an approval may resolve."""
 
-    def plan(self, threads, threshold="low", poster=POSTER):
-        todo, counts = AA.plan_thread_resolution(threads, poster, threshold)
+    def plan(self, threads, threshold="low", poster=POSTER, honour_non_gating=False):
+        todo, counts = AA.plan_thread_resolution(threads, poster, threshold, honour_non_gating)
         return [t["id"] for t, _ in todo], counts
 
     def test_approvable_state_resolves_only_eligible_bot_threads(self):
@@ -1714,7 +1714,7 @@ class AutoResolvePlanTest(unittest.TestCase):
         ])
         self.assertEqual(ids, ["ok-low", "ok-nit", "outdated-low"])
         self.assertEqual(counts, {"resolved": 3, "skipped-human": 2, "skipped-unbadged": 0,
-                                  "skipped-above-threshold": 0})
+                                  "skipped-above-threshold": 0, "skipped-non-gating": 0})
 
     def test_bot_own_replies_do_not_disqualify(self):
         ids, _ = self.plan([thread("t", "low", repliers=[POSTER])])
@@ -1949,7 +1949,8 @@ class AutoResolveCommandTest(unittest.TestCase):
                 mock.patch.object(AA, "gh", lambda args, payload=None: fake(args)):
             counts = AA.resolve_eligible_threads("o/r", 1, POSTER, "low", SHA)
         self.assertEqual(counts, {"resolved": 1, "skipped-human": 1, "skipped-unbadged": 1,
-                                  "skipped-above-threshold": 1, "failed": 0, "deferred": 0})
+                                  "skipped-above-threshold": 1, "skipped-non-gating": 0,
+                                  "failed": 0, "deferred": 0})
         self.assertIn("resolved 1, skipped-human 1, skipped-unbadged 1, skipped-above-threshold 1", lines[-1])
 
 
@@ -2169,9 +2170,9 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertFalse(AA.is_non_gating_thread(bodies["app/handler.py"]))
         medium = thread("medium", "medium")
         medium["comments"]["nodes"][0]["body"] = bodies["app/other.py"]
-        ids, counts = AutoResolvePlanTest.plan(self, [medium, thread("low", "low")])
+        ids, counts = AutoResolvePlanTest.plan(self, [medium, thread("low", "low")], honour_non_gating=True)
         self.assertEqual(ids, ["low"])
-        self.assertEqual(counts[AA.SKIP_ABOVE], 1)
+        self.assertEqual(counts[AA.SKIP_NON_GATING], 1)
 
     def test_model_text_cannot_carry_the_marker(self):
         post_review = AA._load_post_review()
@@ -2219,17 +2220,81 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertEqual(AA.resolve_scope("delta", "built", None, _ledger())["scope"], "full")
         self.assertEqual(AA.resolve_scope("delta", "built", "", None)["scope"], "full")
 
-    def test_empty_delta_rebase_approves_without_open_blocking_threads(self):
-        scope = self.scope(text="")
-        self.assertEqual(scope["scope"], "delta")
-        old = {"severity": "medium", "file": "app/handler.py", "line": 11}
-        self.assertEqual(self.gate([old], scope, threads=[("medium", True)])[:2], ("APPROVE", "pass"))
-        # An earlier GATING thread above the threshold still holds it back.
-        self.assertEqual(self.gate([], scope, threads=[("medium", False)])[:2], ("NONE", "fail"))
-        # And so does every trust check: an incomplete panel is still untrusted.
-        bad = AA.decide_gate("low", [], [{"status": "error"}], "ok", True, SHA, SHA, [],
-                             0, False, False, "main", "main", scope)
-        self.assertEqual(bad[1], "untrusted")
+    def test_empty_delta_rebase_fails_closed_to_full(self):
+        # #357 review: an empty block made every non-severe finding non-gating, and
+        # the rebase that empties it also outdates the earlier threads the
+        # open-thread check would otherwise have counted.
+        for text in ("", "diff --git a/bin.png b/bin.png\nBinary files a/bin.png and b/bin.png differ\n"):
+            with self.subTest(text=text):
+                scope = self.scope(text=text)
+                self.assertEqual(scope["scope"], "full")
+                self.assertIn("no new-side hunk", scope["note"])
+                old = {"severity": "medium", "file": "app/handler.py", "line": 11}
+                self.assertEqual(self.gate([old], scope)[:2], ("REQUEST_CHANGES", "fail"))
+                self.assertFalse(AA.non_gating(old, "low", scope))
+
+    def test_unparseable_section_path_fails_closed_to_full(self):
+        # #357 review: git C-quotes an odd path and parse_paths rejects it; dropping
+        # the section recorded no ranges, so findings in it failed open.
+        quoted = ('diff --git "a/app/we\\"ird.py" "b/app/we\\"ird.py"\n'
+                  '--- "a/app/we\\"ird.py"\n+++ "b/app/we\\"ird.py"\n@@ -1 +1 @@\n-a\n+b\n')
+        self.assertIsNone(AA.hunk_ranges(_fixture_text() + quoted))
+        scope = self.scope(text=_fixture_text() + quoted)
+        self.assertEqual(scope["scope"], "full")
+        self.assertIn("could not be parsed", scope["note"])
+        odd = {"severity": "medium", "file": 'app/we"ird.py', "line": 1}
+        self.assertEqual(self.gate([odd], scope)[:2], ("REQUEST_CHANGES", "fail"))
+
+    def test_finding_without_usable_file_gates(self):
+        scope = self.scope()
+        for path in (None, "", 7, ["a"]):
+            with self.subTest(path=path):
+                f = {"severity": "medium", "file": path, "line": 3}
+                self.assertEqual(AA.gating_reason(f, scope), "no usable file anchor")
+                self.assertFalse(AA.non_gating(f, "low", scope))
+                self.assertEqual(self.gate([f], scope)[0], "REQUEST_CHANGES")
+
+    def test_untrusted_reasons_are_never_read_as_the_scope_note(self):
+        scope = self.scope()
+        event, gate, reasons, _ = AA.decide_gate("low", [], PANEL_OK, "error", True, SHA, "b" * 40, [],
+                                                 0, False, False, "main", "main", scope)
+        self.assertEqual(gate, "untrusted")
+        self.assertGreater(len(reasons), 1)
+        self.assertEqual(AA.scope_note_of(reasons), "")
+        body = AA.render_body(event, reasons, "low", [])
+        self.assertNotIn("_Scope:", body)
+        _, _, scoped, _ = self.gate([], scope)
+        self.assertTrue(AA.scope_note_of(scoped).startswith("approve_scope `delta`"))
+        self.assertIn("_Scope: approve_scope `delta`", AA.render_body("APPROVE", scoped, "low", []))
+
+    def test_marked_thread_blocks_resolution_unless_the_round_was_delta(self):
+        marked = thread("marked", "medium")
+        marked["comments"]["nodes"][0]["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        ids, counts = AutoResolvePlanTest.plan(self, [marked, thread("low", "low")])
+        self.assertEqual((ids, counts[AA.RESOLVED]), ([], 0))
+        ids, _ = AutoResolvePlanTest.plan(self, [marked, thread("low", "low")], honour_non_gating=True)
+        self.assertEqual(ids, ["low"])
+
+    def test_marked_thread_is_never_resolved_even_under_a_looser_threshold(self):
+        marked = thread("marked", "medium")
+        marked["comments"]["nodes"][0]["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        self.assertEqual(AA.classify_thread(marked, POSTER, "medium", GATE), (AA.SKIP_NON_GATING, "medium"))
+        for honour in (False, True):
+            ids, counts = AutoResolvePlanTest.plan(self, [marked], threshold="medium", honour_non_gating=honour)
+            self.assertEqual((ids, counts[AA.SKIP_NON_GATING]), ([], 1))
+
+    def test_nested_marker_cannot_reform_after_stripping(self):
+        post_review = AA._load_post_review()
+        m = AA.NON_GATING_MARKER
+        nested = m[:len(m) // 2] + m + m[len(m) // 2:]
+        for text in (nested, m[:5] + nested + m[5:], f"x\n{nested}\ny", AA.NON_GATING_NOTE,
+                     AA.NON_GATING_NOTE[:9] + AA.NON_GATING_NOTE + AA.NON_GATING_NOTE[9:]):
+            with self.subTest(text=text):
+                sneaky = {"severity": "medium", "file": "a.py", "line": 1, "body": text}
+                body = post_review.normalize_comments([sneaky])[0]["comment"]["body"]
+                self.assertNotIn(m, body)
+                self.assertNotIn(AA.NON_GATING_NOTE, body)
+                self.assertFalse(AA.is_non_gating_thread(body))
 
     def test_full_scope_matches_todays_behaviour(self):
         scope = self.scope(requested="full")
@@ -2245,7 +2310,9 @@ class ApproveScopeTest(unittest.TestCase):
                 self.assertEqual(scoped[3], legacy[3])
 
     def test_scope_validation(self):
-        self.assertEqual(AA.validate_scope(""), "delta")
+        # Empty is fail-closed `full`; only the workflow input's default picks delta.
+        self.assertEqual(AA.validate_scope(""), "full")
+        self.assertEqual(AA.validate_scope("delta"), "delta")
         self.assertEqual(AA.validate_scope("FULL"), "full")
         with self.assertRaises(ValueError):
             AA.validate_scope("partial")
