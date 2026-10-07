@@ -180,6 +180,13 @@ APPROVE_GATE_VALUES = (GATE_PASS, GATE_FAIL, GATE_UNTRUSTED, GATE_CAPPED, GATE_O
 # The label the round cap applies and decide() refuses to approve over. Its
 # removal (an `unlabeled` timeline event) is what resets the round count.
 HUMAN_REVIEW_LABEL = "needs-human-review"
+# The per-PR veto. cursor-review.yml's `gate` job and its `trigger` concurrency
+# slot hard-code the same string, so a rename has to land in all three.
+SKIP_REVIEW_LABEL = "skip-cursor-review"
+# Labels under which `dismiss-stale` withdraws EVERY marked approval by the
+# approver identity, whatever head it was pinned to: the gate runs no round on a
+# vetoed PR, so nothing else would withdraw an approval already standing.
+VETO_LABELS = (SKIP_REVIEW_LABEL,)
 ROUND_CAP_MARKER = "<!-- cursor-review-round-cap -->"
 # post-review.py opens two bodies with CONSOLIDATED_MARKER that report a round
 # which reviewed NOTHING — the "Review failed" error review and the
@@ -1129,6 +1136,7 @@ UNTRUSTED_MESSAGE = "The latest cursor-review round could not be trusted to appr
 DEFERRED_MESSAGE = "cursor-review defers approval to cursor-approve — auto-approve withdrawn until its axes agree."
 PASSED_MESSAGE = "The latest cursor-review round passed its severity threshold — request for changes withdrawn; approval is left to cursor-approve."
 HUMAN_REVIEW_MESSAGE = f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
+SKIP_REVIEW_WITHDRAWN_MESSAGE = f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-review auto-approve withdrawn."
 
 
 def dismiss(repo: str, pr_number, review_id, message: str = STALE_MESSAGE) -> None:
@@ -1192,11 +1200,29 @@ def cmd_dismiss_stale(args) -> int:
     # exits green when it does, so a reader of a green run has no other way to
     # learn that the comparison was not against the real head and base.
     try:
-        live_head, live_base = pr_head_base(read_pr(args.repo, args.pr_number))
+        pr = read_pr(args.repo, args.pr_number)
+        live_head, live_base = pr_head_base(pr)
     except (RuntimeError, ValueError) as e:
         live_head, live_base, read_error = "", None, e
     else:
         read_error = None
+    # A veto label withdraws EVERY marked approval, wherever pinned (the
+    # `--all-approvals` selection): the gate runs no round on a vetoed PR, so an
+    # approval standing when the label lands would otherwise keep satisfying
+    # branch protection until the next push. A failed read checks nothing — the
+    # head/base pass below still runs and the next event redoes this. So does a
+    # malformed `labels`: this job runs on every event, so neither goes red, and
+    # neither mass-withdraws on a payload it cannot read.
+    vetoed = None
+    if read_error is None:
+        if live_labels_readable(pr):
+            vetoed = next((label for label in VETO_LABELS if has_label(pr, label)), None)
+        else:
+            print(f"::warning::The live labels of {args.repo}#{args.pr_number} are not a list of named labels — "
+                  f"could not check for {', '.join(f'`{label}`' for label in VETO_LABELS)} this run; judging "
+                  "staleness by head and base only. The next event redoes the check.")
+    withdraw_all = args.all_approvals or vetoed is not None
+    why_all = f"the PR carries `{vetoed}`" if vetoed else "--all-approvals is set"
     # An empty base is not None either: it would match no recorded base and
     # dismiss every marked approval. No base → skip the base check, as below,
     # where the skip is also ANNOUNCED.
@@ -1217,17 +1243,17 @@ def cmd_dismiss_stale(args) -> int:
         live_head = args.head_sha.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha or "") else ""
         if read_error is not None:
             live_base = None
-        if not live_head and not args.all_approvals:
-            # A retarget needs no head to do its job, so it is not blocked by the
-            # absence of one; every other mode compares against it and cannot run.
+        if not live_head and not withdraw_all:
+            # A retarget or a veto needs no head to do its job, so neither is blocked
+            # by the absence of one; every other mode compares against it and cannot run.
             fallback = (f"the event's head {args.head_sha!r} is not a full commit SHA to fall back to"
                         if args.head_sha else "there is no event head to fall back to")
             print(f"::error::Could not read the PR head to dismiss stale auto-approvals ({cause}), and {fallback}.")
             return 1
         print(f"::warning::Could not read the live PR head of {args.repo}#{args.pr_number} ({cause}) — "
-              + ("withdrawing every marked approval regardless of head, because --all-approvals is set. The "
-                 "base check is moot on a retarget, which withdraws them all anyway."
-                 if args.all_approvals else
+              + (f"withdrawing every marked approval regardless of head, because {why_all}. The "
+                 "base check is moot when they are all withdrawn anyway."
+                 if withdraw_all else
                  f"judging staleness against the event's head {live_head!r}, "
                  + ("with the base check against the live base" if live_base else "without the base check")
                  + ", for this run. A queued or redelivered event can therefore withdraw an approval that is "
@@ -1240,9 +1266,9 @@ def cmd_dismiss_stale(args) -> int:
         # what skipping it costs rather than implying the run was complete.
         live_base = None
         print(f"::warning::Read the live head of {args.repo}#{args.pr_number} but no base ref — "
-              + ("withdrawing every marked approval, because --all-approvals is set; the base check is moot on "
-                 "a retarget."
-                 if args.all_approvals else
+              + (f"withdrawing every marked approval, because {why_all}; the base check is moot when they are "
+                 "all withdrawn anyway."
+                 if withdraw_all else
                  "comparing on head alone for this run. An approval recorded against a DIFFERENT base "
                  "therefore SURVIVES this run and keeps counting; the next event redoes the base check from "
                  "live state."))
@@ -1251,7 +1277,13 @@ def cmd_dismiss_stale(args) -> int:
     except (RuntimeError, ValueError) as e:
         print(f"::error::Could not list reviews to dismiss stale auto-approvals: {annotation_cause(e, 'unknown error')}")
         return 1
-    head = None if args.all_approvals else live_head
+    head = None if withdraw_all else live_head
+    if vetoed:
+        # Takes precedence over the retarget wording: the veto is why every
+        # approval goes, whether or not the base also moved.
+        message = SKIP_REVIEW_WITHDRAWN_MESSAGE
+        emit(f"Auto-approve: the PR carries `{vetoed}` — withdrawing every marked approval by "
+             f"{args.approver_login or '(approver unavailable)'}.")
     ids = stale_reviews_to_dismiss(reviews, args.approver_login, head, live_base)
     others = unactionable_stale_approvals(reviews, args.approver_login, head, live_base)
     failed = []
@@ -1565,8 +1597,6 @@ def cmd_round_cap(args) -> int:
 # output `outcome` for the card.
 
 EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "vetoed", "own_pr", "error")
-# cursor-review.yml's veto label (its gate and concurrency slot hardcode it too).
-SKIP_REVIEW_LABEL = "skip-cursor-review"
 SKIP_REVIEW_MESSAGE = f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve approval withdrawn."
 LABELS_UNREADABLE_MESSAGE = (
     f"The PR's labels could not be read to rule out `{SKIP_REVIEW_LABEL}` — cursor-approve approval withdrawn."
