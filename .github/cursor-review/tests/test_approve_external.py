@@ -21,9 +21,10 @@ AXES = "correctness,conformance"
 
 class FakeGitHub:
     def __init__(self, head=SHA, labels=(), reviews=(), head_after=None, base="main",
-                 labels_after=None, read_error=False, pr_override=None, pr_after=None, post_reply=None):
+                 labels_after=None, read_error=False, pr_override=None, pr_after=None, post_reply=None,
+                 base_after=None):
         self.head, self.labels, self.reviews, self.base = head, list(labels), list(reviews), base
-        self.head_after, self.labels_after = head_after, labels_after
+        self.head_after, self.labels_after, self.base_after = head_after, labels_after, base_after
         self.read_error, self.pr_override = read_error, pr_override
         self.pr_after, self.post_reply = pr_after, post_reply
         self.posted, self.dismissed, self.dismiss_messages, self.reads = [], [], [], 0
@@ -53,7 +54,8 @@ class FakeGitHub:
             return json.dumps(self.pr_override)
         head = self.head_after if (self.head_after and self.reads > 1) else self.head
         labels = self.labels_after if (self.labels_after is not None and self.reads > 1) else self.labels
-        return json.dumps({"head": {"sha": head}, "base": {"ref": self.base},
+        base = self.base_after if (self.base_after and self.reads > 1) else self.base
+        return json.dumps({"head": {"sha": head}, "base": {"ref": base},
                            "labels": [{"name": n} for n in labels]})
 
 
@@ -404,8 +406,17 @@ class ApproveExternal(unittest.TestCase):
     def test_base_changed_since_the_axes_posts_nothing(self):
         fake = FakeGitHub(base="release", reviews=[prior_approval(SHA)])
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"}, base_ref="main")
-        self.assertEqual((rc, outcome), (0, "superseded"))
+        # BE-19527: its own outcome, not `superseded` — the head never moved, so
+        # the card must advise the push a relabel alone cannot replace.
+        self.assertEqual((rc, outcome), (0, "retargeted"))
         self.assertEqual(fake.posted, [])
+
+    def test_base_changed_during_the_post_is_retargeted_not_superseded(self):
+        fake = FakeGitHub(base_after="release")
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE", "REQUEST_CHANGES"])
 
     def test_approval_records_the_axes_base(self):
         fake = FakeGitHub()

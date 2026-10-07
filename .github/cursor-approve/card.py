@@ -58,13 +58,18 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 OUTCOME_APPROVED = "approved"
 OUTCOME_NOT_APPROVED = "not_approved"
 OUTCOME_SUPERSEDED = "superseded"
+# Superseded by a base retarget alone (BE-19527): the head is unchanged, so it
+# needs the push remedy a head move does not.
+OUTCOME_RETARGETED = "retargeted"
 OUTCOME_HUMAN = "needs_human"
 OUTCOME_VETOED = "vetoed"
 OUTCOME_OWN_PR = "own_pr"
 OUTCOME_ERROR = "error"
 
-# The machine-readable contract (docs/callers/cursor-approve.md). Values are
-# never renamed: agents key on them.
+# The machine-readable contract (docs/callers/cursor-approve.md). Agents key on
+# these values, so a released one is not renamed. The one exception was
+# `dismiss_then_relabel`, withdrawn for NEXT_PUSH below before any caller's pin
+# reached it; `next` is an open set, and an unrecognised value reads as `human`.
 STATE_PASS = "pass"
 STATE_CHANGES = "changes_requested"
 STATE_NO_DECISION = "no_decision"
@@ -170,6 +175,7 @@ DECIDE_STATES = {
     OUTCOME_APPROVED: (STATE_PASS, NEXT_NONE),
     OUTCOME_NOT_APPROVED: (STATE_CHANGES, NEXT_RELABEL),
     OUTCOME_SUPERSEDED: (STATE_NO_DECISION, NEXT_RELABEL),
+    OUTCOME_RETARGETED: (STATE_NO_DECISION, NEXT_PUSH),
     OUTCOME_HUMAN: (STATE_CAPPED, NEXT_HUMAN),
     OUTCOME_VETOED: (STATE_NO_DECISION, NEXT_HUMAN),
     OUTCOME_OWN_PR: (STATE_NO_DECISION, NEXT_HUMAN),
@@ -178,6 +184,7 @@ DECIDE_STATES = {
 DECIDE_NEXT_TEXT = {
     OUTCOME_NOT_APPROVED: f"Address the axis verdicts above, push, then start a new round: {RELABEL}.",
     OUTCOME_SUPERSEDED: f"A newer commit needs its own round: {RELABEL}.",
+    OUTCOME_RETARGETED: f"The base was retargeted, so this diff needs its own round. {NEXT_PUSH_TEXT}",
     OUTCOME_HUMAN: NEXT_HUMAN_CAPPED_TEXT,
     OUTCOME_VETOED: "A human is needed: the PR carries `skip-cursor-review`.",
     OUTCOME_OWN_PR: "A human is needed: the approver cannot approve its own PR.",
@@ -290,8 +297,9 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
     state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_PUSH))
     next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_PUSH_TEXT)
     lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), ""]
-    if outcome == OUTCOME_SUPERSEDED:
-        lines += ["**Superseded by a newer commit.**", "", f"**Next step:** {next_text}",
+    if outcome in (OUTCOME_SUPERSEDED, OUTCOME_RETARGETED):
+        what = "a newer commit" if outcome == OUTCOME_SUPERSEDED else "a base retarget"
+        lines += [f"**Superseded by {what}.**", "", f"**Next step:** {next_text}",
                   "", _reviewed_line(sha, run_url)]
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None

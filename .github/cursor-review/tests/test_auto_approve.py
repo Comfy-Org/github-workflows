@@ -26,6 +26,7 @@ Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 import argparse
 import importlib.util
 import json
+import itertools
 import os
 import re
 import subprocess
@@ -2645,6 +2646,15 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                 body = self.card_body()
                 self.assert_markers(body, "no_decision", "relabel")
                 self.assertIn(f"the PR head or base moved while the {event} review was being posted", body)
+
+    def test_a_deferred_round_the_head_outran_advises_a_relabel(self):
+        # The deferred path's re-check saw the head move: the live head carries
+        # no consolidated review, so a relabel alone starts a round and an
+        # empty commit would only cost approvals and CI (BE-19527).
+        rc, gate = self.run_decide(defer="true", head_seq=itertools.chain([SHA], itertools.repeat("b" * 40)))
+        self.assertEqual(gate, AA.GATE_UNTRUSTED)
+        self.assertIn("**Next step:** Re-run the round", self.reviews_posted[-1]["body"])
+        self.assert_markers(self.card_body(), "no_decision", "relabel")
 
     def test_a_failed_review_post_leaves_a_standing_block(self):
         rc, gate = self.run_decide(findings=[finding("high")], fail_first_post=True)

@@ -2897,7 +2897,10 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
     fence = "`" * max(3, longest + 1)
     unclamped = (
         f"{header}\n\n⚠️ **Review failed**\n\n{fence}\n{safe}\n{fence}\n\n"
-        "Re-trigger by removing and re-adding the `cursor-review` label."
+        # BE-19527: this review sits on the head, so the gate's `dup` step skips
+        # a relabel alone, and a COMMENT review cannot be dismissed.
+        "Re-trigger by pushing a commit so the head moves (an empty one is enough), then removing and "
+        "re-adding the `cursor-review` label."
     )
     body_text = clamp_review_body(unclamped)
     payload = json.dumps(

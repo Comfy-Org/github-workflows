@@ -69,7 +69,7 @@ the verdicts. Both workflows write as the `APPROVER_TOKEN` identity, which is
 how they find the same comment; pass the same `APPROVER_TOKEN` to both.
 
 The three lines at the top of the card are a **stable contract** for agents.
-Read them from the start of the comment body; they are never renamed:
+Read them from the start of the comment body. A released value is not renamed (the one exception, `dismiss_then_relabel`, was withdrawn before any caller pinned it), and `next` is an open set — see **Forward compatibility** below:
 
 ```text
 <!-- cursor-approve-card -->
@@ -86,7 +86,8 @@ Read them from the start of the comment body; they are never renamed:
 
 The decide phase maps its outcome onto the same contract: `approved` →
 `pass`/`none`; `not_approved` (an axis was red, missing, or too many yellow) →
-`changes_requested`/`relabel`; `superseded` and `error` → `no_decision`/`relabel`;
+`changes_requested`/`relabel`; `superseded` (the head moved) → `no_decision`/`relabel`;
+`retargeted` (the base alone changed) and `error` → `no_decision`/`push_then_relabel`;
 `needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
 `no_decision`/`human`. Every card also shows the reviewed commit SHA.
 
@@ -151,21 +152,18 @@ Whichever token the caller configures needs **label write** on the repo.
 A `no_decision` round (and a `changes_requested` one held only by an earlier
 round's open thread) also leaves a **standing REQUEST_CHANGES** as the approver
 identity, with the reasons and the next step, so resolving every thread does
-not make an unapproved PR look done. It carries the verdict and the findings
-behind it and nothing else: the scope note and the threshold live on the card,
-which states both in more detail, so the two artifacts stop reading as one
-decision rendered twice. The next no-decision round replaces it;
+not make an unapproved PR look done. The next no-decision round replaces it;
 the next approval withdraws it — cursor-review's own, or, under
 `defer_approval`, its passing decide and this workflow's decide phase. A
 `capped` round posts none and withdraws any earlier one.
 
 This workflow's **decide phase leaves the same block when it withholds** —
-`not_approved`, `error` and `superseded` — with the card's
+`not_approved`, `error`, `superseded` and `retargeted` — with the card's
 reasons and next step and the reviewed-SHA marker, posted before the older
 blocks are dismissed so they never stack. Under `defer_approval` the passing
 cursor-review round has already dismissed every earlier block, so without this
 a red axis would leave the PR with no approval and nothing blocking it.
-`own_pr` posts none, nor does an approval. A `superseded` decide
+`own_pr` posts none, nor does an approval. A `superseded` (or `retargeted`) decide
 that finishes after a newer run approved the live head posts none either: as
 the approver's latest review it would override that approval.
 

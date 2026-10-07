@@ -3925,7 +3925,7 @@ class ErrorReviewBudgetTest(unittest.TestCase):
         posted, _ = self.post("boom " * 50_000)
         body = posted[0]["body"]
         self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
-        self.assertIn("Re-trigger by removing", body, "the instruction survives the cut")
+        self.assertIn("Re-trigger by pushing", body, "the instruction survives the cut")
 
     def test_a_short_error_message_is_untouched(self):
         posted, _ = self.post("judge exited 3")
@@ -4148,7 +4148,7 @@ class ErrorReviewSummaryContractTest(unittest.TestCase):
         self.assertGreater(
             len(summaries[0]), len(posted[0]["body"]), "the summary copy is the whole text"
         )
-        self.assertIn("Re-trigger by removing", summaries[0])
+        self.assertIn("Re-trigger by pushing", summaries[0])
 
     def test_an_unclamped_successful_post_writes_no_summary(self):
         _, summaries = ErrorReviewBudgetTest().post("judge exited 3")
