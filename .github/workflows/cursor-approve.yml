@@ -42,6 +42,11 @@ name: Cursor approve
 #   poster_login     the login cursor-review posts findings under
 #                    (`<app-slug>[bot]` under its GitHub App, else
 #                    github-actions[bot]); empty = resolve nothing
+#   approve_scope    cursor-review's `approve_scope_effective` output (decide
+#                    phase): `delta` lets an above-threshold thread that round
+#                    marked non-gating stop blocking auto-resolution, as
+#                    cursor-review's own decide does. Default `full`: a marked
+#                    thread blocks like any other (fail-closed)
 # Secrets:
 #   APPROVER_TOKEN   token of the approving identity. Empty → warn and exit 0;
 #                    there is deliberately no fallback to an App or GITHUB_TOKEN.
@@ -84,6 +89,9 @@ on:
       poster_login:
         type: string
         default: ''
+      approve_scope:
+        type: string
+        default: full
     secrets:
       APPROVER_TOKEN:
         required: false
@@ -297,12 +305,15 @@ jobs:
           # Both empty by default: no thread is auto-resolved.
           THRESHOLD: ${{ inputs.approve_max_severity }}
           POSTER: ${{ inputs.poster_login }}
+          # cursor-review's `approve_scope_effective`; `full` (the default) is
+          # the fail-closed reading of the non-gating marker.
+          APPROVE_SCOPE: ${{ inputs.approve_scope }}
         run: |
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" approve-external --repo "$REPO" \
             --pr-number "$PR_NUMBER" --commit-sha "$COMMIT_SHA" --axes "$AXES" \
             --decision "$RUNNER_TEMP/decision.json" --approver-login "$LOGIN" \
             --base-ref "$BASE_REF" --card-url "$CARD_URL" \
-            --threshold "$THRESHOLD" --poster-login "$POSTER"
+            --threshold "$THRESHOLD" --poster-login "$POSTER" --approve-scope "$APPROVE_SCOPE"
 
       - name: Write the decide card
         if: always() && steps.token.outputs.present == 'true' && inputs.phase == 'decide' && steps.login.outcome == 'success'

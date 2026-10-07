@@ -126,6 +126,7 @@ jobs:
       max_rounds: ${{ needs.cursor-review.outputs.max_rounds }}
       approve_max_severity: low
       poster_login: github-actions[bot]  # `<app-slug>[bot]` if cursor-review runs with bot_app_id
+      approve_scope: ${{ needs.cursor-review.outputs.approve_scope_effective }}
     secrets:
       APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 ```
@@ -136,6 +137,12 @@ phase's decide resolves cursor-review's at-or-below-threshold threads only when
 be the login cursor-review posts findings under — `<app-slug>[bot]` when
 cursor-review runs with `bot_app_id`, else `github-actions[bot]`. A wrong login
 resolves nothing, so a "require conversation resolution" ruleset still blocks.
+Pass `approve_scope` from cursor-review's `approve_scope_effective` output, not
+a literal: under cursor-review's default `approve_scope: delta`, a round marks
+findings outside its changes as non-gating, and only when that round really
+gated under `delta` may those marked threads stop blocking the resolution of
+the others. Omitted, it is `full` and any open above-threshold thread — marked
+or not — leaves every thread open for a human.
 
 Pass secrets explicitly to the axes — never `secrets: inherit` — so each axis
 receives `CURSOR_API_KEY` and nothing else. `always()` on the decide job makes a
@@ -160,6 +167,7 @@ fails to withdraw it skips them, which decide reads as "no result".
 | `approve_gate` | `''` | cursor-review's `approve_gate` output; `capped` makes the start card say a human is needed. |
 | `approve_max_severity` | `''` | Decide phase: the same threshold cursor-review runs with. With `poster_login`, an approval that stands auto-resolves cursor-review's own at-or-below-threshold threads exactly as cursor-review's own approval does. Empty → no thread is resolved. |
 | `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. |
+| `approve_scope` | `full` | Decide phase: cursor-review's `approve_scope_effective` output. `delta` → an open above-threshold thread that round marked non-gating (*Outside this round's changes*) does not block resolving the at-or-below-threshold threads, exactly as cursor-review's own decide treats it; the marked thread itself is never resolved. `full` (or empty) → any open above-threshold thread, marked or not, blocks all resolution. Any other value warns and resolves as `full`. |
 
 ## Axis inputs
 

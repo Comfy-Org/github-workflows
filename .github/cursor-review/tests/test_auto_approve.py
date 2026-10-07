@@ -1264,7 +1264,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
                    labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None,
-                   approve_scope=None):
+                   approve_scope=None, **extra):
         heads = iter(heads)
         reads = []
         writes = []
@@ -1305,6 +1305,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                 args.max_failed_reviewers = max_failed
             if approve_scope is not None:
                 args.approve_scope = approve_scope
+            for key, value in extra.items():
+                setattr(args, key, value)
             self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -1313,7 +1315,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                     mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
                 rc = AA.cmd_decide(args)
             self.writes = writes
-            return rc, read_outputs(out).get("approve_gate")
+            self.outputs = read_outputs(out)
+            return rc, self.outputs.get("approve_gate")
 
     def test_label_applied_during_the_post_withdraws_the_approval(self):
         self.assertEqual(self.run_decide(labels_after=["needs-human-review"]), (0, "capped"))
@@ -1352,6 +1355,42 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                    "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
         self.assertEqual(self.run_decide(approve_scope="partial", reviews=[earlier]), (2, "untrusted"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
+
+    def test_scope_effective_is_full_unless_the_round_gated_on_delta(self):
+        # cursor-approve's approve-external honours non-gating marks only on this
+        # output's `delta`, so every fallback — and every exit with no decision
+        # standing, before or after the scope resolves — says `full`.
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "ledger.json")
+            with open(ledger, "w") as f:
+                json.dump(_ledger(), f)
+            snap = os.path.join(d, "open-anchors.json")
+            with open(snap, "w") as f:
+                json.dump({"commit": SHA, "open": {}}, f)
+            delta = dict(approve_scope="delta", incremental=INCREMENTAL_FIXTURE, ledger=ledger,
+                         open_anchors=snap)
+            for kwargs, rc, scope in (
+                ({}, 0, "full"),
+                (dict(delta, incremental_state="built", open_anchors=""), 0, "full"),
+                (dict(delta, incremental_state="built"), 0, "delta"),
+                (dict(delta, incremental_state="built", findings=[finding("critical")]), 0, "delta"),
+                (dict(delta, incremental_state="built", defer_approval="true"), 0, "delta"),
+                (dict(delta, incremental_state="none"), 0, "full"),
+                (dict(delta, incremental_state="unavailable"), 0, "full"),
+                (dict(delta, incremental_state="built", approve_scope="full"), 0, "full"),
+                (dict(delta, incremental_state="built", approve_scope="partial"), 2, "full"),
+                (dict(delta, incremental_state="built", max_failed="x"), 2, "full"),
+                # Exits after the scope resolves with no decision standing behind it.
+                (dict(delta, incremental_state="built", heads=(SHA, "b" * 40)), 0, "full"),
+                (dict(delta, incremental_state="built", labels_after=["needs-human-review"]), 0, "full"),
+                (dict(delta, incremental_state="built", post_error="HTTP 502"), 1, "full"),
+                (dict(delta, incremental_state="built", judge_status="error"), 0, "full"),
+                (dict(delta, incremental_state="built", defer_approval="true", heads=(SHA, "b" * 40)),
+                 0, "full"),
+            ):
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(self.run_decide(**kwargs)[0], rc)
+                    self.assertEqual(self.outputs.get("approve_scope_effective"), scope)
 
     def test_fail(self):
         self.assertEqual(self.run_decide(findings=[finding("critical")]), (0, "fail"))
@@ -2285,6 +2324,64 @@ class AutoResolveWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApproveExternalResolveScopeTest(unittest.TestCase):
+    """approve-external's --approve-scope, through the real resolver: a deferred
+    delta round's marked non-gating thread must not hold back the others."""
+
+    def run_external(self, threads, **scope):
+        self.mutations = []
+        fake_graphql = graphql_fake(self.mutations, threads)
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "graphql"]:
+                return fake_graphql(args)
+            if args[:3] == ["api", "-X", "POST"]:
+                return json.dumps({"id": 99})
+            return json.dumps({"head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []})
+
+        with tempfile.TemporaryDirectory() as d:
+            decision = os.path.join(d, "decision.json")
+            with open(decision, "w") as f:
+                json.dump({"event": "APPROVE", "verdicts": {"correctness": "green"}}, f)
+            args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes="correctness",
+                                      decision=decision, approver_login="approver", base_ref="main",
+                                      card_url="", threshold="low", poster_login=POSTER, **scope)
+            self.printed = []
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.join(d, "out")}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                    mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)), \
+                    mock.patch.object(AA, "emit", lambda *a: None), \
+                    mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+                rc = AA.cmd_approve_external(args)
+        return rc, [t for k, t, _ in self.mutations if k == "resolve"]
+
+    def threads(self):
+        marked = thread("marked", "medium")
+        marked["comments"]["nodes"][0]["body"] += f"\n\n{AA.NON_GATING_NOTE}\n{AA.NON_GATING_MARKER}"
+        return [marked, thread("low", "low"), thread("nit", "nit")]
+
+    def test_delta_resolves_eligible_threads_past_a_marked_one(self):
+        for value in ("delta", "Delta", " delta\n"):
+            with self.subTest(value=value):
+                self.assertEqual(self.run_external(self.threads(), approve_scope=value), (0, ["low", "nit"]))
+
+    def test_full_or_absent_scope_lets_a_marked_thread_block(self):
+        for scope in ({}, {"approve_scope": "full"}, {"approve_scope": ""}):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.run_external(self.threads(), **scope), (0, []))
+
+    def test_unknown_scope_warns_and_resolves_as_full(self):
+        self.assertEqual(self.run_external(self.threads(), approve_scope="partial"), (0, []))
+        self.assertTrue(any("approve_scope must be one of" in p for p in self.printed))
+        # Still resolves when nothing blocks: `full` is the old behaviour, not "off".
+        self.assertEqual(self.run_external(self.threads()[1:], approve_scope="partial"), (0, ["low", "nit"]))
+
+    def test_delta_still_blocks_on_an_unmarked_above_threshold_thread(self):
+        threads = self.threads() + [thread("medium", "medium")]
+        self.assertEqual(self.run_external(threads, approve_scope="delta"), (0, []))
 
 
 INCREMENTAL_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "incremental-delta.patch")

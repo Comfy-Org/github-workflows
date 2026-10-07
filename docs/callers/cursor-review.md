@@ -636,3 +636,9 @@ Two more outputs carry the count, for a "round R of M" display:
 |---|---|
 | `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing is not counted). If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
 | `max_rounds` | The effective cap: the `max_rounds` input as applied, or `0` for no cap. A value the cap step rejects as not a whole number reports `0`, because it is not applied. |
+
+One more, for [cursor-approve](cursor-approve.md) under `defer_approval: true`:
+
+| Output | Value |
+|---|---|
+| `approve_scope_effective` | The scope this run's auto-approve decision actually gated under: `delta` only when `approve_scope` is `delta` and the round did not fail closed to `full` (round 1, an unavailable, discarded or empty incremental block, an unparseable path, an unknown ledger, an unreadable list of earlier open threads); `full` otherwise, including when no decision ran or the round withdrew it (`untrusted`/`capped`). Pass it as cursor-approve's `approve_scope`, so its deferred approval auto-resolves threads under the same non-gating rule this round's decide used. |

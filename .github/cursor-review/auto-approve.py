@@ -49,7 +49,9 @@ Five subcommands, each run from a job that checks out NO PR code:
     ``.github/cursor-approve/aggregate.py``) under the same protections — see
     ``cmd_approve_external``. Given ``--threshold`` and ``--poster-login``, an
     APPROVE that survives the re-check auto-resolves threads exactly as
-    ``decide`` does (below).
+    ``decide`` does (below). ``--approve-scope`` carries the round's
+    ``approve_scope_effective``: only ``delta`` lets a marked non-gating thread
+    above the threshold stop blocking that resolution; empty or absent is ``full``.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
@@ -69,6 +71,11 @@ passed the severity gate:
 * ``off`` — set by the workflow itself when `approve_max_severity` is empty, and
   by ``decide`` (``--author-enabled false``) when `approve_authors` does not list
   the PR's author: no review event is posted, though the findings still are.
+
+It also emits ``approve_scope_effective`` — the scope the round gated under after
+``resolve_scope`` and the open-thread snapshot (``delta``, or ``full`` on every fail-closed fallback and
+whenever no decision stands: an exit before the gate decides, a ``none`` decision,
+and every later downgrade to ``untrusted`` or ``capped``) — for cursor-approve's ``--approve-scope``.
 
 Fail-closed rules for ``decide``:
 
@@ -1133,6 +1140,10 @@ def cmd_decide(args) -> int:
     # Written before anything can fail, so every exit path below leaves a value;
     # each decision overwrites it (GITHUB_OUTPUT keeps the last write of a key).
     set_output("approve_gate", GATE_UNTRUSTED)
+    # The scope this round gated under, for cursor-approve's approve-external
+    # (`approve_scope_effective`). `full` until a decision stands on a `delta`
+    # scope, so no exit without one tells cursor-approve to honour non-gating marks.
+    set_output("approve_scope_effective", SCOPE_FULL)
     try:
         threshold = validate_threshold(args.threshold)
     except ValueError as e:
@@ -1221,6 +1232,10 @@ def cmd_decide(args) -> int:
             max_failed,
         )
     set_output("approve_gate", gate)
+    if event != NONE:
+        # Only a decision that ran reports its scope; withdraw_decision() puts
+        # `full` back on every later path that stops standing behind it.
+        set_output("approve_scope_effective", scope.get("scope") or SCOPE_FULL)
     if scope_note_of(reasons):
         emit(f"ℹ️ **Auto-approve scope** — {scope_note_of(reasons)}.")
     if event == NONE:
@@ -1267,7 +1282,7 @@ def cmd_decide(args) -> int:
         # recorded head and base still match. A POST that failed ambiguously (a
         # timeout) may have written an APPROVE anyway; the withdrawal lists live
         # reviews, so it catches that one too.
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
         print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
         return 1
@@ -1289,7 +1304,7 @@ def cmd_decide(args) -> int:
         labelled_now = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
     if moved or (event == APPROVE and labelled_now):
-        set_output("approve_gate", GATE_UNTRUSTED if moved else GATE_CAPPED)
+        withdraw_decision(GATE_UNTRUSTED if moved else GATE_CAPPED)
         why = "the PR head or base moved" if moved else f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"
         try:
             dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
@@ -1328,6 +1343,13 @@ def _read_json_optional(path: str):
     return data if isinstance(data, dict) else None
 
 
+def withdraw_decision(gate: str) -> None:
+    """The round no longer stands behind its decision: downgrade the gate, and
+    report `full` so cursor-approve never honours this round's non-gating marks."""
+    set_output("approve_gate", gate)
+    set_output("approve_scope_effective", SCOPE_FULL)
+
+
 def defer_to_cursor_approve(args, reason: str) -> int:
     """`--defer-approval true` on an APPROVE outcome: post nothing, keep the gate.
 
@@ -1341,7 +1363,7 @@ def defer_to_cursor_approve(args, reason: str) -> int:
     # axes judge, so the gate must not read `pass` over it (same as a failed POST).
     rc = withdraw_own_approvals(args, DEFERRED_MESSAGE)
     if rc:
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
     # Posting path: the APPROVE event supersedes this identity's earlier
     # REQUEST_CHANGES. Nothing is posted here, so dismiss those instead — else a
     # fixed High keeps vetoing the merge until cursor-approve approves, which it
@@ -1358,10 +1380,10 @@ def defer_to_cursor_approve(args, reason: str) -> int:
         head_now = base_now = None  # unknown → treat as moved
         labelled_now = False
     if head_now != args.commit_sha or base_now != args.base_ref:
-        set_output("approve_gate", GATE_UNTRUSTED)
+        withdraw_decision(GATE_UNTRUSTED)
         emit("ℹ️ **Auto-approve: deferred round superseded** — the PR head or base moved.")
     elif labelled_now:
-        set_output("approve_gate", GATE_CAPPED)
+        withdraw_decision(GATE_CAPPED)
         emit(f"ℹ️ **Auto-approve: deferred round superseded** — the PR was labelled `{HUMAN_REVIEW_LABEL}`.")
     return rc
 
@@ -2250,8 +2272,17 @@ def cmd_approve_external(args) -> int:
         except ValueError as e:
             print(f"::warning::Auto-resolve: skipped — {e}")
             return 0
+        # The scope the cursor-review round actually gated under (its
+        # `approve_scope_effective` output), so a marked non-gating thread is
+        # exempt here exactly when it was exempt in that round's decide. Empty or
+        # absent is `full`; an unknown value is `full` too, never `delta`.
+        try:
+            scope = validate_scope(getattr(args, "approve_scope", "") or "")
+        except ValueError as e:
+            print(f"::warning::Auto-resolve: {e}; resolving as `{SCOPE_FULL}`")
+            scope = SCOPE_FULL
         resolve_eligible_threads(args.repo, args.pr_number, getattr(args, "poster_login", "") or "",
-                                 threshold, args.commit_sha)
+                                 threshold, args.commit_sha, scope == SCOPE_DELTA)
     return 0
 
 
@@ -2335,6 +2366,9 @@ def main() -> int:
     # are auto-resolved. Either empty = resolve nothing.
     e.add_argument("--threshold", default="")
     e.add_argument("--poster-login", default="")
+    # cursor-review's `approve_scope_effective`: `delta` exempts marked
+    # non-gating threads from blocking resolution, as decide did. Default `full`.
+    e.add_argument("--approve-scope", default=SCOPE_FULL)
     w = sub.add_parser("withdraw")
     w.add_argument("--repo", required=True)
     w.add_argument("--pr-number", required=True)
