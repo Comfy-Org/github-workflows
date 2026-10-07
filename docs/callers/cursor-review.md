@@ -144,7 +144,16 @@ no SHA-bump across the fleet:
 ```
 
 An unset variable is exactly today's behaviour — the reusable reads empty as
-"use the built-in list" — so the wiring is inert until you set it. A **repo**
+"use the built-in list" — so the wiring is inert until you set it, and deleting
+the variable (or every variable) falls back rather than failing. The run log
+names which list is in effect either way, so a deletion mid-experiment is
+visible instead of looking like a round that was never overridden.
+
+Do **not** give the caller its own literal fallback list. `catalog-drift.py`
+reads the pins out of `cursor-review.yml`; a model list copied into a caller is
+invisible to it, so a delisted or newly-`NO ZDR` model sitting there would never
+be flagged — and it would silently keep that snapshot when the shared default
+moves. A **repo**
 variable overrides an **org** variable of the same name, so one repo can trial a
 list the rest of the org is not on, and the org value can be set later without
 touching any caller. Revert is `gh variable delete`.

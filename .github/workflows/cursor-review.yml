@@ -1973,6 +1973,14 @@ jobs:
             fi
             printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c 'unique' > /tmp/models.json
             echo "panel_models override in effect: $(cat /tmp/models.json)"
+          else
+            # Logged in BOTH branches so the run says which list produced the
+            # review. A caller driving panel_models from a variable makes the
+            # empty case reachable by DELETING that variable, and without this
+            # line a mid-experiment deletion is indistinguishable in the log
+            # from one that was never set — the panel quietly reverts and the
+            # rounds either side of it look the same.
+            echo "panel_models not set — using the built-in list: $(cat /tmp/models.json)"
           fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
