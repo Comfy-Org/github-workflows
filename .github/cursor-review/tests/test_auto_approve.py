@@ -3231,3 +3231,166 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertEqual(text.count("incremental_state=none"), 1)
         self.assertEqual(text.count("incremental_state=built"), 1)
         self.assertEqual(text.count("incremental_state=discarded"), 1)
+
+
+def retried_block(rid, login=APPROVER):
+    """A standing block an earlier auto-retry left, marked so it is counted."""
+    return {"id": rid, "user": {"login": login}, "state": "CHANGES_REQUESTED",
+            "body": AA.APPROVE_MARKER + "\n" + AA.AUTO_RETRY_MARKER + "\nblock"}
+
+
+class AutoRetryTest(unittest.TestCase):
+    """BE-19526: a round the head outran re-runs itself once, instead of leaving
+    a standing block for a human to clear by relabelling."""
+
+    OTHER_SHA = "b" * 40
+
+    def run_decide(self, head=OTHER_SHA, reviews=(), judge="ok", delivered="true",
+                   base_ref="main", live_base="main", label_fail=False, reviews_fail=False,
+                   can_relabel="true"):
+        self.reviews_posted, self.labels, self.card_writes = [], [], []
+
+        def fake_gh(args, payload=None):
+            if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
+                self.reviews_posted.append(payload)
+                return json.dumps({"id": 99})
+            if args[:3] == ["api", "-X", "DELETE"] or (args[:3] == ["api", "-X", "POST"]
+                                                       and args[3].endswith("/labels")):
+                if label_fail:
+                    raise RuntimeError("gh api failed: HTTP 403")
+                self.labels.append((args[2], args[3], payload))
+                return "{}"
+            if args[:3] == ["api", "-X", "PUT"]:
+                return "{}"
+            if args[:3] == ["api", "-X", "PATCH"] or (args[:3] == ["api", "-X", "POST"] and "/comments" in args[3]):
+                self.card_writes.append(payload["body"])
+                return json.dumps({"id": 7, "html_url": "https://github.com/o/r/pull/1#issuecomment-7"})
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([[]])
+            if args[:2] == ["api", "graphql"]:
+                if reviews_fail:
+                    raise RuntimeError("gh api failed: HTTP 502")
+                return graphql_reviews(list(reviews))
+            return json.dumps({"head": {"sha": head}, "base": {"ref": live_base}, "labels": []})
+
+        with tempfile.TemporaryDirectory() as d:
+            fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
+            with open(fpath, "w") as f:
+                json.dump({"findings": [], "panel": list(PANEL_OK)}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            open(out, "w").close()
+            args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status=judge, delivered=delivered,
+                                      ungated="0", approver_login=APPROVER, reviewed_diff=dpath,
+                                      base_ref=base_ref, poster_login=POSTER, defer_approval="",
+                                      author_enabled="", pr_author="someone", card="true",
+                                      round="2", max_rounds="5", review_label="cursor-review",
+                                      can_relabel=can_relabel,
+                                      run_url="https://github.com/o/r/actions/runs/1")
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    mock.patch.object(AA, "gh", fake_gh), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a, **k: []), \
+                    mock.patch.object(AA, "resolve_eligible_threads", lambda *a: None), \
+                    mock.patch.object(AA, "emit", lambda *a: None), \
+                    mock.patch("builtins.print", lambda *a, **k: None):
+                rc = AA.cmd_decide(args)
+            return rc, read_outputs(out).get("approve_gate")
+
+    # -- what is eligible --------------------------------------------------
+
+    def test_only_a_moved_head_is_retryable(self):
+        base = [AA.REASON_HEAD_MOVED]
+        for reasons, want in (
+            (base, True),
+            ([AA.REASON_HEAD_MOVED, AA.REASON_BASE_CHANGED], True),
+            ([AA.REASON_BASE_CHANGED], False),          # head unchanged: the re-run is deduped away
+            ([AA.REASON_HEAD_MOVED, "2/6 panel reviewers did not complete"], False),
+            ([AA.REASON_HEAD_MOVED, AA.REASON_NOT_DELIVERED], False),
+            ([], False),
+            (["", None], False),
+        ):
+            with self.subTest(reasons=reasons):
+                self.assertEqual(AA.auto_retry_eligible(reasons), want)
+
+    def test_spent_counts_this_identity_s_marked_blocks_only(self):
+        reviews = [retried_block(1), retried_block(2, login="someone-else"),
+                   own_change_request(3), {"id": 4}, "not-a-dict"]
+        self.assertEqual(AA.auto_retries_spent(reviews, APPROVER), 1)
+        self.assertEqual(AA.auto_retries_spent(reviews, ""), 0)
+        self.assertEqual(AA.auto_retries_spent([], APPROVER), 0)
+
+    # -- the round re-runs itself ------------------------------------------
+
+    def test_a_moved_head_removes_and_re_adds_the_label(self):
+        rc, gate = self.run_decide()
+        self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
+        self.assertEqual([(a[0], a[1]) for a in self.labels],
+                         [("DELETE", "repos/o/r/issues/1/labels/cursor-review"),
+                          ("POST", "repos/o/r/issues/1/labels")])
+        self.assertEqual(self.labels[1][2], {"labels": ["cursor-review"]})
+
+    def test_the_block_carries_the_retry_marker_and_says_it_is_automatic(self):
+        self.run_decide()
+        body = self.reviews_posted[0]["body"]
+        self.assertIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("re-run automatically", body)
+        self.assertNotIn("**Next step:** Re-run the round: remove and re-add", body)
+
+    def test_the_card_still_reports_relabel_so_agents_wait_for_the_new_round(self):
+        self.run_decide()
+        self.assertEqual(len(self.card_writes), 1)
+        lines = self.card_writes[0].splitlines()
+        self.assertEqual(lines[:3], [CARD.CARD_MARKER, "<!-- cursor-approve-state: no_decision -->",
+                                     "<!-- cursor-approve-next: relabel -->"])
+        self.assertIn("re-run automatically", self.card_writes[0])
+
+    def test_a_retarget_alongside_the_move_rides_along(self):
+        self.run_decide(live_base="other")
+        self.assertEqual(len(self.labels), 2)
+
+    # -- the ceiling -------------------------------------------------------
+
+    def test_the_budget_is_one_per_pr(self):
+        self.run_decide(reviews=[retried_block(5)])
+        self.assertEqual(self.labels, [])
+        body = self.reviews_posted[0]["body"]
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+
+    def test_an_unreadable_review_list_spends_the_budget_rather_than_looping(self):
+        self.run_decide(reviews_fail=True)
+        self.assertEqual(self.labels, [])
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, self.reviews_posted[0]["body"])
+
+    # -- what is never retried ---------------------------------------------
+
+    def test_a_same_head_transient_cause_is_not_retried(self):
+        # The head never moved, so a re-run would hit the gate's same-SHA dedupe.
+        self.run_decide(head=SHA, judge="error")
+        self.assertEqual(self.labels, [])
+
+    def test_a_structural_cause_is_not_retried(self):
+        self.run_decide(head=SHA, delivered="false")
+        self.assertEqual(self.labels, [])
+
+    # -- failure is never fatal --------------------------------------------
+
+    def test_a_failed_relabel_leaves_the_decision_alone(self):
+        rc, gate = self.run_decide(label_fail=True)
+        self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
+        self.assertEqual(self.labels, [])
+        self.assertIn(AA.AUTO_RETRY_MARKER, self.reviews_posted[0]["body"])
+
+    def test_the_github_token_fallback_never_relabels(self):
+        # A GITHUB_TOKEN-applied label fires no run: the retry would start nothing.
+        self.run_decide(can_relabel="false")
+        self.assertEqual(self.labels, [])
+        body = self.reviews_posted[0]["body"]
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", body)
+
+    # -- the mirrored constant ---------------------------------------------
+
+    def test_the_default_label_matches_card_py(self):
+        self.assertEqual(AA.DEFAULT_REVIEW_LABEL, CARD.DEFAULT_REVIEW_LABEL)

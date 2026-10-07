@@ -3431,15 +3431,24 @@ jobs:
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
           # withdraws.
+          # CAN_RELABEL: whether this token can re-run a round by removing and
+          # re-adding the review label (BE-19526). A GITHUB_TOKEN-applied label
+          # fires NO workflow run — the reason cursor-review-auto-label.yml
+          # exists at all — so the fallback identity must never auto-retry: the
+          # relabel would land and start nothing. A PAT and an App token both
+          # fire runs. Needs label write on whichever is configured.
           if [ -n "$APPROVER_TOKEN" ]; then
             export GH_TOKEN="$APPROVER_TOKEN"
             LOGIN="$(gh api user --jq .login)"
+            CAN_RELABEL=true
           elif [ -n "$BOT_TOKEN" ]; then
             export GH_TOKEN="$BOT_TOKEN"
             LOGIN="${APP_SLUG}[bot]"
+            CAN_RELABEL=true
           else
             export GH_TOKEN="$FALLBACK_TOKEN"
             LOGIN="github-actions[bot]"
+            CAN_RELABEL=false
           fi
           # The identity `Post review` posted the findings under — keyed on the
           # same `bot_token.outputs.token || GITHUB_TOKEN` choice it made, not on
@@ -3471,7 +3480,8 @@ jobs:
             --round "$ROUND" \
             --max-rounds "$MAX_ROUNDS" \
             --run-url "$RUN_URL" \
-            --review-label "$REVIEW_LABEL"
+            --review-label "$REVIEW_LABEL" \
+            --can-relabel "$CAN_RELABEL"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
