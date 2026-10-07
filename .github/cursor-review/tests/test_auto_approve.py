@@ -1118,7 +1118,8 @@ class PostWriteRaceTest(unittest.TestCase):
 
     def test_unreadable_head_after_post_withdraws(self):
         rc, writes = self.run_decide([SHA, RuntimeError("timeout")])
-        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+        # Withdrawn, then the standing block (CodeRabbit on #362).
+        self.assertEqual((rc, writes), (0, ["POST", "PUT", "POST"]))
 
     def test_a_post_response_without_a_review_id_withdraws_and_goes_red(self):
         # `gh` exited 0, so the APPROVE may well have landed — but with no id the
@@ -1130,7 +1131,9 @@ class PostWriteRaceTest(unittest.TestCase):
         for response in ("not json", "null", "[]", '{"node_id": "x"}', '{"id": null}'):
             with self.subTest(response=response):
                 rc, writes = self.run_decide([SHA], reviews=[approval], post_response=response)
-                self.assertEqual((rc, writes), (1, ["POST", "PUT"]))
+                # Then ONE attempt at the standing block: an ambiguous reply is
+                # never retried unpinned (that is only for a 422 refusal).
+                self.assertEqual((rc, writes), (1, ["POST", "PUT", "POST"]))
 
     def test_head_unchanged_keeps_the_approval(self):
         rc, writes = self.run_decide([SHA, SHA])
@@ -1138,11 +1141,11 @@ class PostWriteRaceTest(unittest.TestCase):
 
     def test_head_moved_during_post_withdraws_it(self):
         rc, writes = self.run_decide([SHA, "b" * 40])
-        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+        self.assertEqual((rc, writes), (0, ["POST", "PUT", "POST"]))
 
     def test_base_retargeted_during_post_withdraws_it(self):
         rc, writes = self.run_decide([SHA, (SHA, "release")])
-        self.assertEqual((rc, writes), (0, ["POST", "PUT"]))
+        self.assertEqual((rc, writes), (0, ["POST", "PUT", "POST"]))
 
     def test_base_retargeted_before_decide_posts_nothing(self):
         rc, writes = self.run_decide([(SHA, "release")])
@@ -1424,8 +1427,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         # `gh` stderr is several lines; raw, the tail falls out of the annotation
         # and a continuation line starting with `::` is re-parsed as a command.
         self.run_decide(findings=[finding("critical")], post_error="HTTP 502\n::error::injected\nsee docs")
-        self.assertEqual(len(self.errors()), 1, self.printed)
-        self.assertIn("HTTP 502 ::error::injected see docs", self.errors()[0])
+        # One annotation for the failed review, one for the standing block the
+        # same failing POST could not leave either — each on ONE line.
+        submit = [e for e in self.errors() if "Could not submit" in e]
+        self.assertEqual(len(submit), 1, self.printed)
+        self.assertIn("HTTP 502 ::error::injected see docs", submit[0])
+        self.assertTrue(all("\n" not in e for e in self.errors()), self.printed)
 
     def test_a_failed_withdrawal_keeps_its_permission_hint_in_the_annotation(self):
         # The hint is appended AFTER the cause, so a multi-line cause would push
@@ -1924,7 +1931,8 @@ class AutoResolveCommandTest(unittest.TestCase):
 
     def test_moved_head_after_the_approval_resolves_nothing(self):
         rc = self.run_decide([thread("T1", "low")], heads=(SHA, "b" * 40))
-        self.assertEqual((rc, self.writes, self.mutations), (0, ["POST", "PUT"], []))
+        # The APPROVE is withdrawn and the standing block takes its place.
+        self.assertEqual((rc, self.writes, self.mutations), (0, ["POST", "PUT", "POST"], []))
 
     def test_human_review_label_after_the_approval_resolves_nothing(self):
         rc = self.run_decide([thread("T1", "low")], labels_after=["needs-human-review"])
@@ -2353,13 +2361,18 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
 
     def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
                    reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
-                   head=SHA, card="true", review_label="", refuse_pin=False):
+                   head=SHA, card="true", review_label="", refuse_pin=False, head_seq=None,
+                   fail_first_post=False):
         self.reviews_posted, self.dismissed, self.card_writes = [], [], []
+        failed = []
 
         def fake_gh(args, payload=None):
             if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
                 if refuse_pin and "commit_id" in payload and payload["event"] == AA.REQUEST_CHANGES:
                     raise RuntimeError("gh api failed: HTTP 422: No commit found for SHA")
+                if fail_first_post and not failed:
+                    failed.append(payload)
+                    raise RuntimeError("gh api failed: HTTP 502")
                 self.reviews_posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
@@ -2372,7 +2385,8 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                 return json.dumps([list(comments)])
             if args[:2] == ["api", "graphql"]:
                 return graphql_reviews(list(reviews))
-            return json.dumps({"head": {"sha": head}, "base": {"ref": "main"},
+            live = next(head_seq, head) if head_seq is not None else head
+            return json.dumps({"head": {"sha": live}, "base": {"ref": "main"},
                                "labels": [{"name": n} for n in labels]})
 
         def fake_threads(repo, pr, sink=None):
@@ -2484,6 +2498,30 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                 mock.patch.object(AA, "_load_card", lambda: CARD):
             rc, gate = self.run_decide()
         self.assertEqual((rc, gate, [p["event"] for p in self.reviews_posted]), (0, AA.GATE_PASS, [AA.APPROVE]))
+
+    def test_a_move_during_the_post_leaves_a_standing_block(self):
+        # CodeRabbit on #362: the post-write re-check withdrew the review and
+        # wrote a no_decision card, but left nothing blocking the PR.
+        for findings, event in (((), AA.APPROVE), ([finding("high")], AA.REQUEST_CHANGES)):
+            with self.subTest(event=event):
+                heads = iter([SHA, "b" * 40])
+                rc, gate = self.run_decide(findings=findings, head_seq=heads)
+                self.assertEqual((rc, gate), (0, AA.GATE_UNTRUSTED))
+                self.assertEqual([p["event"] for p in self.reviews_posted], [event, AA.REQUEST_CHANGES])
+                self.assertEqual(self.dismissed[0], (99, AA.STALE_MESSAGE))
+                block = self.reviews_posted[1]["body"]
+                self.assertIn(f"- the PR head or base moved while the {event} review was being posted", block)
+                self.assertIn("**Next step:** Re-run the round: remove and re-add the `cursor-review` label.", block)
+                body = self.card_body()
+                self.assert_markers(body, "no_decision", "relabel")
+                self.assertIn(f"the PR head or base moved while the {event} review was being posted", body)
+
+    def test_a_failed_review_post_leaves_a_standing_block(self):
+        rc, gate = self.run_decide(findings=[finding("high")], fail_first_post=True)
+        self.assertEqual((rc, gate), (1, AA.GATE_UNTRUSTED))
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.REQUEST_CHANGES])
+        self.assertIn("- the REQUEST_CHANGES review could not be posted", self.reviews_posted[0]["body"])
+        self.assert_markers(self.card_body(), "no_decision", "relabel")
 
     def test_an_unpinnable_block_is_posted_unpinned(self):
         # After a force-push the reviewed commit is no longer in the PR and

@@ -1355,7 +1355,10 @@ def post_standing_change_request(args, headline: str, reasons: list, next_text: 
             if "own pull request" in str(e).lower():
                 emit(f"ℹ️ **Auto-approve: no standing request for changes** — the approver authored this PR ({e}).")
                 return 0
-            if "commit_id" not in payload:
+            # Only GitHub REFUSING the pin (a 422) is retried unpinned. Anything
+            # else — a 5xx, a timeout, a reply without an id — may have landed,
+            # and a second POST would only add a duplicate block.
+            if "commit_id" not in payload or not (isinstance(e, RuntimeError) and "422" in str(e)):
                 print(f"::error::Could not post the standing request for changes: {annotation_cause(e, 'unknown error')}")
                 return 1
             print(f"::warning::The standing request for changes could not be pinned to {args.commit_sha[:7]} "
@@ -1600,8 +1603,12 @@ def cmd_decide(args) -> int:
         withdraw_decision(GATE_UNTRUSTED)
         print(f"::error::Could not submit the {event} review: {annotation_cause(e, 'unknown error')}")
         withdraw_own_approvals(args)
-        write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
-                         [f"the {event} review could not be posted"], _card_text("next_relabel_text", args), threshold)
+        # A no-decision outcome like any other: leave the standing block (the
+        # same POST may fail again; then it is red twice, and says so).
+        why = [f"the {event} review could not be posted"]
+        next_text = _card_text("next_relabel_text", args)
+        post_standing_change_request(args, NO_DECISION_HEADLINE, why, next_text, threshold)
+        write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE, why, next_text, threshold)
         return 1
 
     # Close the read → POST race. A push or retarget landing in that window fires
@@ -1630,12 +1637,16 @@ def cmd_decide(args) -> int:
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         if moved:
+            # The review just dismissed was this round's only verdict: without a
+            # standing block the PR would carry neither approval nor veto.
+            reasons_moved = [f"{why} while the {event} review was being posted"]
+            next_text = _card_text("next_relabel_text", args)
+            rc = post_standing_change_request(args, NO_DECISION_HEADLINE, reasons_moved, next_text, threshold)
             write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
-                             [f"{why} while the {event} review was being posted"],
-                             _card_text("next_relabel_text", args), threshold)
-        else:
-            write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
-                             [why], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
+                             reasons_moved, next_text, threshold)
+            return rc
+        write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
+                         [why], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
         return 0
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     if event == APPROVE:
