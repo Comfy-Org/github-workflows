@@ -409,7 +409,12 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   The next no-decision round replaces it (it never stacks); the next round that
   approves — or, under `defer_approval`, that passes, and cursor-approve's
   approval after it — dismisses it. A `capped` round (`needs-human-review`)
-  posts none: the label already hands the PR to a human.
+  posts none and **withdraws** any earlier one: the label hands the PR to a
+  human, no round will approve it, so a human's own review decides it.
+  The same holds once auto-approve stops deciding the PR for good — it is
+  labelled `skip-cursor-review` or `needs-human-review`, or `approve_max_severity`
+  is cleared: the **Dismiss stale auto-approval** job (below) withdraws the
+  bot's standing blocks then, so none is left to dismiss by hand.
 
 Whatever the outcome, `decide` then writes the **cursor-approve status card**
 (one PR comment, edited in place each round; see
@@ -521,12 +526,21 @@ approver identity changed, or the approver's secrets are not available to the
 run (`APPROVER_TOKEN` / `BOT_APP_PRIVATE_KEY` on a Dependabot PR) — the job goes
 **red** rather than passing unchecked; dismiss it by hand.
 
-A request-changes is left in place — a push does not start a new panel under the
-label-triggered caller, so only the next round (re-apply the label) supersedes it.
+A request-changes is left in place on a push — a push does not start a new panel
+under the label-triggered caller, so only the next round (re-apply the label)
+supersedes it. The job withdraws the bot's own marked, unedited request-changes
+only once no round is coming to: the PR carries `skip-cursor-review` or
+`needs-human-review` (either label also withdraws every one of the bot's
+approvals, and is re-read after the reviews are listed), or
+`approve_max_severity` is empty (then only once none of the bot's approvals
+still stands, which the newer request-changes is outranking). A human's
+request-changes, and a bot review someone edited, are never touched; a failed
+withdrawal turns the job red.
 
 **The dismissal is not gated on `approve_max_severity`.** Unsetting the variable
 is the kill switch for *new* approvals; the next push still withdraws any
-approval already on a PR. On a repo that never approved, the job lists the
+approval already on a PR, and the next event of any kind withdraws its standing
+request-changes. On a repo that never approved, the job lists the
 reviews, finds none of its own, and does nothing. It does key on the approver
 identity, though: change `APPROVER_TOKEN` / `bot_app_id` while approvals are
 live and the old identity's approvals can no longer be dismissed — the job goes

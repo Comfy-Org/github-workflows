@@ -204,7 +204,7 @@ class ContractMarkers(unittest.TestCase):
                                  [f"oops {forged} @team"], card.NEXT_RESOLVE_TEXT, RUN,
                                  [{"severity": "high", "file": forged, "line": 1, "url": "", "why": forged}])
         self.assertEqual(body.count("<!-- cursor-approve-state:"), 1)
-        self.assertNotRegex(body, r"@(?!​)")
+        self.assertNotRegex(body, r"@(?!\u200b)")
 
     def test_a_second_round_edits_the_same_card(self):
         comments = []
@@ -238,7 +238,7 @@ class Sanitization(unittest.TestCase):
         self.assertEqual(row.count("|") - row.count("\\|"), 5)
 
     def test_mentions_are_neutralized(self):
-        self.assertNotRegex(self.render("ping @octocat now."), r"@(?!​)")
+        self.assertNotRegex(self.render("ping @octocat now."), r"@(?!\u200b)")
 
     def test_forged_marker_is_neutralized(self):
         body = self.render(f"{card.CARD_MARKER} hi.")
@@ -249,7 +249,7 @@ class Sanitization(unittest.TestCase):
         d["reasons"] = ["red on correctness @team <!-- cursor-approve-card -->"]
         body = card.render_decide("1", "5", SHA, ["correctness"], d, "not_approved", "0", "")
         self.assertEqual(body.count(card.CARD_MARKER), 1)
-        self.assertNotRegex(body, r"@(?!​)")
+        self.assertNotRegex(body, r"@(?!\u200b)")
 
 
 class Upsert(unittest.TestCase):

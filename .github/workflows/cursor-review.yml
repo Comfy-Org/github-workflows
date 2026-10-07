@@ -3477,9 +3477,11 @@ jobs:
     # Companion to `Auto-approve decision`. A ruleset with
     # `dismiss_stale_reviews_on_push: false` keeps an approval valid for every
     # later commit, so when what was reviewed changes the bot withdraws its own
-    # auto-approve APPROVALS. A request-changes stays: a push under a
+    # auto-approve APPROVALS. A request-changes stays on a push: a push under a
     # label-triggered caller starts no new round, so only a later round's own
-    # review may supersede the veto. Only reviews carrying the auto-approve
+    # review may supersede the veto. It is withdrawn only once no round is
+    # coming: the PR carries `skip-cursor-review` or `needs-human-review`, or
+    # `approve_max_severity` is empty (`--threshold`). Only reviews carrying the auto-approve
     # marker and authored by the approver identity are touched. Independent of
     # `gate`: it must run on a push whether or not a panel runs. Checks out no
     # PR code.
@@ -3502,7 +3504,8 @@ jobs:
     # A third trigger is the `skip-cursor-review` veto label (auto-approve.py's
     # VETO_LABELS, read off the live PR): `gate` runs no round on a vetoed PR,
     # so a `labeled` event reaching this job is what withdraws EVERY marked
-    # approval, same head or not. Hence no `github.event.action` filter here.
+    # approval, same head or not — as does `needs-human-review`, the hand-off
+    # (BE-19492). Hence no `github.event.action` filter here.
     # Open PRs only: a title edit on a merged PR must not try a dismissal.
     name: Dismiss stale auto-approval
     if: >-
@@ -3608,6 +3611,9 @@ jobs:
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Non-empty only on a base retarget (`edited` with `changes.base`).
           BASE_FROM: ${{ github.event.changes.base.ref.from }}
+          # Empty = auto-approve is off: its standing requests for changes are
+          # withdrawn, since no round will ever approve over them.
+          THRESHOLD: ${{ inputs.approve_max_severity }}
         run: |
           # Same identity precedence as `Auto-approve decision`, so the login
           # whose reviews are dismissed is the login that posted them.
@@ -3644,6 +3650,7 @@ jobs:
             --pr-number "$PR_NUMBER" \
             --approver-login "$LOGIN" \
             --head-sha "$EVENT_HEAD_SHA" \
+            --threshold "$THRESHOLD" \
             "${ALL[@]}"
 
   blocking-gate:
