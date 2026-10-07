@@ -95,17 +95,17 @@ counting through a degraded re-run at the same head.
 
 Trust model: every signal here — findings, panel status, judge status — is model
 output over the PR's own content, so a diff that prompt-injects the panel and
-judge can steer the round to an approval. The recorded SHA shares that ceiling:
-a review body is mutable by anyone with repo WRITE access (and by the approver
-token itself), so rewriting the marker to the current head keeps a stale approval
-valid — a strictly higher privilege than planting text in a diff, and not one
-`commit_id` can cross-check, since GitHub has already moved that field to the
-same head. Treat the approval as an automated review signal, not as a substitute
-for a human reviewer, and read the caller guide's trust-model section before
-letting it satisfy a ruleset.
+judge can steer the round to an approval. The recorded SHA is mutable too — a
+review body can be edited by anyone with repo WRITE access (and by the approver
+token itself), and `commit_id` cannot cross-check it, since GitHub has already
+moved that field to the same head — so an EDITED approval is always treated as
+stale, whatever its markers say. Treat the approval as an automated review
+signal, not as a substitute for a human reviewer, and read the caller guide's
+trust-model section before letting it satisfy a ruleset.
 
-Only reviews carrying ``APPROVE_MARKER`` and authored by the approver login are
-ever dismissed, so a human's review — or another bot's — is never touched.
+Only reviews authored by the approver login, and carrying ``APPROVE_MARKER`` or
+EDITED, are ever dismissed, so a human's review — or another bot's — is never
+touched.
 """
 
 import argparse
@@ -313,34 +313,53 @@ def recorded_base(body: str):
 
 
 def _stale_approvals(reviews: list, head_sha, live_base):
-    """(login, id) of every live marked APPROVAL that is stale.
+    """(login, id, marked) of every live auto-approve APPROVAL that is stale.
 
     Stale = not on `head_sha` (`None` selects every one, wherever pinned), or
-    recorded against a base other than `live_base` (`None` skips that check).
+    recorded against a base other than `live_base` (`None` skips that check), or
+    edited. An EDITED approval counts even with the marker gone (`marked` False):
+    deleting the marker is the cheaper forgery of the two, and without this it
+    would take the approval out of every filter here for good.
     """
     out = []
     for r in reviews:
         if r.get("state") != "APPROVED":
             continue
         body = r.get("body") or ""
-        if APPROVE_MARKER not in body:
+        marked = APPROVE_MARKER in body
+        if not marked and not r.get("edited"):
             continue
         # The SHA recorded in the body, NOT `commit_id` (see REVIEWED_SHA_RE). A
         # marked approval without a recorded SHA predates that record: treat it
         # as stale rather than trust a commit_id GitHub may have moved.
         match = REVIEWED_SHA_RE.search(body)
-        off_head = head_sha is None or not match or match.group(1) != head_sha.lower()
+        # An EDITED body is not evidence either. The recorded SHA (and base) is
+        # the only staleness anchor an approval has, and a user with write access
+        # can edit this identity's review and rewrite those markers to the live
+        # head and base — which would keep a stale approval standing through
+        # every later push. Nothing in this workflow edits its own review (the
+        # only write to one is the dismissal PUT), so an edit is always someone
+        # else's and the markers it carries cannot be trusted to say what was
+        # reviewed.
+        off_head = (head_sha is None or not match or bool(r.get("edited"))
+                    or match.group(1) != head_sha.lower())
         base = recorded_base(body)
         off_base = live_base is not None and base is not None and base != live_base
         if off_head or off_base:
             login = (r.get("user") or {}).get("login")
-            out.append((login if isinstance(login, str) else "", r["id"]))
+            out.append((login if isinstance(login, str) else "", r["id"], marked))
     return out
 
 
 def stale_reviews_to_dismiss(reviews: list, approver_login: str, head_sha, live_base=None) -> list:
-    """Ids of this identity's stale auto-approve APPROVALS (see _stale_approvals)."""
-    return [rid for login, rid in _stale_approvals(reviews, head_sha, live_base)
+    """Ids of this identity's stale auto-approve APPROVALS (see _stale_approvals).
+
+    That includes an edited approval by this identity whose marker was removed.
+    It cannot be told apart from a manual approval the identity later edited, so
+    an APPROVER_TOKEN that is a human account loses that one too; an unedited
+    unmarked approval is still never touched.
+    """
+    return [rid for login, rid, _ in _stale_approvals(reviews, head_sha, live_base)
             if login.lower() == approver_login.lower()]
 
 
@@ -349,10 +368,11 @@ def unactionable_stale_approvals(reviews: list, approver_login: str, head_sha, l
 
     This run cannot dismiss them, so it must not report clean over them. An
     empty `approver_login` (the approver's secrets are not in this run) puts
-    every stale marked approval here.
+    every stale marked approval here. An unmarked one is not: by another login
+    it is a human's own approval that they edited, not an auto-approval.
     """
-    return [f"{login or '?'}:{rid}" for login, rid in _stale_approvals(reviews, head_sha, live_base)
-            if not approver_login or login.lower() != approver_login.lower()]
+    return [f"{login or '?'}:{rid}" for login, rid, marked in _stale_approvals(reviews, head_sha, live_base)
+            if marked and (not approver_login or login.lower() != approver_login.lower())]
 
 
 def gh(args: list, payload=None) -> str:
@@ -605,25 +625,121 @@ def has_label(pr: dict, name: str) -> bool:
     )
 
 
+# The reviews list, read through GraphQL because REST has no field for the one
+# thing the staleness decision now turns on: whether a review's body was EDITED
+# after it was posted.
+REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          # Dismissal is a REST call, so this list carries the REST id.
+          # `fullDatabaseId` first for the same reason gate-unresolved.py reads
+          # it: live review ids are already past 2^31-1, which `databaseId` is
+          # typed for (`Int`). `databaseId` stays as the fallback.
+          fullDatabaseId
+          databaseId
+          state
+          body
+          # The whole reason this is not REST: null until someone edits the
+          # review.
+          lastEditedAt
+          # The round cap reads these two: `round_reviews` orders and windows
+          # the count on `submittedAt`, and the cap comment links the latest
+          # round by `url`. REST names them `submitted_at` and `html_url`.
+          submittedAt
+          url
+          # GraphQL reports a Bot's login WITHOUT the `[bot]` suffix that REST
+          # reports and that the workflow passes as --approver-login. The suffix
+          # is restored in `_review_node`; without it the identity comparison in
+          # `stale_reviews_to_dismiss` matches nothing, no stale approval is
+          # ever dismissed, and the job still exits green.
+          author { __typename login }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _review_node(node: dict) -> dict:
+    """One GraphQL review in the REST shape this module's readers expect."""
+    author = node.get("author") or {}
+    login = author.get("login") or ""
+    if login and author.get("__typename") == "Bot":
+        login = f"{login}[bot]"
+    rid = node.get("fullDatabaseId")
+    if rid is None:
+        rid = node.get("databaseId")
+    if rid is None:
+        # Raise here rather than carry None into a dismissal URL, where it would
+        # surface as a misleading 404 "could not dismiss".
+        raise ValueError("a review in the GraphQL response has no database id")
+    return {
+        "id": int(rid),
+        "user": {"login": login},
+        "state": node.get("state") or "",
+        "body": node.get("body") or "",
+        "edited": node.get("lastEditedAt") is not None,
+        "submitted_at": node.get("submittedAt"),
+        "html_url": node.get("url") or "",
+    }
+
+
 def list_reviews(repo: str, pr_number) -> list:
-    pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100"]))
-    if not isinstance(pages, list):
-        # `--slurp` always yields an array of pages. Anything else — an error
-        # object such as {"message": ...}, `null`, a string — would reach a caller
-        # as `pages[0]` (KeyError) or as a value `_stale_approvals` iterates
-        # (TypeError) or calls `.get` on per character (AttributeError). None of
-        # those is a (RuntimeError, ValueError), so each escapes as a traceback
-        # past both call sites, bypassing the announced degradation AND
-        # DISMISS_PERMISSION_HINT. Same contract as read_pr's top-level guard.
-        raise ValueError(f"expected a list of review pages, got {type(pages).__name__}")
-    reviews = [r for page in pages for r in page] if pages and isinstance(pages[0], list) else pages
-    # A review that is not an object cannot answer `.get` either; drop it rather
-    # than let it reach the filters.
-    return [r for r in reviews if isinstance(r, dict)]
+    """Every review on the PR, REST-shaped, plus `edited`.
+
+    A missing `pullRequest` or `reviews` connection, a page claiming more with
+    no new cursor to follow, and a review with no id all raise rather than return
+    a short list: both callers treat a missing review as "nothing to dismiss" and
+    exit green, and reviews come back oldest-first, so a truncated read drops
+    exactly the newest approval.
+    """
+    owner, _, name = repo.partition("/")
+    out = []
+    cursor = None
+    while True:
+        args = [
+            "api", "graphql",
+            "-f", f"query={REVIEWS_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"pr={int(pr_number)}",
+        ]
+        # Same -F/-f split as gate-unresolved.py: the first page needs a JSON
+        # null, later pages an opaque string cursor.
+        args += ["-F", "cursor=null"] if cursor is None else ["-f", f"cursor={cursor}"]
+        body = json.loads(gh(args))
+        # Valid JSON that is not an object (`null`, an array, a string) cannot
+        # answer `.get`, and the AttributeError would escape every caller's
+        # `except (RuntimeError, ValueError)` as a traceback — same contract as
+        # read_pr's top-level guard. Each nested level is checked for the same
+        # reason before it is indexed.
+        data = body.get("data") if isinstance(body, dict) else None
+        repository = data.get("repository") if isinstance(data, dict) else None
+        pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+        if not isinstance(pr, dict):
+            raise ValueError(f"no pullRequest in the GraphQL reviews response for {repo}#{pr_number}")
+        reviews = pr.get("reviews")
+        page = reviews.get("pageInfo") if isinstance(reviews, dict) else None
+        if not isinstance(page, dict):
+            raise ValueError(f"no reviews connection in the GraphQL response for {repo}#{pr_number}")
+        out += [_review_node(n) for n in (reviews.get("nodes") or []) if isinstance(n, dict)]
+        if not page.get("hasNextPage"):
+            return out
+        nxt = page.get("endCursor")
+        # No cursor, or the same one again: following it would loop on one page
+        # until the job times out; stopping would return a truncated list.
+        if not nxt or nxt == cursor:
+            raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} report another page with no new cursor")
+        cursor = nxt
 
 
 def withdraw_own_approvals(args) -> int:
-    """Dismiss every marked approval by this identity. Red if any could not be."""
+    """Dismiss every marked (or edited) approval by this identity. Red if any could not be."""
     try:
         ids = stale_reviews_to_dismiss(list_reviews(args.repo, args.pr_number), args.approver_login, None)
     except (RuntimeError, ValueError) as e:
