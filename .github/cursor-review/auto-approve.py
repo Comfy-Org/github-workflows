@@ -270,8 +270,9 @@ HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 def validate_scope(value: str) -> str:
     # Empty is `full`, not `delta`: an explicitly empty flag (a caller passing an
     # unset `${{ vars.X }}`) must not widen the gate. The workflow input's own
-    # `default:` is the only place `delta` is chosen.
-    scope = (value or SCOPE_FULL).strip().lower()
+    # `default:` is the only place `delta` is chosen. Strip BEFORE defaulting, so
+    # a whitespace-only value (a `${{ vars.X }}` holding a newline) is empty too.
+    scope = (value or "").strip().lower() or SCOPE_FULL
     if scope not in ALLOWED_SCOPES:
         raise ValueError(f"approve_scope must be one of {', '.join(ALLOWED_SCOPES)}, got {value!r}")
     return scope
@@ -283,13 +284,17 @@ def hunk_ranges(patch_text: str):
     None when ANY section's path cannot be read (git C-quotes a path carrying a
     quote, backslash, control or non-ASCII byte, and parse_paths rejects it):
     dropping that section would record no range for a path the round DID change,
-    so every non-severe finding in it would fail open as non-gating.
+    so every non-severe finding in it would fail open as non-gating. A rename's
+    `rename from`/`rename to` lines are C-quoted the same way but returned
+    verbatim by section_paths, so a path that still opens with `"` (which git
+    never leaves unquoted) is unreadable too: keyed raw, it would match no
+    finding's decoded path.
     """
     inc = _load_incremental_diff()
     ranges = {}
     for header, lines in inc.split_sections(patch_text or ""):
         paths = inc.section_paths(header, lines)
-        if not paths:
+        if not paths or any(not p or p.startswith('"') for p in paths):
             return None
         for line in lines:
             m = HUNK_RE.match(line)
@@ -1043,6 +1048,9 @@ def cmd_decide(args) -> int:
         requested_scope = validate_scope(getattr(args, "approve_scope", "") or "")
     except ValueError as e:
         print(f"::error::{e}")
+        # Same as max_failed_reviewers above: a mid-PR edit must not leave an
+        # earlier round's approval satisfying branch protection.
+        withdraw_own_approvals(args)
         return 2
     scope = resolve_scope(requested_scope, getattr(args, "incremental_state", "") or "",
                           _read_optional(getattr(args, "incremental", "") or ""),

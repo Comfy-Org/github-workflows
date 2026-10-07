@@ -1261,7 +1261,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
     """cmd_decide writes approve_gate on every path, including the I/O ones."""
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
-                   labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None):
+                   labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None,
+                   approve_scope=None):
         heads = iter(heads)
         reads = []
         writes = []
@@ -1300,6 +1301,8 @@ class CmdDecideGateOutputTest(unittest.TestCase):
                                       reviewed_diff=dpath, base_ref="main")
             if max_failed is not None:
                 args.max_failed_reviewers = max_failed
+            if approve_scope is not None:
+                args.approve_scope = approve_scope
             self.printed = []
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
@@ -1340,6 +1343,12 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
                    "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
         self.assertEqual(self.run_decide(max_failed="x", reviews=[earlier]), (2, "untrusted"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
+
+    def test_an_invalid_approve_scope_withdraws_an_earlier_approval(self):
+        earlier = {"id": 7, "user": {"login": "cursor-approver"}, "state": "APPROVED",
+                   "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main")}
+        self.assertEqual(self.run_decide(approve_scope="partial", reviews=[earlier]), (2, "untrusted"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/7/dismissals"])
 
     def test_fail(self):
@@ -2245,6 +2254,18 @@ class ApproveScopeTest(unittest.TestCase):
         odd = {"severity": "medium", "file": 'app/we"ird.py', "line": 1}
         self.assertEqual(self.gate([odd], scope)[:2], ("REQUEST_CHANGES", "fail"))
 
+    def test_quoted_rename_path_fails_closed_to_full(self):
+        # #359 review: section_paths returns `rename from`/`rename to` verbatim, so a
+        # C-quoted rename yielded a truthy-but-quoted pair keyed under the raw form.
+        renamed = ('diff --git "a/app/o\\"ld.py" "b/app/we\\"ird.py"\n'
+                   'similarity index 90%\nrename from "app/o\\"ld.py"\nrename to "app/we\\"ird.py"\n'
+                   '--- "a/app/o\\"ld.py"\n+++ "b/app/we\\"ird.py"\n@@ -1 +1 @@\n-a\n+b\n')
+        self.assertIsNone(AA.hunk_ranges(_fixture_text() + renamed))
+        scope = self.scope(text=_fixture_text() + renamed)
+        self.assertEqual(scope["scope"], "full")
+        odd = {"severity": "medium", "file": 'app/we"ird.py', "line": 1}
+        self.assertEqual(self.gate([odd], scope)[:2], ("REQUEST_CHANGES", "fail"))
+
     def test_finding_without_usable_file_gates(self):
         scope = self.scope()
         for path in (None, "", 7, ["a"]):
@@ -2314,6 +2335,9 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertEqual(AA.validate_scope(""), "full")
         self.assertEqual(AA.validate_scope("delta"), "delta")
         self.assertEqual(AA.validate_scope("FULL"), "full")
+        # Whitespace-only is empty too, not an invalid value (#359 review).
+        for blank in (" ", "\n", " \t\n"):
+            self.assertEqual(AA.validate_scope(blank), "full")
         with self.assertRaises(ValueError):
             AA.validate_scope("partial")
 
