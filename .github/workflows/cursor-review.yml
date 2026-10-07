@@ -370,6 +370,22 @@ on:
         type: boolean
         required: false
         default: false
+      approve_max_failed_reviewers:
+        description: >-
+          How many panel reviewers may ERROR (status `error`: the cell ran but
+          failed, timed out, or never uploaded) before auto-approve withholds its
+          decision. 0 (default) → any reviewer that did not complete withholds,
+          as before. N → up to N errored reviewers are tolerated and the round
+          is decided normally (the decision names them, e.g. "approved with
+          1/6 reviewers errored: <model>:edge-case"), but it is still withheld
+          when more than N errored, a reviewer has any other status, the panel
+          metadata is missing, or a review type (`adversarial` or `edge-case`)
+          has no reviewer that completed. Applies to the decision `defer_approval`
+          hands to cursor-approve too. No effect unless `approve_max_severity`
+          is set.
+        type: number
+        required: false
+        default: 0
       max_rounds:
         description: >-
           Cap on review rounds per PR. Before the panel starts, the run counts
@@ -3317,6 +3333,7 @@ jobs:
           DEFER_APPROVAL: ${{ inputs.defer_approval }}
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
+          MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
         run: |
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
@@ -3352,7 +3369,8 @@ jobs:
             --approve-scope "$APPROVE_SCOPE" \
             --incremental /tmp/pr-diff-new.patch \
             --incremental-state "$INCREMENTAL_STATE" \
-            --ledger /tmp/ledger/ledger.json
+            --ledger /tmp/ledger/ledger.json \
+            --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with

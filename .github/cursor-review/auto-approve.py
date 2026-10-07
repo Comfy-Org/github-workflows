@@ -77,7 +77,13 @@ An untrusted round submits NO review event — neither approve nor request chang
 (its findings are still on the PR as threads):
 
 * the judge did not adjudicate (degraded panel-union fallback);
-* any panel cell is not ``ok`` (a short panel finding nothing proves nothing);
+* any panel cell is not ``ok`` (a short panel finding nothing proves nothing) —
+  unless ``--max-failed-reviewers N`` (the workflow's
+  `approve_max_failed_reviewers`, default 0) tolerates it. Only a cell that ran
+  and reported ``status: "error"`` is tolerable, at most N of them, and only
+  while every review type (``PANEL_REVIEW_TYPES``) still has an ``ok`` cell. A
+  non-dict cell, a missing or unknown status, or an empty panel always
+  withholds. Tolerated cells are named in the decision's reason;
 * the review did not land as resolvable threads (`delivered` is not ``true``,
   or any finding reached the review body only — ``ungated_findings`` > 0 — where
   the open-thread check below cannot see it);
@@ -175,7 +181,17 @@ GATE_FAIL = "fail"
 GATE_UNTRUSTED = "untrusted"
 GATE_CAPPED = "capped"
 GATE_OFF = "off"
+
 APPROVE_GATE_VALUES = (GATE_PASS, GATE_FAIL, GATE_UNTRUSTED, GATE_CAPPED, GATE_OFF)
+
+# The panel matrix's review types (cursor-review.yml's `matrix.review_type`, pinned
+# by test_auto_approve.py). With `--max-failed-reviewers` > 0, a round where one of
+# these has no `ok` cell is still withheld: never approve with a whole review
+# type missing.
+PANEL_REVIEW_TYPES = ("adversarial", "edge-case")
+# The one cell status meaning "ran but failed" (the workflow writes it for a cell
+# that crashed, timed out, or never uploaded) — the only one that is tolerable.
+TOLERABLE_CELL_STATUS = "error"
 
 # The label the round cap applies and decide() refuses to approve over. Its
 # removal (an `unlabeled` timeline event) is what resets the round count.
@@ -358,6 +374,59 @@ def validate_threshold(value: str) -> str:
     return threshold
 
 
+def parse_max_failed_reviewers(value) -> int:
+    """`approve_max_failed_reviewers` as a non-negative int; '' → 0 (the strict rule).
+
+    Like parse_max_rounds: a `type: number` input can render as `1` or `1.0`, so
+    an integral float is accepted, and anything else is a ValueError.
+    """
+    raw = str(value if value is not None else "").strip() or "0"
+    try:
+        number = float(raw)
+    except ValueError:
+        number = math.nan
+    if not math.isfinite(number) or not number.is_integer() or number < 0:
+        raise ValueError(f"approve_max_failed_reviewers must be a non-negative whole number, got {value!r}")
+    return int(number)
+
+
+def _label_part(value) -> str:
+    """A panel model / review type for a posted note. The workflow writes these,
+    not a model, but the note posts under the approver identity: echo only a
+    plain token."""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,100}", value) else "?"
+
+
+def _cell_label(cell: dict) -> str:
+    return f"{_label_part(cell.get('model'))}:{_label_part(cell.get('review_type'))}"
+
+
+def panel_gate(panel: list, max_failed: int = 0):
+    """(withhold_reason or None, tolerated_cells). Pure.
+
+    max_failed=0 is the original rule exactly: any cell not `ok` withholds.
+    """
+    if not panel:
+        return "no panel metadata", []
+    bad = [c for c in panel if not isinstance(c, dict) or c.get("status") != "ok"]
+    if not bad:
+        return None, []
+    incomplete = f"{len(bad)}/{len(panel)} panel reviewers did not complete"
+    tolerable = [c for c in bad if isinstance(c, dict) and c.get("status") == TOLERABLE_CELL_STATUS]
+    if len(tolerable) != len(bad) or len(bad) > max_failed:
+        return incomplete, []
+    # Every review type the matrix runs — and any other the panel names — must
+    # keep at least one completed cell.
+    types = list(PANEL_REVIEW_TYPES) + sorted(
+        {str(c.get("review_type")) for c in panel} - set(PANEL_REVIEW_TYPES)
+    )
+    ok_types = {str(c.get("review_type")) for c in panel if isinstance(c, dict) and c.get("status") == "ok"}
+    missing = [_label_part(t) for t in types if t not in ok_types]
+    if missing:
+        return f"{incomplete}, leaving no completed {', '.join(f'`{t}`' for t in missing)} review", []
+    return None, bad
+
+
 def above_threshold(severity, threshold: str) -> bool:
     """True when `severity` is worse than `threshold`; unrecognised counts as worse."""
     sev = severity.strip().lower() if isinstance(severity, str) else ""
@@ -387,6 +456,7 @@ def decide(
     live_base: str = "",
     human_review: bool = False,
     scope=None,
+    max_failed_reviewers: int = 0,
 ):
     """Return (event, reasons, blocking_findings). Pure; no I/O.
 
@@ -397,7 +467,7 @@ def decide(
     event, _, reasons, blocking = decide_gate(
         threshold, findings, panel, judge_status, delivered, reviewed_sha,
         live_head_sha, open_thread_severities, ungated, human_review,
-        reviewed_diff_empty, reviewed_base, live_base, scope,
+        reviewed_diff_empty, reviewed_base, live_base, scope, max_failed_reviewers,
     )
     return event, reasons, blocking
 
@@ -417,6 +487,7 @@ def decide_gate(
     reviewed_base: str = "",
     live_base: str = "",
     scope=None,
+    max_failed_reviewers: int = 0,
 ):
     """decide(), plus the approve_gate value: (event, gate, reasons, blocking).
 
@@ -434,11 +505,9 @@ def decide_gate(
     reasons = []
     if judge_status != "ok":
         reasons.append(f"the judge did not adjudicate this round (status={judge_status or 'missing'})")
-    bad_cells = [c for c in panel if not isinstance(c, dict) or c.get("status") != "ok"]
-    if not panel:
-        reasons.append("no panel metadata")
-    elif bad_cells:
-        reasons.append(f"{len(bad_cells)}/{len(panel)} panel reviewers did not complete")
+    panel_reason, tolerated = panel_gate(panel, max_failed_reviewers)
+    if panel_reason:
+        reasons.append(panel_reason)
     if not delivered:
         reasons.append("the review did not land on the PR as resolvable threads")
     elif ungated:
@@ -453,6 +522,16 @@ def decide_gate(
     if reasons:
         return NONE, GATE_UNTRUSTED, reasons, []
 
+    event, gate, reasons, blocking = _trusted_decision(threshold, findings, open_thread_severities, scope, noted)
+    if tolerated:
+        verb = "approved" if event == APPROVE else "decided"
+        reasons[0] += (f" ({verb} with {len(tolerated)}/{len(panel)} reviewers errored: "
+                       f"{', '.join(_cell_label(c) for c in tolerated)})")
+    return event, gate, reasons, blocking
+
+
+def _trusted_decision(threshold: str, findings: list, open_thread_severities: list, scope: dict, noted: bool):
+    """decide_gate() past the trust checks: (event, gate, reasons, blocking)."""
     above = [
         f for f in findings if not isinstance(f, dict) or above_threshold(f.get("severity"), threshold)
     ]
@@ -898,6 +977,11 @@ def cmd_decide(args) -> int:
     except ValueError as e:
         print(f"::error::{e}")
         return 2
+    try:
+        max_failed = parse_max_failed_reviewers(getattr(args, "max_failed_reviewers", ""))
+    except ValueError as e:
+        print(f"::error::{e}")
+        return 2
     with open(args.findings, encoding="utf-8") as f:
         data = json.load(f)
     findings = data.get("findings") or []
@@ -939,6 +1023,7 @@ def cmd_decide(args) -> int:
             args.base_ref,
             live_base,
             scope,
+            max_failed,
         )
     set_output("approve_gate", gate)
     if len(reasons) > 1:
@@ -2017,6 +2102,8 @@ def main() -> int:
     d.add_argument("--incremental", default="")
     d.add_argument("--incremental-state", default="")
     d.add_argument("--ledger", default="")
+    # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
+    d.add_argument("--max-failed-reviewers", default="0")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
