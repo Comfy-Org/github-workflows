@@ -2391,7 +2391,7 @@ class ApproveScopeTest(unittest.TestCase):
     def anchored(self, scope, threads):
         with mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
                 mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)):
-            return AA.with_open_anchors(scope, "o/r", 1, SHA)
+            return AA.with_open_anchors(scope, "o/r", 1)
 
     @staticmethod
     def earlier(path="app/other.py", line=3, start=None, commit="b" * 40, **kw):
@@ -2416,18 +2416,73 @@ class ApproveScopeTest(unittest.TestCase):
         self.assertIn("unresolved earlier thread", reasons[-1])
         self.assertFalse(AA.non_gating(reraise, "low", scope))
 
-    def test_anchor_match_ignores_this_rounds_closed_and_elsewhere_threads(self):
+    def test_anchor_match_ignores_closed_and_elsewhere_threads(self):
         reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
-        for name, node in (("this round's own thread", self.earlier(commit=SHA)),
-                           ("resolved", self.earlier(resolved=True)),
+        for name, node in (("resolved", self.earlier(resolved=True)),
                            ("outdated", self.earlier(outdated=True)),
                            ("another line", self.earlier(line=4)),
                            ("another file", self.earlier(path="app/handler.py")),
                            ("not cursor-review's", self.earlier(marker=False)),
-                           ("no line", self.earlier(line=None))):
+                           ("no line", self.earlier(line=None)),
+                           ("no path", self.earlier(path=None))):
             with self.subTest(name):
                 scope = self.anchored(self.scope(), [node])
                 self.assertEqual(self.gate([reraise], scope)[0], "APPROVE")
+
+    def test_an_earlier_thread_on_the_reviewed_head_still_anchors(self):
+        # A head reset back to a commit an earlier round reviewed: that round's
+        # open thread was opened on today's head. The snapshot is read before
+        # this round posts, so no commit filter drops it (or a null originalCommit).
+        reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
+        for commit in (SHA, None):
+            with self.subTest(commit=commit):
+                node = self.earlier(commit=commit)
+                if commit is None:
+                    node["comments"]["nodes"][0]["originalCommit"] = None
+                self.assertEqual(self.gate([reraise], self.anchored(self.scope(), [node]))[0],
+                                 "REQUEST_CHANGES")
+
+    def test_the_thread_walk_is_bounded_by_wall_clock(self):
+        clock = iter([0.0, 0.0, 200.0])
+        threads = [self.earlier(), self.earlier(line=4)]
+        with mock.patch.object(AA.time, "monotonic", lambda: next(clock)), \
+                self.assertRaisesRegex(RuntimeError, "took over 90s"):
+            self.anchored(self.scope(), threads)
+
+    def test_decide_gates_on_post_reviews_snapshot_not_a_second_read(self):
+        reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "open-anchors.json")
+            AA.write_open_anchors(snap, self.anchored(self.scope(), [self.earlier(line=4, start=2)]), SHA)
+            with mock.patch.object(AA, "_load_gate_unresolved", side_effect=AssertionError("read")):
+                scope = AA.with_snapshot_anchors(self.scope(), snap, SHA)
+            self.assertEqual((scope["scope"], scope["open"]), ("delta", {"app/other.py": [(2, 4)]}))
+            self.assertEqual(self.gate([reraise], scope)[0], "REQUEST_CHANGES")
+
+    def test_a_missing_or_foreign_snapshot_fails_decide_closed_to_full(self):
+        # post-review marked nothing non-gating, so decide must count every
+        # above-threshold finding too — never APPROVE past unmarked threads.
+        outside = {"severity": "medium", "file": "app/other.py", "line": 30}
+        self.assertEqual(self.gate([outside], self.scope())[0], "APPROVE")
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "open-anchors.json")
+            bad = {"another commit": {"commit": "b" * 40, "open": {}},
+                   "no open": {"commit": SHA},
+                   "bad span": {"commit": SHA, "open": {"a.py": [[1, "2"]]}},
+                   "bool span": {"commit": SHA, "open": {"a.py": [[True, 2]]}},
+                   "short span": {"commit": SHA, "open": {"a.py": [[1]]}},
+                   "spans not a list": {"commit": SHA, "open": {"a.py": 3}}}
+            for name, payload in [("missing", None), *bad.items()]:
+                with self.subTest(name):
+                    if payload is not None:
+                        with open(snap, "w", encoding="utf-8") as f:
+                            json.dump(payload, f)
+                    scope = AA.with_snapshot_anchors(self.scope(), snap, SHA)
+                    self.assertEqual(scope["scope"], "full")
+                    self.assertIn("snapshot is unavailable", scope["note"])
+                    self.assertEqual(self.gate([outside], scope)[0], "REQUEST_CHANGES")
+        full = self.scope(requested="full")
+        self.assertIs(AA.with_snapshot_anchors(full, "", SHA), full)
 
     def test_anchor_match_covers_a_multi_line_thread(self):
         scope = self.anchored(self.scope(), [self.earlier(line=9, start=5)])
@@ -2440,7 +2495,7 @@ class ApproveScopeTest(unittest.TestCase):
     def test_anchors_are_read_only_under_delta(self):
         full = self.scope(requested="full")
         with mock.patch.object(AA, "_load_gate_unresolved", side_effect=AssertionError("read")):
-            self.assertIs(AA.with_open_anchors(full, "o/r", 1, SHA), full)
+            self.assertIs(AA.with_open_anchors(full, "o/r", 1), full)
 
     def test_post_review_leaves_a_reraise_on_an_open_thread_unmarked(self):
         post_review = AA._load_post_review()
@@ -2450,9 +2505,10 @@ class ApproveScopeTest(unittest.TestCase):
                 f.write(_fixture_text())
             with open(led, "w", encoding="utf-8") as f:
                 json.dump(_ledger(), f)
+            snap = os.path.join(d, "open-anchors.json")
             args = argparse.Namespace(approve_threshold="low", approve_scope="delta", incremental=inc,
                                       incremental_state="built", ledger=led, repo="o/r",
-                                      pr_number="1", commit_sha=SHA)
+                                      pr_number="1", commit_sha=SHA, open_anchors_out=snap)
             reraise = {"severity": "medium", "file": "app/other.py", "line": 3}
             # post-review loads its own copies of both scripts, so stub the one
             # thing they share: the `gh api graphql` call under iter_threads.
@@ -2464,10 +2520,18 @@ class ApproveScopeTest(unittest.TestCase):
             self.assertIn("graphql", run.call_args[0][0])
             self.assertFalse(predicate(reraise))
             self.assertTrue(predicate(dict(reraise, line=30)))
-            # An unreadable thread list marks nothing (the fail-closed direction).
+            # decide gates on the snapshot post-review saved: same verdicts.
+            scope = AA.with_snapshot_anchors(self.scope(), snap, SHA)
+            self.assertFalse(AA.non_gating(reraise, "low", scope))
+            self.assertTrue(AA.non_gating(dict(reraise, line=30), "low", scope))
+            # An unreadable thread list marks nothing (the fail-closed direction)
+            # and leaves no snapshot — not even the earlier call's — so decide
+            # falls back to `full` with it.
             failed = mock.Mock(returncode=1, stdout="", stderr="boom")
             with mock.patch("subprocess.run", return_value=failed):
                 self.assertIsNone(post_review.load_non_gating(args))
+            self.assertFalse(os.path.exists(snap))
+            self.assertEqual(AA.with_snapshot_anchors(self.scope(), snap, SHA)["scope"], "full")
 
     def test_discarded_or_missing_block_fails_closed_to_full(self):
         outside = {"severity": "medium", "file": "app/other.py", "line": 3}

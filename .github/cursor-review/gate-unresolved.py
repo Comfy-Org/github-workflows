@@ -83,9 +83,6 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
               # The first comment's body carries the severity badge
               # auto-approve.py reads to find open critical/high threads.
               body
-              # The commit the thread was opened on: this round's own threads are
-              # opened on the reviewed head, an earlier round's on an older one.
-              originalCommit { oid }
               pullRequestReview { body }
             }
           }
