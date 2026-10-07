@@ -176,6 +176,10 @@ address names the whole family, so the companions still move and the sibling
 does not. The one residual: a genuine sibling that carries its OWN
 `workflows_ref:` would have that input moved to this fleet's SHA, because a
 line-wise rewrite cannot tell whose input it is. No caller does that today.
+A second, cosmetic one in the same sibling case: an unattributed
+`# github-workflows main (<sha>)` marker is left as found even on a family pin
+line that DID move (only the `# main @` note is address-scoped), so it can name
+the SHA that pin no longer uses until the file is ours alone again.
 
 ## Preflight
 

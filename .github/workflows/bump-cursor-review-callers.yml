@@ -274,6 +274,7 @@ jobs:
           # only one of them.
           WATCHED_EXEC: |
             .github/workflows/cursor-review.yml
+            .github/cursor-review/auto-approve.py
             .github/cursor-review/build-ledger.py
             .github/cursor-review/fence-diff.py
             .github/cursor-review/gate-unresolved.py

@@ -750,9 +750,12 @@ bump_repo() {
     # `…/workflows/legacy-groom.yml` — the target name merely ENDS the token — so
     # that caller would be treated as ours, repinned to this fleet's SHA by rules
     # 1/4-6, and pass the address-filtered assertion. Requiring the `/` that
-    # starts the filename scopes it to the intended reusable. A right delimiter is
-    # unnecessary: `[^[:space:]]*` cannot cross whitespace, so the match is
-    # confined to the single `uses:` token, where `.yml` is followed by `@`.
+    # starts the filename scopes it to the intended reusable. It needs a RIGHT
+    # delimiter too, the `@` that starts the ref: `[^[:space:]]*` keeps the match
+    # inside one token, but not inside the PIN token — a sibling reusable named
+    # `axis-design.yml-v2.yml`, or a space-free URL in a sibling line's comment
+    # that names a family file, otherwise satisfies the address. With eight
+    # family names (BE-19438) rather than one, that is no longer far-fetched.
     #
     # SHA_ADDR is consumed two ways and needs two spellings. `grep -E` takes it
     # raw; sed takes it as a `/…/` ADDRESS, where an unescaped `/` would close the
@@ -762,7 +765,7 @@ bump_repo() {
     local SHA_ADDR SHA_ADDR_SED
     SHA_ADDR='github-workflows|workflows_ref'
     if (( GW_HAS_SIBLING )); then
-      SHA_ADDR="github-workflows[^[:space:]]*/${FLEET_FILES_RE}|workflows_ref"
+      SHA_ADDR="github-workflows[^[:space:]]*/${FLEET_FILES_RE}@|workflows_ref"
     fi
     SHA_ADDR_SED="${SHA_ADDR//\//\\/}"
 

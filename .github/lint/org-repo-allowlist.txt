@@ -169,6 +169,10 @@ secret-branch               # fixture: bump-callers / public-repo-hygiene
 secret-c                    # fixture: bump-callers / public-repo-hygiene
 secret-case                 # fixture: bump-callers / public-repo-hygiene
 secret-coloc                # fixture: bump-callers / public-repo-hygiene
+secret-companions           # fixture: bump-callers / public-repo-hygiene
+secret-componly             # fixture: bump-callers / public-repo-hygiene
+secret-compsib              # fixture: bump-callers / public-repo-hygiene
+secret-compstale            # fixture: bump-callers / public-repo-hygiene
 secret-conv                 # fixture: bump-callers / public-repo-hygiene
 secret-converged            # fixture: bump-callers / public-repo-hygiene
 secret-converted            # fixture: bump-callers / public-repo-hygiene

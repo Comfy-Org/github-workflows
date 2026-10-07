@@ -837,11 +837,27 @@ for path in "${FILES[@]}"; do
   while IFS= read -r c; do
     [[ -n "$c" ]] && companions+=("$c")
   done < <(parse_preflight_env "$path" COMPANION_FILES 'Bump SHA in caller repos' | tr -s '[:space:]' '\n')
-  (( ${#companions[@]} > 0 )) || continue
-  COMPANION_FLEETS=$((COMPANION_FLEETS+1))
   filter=()
   while IFS= read -r line; do [[ -n "$line" ]] && filter+=("$line"); done < <(parse_push_paths "$path")
   watched="$(parse_preflight_env "$path" WATCHED)"
+  # The reverse direction runs for EVERY fleet, companions or not: a
+  # companion-less fleet that gains a second reusable in its filter is exactly
+  # the case that bumps and then leaves that reusable's pins behind. `.ya?ml`,
+  # as the bumper and FILE_FILTER accept both.
+  extra=""
+  for p in ${filter[@]+"${filter[@]}"}; do
+    [[ ( "$p" == .github/workflows/*.yml || "$p" == .github/workflows/*.yaml ) && "$p" != "$watched" ]] || continue
+    found=""
+    for c in ${companions[@]+"${companions[@]}"}; do [[ "$p" == ".github/workflows/${c}" ]] && { found=1; break; }; done
+    [[ -n "$found" ]] || extra="${extra}${extra:+ }${p}"
+  done
+  if [[ -n "$extra" ]]; then
+    bad "${file}: the \`paths:\` filter watches ${extra}, which is neither WATCHED nor a COMPANION_FILES entry — a change to it fires a bump that then reads its pins as a sibling fleet's and leaves them behind"
+  else
+    ok "${file}: every reusable workflow in the \`paths:\` filter is WATCHED or a companion"
+  fi
+  (( ${#companions[@]} > 0 )) || continue
+  COMPANION_FLEETS=$((COMPANION_FLEETS+1))
   missing="" untracked=""
   for c in "${companions[@]}"; do
     cpath=".github/workflows/${c}"
@@ -849,7 +865,7 @@ for path in "${FILES[@]}"; do
       untracked="${untracked}${untracked:+ }${c}"
     fi
     found=""
-    for p in "${filter[@]}"; do [[ "$p" == "$cpath" ]] && { found=1; break; }; done
+    for p in ${filter[@]+"${filter[@]}"}; do [[ "$p" == "$cpath" ]] && { found=1; break; }; done
     [[ -n "$found" ]] || missing="${missing}${missing:+ }${c}"
   done
   if [[ -n "$untracked" ]]; then
@@ -861,18 +877,6 @@ for path in "${FILES[@]}"; do
     bad "${file}: COMPANION_FILES ${missing} not in the \`paths:\` filter — a change to it moves every caller's pin of it yet starts no bump run. Add .github/workflows/<name> to the filter (and to WATCHED_ASSETS / WATCHED_PATHSPECS)"
   else
     ok "${file}: every companion is watched by the \`paths:\` filter"
-  fi
-  extra=""
-  for p in "${filter[@]}"; do
-    [[ "$p" == .github/workflows/*.yml && "$p" != "$watched" ]] || continue
-    found=""
-    for c in "${companions[@]}"; do [[ "$p" == ".github/workflows/${c}" ]] && { found=1; break; }; done
-    [[ -n "$found" ]] || extra="${extra}${extra:+ }${p}"
-  done
-  if [[ -n "$extra" ]]; then
-    bad "${file}: the \`paths:\` filter watches ${extra}, which is neither WATCHED nor a COMPANION_FILES entry — a change to it fires a bump that then reads its pins as a sibling fleet's and leaves them behind"
-  else
-    ok "${file}: every reusable workflow in the \`paths:\` filter is WATCHED or a companion"
   fi
 done
 # The cursor-review fleet is the one this exists for; a parse that silently finds

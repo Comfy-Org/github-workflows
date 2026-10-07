@@ -1428,6 +1428,10 @@ printf '%s\n' \
   '    uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
   '  groom:' \
   '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@3333333333333333333333333333333333333333  # main @ 3333333' \
+  '  legacy:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml-v2.yml@4444444444444444444444444444444444444444  # main @ 4444444' \
+  '  linked:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@5555555555555555555555555555555555555555  # https://github.com/Comfy-Org/github-workflows/blob/main/.github/workflows/cursor-review.yml' \
   > "$COMPSIB_FIXTURE"
 STUB_CONTENT_FILE="$COMPSIB_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
@@ -1442,6 +1446,11 @@ check "both workflows_ref moved"                 "[[ \$(grep -cE \"workflows_ref
 check "companion's '# main @' moved with its pin" "grep -qE \"cursor-approve.yml@${NEW_SHA} +# main @ ${SHORT}\\\$\" \"$PUT\""
 check "the SIBLING groom.yml pin is UNCHANGED"   "grep -qF 'groom.yml@3333333333333333333333333333333333333333' \"$PUT\""
 check "the sibling's '# main @' note untouched"  "grep -qF '# main @ 3333333' \"$PUT\""
+# The address is anchored on the `@` that ends the filename, so neither a sibling
+# whose name merely STARTS with a family name nor a family name inside a sibling
+# line's comment URL makes that line ours.
+check "family-prefixed sibling pin UNCHANGED"    "grep -qF 'axis-design.yml-v2.yml@4444444444444444444444444444444444444444  # main @ 4444444' \"$PUT\""
+check "sibling naming a family file in a URL UNCHANGED" "grep -qF 'groom.yml@5555555555555555555555555555555555555555' \"$PUT\""
 check "unattributed marker left alone"           "grep -qF 'github-workflows main (2222222)' \"$PUT\""
 check "warned the file is not ours alone"        "grep -q 'pin comments untouched' <<<\"\$OUT\""
 
