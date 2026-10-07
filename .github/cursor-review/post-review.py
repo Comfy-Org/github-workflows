@@ -46,6 +46,7 @@ empty — this job's copy of ledger.json is not what the judge saw.
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -2435,7 +2436,7 @@ def build_panel_summary(panel: list[dict]) -> str:
 
 
 def normalize_comments(
-    findings: list[dict], shown_repeat_urls: frozenset[str] | None = None
+    findings: list[dict], shown_repeat_urls: frozenset[str] | None = None, non_gating=None
 ) -> list[dict]:
     """Build sorted, severity-tagged inline comments from raw judge findings.
 
@@ -2447,7 +2448,13 @@ def normalize_comments(
 
     `shown_repeat_urls` is threaded straight to repeat_url_of; None (the default,
     which keeps every existing caller unchanged) means shape-only.
+
+    `non_gating` (approve_scope `delta`, see load_non_gating) is a predicate over
+    the raw finding: True appends the non-gating note + marker AFTER the model's
+    text. The marker is stripped out of every model body first, so a finding can
+    never exempt itself from auto-approve's gate by echoing it.
     """
+    marker = NON_GATING_MARKER
     enriched = []
     for finding in findings:
         if not isinstance(finding, dict):
@@ -2511,7 +2518,10 @@ def normalize_comments(
                     # same escape and fails identically, leaving the review only in the
                     # job summary — the one copy that WAS sanitized, so the two channels
                     # would disagree on the finding's text.
-                    "body": encodable(badge + neutralize_mentions(body) + repeat_line),
+                    "body": encodable(
+                        badge + neutralize_mentions(body.replace(marker, "")) + repeat_line
+                        + (f"\n\n{NON_GATING_NOTE}\n{marker}" if non_gating and non_gating(finding) else "")
+                    ),
                 },
             }
         )
@@ -2558,6 +2568,44 @@ def warn_membership_guard_off() -> None:
         "(membership against the ledger the judge was shown is OFF).",
         flush=True,
     )
+
+
+# Mirrors auto-approve.NON_GATING_MARKER / NON_GATING_NOTE (a test pins them equal).
+NON_GATING_MARKER = "<!-- cursor-review-non-gating -->"
+NON_GATING_NOTE = "_Outside this round's changes: not blocking auto-approve._"
+
+
+def load_non_gating(args):
+    """The approve_scope `delta` predicate for normalize_comments, or None.
+
+    Resolved by auto-approve.py's own resolve_scope/non_gating — the same call its
+    `decide` makes over the same inputs — so the thread a reader sees marked
+    non-blocking is exactly the finding the gate did not count. Any failure (no
+    threshold, a `full` scope, an unreadable input) marks nothing: an unmarked
+    thread is the fail-closed direction, since it blocks.
+    """
+    threshold = (getattr(args, "approve_threshold", "") or "").strip().lower()
+    if not threshold:
+        return None
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto-approve.py")
+        spec = importlib.util.spec_from_file_location("auto_approve", path)
+        approve = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(approve)
+        threshold = approve.validate_threshold(threshold)
+        requested = approve.validate_scope(getattr(args, "approve_scope", "") or "")
+        scope = approve.resolve_scope(
+            requested,
+            getattr(args, "incremental_state", "") or "",
+            approve._read_optional(getattr(args, "incremental", "") or ""),
+            approve._read_json_optional(getattr(args, "ledger", "") or ""),
+        )
+    except Exception as e:  # noqa: BLE001 - fail closed: mark nothing
+        print(f"Could not resolve approve_scope, marking no finding non-gating: {e}", file=sys.stderr)
+        return None
+    if scope["scope"] != approve.SCOPE_DELTA:
+        return None
+    return lambda finding: approve.non_gating(finding, threshold, scope)
 
 
 def load_shown_repeat_urls(path) -> frozenset[str] | None:
@@ -2905,6 +2953,12 @@ def main():
             "job's own copy of ledger.json is not what the judge saw."
         ),
     )
+    # approve_scope: the same inputs auto-approve.py `decide` reads, so
+    # the threads it does not count can say so. Empty threshold = mark nothing.
+    parser.add_argument("--approve-threshold", default="")
+    parser.add_argument("--approve-scope", default="full")
+    parser.add_argument("--incremental", default="")
+    parser.add_argument("--incremental-state", default="")
     parser.add_argument(
         "--ledger-note",
         default=None,
@@ -3034,7 +3088,7 @@ def main():
         shown_repeat_urls = frozenset()
     else:
         shown_repeat_urls = load_shown_repeat_urls(args.ledger)
-    enriched = normalize_comments(findings, shown_repeat_urls)
+    enriched = normalize_comments(findings, shown_repeat_urls, load_non_gating(args))
     enriched, repeats_dropped = enforce_repeat_cap(enriched)
     # Anchor-aware split. The COUNT below stays the total across both halves — a finding
     # that lands in the body is still a finding, and a headline that shrank because an

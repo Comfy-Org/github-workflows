@@ -1942,3 +1942,157 @@ class AutoResolveWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+INCREMENTAL_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "incremental-delta.patch")
+LIVE_URL = "https://github.com/o/r/pull/1#discussion_r100"
+RESOLVED_URL = "https://github.com/o/r/pull/1#discussion_r200"
+
+
+def _fixture_text():
+    with open(INCREMENTAL_FIXTURE, encoding="utf-8") as f:
+        return f.read()
+
+
+def _ledger(status="ok"):
+    return {"status": status, "entries": [
+        {"discussion_url": LIVE_URL, "anchored": True, "thread": {"resolved": False}},
+        {"discussion_url": RESOLVED_URL, "anchored": True, "thread": {"resolved": True}},
+    ]}
+
+
+class ApproveScopeTest(unittest.TestCase):
+    """approve_scope: rounds 2+ gate on the delta since the last reviewed commit."""
+
+    def scope(self, requested="delta", state="built", text=None, ledger=None):
+        return AA.resolve_scope(requested, state, _fixture_text() if text is None else text,
+                                _ledger() if ledger is None else ledger)
+
+    def gate(self, findings, scope, threads=()):
+        return AA.decide_gate("low", findings, PANEL_OK, "ok", True, SHA, SHA, list(threads),
+                              0, False, False, "main", "main", scope)
+
+    def test_hunk_ranges_reads_new_side_of_the_fixture(self):
+        self.assertEqual(AA.hunk_ranges(_fixture_text()), {"app/handler.py": [(10, 14), (43, 43)]})
+
+    def test_round_one_with_delta_behaves_like_full(self):
+        scope = self.scope(state="none")
+        self.assertEqual(scope["scope"], "full")
+        outside = {"severity": "medium", "file": "app/other.py", "line": 3}
+        event, gate, reasons, blocking = self.gate([outside], scope)
+        self.assertEqual((event, gate, blocking), ("REQUEST_CHANGES", "fail", [outside]))
+        self.assertIn("first round", reasons[-1])
+
+    def test_medium_outside_delta_and_low_inside_approves(self):
+        scope = self.scope()
+        outside = {"severity": "medium", "file": "app/other.py", "line": 3}
+        inside_low = {"severity": "low", "file": "app/handler.py", "line": 11}
+        event, gate, reasons, blocking = self.gate([outside, inside_low], scope,
+                                                   threads=[("medium", True), ("low", False)])
+        self.assertEqual((event, gate, blocking), ("APPROVE", "pass", []))
+        self.assertIn("1 non-gating", reasons[-1])
+        self.assertTrue(AA.non_gating(outside, "low", scope))
+        self.assertFalse(AA.non_gating(inside_low, "low", scope))
+
+    def test_non_gating_medium_thread_is_posted_marked_and_left_unresolved(self):
+        post_review = AA._load_post_review()
+        scope = self.scope()
+        outside = {"severity": "medium", "file": "app/other.py", "line": 3, "body": "issue"}
+        inside_low = {"severity": "low", "file": "app/handler.py", "line": 11, "body": "nit"}
+        enriched = post_review.normalize_comments(
+            [outside, inside_low], None, lambda f: AA.non_gating(f, "low", scope))
+        bodies = {e["comment"]["path"]: e["comment"]["body"] for e in enriched}
+        self.assertTrue(AA.is_non_gating_thread(bodies["app/other.py"]))
+        self.assertIn("Outside this round's changes: not blocking auto-approve", bodies["app/other.py"])
+        self.assertFalse(AA.is_non_gating_thread(bodies["app/handler.py"]))
+        medium = thread("medium", "medium")
+        medium["comments"]["nodes"][0]["body"] = bodies["app/other.py"]
+        ids, counts = AutoResolvePlanTest.plan(self, [medium, thread("low", "low")])
+        self.assertEqual(ids, ["low"])
+        self.assertEqual(counts[AA.SKIP_ABOVE], 1)
+
+    def test_model_text_cannot_carry_the_marker(self):
+        post_review = AA._load_post_review()
+        sneaky = {"severity": "medium", "file": "a.py", "line": 1, "body": f"x\n{AA.NON_GATING_MARKER}"}
+        body = post_review.normalize_comments([sneaky])[0]["comment"]["body"]
+        self.assertFalse(AA.is_non_gating_thread(body))
+
+    def test_marker_constants_match_post_review(self):
+        post_review = AA._load_post_review()
+        self.assertEqual(post_review.NON_GATING_MARKER, AA.NON_GATING_MARKER)
+        self.assertEqual(post_review.NON_GATING_NOTE, AA.NON_GATING_NOTE)
+
+    def test_medium_inside_delta_requests_changes(self):
+        inside = {"severity": "medium", "file": "app/handler.py", "line": 12}
+        event, gate, reasons, blocking = self.gate([inside], self.scope())
+        self.assertEqual((event, gate, blocking), ("REQUEST_CHANGES", "fail", [inside]))
+        self.assertIn("inside this round's changes", reasons[-1])
+
+    def test_high_outside_delta_requests_changes(self):
+        high = {"severity": "high", "file": "app/other.py", "line": 3}
+        event, gate, _, blocking = self.gate([high], self.scope())
+        self.assertEqual((event, gate, blocking), ("REQUEST_CHANGES", "fail", [high]))
+
+    def test_unrecognised_severity_outside_delta_still_gates(self):
+        odd = {"severity": "weird", "file": "app/other.py", "line": 3}
+        self.assertEqual(self.gate([odd], self.scope())[0], "REQUEST_CHANGES")
+
+    def test_reraise_of_unresolved_medium_requests_changes(self):
+        repeat = {"severity": "medium", "file": "app/other.py", "line": 3, "repeat_of": LIVE_URL}
+        event, gate, reasons, _ = self.gate([repeat], self.scope())
+        self.assertEqual((event, gate), ("REQUEST_CHANGES", "fail"))
+        self.assertIn("re-raise", reasons[-1])
+        resolved = dict(repeat, repeat_of=RESOLVED_URL)
+        self.assertEqual(self.gate([resolved], self.scope())[0], "APPROVE")
+
+    def test_discarded_or_missing_block_fails_closed_to_full(self):
+        outside = {"severity": "medium", "file": "app/other.py", "line": 3}
+        for kwargs in ({"state": "discarded"}, {"state": "unavailable"}, {"state": ""},
+                       {"ledger": {"status": "unknown"}}):
+            with self.subTest(**kwargs):
+                scope = self.scope(**kwargs)
+                self.assertEqual(scope["scope"], "full")
+                self.assertIn("fails closed", scope["note"])
+                self.assertEqual(self.gate([outside], scope)[0], "REQUEST_CHANGES")
+        self.assertEqual(AA.resolve_scope("delta", "built", None, _ledger())["scope"], "full")
+        self.assertEqual(AA.resolve_scope("delta", "built", "", None)["scope"], "full")
+
+    def test_empty_delta_rebase_approves_without_open_blocking_threads(self):
+        scope = self.scope(text="")
+        self.assertEqual(scope["scope"], "delta")
+        old = {"severity": "medium", "file": "app/handler.py", "line": 11}
+        self.assertEqual(self.gate([old], scope, threads=[("medium", True)])[:2], ("APPROVE", "pass"))
+        # An earlier GATING thread above the threshold still holds it back.
+        self.assertEqual(self.gate([], scope, threads=[("medium", False)])[:2], ("NONE", "fail"))
+        # And so does every trust check: an incomplete panel is still untrusted.
+        bad = AA.decide_gate("low", [], [{"status": "error"}], "ok", True, SHA, SHA, [],
+                             0, False, False, "main", "main", scope)
+        self.assertEqual(bad[1], "untrusted")
+
+    def test_full_scope_matches_todays_behaviour(self):
+        scope = self.scope(requested="full")
+        outside = {"severity": "medium", "file": "app/other.py", "line": 3}
+        for findings, threads in (([outside], []), ([], [("medium", True)]), ([], ["low"]), ([], [])):
+            with self.subTest(findings=findings, threads=threads):
+                legacy = AA.decide_gate("low", findings, PANEL_OK, "ok", True, SHA, SHA,
+                                        [t[0] if isinstance(t, tuple) else t for t in threads],
+                                        0, False, False, "main", "main")
+                scoped = self.gate(findings, scope, threads)
+                self.assertEqual(scoped[:2], legacy[:2])
+                self.assertEqual(scoped[2][0], legacy[2][0])
+                self.assertEqual(scoped[3], legacy[3])
+
+    def test_scope_validation(self):
+        self.assertEqual(AA.validate_scope(""), "delta")
+        self.assertEqual(AA.validate_scope("FULL"), "full")
+        with self.assertRaises(ValueError):
+            AA.validate_scope("partial")
+
+    def test_workflow_input_defaults_to_delta_and_reaches_both_steps(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            text = f.read()
+        self.assertRegex(text, r"\n      approve_scope:\n(?:        .*\n)+?        default: delta\n")
+        self.assertEqual(text.count("APPROVE_SCOPE: ${{ inputs.approve_scope }}"), 2)
+        self.assertEqual(text.count("incremental_state=none"), 1)
+        self.assertEqual(text.count("incremental_state=built"), 1)
+        self.assertEqual(text.count("incremental_state=discarded"), 1)
