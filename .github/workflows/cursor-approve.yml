@@ -24,7 +24,7 @@ name: Cursor approve
 #                    (head and base re-read, reviewed-SHA marker, own stale
 #                    approvals withdrawn, never over needs-human-review or
 #                    skip-cursor-review, both re-read live at decide time;
-#                    on not_approved / error / superseded it leaves a
+#                    on not_approved / error / superseded / retargeted it leaves a
 #                    standing REQUEST_CHANGES instead; on needs_human /
 #                    vetoed it withdraws its own instead) and rewrites the
 #                    card with the verdicts.

@@ -58,13 +58,18 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 OUTCOME_APPROVED = "approved"
 OUTCOME_NOT_APPROVED = "not_approved"
 OUTCOME_SUPERSEDED = "superseded"
+# Superseded by a base retarget alone (BE-19527): the head is unchanged, so it
+# needs the push remedy a head move does not.
+OUTCOME_RETARGETED = "retargeted"
 OUTCOME_HUMAN = "needs_human"
 OUTCOME_VETOED = "vetoed"
 OUTCOME_OWN_PR = "own_pr"
 OUTCOME_ERROR = "error"
 
-# The machine-readable contract (docs/callers/cursor-approve.md). Values are
-# never renamed: agents key on them.
+# The machine-readable contract (docs/callers/cursor-approve.md). Agents key on
+# these values, so a released one is not renamed. The one exception was
+# `dismiss_then_relabel`, withdrawn for NEXT_PUSH below before any caller's pin
+# reached it; `next` is an open set, and an unrecognised value reads as `human`.
 STATE_PASS = "pass"
 STATE_CHANGES = "changes_requested"
 STATE_NO_DECISION = "no_decision"
@@ -76,11 +81,22 @@ NEXT_RELABEL = "relabel"
 NEXT_HUMAN = "human"
 # BE-19527. A relabel alone is a NO-OP for a round whose head never moved: the
 # gate's `dup` step skips any head that already carries a bot-posted
-# consolidated review, and a degraded round posts one too. Its documented
-# escape hatch is to dismiss that review first — so this is its own next step,
-# not `relabel`, because an agent following `relabel` would start nothing.
-NEXT_DISMISS = "dismiss_then_relabel"
-NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_DISMISS, NEXT_HUMAN)
+# consolidated review, and a degraded round posts one too.
+#
+# The first cut of this named the gate's own `state != "DISMISSED"` escape hatch
+# and called itself `dismiss_then_relabel`. That remedy does not exist:
+# post-review.py submits the consolidated review with `"event": "COMMENT"`, and
+# GitHub dismisses only APPROVED / CHANGES_REQUESTED reviews (422 otherwise, and
+# the UI offers no Dismiss control), so that branch of the filter is unreachable
+# for the one review it is matched against. It replaced an impossible remedy
+# with another one.
+#
+# What actually clears the dedupe is MOVING THE HEAD, so that is what this says.
+# An empty commit is enough. The relabel stays in the text because a label-gated
+# caller no-ops on `synchronize`: the push alone restarts the round only under
+# `run_without_label`.
+NEXT_PUSH = "push_then_relabel"
+NEXTS = (NEXT_NONE, NEXT_RESOLVE, NEXT_RELABEL, NEXT_PUSH, NEXT_HUMAN)
 STATE_MARKER = "<!-- cursor-approve-state: {} -->"
 NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
 
@@ -115,10 +131,14 @@ def next_relabel_text(label=DEFAULT_REVIEW_LABEL) -> str:
     return f"Re-run the round: {relabel(label)}."
 
 
-def next_dismiss_text(label=DEFAULT_REVIEW_LABEL) -> str:
-    """The round that a relabel alone cannot re-run (BE-19527)."""
-    return ("Dismiss the consolidated Cursor Review on this commit (the gate skips a head that already has one), "
-            f"then re-run the round: {relabel(label)}.")
+def next_push_text(label=DEFAULT_REVIEW_LABEL) -> str:
+    """The round that a relabel alone cannot re-run (BE-19527).
+
+    Moving the head is the only remedy the gate's dedupe actually honours; the
+    review it skips on cannot be dismissed (see NEXT_PUSH).
+    """
+    return ("Push a commit so the head moves — an empty one (`git commit --allow-empty`) is enough, since the gate "
+            f"skips a head that already carries a review — then re-run the round: {relabel(label)}.")
 
 
 def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
@@ -140,7 +160,7 @@ RELABEL = relabel()
 NEXT_RESOLVE_TEXT = next_resolve_text()
 NEXT_RELABEL_TEXT = next_relabel_text()
 NEXT_AUTO_RETRY_TEXT = next_auto_retry_text()
-NEXT_DISMISS_TEXT = next_dismiss_text()
+NEXT_PUSH_TEXT = next_push_text()
 # The hand-off withdraws the bot's own requests for changes (BE-19492), so a
 # human's review is what clears the PR; the label only resets the round count.
 # Not stated as done: every caller writes this card whether or not that
@@ -155,18 +175,20 @@ DECIDE_STATES = {
     OUTCOME_APPROVED: (STATE_PASS, NEXT_NONE),
     OUTCOME_NOT_APPROVED: (STATE_CHANGES, NEXT_RELABEL),
     OUTCOME_SUPERSEDED: (STATE_NO_DECISION, NEXT_RELABEL),
+    OUTCOME_RETARGETED: (STATE_NO_DECISION, NEXT_PUSH),
     OUTCOME_HUMAN: (STATE_CAPPED, NEXT_HUMAN),
     OUTCOME_VETOED: (STATE_NO_DECISION, NEXT_HUMAN),
     OUTCOME_OWN_PR: (STATE_NO_DECISION, NEXT_HUMAN),
-    OUTCOME_ERROR: (STATE_NO_DECISION, NEXT_RELABEL),
+    OUTCOME_ERROR: (STATE_NO_DECISION, NEXT_PUSH),
 }
 DECIDE_NEXT_TEXT = {
     OUTCOME_NOT_APPROVED: f"Address the axis verdicts above, push, then start a new round: {RELABEL}.",
     OUTCOME_SUPERSEDED: f"A newer commit needs its own round: {RELABEL}.",
+    OUTCOME_RETARGETED: f"The base was retargeted, so this diff needs its own round. {NEXT_PUSH_TEXT}",
     OUTCOME_HUMAN: NEXT_HUMAN_CAPPED_TEXT,
     OUTCOME_VETOED: "A human is needed: the PR carries `skip-cursor-review`.",
     OUTCOME_OWN_PR: "A human is needed: the approver cannot approve its own PR.",
-    OUTCOME_ERROR: f"Re-run the round: {RELABEL}.",
+    OUTCOME_ERROR: NEXT_PUSH_TEXT,
 }
 
 # Markdown/HTML-significant characters, backslash-escaped. `<` alone would be
@@ -272,11 +294,12 @@ def _confidence(value) -> str:
 
 def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome: str,
                   max_yellow: str, run_url: str) -> str:
-    state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_RELABEL))
-    next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_RELABEL_TEXT)
+    state, next_step = DECIDE_STATES.get(outcome, (STATE_NO_DECISION, NEXT_PUSH))
+    next_text = DECIDE_NEXT_TEXT.get(outcome, NEXT_PUSH_TEXT)
     lines = card_head(state, next_step) + [heading(round_no, max_rounds, sha), ""]
-    if outcome == OUTCOME_SUPERSEDED:
-        lines += ["**Superseded by a newer commit.**", "", f"**Next step:** {next_text}",
+    if outcome in (OUTCOME_SUPERSEDED, OUTCOME_RETARGETED):
+        what = "a newer commit" if outcome == OUTCOME_SUPERSEDED else "a base retarget"
+        lines += [f"**Superseded by {what}.**", "", f"**Next step:** {next_text}",
                   "", _reviewed_line(sha, run_url)]
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None
