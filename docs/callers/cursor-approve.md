@@ -36,7 +36,10 @@ the context axes (business, design, completeness) are not available yet.
    yellow than `max_yellow_axes` → no approval), reading each axis only from its
    own `axis-<name>` artifact, then `auto-approve.py approve-external`: it
    re-reads the head and base and withholds when either moved since the axes
-   ran, never approves a PR labelled `needs-human-review`,
+   ran, never approves a PR labelled `needs-human-review` or
+   `skip-cursor-review` (both read live from the PR at decide time, so a veto
+   applied while the axes run still stops the approval — a caller's
+   label-keyed concurrency group cannot cancel that in-flight decide),
    records the reviewed SHA in the review body, and withdraws this identity's
    own earlier approvals whenever it does not approve. An approval is one line
    linking the card. The card is rewritten with the verdicts, the result and
@@ -160,7 +163,11 @@ fails to withdraw it skips them, which decide reads as "no result".
 
 ## Axis inputs
 
-`axis-correctness.yml` and `axis-conformance.yml` (each declares only `CURSOR_API_KEY`):
+Every axis wrapper — `axis-correctness.yml`, `axis-conformance.yml`,
+`axis-business.yml`, `axis-design.yml`, `axis-completeness.yml` — takes the same
+three inputs. Their secrets differ; see [Context axes](#context-axes) for the
+last three. (Without a checkout, `commit_sha` is the head whose merge-base
+diff the workflow fetches from the GitHub API.)
 
 | Input | Default | Meaning |
 |---|---|---|
@@ -180,8 +187,99 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `model` | `claude-opus-5-thinking-xhigh` | As above. |
 | `runs_on` | `"ubuntu-latest"` | As above. |
 | `checkout` | `false` | Full read-only checkout of the PR head (`persist-credentials: false`). |
-| `mcp_config` | `''` | Reserved for the context axes; must be empty. |
-| `no_shell` | `false` | Reserved for the context axes; must be false. |
+| `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
+| `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
+
+Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
+transcript, plus the proxy's call log for the context axes. On a context axis
+each tool call in it is cut to the tool's name: no arguments and no results, so
+no Linear, Notion or Slack content. Only the verdict
+JSON (`verdict`, `confidence`, `summary` capped at 1200 characters) reaches
+`cursor-approve.yml`; its `axis-*` download never matches a transcript.
+
+## Context axes
+
+`axis-business.yml`, `axis-design.yml` and `axis-completeness.yml` judge a PR
+against company context, not just its code. They read Linear, Notion and Slack
+through `.github/cursor-approve/context-proxy.py`, a read-only MCP server that
+holds the tokens: the agent can search, but never holds a credential.
+
+| Axis | Agent sees | Context tools | Secrets (all but `CURSOR_API_KEY` optional) |
+|---|---|---|---|
+| business | PR title, body, changed-file list with line counts — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page`, `slack_search`, `slack_history` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN`, `SLACK_TOKEN` |
+| design | PR title, body, merge-base diff cut at 200 KB — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN` |
+| completeness | Full read-only checkout (`persist-credentials: false`), shell allowed for `git` | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
+
+A missing token leaves that source unconfigured; the axis still runs. The tokens
+are read-only bot identities (Linear and Notion as the tools bot, Slack as the
+cursor-approver app). The Slack bot cannot call `search.messages`, so the proxy
+loads the last 30 days of every public channel the bot is a member of and
+searches that.
+
+How a token reaches the proxy without reaching the agent:
+
+1. One step, the only one with the token secrets in its env, writes the enabled
+   tokens to a `0600` file and passes on nothing but its path.
+2. The axis step starts `context-proxy.py` FIRST, on two FIFOs and without
+   `CURSOR_API_KEY`; the proxy reads the token file and deletes it, and the
+   agent is not started until the file is gone. Tokens are never environment
+   variables of the proxy or the agent.
+3. cursor-agent's only MCP server is `mcp-relay.py`, which copies bytes between
+   the agent and the already-running proxy. The axis step's env holds none of
+   `LINEAR_KEY`, `NOTION_TOKEN`, `SLACK_TOKEN` (a test enforces this).
+
+Each axis runs only on a same-repo PR in a **private** repository. On a fork PR
+or a public repository the wrapper skips its axis with a notice; the base fails
+closed on a public repo too. A skipped axis uploads no verdict, so leave it out
+of `axes:` on a repo where it cannot run, or decide reads it as "no result".
+
+Business and design fetch the change from the GitHub compare API, which
+`contents: read` covers; no extra permission is needed.
+
+```yaml
+  axis-business:
+    needs: [cursor-review, approve-start]
+    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    uses: Comfy-Org/github-workflows/.github/workflows/axis-business.yml@<sha>  # v1
+    with:
+      commit_sha: ${{ github.event.pull_request.head.sha }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+
+  axis-design:
+    needs: [cursor-review, approve-start]
+    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml@<sha>  # v1
+    with:
+      commit_sha: ${{ github.event.pull_request.head.sha }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+
+  axis-completeness:
+    needs: [cursor-review, approve-start]
+    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    uses: Comfy-Org/github-workflows/.github/workflows/axis-completeness.yml@<sha>  # v1
+    with:
+      commit_sha: ${{ github.event.pull_request.head.sha }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
+```
+
+**Accepted risk.** These axes read author-written text (the PR, and whatever
+anyone wrote in an issue, page or channel) while holding read-only company
+context. A prompt injection in any of it can make the agent repeat that context
+into its verdict summary, which lands on the PR, or steer its verdict. That is
+acceptable on private repositories only, where everyone who can read the PR can
+already read the company, and is why the axes refuse to run on a public one.
+The completeness axis keeps a shell for `git`: on a hosted runner (passwordless
+`sudo`) a hostile agent could read the running proxy's memory, so its Linear
+token is protected by policy and prompt, not by the sandbox.
 
 ## Trust model
 

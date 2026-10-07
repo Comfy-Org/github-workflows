@@ -1,0 +1,63 @@
+name: Cursor axis (design)
+
+# The design axis of cursor-approve: a thin wrapper over cursor-axis-base.yml.
+# No checkout and no shell: the agent sees the PR title, body and
+# diff (truncated to 200 KB), fetched by the workflow.
+# Company context comes through context-proxy.py (tools: linear,notion), which
+# holds the tokens; the agent never does. Declares ONLY the secrets below, all
+# but CURSOR_API_KEY optional (a missing token leaves that tool unconfigured).
+# Runs only on same-repo PRs in a PRIVATE repo; otherwise it skips with a
+# notice. See docs/callers/cursor-approve.md for the caller and accepted risk.
+#
+# Inputs (passed through): commit_sha, model, runs_on.
+# Secrets: CURSOR_API_KEY, LINEAR_KEY, NOTION_TOKEN.
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5-thinking-xhigh
+      runs_on:
+        type: string
+        default: '"ubuntu-latest"'
+    secrets:
+      CURSOR_API_KEY:
+        required: true
+      LINEAR_KEY:
+        required: false
+      NOTION_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  skipped:
+    if: github.event.pull_request.head.repo.full_name != github.repository || github.event.repository.private != true
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain the skip
+        run: echo "::notice::the design axis runs only on same-repo PRs in a private repository; skipped"
+
+  design:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.repository.private == true
+    uses: ./.github/workflows/cursor-axis-base.yml
+    permissions:
+      contents: read
+    with:
+      axis: design
+      checkout: false
+      no_shell: true
+      context_sources: linear,notion
+      commit_sha: ${{ inputs.commit_sha }}
+      model: ${{ inputs.model }}
+      runs_on: ${{ inputs.runs_on }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

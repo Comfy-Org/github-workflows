@@ -1,0 +1,59 @@
+name: Cursor axis (completeness)
+
+# The completeness axis of cursor-approve: a thin wrapper over cursor-axis-base.yml.
+# A full read-only checkout of the PR head (persist-credentials false).
+# Company context comes through context-proxy.py (tools: linear), which
+# holds the tokens; the agent never does. Declares ONLY the secrets below, all
+# but CURSOR_API_KEY optional (a missing token leaves that tool unconfigured).
+# Runs only on same-repo PRs in a PRIVATE repo; otherwise it skips with a
+# notice. See docs/callers/cursor-approve.md for the caller and accepted risk.
+#
+# Inputs (passed through): commit_sha, model, runs_on.
+# Secrets: CURSOR_API_KEY, LINEAR_KEY.
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5-thinking-xhigh
+      runs_on:
+        type: string
+        default: '"ubuntu-latest"'
+    secrets:
+      CURSOR_API_KEY:
+        required: true
+      LINEAR_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  skipped:
+    if: github.event.pull_request.head.repo.full_name != github.repository || github.event.repository.private != true
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain the skip
+        run: echo "::notice::the completeness axis runs only on same-repo PRs in a private repository; skipped"
+
+  completeness:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.repository.private == true
+    uses: ./.github/workflows/cursor-axis-base.yml
+    permissions:
+      contents: read
+    with:
+      axis: completeness
+      checkout: true
+      no_shell: false
+      context_sources: linear
+      commit_sha: ${{ inputs.commit_sha }}
+      model: ${{ inputs.model }}
+      runs_on: ${{ inputs.runs_on }}
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      LINEAR_KEY: ${{ secrets.LINEAR_KEY }}

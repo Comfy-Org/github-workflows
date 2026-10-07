@@ -954,9 +954,14 @@ def pr_head_base(pr: dict) -> tuple:
 
 
 def live_labels_readable(pr: dict) -> bool:
-    """Whether `pr`'s `labels` is a list of label objects, each with a string name."""
+    """Whether the PR payload carries a label list `has_label` can fully read.
+    `has_label` reads a missing or shapeless `labels` — or skips an entry that is
+    not a dict with a string `name` — as "no such label", which fails OPEN for a
+    veto label; a caller that must fail closed checks this first."""
     labels = pr.get("labels")
-    return isinstance(labels, list) and all(isinstance(l, dict) and isinstance(l.get("name"), str) for l in labels)
+    return isinstance(labels, list) and all(
+        isinstance(label, dict) and isinstance(label.get("name"), str) for label in labels
+    )
 
 
 def has_label(pr: dict, name: str) -> bool:
@@ -1586,9 +1591,16 @@ def cmd_round_cap(args) -> int:
 # base ride in the body's markers (so `dismiss-stale` withdraws it on a push or
 # retarget like any other auto-approval), this identity's own earlier approvals
 # are withdrawn on every non-approval, and a `needs-human-review` PR is never
-# approved. The outcome is written as the step output `outcome` for the card.
+# approved. Nor is a PR labelled `skip-cursor-review`: a caller's label-keyed
+# concurrency group cannot cancel an in-flight decide when that veto lands
+# mid-axes, so decide re-reads it live. The outcome is written as the step
+# output `outcome` for the card.
 
-EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "own_pr", "error")
+EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "vetoed", "own_pr", "error")
+SKIP_REVIEW_MESSAGE = f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve approval withdrawn."
+LABELS_UNREADABLE_MESSAGE = (
+    f"The PR's labels could not be read to rule out `{SKIP_REVIEW_LABEL}` — cursor-approve approval withdrawn."
+)
 EXTERNAL_AXES = ("business", "design", "correctness", "completeness", "conformance")
 
 
@@ -1639,12 +1651,21 @@ def cmd_approve_external(args) -> int:
     try:
         pr = read_pr(args.repo, args.pr_number)
         live_head, live_base = pr_head_base(pr)
+        if not live_labels_readable(pr):
+            # The veto below must be read, not assumed absent.
+            raise ValueError("the PR payload carries no label list")
         human_review = has_label(pr, HUMAN_REVIEW_LABEL)
+        vetoed = has_label(pr, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError) as e:
         print(f"::error::Could not read the PR state: {e}")
         withdraw_own_approvals(args)
         return 1
-    if live_head != args.commit_sha:
+    # The veto is PR-wide, so it outranks `superseded`: that path withdraws only
+    # what is stale against the live head, and would leave an approval already
+    # standing on the live head in place on a vetoed PR.
+    if vetoed:
+        outcome, why = "vetoed", f"the PR is labelled `{SKIP_REVIEW_LABEL}`"
+    elif live_head != args.commit_sha:
         outcome, why = "superseded", f"the PR head moved from {args.commit_sha[:7]} to {live_head[:7] or '?'}"
     elif live_base != args.base_ref:
         # Same head, different base: the axes diffed against a base the PR no
@@ -1664,6 +1685,8 @@ def cmd_approve_external(args) -> int:
             # is stale against the LIVE head and base, so a decide that finishes
             # late cannot dismiss an approval that run already posted.
             return withdraw_own_approvals(args, STALE_MESSAGE, live_head, live_base)
+        if outcome == "vetoed":
+            return withdraw_own_approvals(args, SKIP_REVIEW_MESSAGE)
         return withdraw_own_approvals(args)
 
     body = render_external_body(args.card_url, args.commit_sha, args.base_ref)
@@ -1674,7 +1697,11 @@ def cmd_approve_external(args) -> int:
                 {"commit_id": args.commit_sha, "event": APPROVE, "body": body},
             )
         )
-    except RuntimeError as e:
+        # As cmd_decide: the id is what a late veto or move dismisses by, so a
+        # `gh` that exits 0 without one is an ambiguous POST, not a success.
+        if not isinstance(posted, dict) or posted.get("id") is None:
+            raise ValueError(f"the review POST returned no review id ({type(posted).__name__})")
+    except (RuntimeError, ValueError) as e:
         if "own pull request" in str(e).lower():
             set_output("outcome", "own_pr")
             emit(f"ℹ️ **cursor-approve: skipped** — the approver authored this PR ({e}).")
@@ -1688,16 +1715,38 @@ def cmd_approve_external(args) -> int:
         pr_now = read_pr(args.repo, args.pr_number)
         head_now, base_now = pr_head_base(pr_now)
         labelled_now = has_label(pr_now, HUMAN_REVIEW_LABEL)
+        # An unreadable label list cannot clear the veto: withdraw, but under
+        # its own cause rather than claiming a label nobody applied.
+        labels_unreadable = not live_labels_readable(pr_now)
+        vetoed_now = has_label(pr_now, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError):
         head_now = base_now = None
-        labelled_now = False
+        labelled_now = vetoed_now = labels_unreadable = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
-    if moved or labelled_now:
-        set_output("outcome", "superseded" if moved else "needs_human")
+    if moved or labelled_now or vetoed_now or labels_unreadable:
+        # Veto first, as before the POST: it is PR-wide.
+        if vetoed_now:
+            outcome, message = "vetoed", SKIP_REVIEW_MESSAGE
+        elif moved:
+            outcome, message = "superseded", STALE_MESSAGE
+        elif labelled_now:
+            outcome, message = "needs_human", HUMAN_REVIEW_MESSAGE
+        else:
+            outcome, message = "error", LABELS_UNREADABLE_MESSAGE
+        set_output("outcome", outcome)
         try:
-            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
+            dismiss(args.repo, args.pr_number, posted["id"], message)
         except RuntimeError as e:
             print(f"::error::The PR changed while the approval was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
+            return 1
+        if outcome in ("vetoed", "error"):
+            # Not only the review just posted: any other standing approval by
+            # this identity (an earlier run's, or one posted concurrently) would
+            # still count toward branch protection on a PR that cannot be cleared.
+            if withdraw_own_approvals(args, message):
+                return 1
+        if outcome == "error":
+            print(f"::error::{LABELS_UNREADABLE_MESSAGE}")
             return 1
         emit("ℹ️ **cursor-approve: withdrawn** — the PR changed while the approval was being posted.")
         return 0

@@ -68,6 +68,12 @@ class CardStates(unittest.TestCase):
         self.assertIn("red on correctness", body)
         self.assertIn("no red, at most 0 yellow", body)
 
+    def test_decide_vetoed_names_the_skip_label(self):
+        body = card.render_decide("1", "5", SHA, ["correctness"], decision(correctness="green"), "vetoed", "0", "")
+        self.assertIn("**Result: ❌ Not approved.**", body)
+        self.assertIn("- vetoed: the PR is labelled `skip-cursor-review`", body)
+        self.assertNotIn("no decision was reached", body)
+
     def test_malformed_decision_shows_no_result(self):
         body = card.render_decide("1", "5", SHA, ["correctness"], {"axes": "junk"}, "not_approved", "0", "")
         self.assertIn("| correctness | ⚠️ no result |", body)
@@ -179,9 +185,10 @@ class WorkflowWiring(unittest.TestCase):
             self.assertEqual(used, {"CURSOR_API_KEY"}, name)
             self.assertNotIn("secrets: inherit", text, name)
 
-    def test_axis_base_declares_only_cursor_api_key_and_reads_only(self):
+    def test_axis_base_declares_only_its_known_secrets_and_reads_only(self):
         path = os.path.join(WORKFLOWS, "cursor-axis-base.yml")
-        self.assertEqual(_secrets_declared(path), ["CURSOR_API_KEY"])
+        self.assertEqual(_secrets_declared(path),
+                         ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"])
         text = open(path, encoding="utf-8").read()
         self.assertNotRegex(text, r":\s*write\b")
         self.assertIn("persist-credentials: false", text)
