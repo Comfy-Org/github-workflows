@@ -307,20 +307,22 @@ The remaining shapes to expect before you require it:
   skip this check exactly when a dup-check API call errored, the diff could not
   be built, or a delisted model stopped the panel before a single cell started —
   and GitHub counts a skipped required check as **passing**. So a failed `Gate`,
-  `Diff size check`, `Preflight` **or `Prior-review ledger`** runs this job and
-  fails it: an undecided run is not a clean run. (`Prior-review ledger` is built
+  `Round cap`, `Diff size check`, `Preflight` **or `Prior-review ledger`** runs
+  this job and fails it: an undecided run is not a clean run. (`Round cap` sits
+  upstream of `Diff size check`, so a red one skips the panel just the same.) (`Prior-review ledger` is built
   never to fail — every step in it is `continue-on-error` — but a job timeout,
   a cancellation or a lost runner is not a step outcome, and "rare" is the wrong
   bar for something that would otherwise hand you a green merge gate.)
 * **It still skips when no review was warranted, and a skip is green.** The
   deliberate no-panel branches — no trigger label, an already-reviewed commit, a
-  PR over the diff-size cap, a fork the panel cannot run on — are the ones where
-  `Gate` and `Diff size check` both *succeeded* and said no panel should run.
+  PR that hit its `max_rounds` cap, a PR over the diff-size cap, a fork the panel
+  cannot run on — are the ones where `Gate`, `Round cap` and `Diff size check`
+  *succeeded* and said no panel should run.
   This check stays skipped there, and a required skipped check passes. That is
   the intended shape: it answers **"was the panel that ran whole?"**, not "was
   this PR reviewed at all?" If you need the second question gated too — most
-  relevantly, if you do not want an over-cap PR merging unreviewed — require the
-  Blocking gate, which fails closed on over-cap fresh reviews, and keep your own
+  relevantly, if you do not want an over-cap or round-capped PR merging
+  unreviewed — require the Blocking gate, which fails closed on both, and keep your own
   label policy. Do not read a skipped Panel integrity as "the panel was fine".
 * **A later no-panel run on the same commit supersedes a red with a skip.**
   That is the previous bullet's sharp edge, and reaching it needs no failure at

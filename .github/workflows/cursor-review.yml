@@ -3583,7 +3583,7 @@ jobs:
     # `always()`, and the same four gate conditions `consolidate` uses, so this
     # reports on exactly the runs where a panel was supposed to happen and stays
     # skipped on the ones where nothing was (no trigger label, already reviewed,
-    # over the diff-size cap, panel skipped). `always()` rather than
+    # capped by `max_rounds`, over the diff-size cap, panel skipped). `always()` rather than
     # `!cancelled()` for `Blocking gate`'s reason: GitHub counts a SKIPPED
     # required check as passing, so green-on-cancel would be a fail-open for any
     # caller that requires this. A cancelled run therefore reports red here —
@@ -3615,9 +3615,21 @@ jobs:
     # exact fail-open silently, which is how `preflight` and then `ledger` were
     # each missed in turn. `test_workflow_panel_integrity.py` pins the two lists
     # against each other so the next one cannot be.
+    #
+    # `round-cap` is the one decision job the matrix does NOT need directly: it
+    # sits upstream of `diff-size`, whose own `if:` skips on `capped == 'true'`.
+    # So it is read here on BOTH sides. A `round-cap` that did not succeed skips
+    # `diff-size` and the panel with it — undecided, so red, like the four
+    # above. A `round-cap` that SUCCEEDED and said `capped` is the deliberate
+    # `max_rounds` stop: no panel was warranted on this head, the PR is labelled
+    # `needs-human-review`, and the Blocking gate already fails closed on it, so
+    # this check skips exactly as it does over the diff-size cap. Without the
+    # `capped` disjunct the skipped `diff-size` reads as a failure and the guard
+    # below goes red telling the caller to "re-run the failed job" — which just
+    # hits the cap again.
     name: Panel integrity
-    needs: [gate, diff-size, preflight, ledger, review, consolidate, post-review]
-    if: ${{ always() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && (needs.preflight.result != 'success' || needs.ledger.result != 'success' || needs.review.result != 'skipped'))))) }}
+    needs: [gate, round-cap, diff-size, preflight, ledger, review, consolidate, post-review]
+    if: ${{ always() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.round-cap.result != 'success' || (needs.round-cap.outputs.capped != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && (needs.preflight.result != 'success' || needs.ledger.result != 'success' || needs.review.result != 'skipped'))))))) }}
     runs-on: ubuntu-latest
     # Reads job outputs and prints. No API call, no checkout, no network.
     timeout-minutes: 5
@@ -3636,12 +3648,14 @@ jobs:
         # even decided on, which is a true statement about the wrong question.
         #
         # This condition is exact GIVEN the job `if:` above, which admits only
-        # three ways to arrive here with an upstream decision job unfinished:
+        # four ways to arrive here with an upstream decision job unfinished:
         # `gate` did not succeed; `gate` selected a fresh in-scope review and
-        # `diff-size` did not succeed; or both succeeded and said review, and
-        # `preflight` or `ledger` did not succeed. All four are read back
+        # `round-cap` did not succeed; `round-cap` succeeded uncapped and
+        # `diff-size` did not succeed; or all three succeeded and said review,
+        # and `preflight` or `ledger` did not succeed. All five are read back
         # verbatim. (`within_cap` can only be the string 'true' when `diff-size`
-        # succeeded, so the deliberate over-cap skip never reaches this step.)
+        # succeeded, and a `capped` round-cap skips the job outright, so neither
+        # deliberate stop ever reaches this step.)
         #
         # `preflight` and `ledger` are here because they are the decision jobs
         # whose failure is invisible from the outputs: `review` needs BOTH, so a
@@ -3666,14 +3680,15 @@ jobs:
         # Note these are read as RESULTS, not as a reason to believe the matrix
         # ran: if `review` ran at all, all four succeeded, so this guard can only
         # fire on runs where the panel never started.
-        if: ${{ needs.gate.result != 'success' || needs.diff-size.result != 'success' || needs.preflight.result != 'success' || needs.ledger.result != 'success' }}
+        if: ${{ needs.gate.result != 'success' || needs.round-cap.result != 'success' || needs.diff-size.result != 'success' || needs.preflight.result != 'success' || needs.ledger.result != 'success' }}
         env:
           GATE_RESULT: ${{ needs.gate.result }}
+          ROUND_CAP_RESULT: ${{ needs.round-cap.result }}
           DIFF_SIZE_RESULT: ${{ needs.diff-size.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           LEDGER_RESULT: ${{ needs.ledger.result }}
         run: |
-          echo "::error::Panel integrity cannot be judged: the jobs that decide whether a panel should run did not succeed (gate: ${GATE_RESULT}, diff size: ${DIFF_SIZE_RESULT}, preflight: ${PREFLIGHT_RESULT}, ledger: ${LEDGER_RESULT}). Whether this PR was reviewed at all is unknown — re-run the failed job."
+          echo "::error::Panel integrity cannot be judged: the jobs that decide whether a panel should run did not succeed (gate: ${GATE_RESULT}, round cap: ${ROUND_CAP_RESULT}, diff size: ${DIFF_SIZE_RESULT}, preflight: ${PREFLIGHT_RESULT}, ledger: ${LEDGER_RESULT}). Whether this PR was reviewed at all is unknown — re-run the failed job."
           exit 1
 
       - name: Report panel integrity

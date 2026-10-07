@@ -60,6 +60,7 @@ REPORT_STEP = "Report panel integrity"
 GATE_CONDITIONS = (
     "needs.gate.outputs.should_run == 'true'",
     "needs.gate.outputs.already_reviewed != 'true'",
+    "needs.round-cap.outputs.capped != 'true'",
     "needs.diff-size.outputs.within_cap == 'true'",
     "needs.review.result != 'skipped'",
 )
@@ -82,6 +83,7 @@ UNTRUSTED_VALUES = ("OK_COUNT", "TOTAL", "JUDGE_STATUS", "DELIVERED", "UNGATED",
 # Rare is the wrong bar for a guard that hands out a green required check.
 DECISION_RESULTS = (
     "needs.gate.result != 'success'",
+    "needs.round-cap.result != 'success'",
     "needs.diff-size.result != 'success'",
     "needs.preflight.result != 'success'",
     "needs.ledger.result != 'success'",
@@ -623,6 +625,137 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
         # unlabelled PR is what would get this check un-required again.
         for gate in GATE_CONDITIONS:
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
+
+
+NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)\.(result|outputs\.[A-Za-z0-9_]+)")
+
+
+def evaluate_if(condition, needs):
+    """Evaluate a job `if:` built only from `always()`, `needs.*` reads, string
+    literals, `==`/`!=`, `&&`/`||` and parentheses.
+
+    `needs` maps a job to `{"result": ..., "outputs": {...}}`. A job absent from
+    it, or an output it does not declare, reads as '' — which is exactly what
+    GitHub hands a FAILED or SKIPPED job's outputs. Anything outside that small
+    grammar fails the translation loudly rather than evaluating to a guess.
+    """
+    expr = condition.strip()
+    if expr.startswith("${{") and expr.endswith("}}"):
+        expr = expr[3:-2].strip()
+
+    def read(match):
+        job, field = match.group(1), match.group(2)
+        entry = needs.get(job, {})
+        if field == "result":
+            value = entry.get("result", "")
+        else:
+            value = entry.get("outputs", {}).get(field.split(".", 1)[1], "")
+        return repr(value)
+
+    py = NEEDS_REF.sub(read, expr)
+    py = py.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
+    leftover = re.sub(r"'[^']*'|\b(True|and|or)\b|==|!=|[()\s]", "", py)
+    if leftover:  # pragma: no cover - only on a grammar this helper does not know
+        raise AssertionError("cannot evaluate `if:` remainder %r" % leftover)
+    return eval(py, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
+
+
+class RoundCapIsADecisionJobTest(unittest.TestCase):
+    """`round-cap` (the `max_rounds` stop) sits upstream of `diff-size`.
+
+    A CAPPED round-cap skips `diff-size` by design, and a skipped `diff-size`
+    is what the fail-closed disjunct reads as "undecided" — so without its own
+    `capped` disjunct this check went RED on every capped head, telling the
+    caller to re-run a job that would just hit the cap again. A round-cap that
+    did NOT succeed is the opposite case: it skips the panel with nobody having
+    decided anything, so it must still go red rather than skip to green.
+
+    Evaluated, not substring-matched: the bug was a correct-looking expression
+    whose nesting produced the wrong branch.
+    """
+
+    def setUp(self):
+        self.panel = split_jobs(read_workflow())[PANEL_JOB]
+        self.condition = job_scalar(self.panel, "if")
+        self.guard_if = None
+        for line in code_lines(step_named(self.panel, UNDECIDED_STEP)):
+            if line.strip().startswith("if:"):
+                self.guard_if = line.strip()[len("if:"):].strip()
+        self.assertIsNotNone(self.condition)
+        self.assertIsNotNone(self.guard_if)
+
+    def fresh(self, **overrides):
+        needs = {
+            "gate": {"result": "success", "outputs": {"should_run": "true", "already_reviewed": "false"}},
+            "round-cap": {"result": "success", "outputs": {"capped": "false"}},
+            "diff-size": {"result": "success", "outputs": {"within_cap": "true"}},
+            "preflight": {"result": "success"},
+            "ledger": {"result": "success"},
+            "review": {"result": "success"},
+            "consolidate": {"result": "success"},
+            "post-review": {"result": "success"},
+        }
+        needs.update(overrides)
+        return needs
+
+    def test_a_whole_run_reports_and_does_not_trip_the_guard(self):
+        needs = self.fresh()
+        self.assertTrue(evaluate_if(self.condition, needs))
+        self.assertFalse(evaluate_if(self.guard_if, needs))
+
+    def test_a_capped_head_skips_like_the_other_deliberate_stops(self):
+        needs = self.fresh(**{
+            "round-cap": {"result": "success", "outputs": {"capped": "true"}},
+            "diff-size": {"result": "skipped"},
+            "preflight": {"result": "skipped"},
+            "ledger": {"result": "success"},
+            "review": {"result": "skipped"},
+            "consolidate": {"result": "skipped"},
+            "post-review": {"result": "skipped"},
+        })
+        self.assertFalse(
+            evaluate_if(self.condition, needs),
+            f"`{PANEL_JOB}` runs on a `max_rounds`-capped head, where its guard "
+            "reads the deliberately skipped `diff-size` as a failure and goes red",
+        )
+
+    def test_max_rounds_off_leaves_capped_empty_and_still_reports(self):
+        # `max_rounds: 0` skips the counting step, so `capped` is '' — not
+        # 'true', and the panel runs as normal.
+        needs = self.fresh(**{"round-cap": {"result": "success", "outputs": {}}})
+        self.assertTrue(evaluate_if(self.condition, needs))
+        self.assertFalse(evaluate_if(self.guard_if, needs))
+
+    def test_a_failed_round_cap_is_red_not_skipped(self):
+        for result in ("failure", "cancelled"):
+            needs = self.fresh(**{
+                "round-cap": {"result": result},
+                "diff-size": {"result": "skipped"},
+                "preflight": {"result": "skipped"},
+                "review": {"result": "skipped"},
+                "consolidate": {"result": "skipped"},
+                "post-review": {"result": "skipped"},
+            })
+            self.assertTrue(evaluate_if(self.condition, needs), result)
+            self.assertTrue(evaluate_if(self.guard_if, needs), result)
+
+    def test_the_other_deliberate_stops_still_skip(self):
+        unlabelled = self.fresh(**{
+            "gate": {"result": "success", "outputs": {"should_run": "false"}},
+            "round-cap": {"result": "skipped"},
+            "diff-size": {"result": "skipped"},
+        })
+        over_cap = self.fresh(**{
+            "diff-size": {"result": "success", "outputs": {"within_cap": "false"}},
+            "review": {"result": "skipped"},
+        })
+        for needs in (unlabelled, over_cap):
+            self.assertFalse(evaluate_if(self.condition, needs))
+
+    def test_the_guard_names_round_cap_in_its_message(self):
+        body = "\n".join(code_lines(step_named(self.panel, UNDECIDED_STEP)))
+        self.assertIn("ROUND_CAP_RESULT: ${{ needs.round-cap.result }}", body)
+        self.assertIn("${ROUND_CAP_RESULT}", body)
 
 
 class FlattenEscapesWorkflowCommandsTest(unittest.TestCase):
