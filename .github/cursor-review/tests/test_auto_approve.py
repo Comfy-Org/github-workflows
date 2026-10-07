@@ -221,6 +221,16 @@ class MaxFailedReviewersTest(unittest.TestCase):
         self.assertEqual(decide(panel=panel, max_failed=1, judge="error")[0], AA.NONE)
         self.assertEqual(decide(panel=panel, max_failed=1, delivered=False)[0], AA.NONE)
 
+    def test_composes_with_approve_scope(self):
+        # The errored-reviewer note stays on reasons[0]; the scope note keeps
+        # riding as the second reason, as approve_scope documents.
+        panel = panel_with(("m1", "edge-case"))
+        event, reasons, _ = AA.decide("medium", [], panel, "ok", True, SHA, SHA, [], 0, False, "main", "main",
+                                      scope={"scope": AA.SCOPE_FULL}, max_failed_reviewers=1)
+        self.assertEqual(event, AA.APPROVE)
+        self.assertIn("approved with 1/6 reviewers errored: m1:edge-case", reasons[0])
+        self.assertTrue(reasons[1].startswith("approve_scope `full`"))
+
     def test_the_note_echoes_only_plain_tokens(self):
         panel = panel_with(("m1", "edge-case"))
         panel[1]["model"] = "@someone `x`\n"
