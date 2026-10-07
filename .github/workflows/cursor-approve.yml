@@ -9,8 +9,9 @@ name: Cursor approve
 #                    `defer_approval: true` (recommended: then this phase's
 #                    decide is the only approver), its decide has ALREADY
 #                    approved when it reports approve_gate == pass, and that
-#                    approval must not stand while the axes judge — then
-#                    writes the status card (every axis pending, or "Round
+#                    approval must not stand while the axes judge (on
+#                    approve_gate == capped, its own standing
+#                    REQUEST_CHANGES too) — then writes the status card (every axis pending, or "Round
 #                    limit reached" when cursor-review reported
 #                    approve_gate == capped). cursor-review's decide has
 #                    already written the card for this round, on every
@@ -23,9 +24,10 @@ name: Cursor approve
 #                    (head and base re-read, reviewed-SHA marker, own stale
 #                    approvals withdrawn, never over needs-human-review or
 #                    skip-cursor-review, both re-read live at decide time;
-#                    on not_approved / error / superseded / needs_human it
-#                    leaves a standing REQUEST_CHANGES instead) and rewrites
-#                    the card with the verdicts.
+#                    on not_approved / error / superseded it leaves a
+#                    standing REQUEST_CHANGES instead; on needs_human /
+#                    vetoed it withdraws its own instead) and rewrites the
+#                    card with the verdicts.
 #
 # No job here checks out PR code; the only checkout is this repo at
 # workflows_ref, for the scripts.
@@ -225,9 +227,12 @@ jobs:
           LOGIN: ${{ steps.login.outputs.login }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # `capped` also withdraws the standing request for changes: on the
+          # round-cap path no cursor-review decide ran to do it.
+          APPROVE_GATE: ${{ inputs.approve_gate }}
         run: |
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" withdraw --repo "$REPO" \
-            --pr-number "$PR_NUMBER" --approver-login "$LOGIN"
+            --pr-number "$PR_NUMBER" --approver-login "$LOGIN" --approve-gate "$APPROVE_GATE"
 
       - name: Write the start card
         if: steps.token.outputs.present == 'true' && inputs.phase == 'start'

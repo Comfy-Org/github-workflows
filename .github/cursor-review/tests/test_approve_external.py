@@ -38,7 +38,7 @@ class FakeGitHub:
         if args[:2] == ["api", "graphql"]:
             # list_reviews reads through GraphQL (for `lastEditedAt`).
             nodes = [{"fullDatabaseId": str(r["id"]), "databaseId": r["id"], "state": r.get("state"),
-                      "body": r.get("body"), "lastEditedAt": None, "submittedAt": None, "url": "",
+                      "body": r.get("body"), "lastEditedAt": r.get("lastEditedAt"), "submittedAt": None, "url": "",
                       "author": {"__typename": "User", "login": (r.get("user") or {}).get("login", "")}}
                      for r in self.reviews]
             return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
@@ -59,6 +59,16 @@ class FakeGitHub:
 def prior_approval(sha="c" * 40, rid=42):
     return {"id": rid, "state": "APPROVED", "user": {"login": LOGIN},
             "body": aa.APPROVE_MARKER + f"\n<!-- cursor-review-auto-approve:sha={sha} -->"}
+
+
+def handoff_reviews():
+    """The bot's own standing block (77), a human's REQUEST_CHANGES (78), and a
+    bot block someone edited (79): a hand-off withdraws only the first."""
+    marked = aa.APPROVE_MARKER + "\nNo decision this round."
+    return [{"id": 77, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN}, "body": marked},
+            {"id": 78, "state": "CHANGES_REQUESTED", "user": {"login": "a-human"}, "body": marked},
+            {"id": 79, "state": "CHANGES_REQUESTED", "user": {"login": LOGIN}, "body": marked,
+             "lastEditedAt": "2026-01-01T00:00:00Z"}]
 
 
 class ApproveExternal(unittest.TestCase):
@@ -215,11 +225,42 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "superseded"))
         self.assertEqual(fake.dismissed, ["555"])
 
-    def test_needs_human_review_label_approves_nothing_and_blocks(self):
-        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL])
+    def test_needs_human_review_label_approves_nothing_and_withdraws_the_block(self):
+        # BE-19492: the hand-off means no round will approve, so no approving
+        # round would ever withdraw a block either — it goes now, and none is
+        # posted. A human's REQUEST_CHANGES and an edited bot one stay.
+        fake = FakeGitHub(labels=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "needs_human"))
-        self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+        self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["needs_human"]])
+
+    def test_needs_human_review_landing_during_the_post_withdraws_approval_and_blocks(self):
+        fake = FakeGitHub(labels_after=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "needs_human"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+        self.assertEqual(fake.dismissed, ["555", "77"])
+
+    def test_a_veto_withdraws_the_standing_block_too(self):
+        fake = FakeGitHub(labels=[aa.SKIP_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "vetoed"))
+        self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["77"])
+        self.assertEqual(fake.dismiss_messages, [aa.EXTERNAL_HANDOFF_MESSAGES["vetoed"]])
+
+    def test_a_handoff_block_that_cannot_be_withdrawn_is_red(self):
+        class Refuses(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "PUT"]:
+                    raise RuntimeError("gh api: HTTP 403")
+                return super().__call__(args, payload)
+
+        fake = Refuses(labels=[aa.HUMAN_REVIEW_LABEL], reviews=handoff_reviews())
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (1, "needs_human"))
 
     # --- the skip-cursor-review veto, re-read live at decide time ---
 
@@ -367,6 +408,34 @@ class ApproveExternal(unittest.TestCase):
         args.approver_login = " "
         with mock.patch.object(aa, "gh", fake):
             self.assertEqual(aa.cmd_withdraw(args), 2)
+
+    def test_withdraw_on_a_capped_gate_also_withdraws_the_block(self):
+        # BE-19492: the round cap labelled the PR and no decide ran to do it.
+        for gate, dismissed in (("capped", ["77"]), ("pass", []), ("", [])):
+            with self.subTest(gate=gate):
+                fake = FakeGitHub(reviews=handoff_reviews())
+                args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate=gate)
+                with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+                    self.assertEqual(aa.cmd_withdraw(args), 0)
+                self.assertEqual(fake.dismissed, dismissed)
+
+    def test_withdraw_stays_green_when_the_block_cannot_be_withdrawn(self):
+        class Refuses(FakeGitHub):
+            def __call__(self, args, payload=None):
+                if args[:3] == ["api", "-X", "PUT"]:
+                    raise RuntimeError("gh api: HTTP 403")
+                return super().__call__(args, payload)
+
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate="capped")
+        with mock.patch.object(aa, "gh", Refuses(reviews=handoff_reviews())), \
+                mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+            self.assertEqual(aa.cmd_withdraw(args), 0)
+
+    def test_the_start_phase_passes_the_gate_to_withdraw(self):
+        path = os.path.join(HERE, "..", "..", "workflows", "cursor-approve.yml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('--approver-login "$LOGIN" --approve-gate "$APPROVE_GATE"', text)
 
     # --- the bot's own at-or-below-threshold threads, as cursor-review's decide ---
 

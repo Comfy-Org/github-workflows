@@ -33,7 +33,11 @@ Five subcommands, each run from a job that checks out NO PR code:
     CHANGES_REQUESTED is deliberately NOT dismissed on a push: under the
     label-triggered caller a push starts no new round, so dismissing it would let
     any trivial push clear the bot's veto. Only a later round's own review event
-    supersedes it (GitHub counts a reviewer's most recent review).
+    supersedes it (GitHub counts a reviewer's most recent review) — unless no
+    round is coming: on a PR labelled ``skip-cursor-review`` or
+    ``needs-human-review``, or with ``--threshold ''`` (the caller's
+    ``approve_max_severity`` is empty), this identity's own marked, unedited
+    REQUEST_CHANGES are dismissed too (``withdraw_handed_off_blocks``).
 
 ``round-cap`` (in `round-cap`, before the panel starts)
     Count the consolidated reviews the posting identity has already left on
@@ -56,7 +60,8 @@ Five subcommands, each run from a job that checks out NO PR code:
     ``approve_scope_effective``: only ``delta`` lets a marked non-gating thread
     above the threshold stop blocking that resolution; empty or absent is ``full``.
     An outcome that withholds (``EXTERNAL_BLOCK_OUTCOMES``) leaves the same
-    standing REQUEST_CHANGES a no-decision ``decide`` does (BE-19489).
+    standing REQUEST_CHANGES a no-decision ``decide`` does (BE-19489); one that
+    hands the PR to a human (``needs_human``, ``vetoed``) withdraws it instead.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
@@ -1398,13 +1403,15 @@ def _review_label(args) -> str:
 def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list, scope: dict) -> int:
     """A NONE decision: the card, plus the standing request for changes.
 
-    `capped` keeps its behaviour — the label already hands the PR to a human,
-    so no new request for changes; the card says so.
+    `capped` posts none: the label hands the PR to a human, and no round will
+    approve it, so an earlier one is withdrawn instead (BE-19492) — else it
+    would block the merge until dismissed by hand. The card says so.
     """
     if gate == GATE_CAPPED:
+        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
         write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
                          reasons, _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
-        return 0
+        return rc
     if gate == GATE_FAIL:
         # Trusted round, but an earlier round's thread above the threshold is
         # still open.
@@ -1618,7 +1625,8 @@ def cmd_decide(args) -> int:
     #
     # The same window can label the PR `needs-human-review` — a human, or a
     # concurrent run hitting the round cap — and an APPROVE must not outlive
-    # that hand-off either. (A REQUEST_CHANGES withholds nothing, so it stays.)
+    # that hand-off either. A REQUEST_CHANGES withholds nothing, so it is not
+    # undone as a decision; it goes with the hand-off's other blocks below.
     try:
         pr_now = read_pr(args.repo, args.pr_number)
         head_now, base_now = pr_head_base(pr_now)
@@ -1645,9 +1653,23 @@ def cmd_decide(args) -> int:
             write_round_card(args, CARD_NO_DECISION, CARD_NEXT_RELABEL, NO_DECISION_HEADLINE,
                              reasons_moved, next_text, threshold)
             return rc
+        # The withdrawn approval may have been the only thing superseding an
+        # earlier block, and a PR handed to a human keeps none (card_for_none).
+        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
         write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
                          [why], _card_text("NEXT_HUMAN_CAPPED_TEXT"), threshold)
-        return 0
+        return rc
+    if labelled_now:
+        # A REQUEST_CHANGES that raced the hand-off: the PR is a human's now,
+        # and no round will withdraw this one either.
+        withdraw_decision(GATE_CAPPED)
+        emit(f"ℹ️ **Auto-approve: REQUEST_CHANGES withdrawn** — the PR was labelled `{HUMAN_REVIEW_LABEL}` "
+             "while it was being posted.")
+        rc = dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
+        write_round_card(args, CARD_CAPPED, CARD_NEXT_HUMAN, CAPPED_HEADLINE,
+                         [f"the PR was labelled `{HUMAN_REVIEW_LABEL}`"], _card_text("NEXT_HUMAN_CAPPED_TEXT"),
+                         threshold)
+        return rc
     emit(f"{'✅' if event == APPROVE else '❌'} **Auto-approve: {event}** — {reasons[0]}.")
     if event == APPROVE:
         # Only here: the APPROVE is posted AND the head/base re-check passed.
@@ -1748,18 +1770,30 @@ def dismiss_own_change_requests(args, message: str = "", older_than=None) -> int
     lower id, i.e. posted before it: review ids grow monotonically, and a run
     that finishes late must not dismiss a block a NEWER run posted. An edited
     one is someone else's words (see _stale_approvals) and stays."""
-    login = (args.approver_login or "").strip().lower()
-    if not login:
+    if not (args.approver_login or "").strip():
         return 0
     try:
-        ids = [r["id"] for r in list_reviews(args.repo, args.pr_number)
-               if r.get("state") == "CHANGES_REQUESTED" and not r.get("edited")
-               and APPROVE_MARKER in (r.get("body") or "")
-               and (r.get("user") or {}).get("login", "").lower() == login
-               and (older_than is None or int(r["id"]) < int(older_than))]
+        ids = own_change_requests(list_reviews(args.repo, args.pr_number), args.approver_login, older_than)
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not list reviews to withdraw an earlier request for changes: {annotation_cause(e, 'unknown error')}")
         return 1
+    return _dismiss_change_requests(args, ids, message)
+
+
+def own_change_requests(reviews: list, approver_login: str, older_than=None) -> list:
+    """Ids of `approver_login`'s own unedited, marked REQUEST_CHANGES reviews
+    (older than review id `older_than`, when given). Empty login → none."""
+    login = (approver_login or "").strip().lower()
+    if not login:
+        return []
+    return [r["id"] for r in reviews
+            if r.get("state") == "CHANGES_REQUESTED" and not r.get("edited")
+            and APPROVE_MARKER in (r.get("body") or "")
+            and (r.get("user") or {}).get("login", "").lower() == login
+            and (older_than is None or int(r["id"]) < int(older_than))]
+
+
+def _dismiss_change_requests(args, ids: list, message: str = "") -> int:
     failed = []
     for rid in ids:
         try:
@@ -2081,9 +2115,11 @@ def cmd_dismiss_stale(args) -> int:
     # malformed `labels`: this job runs on every event, so neither goes red, and
     # neither mass-withdraws on a payload it cannot read.
     vetoed = None
+    human_review = False
     if read_error is None:
         if live_labels_readable(pr):
             vetoed = next((label for label in VETO_LABELS if has_label(pr, label)), None)
+            human_review = has_label(pr, HUMAN_REVIEW_LABEL)
         else:
             print(f"::warning::The live labels of {args.repo}#{args.pr_number} are not a list of named labels — "
                   f"could not check for {', '.join(f'`{label}`' for label in VETO_LABELS)} this run; judging "
@@ -2171,7 +2207,35 @@ def cmd_dismiss_stale(args) -> int:
         # Red, not a warning: a stale approval that stays valid is the exact
         # failure this job exists to prevent.
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
-    return 1 if failed or others else 0
+    blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review)
+    return 1 if failed or others or blocks_failed else 0
+
+
+THRESHOLD_OFF_MESSAGE = ("cursor-review auto-approve is off for this repo (`approve_max_severity` is empty) — "
+                         "earlier request for changes withdrawn.")
+
+
+def withdraw_handed_off_blocks(args, reviews: list, vetoed, human_review: bool) -> int:
+    """dismiss-stale's other half (BE-19492): withdraw this identity's own
+    marked REQUEST_CHANGES once auto-approve has stopped deciding the PR.
+
+    A push alone never clears one — a label-triggered caller starts no round
+    on a push, so only a later round may supersede it. But on a vetoed PR
+    (`skip-cursor-review`), one handed to a human (`needs-human-review`), or
+    a caller whose threshold is empty (`--threshold ''`, the kill switch), no
+    approving round is coming to withdraw it, and it would block the merge
+    until someone dismissed it by hand. `--threshold` absent (None) checks
+    the labels only. Red when a dismissal fails, like a stale approval.
+    """
+    if vetoed:
+        message = SKIP_REVIEW_WITHDRAWN_MESSAGE
+    elif human_review:
+        message = HUMAN_REVIEW_MESSAGE
+    elif getattr(args, "threshold", None) is not None and not args.threshold.strip():
+        message = THRESHOLD_OFF_MESSAGE
+    else:
+        return 0
+    return _dismiss_change_requests(args, own_change_requests(reviews, args.approver_login), message)
 
 
 def last_unlabeled_at(timeline: list, label: str):
@@ -2500,9 +2564,17 @@ def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str
 # standing REQUEST_CHANGES a no-decision cursor-review round does, so under
 # `defer_approval` — where the passing cursor-review round already dismissed
 # every earlier block — a red axis still leaves the PR visibly blocked until
-# something approves. `vetoed` (a human's label) and `own_pr` (nothing can
-# approve) do not; neither does an approval.
-EXTERNAL_BLOCK_OUTCOMES = ("not_approved", "error", "superseded", "needs_human")
+# something approves. `own_pr` (nothing can approve) does not; neither does an
+# approval.
+EXTERNAL_BLOCK_OUTCOMES = ("not_approved", "error", "superseded")
+# Outcomes that hand the PR to a human (BE-19492): no round will approve it,
+# so no approving round would ever withdraw a block either. These post none
+# and withdraw this identity's earlier ones, as cursor-review's capped round
+# and dismiss-stale's veto do.
+EXTERNAL_HANDOFF_MESSAGES = {
+    "needs_human": f"The PR was labelled `{HUMAN_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
+    "vetoed": f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve's request for changes withdrawn.",
+}
 EXTERNAL_BLOCK_HEADLINE = "cursor-approve did not approve this round, so this PR is not approved."
 
 
@@ -2529,8 +2601,11 @@ def external_block(args, outcome: str, decision, why: str, live_head: str = "") 
     The body is the decide card's own reasons (card.decide_reasons) and next
     step. A `superseded` decide that finishes late must not veto a newer run's
     approval of the live head (GitHub counts a reviewer's LATEST review), so
-    it posts nothing when one stands.
+    it posts nothing when one stands. A hand-off outcome
+    (EXTERNAL_HANDOFF_MESSAGES) withdraws the earlier blocks instead.
     """
+    if outcome in EXTERNAL_HANDOFF_MESSAGES:
+        return dismiss_own_change_requests(args, EXTERNAL_HANDOFF_MESSAGES[outcome])
     if outcome not in EXTERNAL_BLOCK_OUTCOMES:
         return 0
     card = _load_card()
@@ -2730,11 +2805,19 @@ def cmd_withdraw(args) -> int:
     approved when it reports `approve_gate == 'pass'`, so without this the axes
     would judge a PR that is approved for their whole run, and branch protection
     or auto-merge could land it before a red axis withdrew the approval. With
-    defer on it is a backstop."""
+    defer on it is a backstop.
+
+    With ``--approve-gate capped`` it also withdraws this identity's standing
+    REQUEST_CHANGES (BE-19492): when the round cap is what labelled the PR, no
+    `decide` ran to do it, and no round will approve a PR handed to a human.
+    Not fatal — a failure here must not skip the start card after it."""
     if not (args.approver_login or "").strip():
         print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
         return 2
-    return withdraw_own_approvals(args, AXES_PENDING_MESSAGE)
+    rc = withdraw_own_approvals(args, AXES_PENDING_MESSAGE)
+    if (getattr(args, "approve_gate", "") or "").strip() == GATE_CAPPED:
+        dismiss_own_change_requests(args, HUMAN_REVIEW_MESSAGE)
+    return rc
 
 
 def main() -> int:
@@ -2790,6 +2873,9 @@ def main() -> int:
     s.add_argument("--all-approvals", action="store_true")
     # The event's head: used ONLY when the live PR head cannot be read.
     s.add_argument("--head-sha", default="")
+    # The caller's approve_max_severity. Passed but empty = auto-approve is
+    # off, so its standing requests for changes are withdrawn; absent = unknown.
+    s.add_argument("--threshold", default=None)
     c = sub.add_parser("round-cap")
     c.add_argument("--repo", required=True)
     c.add_argument("--pr-number", required=True)
@@ -2817,6 +2903,8 @@ def main() -> int:
     w.add_argument("--repo", required=True)
     w.add_argument("--pr-number", required=True)
     w.add_argument("--approver-login", required=True)
+    # cursor-review's approve_gate: `capped` also withdraws the standing block.
+    w.add_argument("--approve-gate", default="")
     args = parser.parse_args()
     if args.cmd == "approve-external":
         return cmd_approve_external(args)

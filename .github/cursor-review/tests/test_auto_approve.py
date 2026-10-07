@@ -542,7 +542,7 @@ class StaleReviewTest(unittest.TestCase):
         self.assertEqual(AA.unactionable_stale_approvals(reviews, "", NEW), ["cursor-approver:1", "old-approver:2"])
 
     def run_dismiss(self, reviews, all_approvals=False, list_error=None, login="cursor-approver", live_base="main",
-                    labels=None):
+                    labels=None, threshold=None, put_error=None):
         # `labels=None` is a real PR's empty label list; pass a malformed value
         # (a number, a nameless label) to exercise the unreadable-labels path.
         labels = [] if labels is None else labels
@@ -554,6 +554,8 @@ class StaleReviewTest(unittest.TestCase):
                     raise list_error
                 return graphql_reviews(reviews)
             if args[:2] == ["api", "-X"]:
+                if put_error:
+                    raise put_error
                 puts.append((args[3], payload["message"]))
                 return "{}"
             # The live PR: head NEW, even when the event that started the run carried an older one.
@@ -561,6 +563,8 @@ class StaleReviewTest(unittest.TestCase):
 
         args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=login, all_approvals=all_approvals,
                                   head_sha=OLD)
+        if threshold is not None:
+            args.threshold = threshold
         self.printed, self.emitted = [], []
         with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", self.emitted.append), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
@@ -653,6 +657,73 @@ class StaleReviewTest(unittest.TestCase):
                 self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/2/dismissals", AA.STALE_MESSAGE)]))
                 self.assertTrue(any(line.startswith("::warning::") and "skip-cursor-review" in line
                                     for line in self.printed))
+
+
+class HandedOffBlockTest(unittest.TestCase):
+    """BE-19492: dismiss-stale also withdraws the bot's standing REQUEST_CHANGES
+    once no round is coming to — a veto, a hand-off to a human, or an empty
+    threshold — and never on a plain push."""
+
+    # Borrowed, not inherited: subclassing would re-run every StaleReviewTest.
+    review, run_dismiss, VETO = StaleReviewTest.review, StaleReviewTest.run_dismiss, StaleReviewTest.VETO
+
+    def block(self, rid, login="cursor-approver", marker=True, edited=False):
+        return self.review(rid, login=login, state="CHANGES_REQUESTED", marker=marker, edited=edited)
+
+    def mixed(self):
+        # Own block (3); a human's REQUEST_CHANGES (4); an edited bot block (5);
+        # an unmarked one by the approver identity, i.e. not auto-approve's (6).
+        return [self.block(3), self.block(4, login="a-human"), self.block(5, edited=True),
+                self.block(6, marker=False)]
+
+    def blocks_dismissed(self, puts):
+        return [(int(path.split("/")[-2]), message) for path, message in puts
+                if int(path.split("/")[-2]) in (3, 4, 5, 6)]
+
+    def test_a_push_keeps_the_block(self):
+        rc, puts = self.run_dismiss(self.mixed())
+        self.assertEqual((rc, puts), (0, []))
+        rc, puts = self.run_dismiss(self.mixed(), threshold="low")
+        self.assertEqual((rc, puts), (0, []))
+
+    def test_the_veto_withdraws_only_the_bots_own_block(self):
+        rc, puts = self.run_dismiss(self.mixed() + [self.review(1, sha=NEW, base="main")], labels=self.VETO,
+                                    threshold="low")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.blocks_dismissed(puts), [(3, AA.SKIP_REVIEW_WITHDRAWN_MESSAGE)])
+        # The approval goes too, as before.
+        self.assertIn(("repos/o/r/pulls/1/reviews/1/dismissals", AA.SKIP_REVIEW_WITHDRAWN_MESSAGE), puts)
+
+    def test_needs_human_review_withdraws_the_block_but_not_an_on_head_approval(self):
+        rc, puts = self.run_dismiss(self.mixed() + [self.review(1, sha=NEW, base="main")],
+                                    labels=[{"name": "needs-human-review"}], threshold="low")
+        self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/3/dismissals", AA.HUMAN_REVIEW_MESSAGE)]))
+
+    def test_an_empty_threshold_withdraws_the_block(self):
+        for threshold in ("", "  "):
+            with self.subTest(threshold=threshold):
+                rc, puts = self.run_dismiss(self.mixed(), threshold=threshold)
+                self.assertEqual((rc, puts), (0, [("repos/o/r/pulls/1/reviews/3/dismissals",
+                                                   AA.THRESHOLD_OFF_MESSAGE)]))
+
+    def test_no_approver_identity_dismisses_nothing(self):
+        rc, puts = self.run_dismiss(self.mixed(), login="", labels=self.VETO)
+        self.assertEqual((rc, puts), (0, []))
+
+    def test_unreadable_labels_withdraw_no_block(self):
+        rc, puts = self.run_dismiss(self.mixed(), labels=7, threshold="low")
+        self.assertEqual((rc, puts), (0, []))
+
+    def test_a_block_that_cannot_be_withdrawn_goes_red(self):
+        rc, puts = self.run_dismiss([self.block(3)], labels=self.VETO, put_error=RuntimeError("HTTP 403"))
+        self.assertEqual((rc, puts), (1, []))
+        self.assertTrue(any(line.startswith("::warning::") and "3: RuntimeError" in line for line in self.printed))
+
+    def test_the_job_passes_the_threshold(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            job = re.search(r"^  dismiss-stale-approval:\n(.*?)^  \S", f.read(), re.S | re.M).group(1)
+        self.assertIn("THRESHOLD: ${{ inputs.approve_max_severity }}", job)
+        self.assertIn('--threshold "$THRESHOLD"', job)
 
 
 class DismissJobTriggerTest(unittest.TestCase):
@@ -1329,9 +1400,24 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         self.assertEqual(self.run_decide(labels_after=["needs-human-review"]), (0, "capped"))
         self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/99/dismissals"])
 
-    def test_label_applied_during_a_request_changes_leaves_it(self):
-        rc, gate = self.run_decide(findings=[finding("critical")], labels_after=["needs-human-review"])
-        self.assertEqual((rc, gate, self.writes), (0, "fail", []))
+    def test_label_applied_during_the_post_withdraws_an_earlier_block_too(self):
+        # BE-19492: the dismissed approval no longer supersedes it, and no round
+        # is coming to.
+        block = {"id": 5, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+                 "body": AA.APPROVE_MARKER + "\nblock"}
+        self.assertEqual(self.run_decide(labels_after=["needs-human-review"], reviews=[block]), (0, "capped"))
+        self.assertEqual(self.writes, ["repos/o/r/pulls/1/reviews/99/dismissals",
+                                       "repos/o/r/pulls/1/reviews/5/dismissals"])
+
+    def test_label_applied_during_a_request_changes_withdraws_it(self):
+        # BE-19492: the PR is a human's now, so the block just posted goes with
+        # the hand-off (the listing returns it, as GitHub's would).
+        posted = {"id": 99, "user": {"login": "cursor-approver"}, "state": "CHANGES_REQUESTED",
+                  "body": AA.APPROVE_MARKER + "\nchanges"}
+        rc, gate = self.run_decide(findings=[finding("critical")], labels_after=["needs-human-review"],
+                                   reviews=[posted])
+        self.assertEqual((rc, gate, self.writes), (0, "capped", ["repos/o/r/pulls/1/reviews/99/dismissals"]))
+        self.assertEqual([p["event"] for p in self.posted], ["REQUEST_CHANGES"])
 
     def test_pass(self):
         self.assertEqual(self.run_decide(), (0, "pass"))
@@ -2539,6 +2625,19 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
     def test_capped_posts_no_new_request_for_changes(self):
         self.run_decide(labels=["needs-human-review"])
         self.assertEqual(self.reviews_posted, [])
+        self.assertEqual(self.dismissed, [])
+
+    def test_capped_withdraws_the_bots_earlier_block(self):
+        # BE-19492: no round will approve a PR handed to a human, so nothing
+        # else would ever withdraw it. A human's and an edited one stay.
+        human = dict(own_change_request(6), user={"login": "a-human"})
+        rc, gate = self.run_decide(labels=["needs-human-review"],
+                                   reviews=[own_change_request(5), human, own_change_request(7, edited=True)])
+        self.assertEqual((rc, gate), (0, AA.GATE_CAPPED))
+        self.assertEqual(self.reviews_posted, [])
+        self.assertEqual(self.dismissed, [(5, AA.HUMAN_REVIEW_MESSAGE)])
+        # The card's next step names what actually clears the PR.
+        self.assertIn("request for changes is withdrawn", self.card_body())
         body = self.card_body()
         self.assert_markers(body, "capped", "human")
         self.assertIn("needs-human-review", body)
