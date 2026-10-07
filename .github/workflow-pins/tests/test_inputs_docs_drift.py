@@ -196,9 +196,15 @@ ROWS = (
     # The cursor-approve family shares one guide, one Inputs table each. Their
     # header comments document inputs in prose and leave `with:` to the guide;
     # the base is never called by consumers, so it has no example at all.
+    Row(workflow="axis-business", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Axis inputs", expect_header_with=False),
+    Row(workflow="axis-completeness", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Axis inputs", expect_header_with=False),
     Row(workflow="axis-conformance", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
         inputs_heading="## Axis inputs", expect_header_with=False),
     Row(workflow="axis-correctness", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Axis inputs", expect_header_with=False),
+    Row(workflow="axis-design", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
         inputs_heading="## Axis inputs", expect_header_with=False),
     Row(workflow="cursor-approve", sentinel="workflows_ref", expect_header_with=False),
     Row(workflow="cursor-axis-base", sentinel="axis", guide="docs/callers/cursor-approve.md",
