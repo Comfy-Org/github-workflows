@@ -36,7 +36,10 @@ the context axes (business, design, completeness) are not available yet.
    yellow than `max_yellow_axes` → no approval), reading each axis only from its
    own `axis-<name>` artifact, then `auto-approve.py approve-external`: it
    re-reads the head and base and withholds when either moved since the axes
-   ran, never approves a PR labelled `needs-human-review`,
+   ran, never approves a PR labelled `needs-human-review` or
+   `skip-cursor-review` (both read live from the PR at decide time, so a veto
+   applied while the axes run still stops the approval — a caller's
+   label-keyed concurrency group cannot cancel that in-flight decide),
    records the reviewed SHA in the review body, and withdraws this identity's
    own earlier approvals whenever it does not approve. An approval is one line
    linking the card. The card is rewritten with the verdicts, the result and

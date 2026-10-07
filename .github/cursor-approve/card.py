@@ -46,6 +46,7 @@ OUTCOME_APPROVED = "approved"
 OUTCOME_NOT_APPROVED = "not_approved"
 OUTCOME_SUPERSEDED = "superseded"
 OUTCOME_HUMAN = "needs_human"
+OUTCOME_VETOED = "vetoed"
 OUTCOME_OWN_PR = "own_pr"
 OUTCOME_ERROR = "error"
 
@@ -159,6 +160,7 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
     else:
         why = {
             OUTCOME_HUMAN: ["the PR is labelled `needs-human-review`"],
+            OUTCOME_VETOED: ["vetoed: the PR is labelled `skip-cursor-review`"],
             OUTCOME_OWN_PR: ["the approver authored this PR"],
             OUTCOME_ERROR: ["the approval could not be posted (see the workflow run)"],
         }.get(outcome)
