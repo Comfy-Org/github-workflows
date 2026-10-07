@@ -1326,6 +1326,195 @@ check "workflows_ref pin bumped even here"       "grep -qE \"workflows_ref: ${NE
 check "workflows_ref's '# main @' moved with it" \
   "grep -qE \"workflows_ref: ${NEW_SHA} +# main @ ${SHORT}\\\$\" \"$PUT\""
 
+echo "== cursor-review's companions move WITH it: cursor-approve + axes in one file (BE-19438) =="
+# The shape a real caller ships: cursor-review.yml, cursor-approve.yml twice
+# (phase start / decide) and two axis workflows, all in ONE file, with three
+# `workflows_ref:` inputs. Before COMPANION_FILES the file read as calling a
+# SIBLING reusable, so rule 1 moved only cursor-review.yml's `uses:` while rule 2
+# moved every `workflows_ref:` — cursor-approve's `uses:` stayed on the old SHA
+# beside a `workflows_ref:` on the new one, a split pin the assertion could not
+# see. The fixture starts in exactly that split state (cursor-approve/axes on
+# 2222…, every workflows_ref already on 1111…), so it also proves a bump REPAIRS
+# a caller an earlier bump left split.
+CR_COMPANIONS='cursor-approve.yml
+cursor-axis-base.yml
+axis-correctness.yml
+axis-conformance.yml
+axis-business.yml
+axis-design.yml
+axis-completeness.yml'
+new_case companions
+COMP_FIXTURE="${WORK}/companions_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111 # github-workflows main (0000000)' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  '  approve-start:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-approve.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  '  axis-correctness:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/axis-correctness.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  '  axis-conformance:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/axis-conformance.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  '  approve-decide:' \
+  '    steps:' \
+  '      - uses: actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd  # v6' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-approve.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  > "$COMP_FIXTURE"
+STUB_CONTENT_FILE="$COMP_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  COMPANION_FILES="$CR_COMPANIONS" \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-companions","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0"                                   "[[ $RC -eq 0 ]]"
+check "committed the file"                       "[[ -f \"$PUT\" ]]"
+check "all FIVE github-workflows uses: moved"    "[[ \$(grep -cE \"github-workflows/\\.github/workflows/[a-z-]+\\.yml@${NEW_SHA}\" \"$PUT\") -eq 5 ]]"
+check "cursor-review.yml moved"                  "grep -qF \"cursor-review.yml@${NEW_SHA}\" \"$PUT\""
+check "BOTH cursor-approve.yml pins moved"       "[[ \$(grep -cF \"cursor-approve.yml@${NEW_SHA}\" \"$PUT\") -eq 2 ]]"
+check "axis-correctness.yml moved"               "grep -qF \"axis-correctness.yml@${NEW_SHA}\" \"$PUT\""
+check "axis-conformance.yml moved"               "grep -qF \"axis-conformance.yml@${NEW_SHA}\" \"$PUT\""
+check "all THREE workflows_ref moved"            "[[ \$(grep -cE \"workflows_ref: ${NEW_SHA}\\\$\" \"$PUT\") -eq 3 ]]"
+check "no old pin survives anywhere"             "! grep -qE '1111111111111111111111111111111111111111|2222222222222222222222222222222222222222' \"$PUT\""
+check "third-party checkout pin untouched"       "grep -qF 'actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd' \"$PUT\""
+# Provably ours alone now, so the unattributed markers are refreshed on EVERY
+# family line — including cursor-review's own, which the multi-reusable guard
+# used to freeze (a real caller's still named a SHA two bumps old).
+check "all FIVE markers name the new short SHA"  "[[ \$(grep -cF \"github-workflows main (${SHORT})\" \"$PUT\") -eq 5 ]]"
+check "no stale marker survives"                 "! grep -qE 'github-workflows main \\((0000000|2222222)\\)' \"$PUT\""
+check "no multi-reusable warning (companions are ours)" \
+  "! grep -q 'pin comments untouched' <<<\"\$OUT\""
+check "no half-bump warning"                     "! grep -q 'still pins github-workflows' <<<\"\$OUT\""
+
+echo "== the same file WITHOUT COMPANION_FILES is still treated as multi-reusable =="
+# Unset COMPANION_FILES must leave every other fleet byte-identical, and this is
+# the shape that proves the input is load-bearing: the family is WORKFLOW_FILE
+# alone again, cursor-approve reads as a sibling, and its pins are not ours to
+# move — the pre-BE-19438 behavior, kept for fleets that have no companions.
+new_case nocompanions
+STUB_CONTENT_FILE="$COMP_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-companions","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0"                                   "[[ $RC -eq 0 ]]"
+check "warned the file is not ours alone"        "grep -q 'pin comments untouched' <<<\"\$OUT\""
+check "cursor-approve.yml left on its own SHA"   "[[ \$(grep -cF 'cursor-approve.yml@2222222222222222222222222222222222222222' \"$PUT\") -eq 2 ]]"
+
+echo "== a GENUINE sibling beside the companions keeps its pin (BE-19438) =="
+# Companions widen what counts as ours; they must not widen it to everything. A
+# file that ALSO calls a different fleet's reusable (groom.yml) is still
+# multi-reusable: rule 1's address now names the whole family, so cursor-review,
+# cursor-approve and the axis move together, and groom's `uses:` pin, its
+# `# main @` note and every unattributed marker are left exactly as found.
+new_case companionsibling
+COMPSIB_FIXTURE="${WORK}/companions_sibling_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111  # main @ 1111111' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  '  approve:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-approve.yml@2222222222222222222222222222222222222222  # main @ 2222222' \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
+  '  axis-design:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@3333333333333333333333333333333333333333  # main @ 3333333' \
+  '  legacy:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml-v2.yml@4444444444444444444444444444444444444444  # main @ 4444444' \
+  '  linked:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@5555555555555555555555555555555555555555  # https://github.com/Comfy-Org/github-workflows/blob/main/.github/workflows/cursor-review.yml' \
+  > "$COMPSIB_FIXTURE"
+STUB_CONTENT_FILE="$COMPSIB_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  COMPANION_FILES="$CR_COMPANIONS" \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-compsib","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0"                                   "[[ $RC -eq 0 ]]"
+check "cursor-review.yml moved"                  "grep -qF \"cursor-review.yml@${NEW_SHA}\" \"$PUT\""
+check "companion cursor-approve.yml moved"       "grep -qF \"cursor-approve.yml@${NEW_SHA}\" \"$PUT\""
+check "companion axis-design.yml moved"          "grep -qF \"axis-design.yml@${NEW_SHA}\" \"$PUT\""
+check "both workflows_ref moved"                 "[[ \$(grep -cE \"workflows_ref: ${NEW_SHA}\\\$\" \"$PUT\") -eq 2 ]]"
+check "companion's '# main @' moved with its pin" "grep -qE \"cursor-approve.yml@${NEW_SHA} +# main @ ${SHORT}\\\$\" \"$PUT\""
+check "the SIBLING groom.yml pin is UNCHANGED"   "grep -qF 'groom.yml@3333333333333333333333333333333333333333' \"$PUT\""
+check "the sibling's '# main @' note untouched"  "grep -qF '# main @ 3333333' \"$PUT\""
+# The address is anchored on the `@` that ends the filename, so neither a sibling
+# whose name merely STARTS with a family name nor a family name inside a sibling
+# line's comment URL makes that line ours.
+check "family-prefixed sibling pin UNCHANGED"    "grep -qF 'axis-design.yml-v2.yml@4444444444444444444444444444444444444444  # main @ 4444444' \"$PUT\""
+check "sibling naming a family file in a URL UNCHANGED" "grep -qF 'groom.yml@5555555555555555555555555555555555555555' \"$PUT\""
+check "unattributed marker left alone"           "grep -qF 'github-workflows main (2222222)' \"$PUT\""
+check "warned the file is not ours alone"        "grep -q 'pin comments untouched' <<<\"\$OUT\""
+
+echo "== the post-rewrite assertion covers a companion pin it cannot move (BE-19438) =="
+# In the sibling case the stale-pin reader is restricted to SHA_ADDR's lines. A
+# companion is on those lines now, so a companion `uses:` the rewrite cannot move
+# (an expression ref) fails the repo instead of reading as somebody else's pin.
+new_case companionstale
+COMPSTALE_FIXTURE="${WORK}/companions_stale_caller.yml"
+printf '%s\n' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  '  axis:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/axis-correctness.yml@\${{ inputs.ref }}" \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@3333333333333333333333333333333333333333' \
+  > "$COMPSTALE_FIXTURE"
+STUB_CONTENT_FILE="$COMPSTALE_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  COMPANION_FILES="$CR_COMPANIONS" \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-compstale","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit non-zero (repo failed)"              "[[ $RC -ne 0 ]]"
+check "named the companion's unmovable pin"      "grep -q 'still pins github-workflows at' <<<\"\$OUT\""
+check "committed nothing"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a file pinning ONLY companions still clears the address gate =="
+# The pre-rewrite gate asks whether the file carries a pin this fleet can move.
+# A companion IS one, so a file that (today, or mid-migration) calls only
+# cursor-approve is bumped rather than reported as an un-bumpable roster entry.
+new_case companiononly
+COMPONLY_FIXTURE="${WORK}/companion_only_caller.yml"
+printf '%s\n' \
+  'jobs:' \
+  '  approve:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-approve.yml@2222222222222222222222222222222222222222' \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
+  > "$COMPONLY_FIXTURE"
+STUB_CONTENT_FILE="$COMPONLY_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  COMPANION_FILES="$CR_COMPANIONS" \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-componly","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0"                                   "[[ $RC -eq 0 ]]"
+check "no un-bumpable warning"                   "! grep -q 'carries no' <<<\"\$OUT\""
+check "cursor-approve.yml moved"                 "grep -qF \"cursor-approve.yml@${NEW_SHA}\" \"$PUT\""
+check "workflows_ref moved"                      "grep -qE \"workflows_ref: ${NEW_SHA}\\\$\" \"$PUT\""
+
+echo "== a malformed COMPANION_FILES entry is a hard error =="
+# A companion name that could never match a `uses:` scan would silently turn its
+# pins back into a sibling's — so the shape is enforced before anything runs. The
+# glob case also proves the list is split without pathname expansion.
+for BAD in '.github/workflows/cursor-approve.yml' 'cursor-approve' '*.yml' 'a b.txt'; do
+  new_case "badcompanion"
+  STUB_CONTENT_FILE="$COMP_FIXTURE" run_bump \
+    VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+    COMPANION_FILES="$BAD" \
+    CALLERS_JSON='[{"repo":"Comfy-Org/secret-companions","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+  check "rejected '$BAD' (exit 1)"      "[[ $RC -eq 1 ]]"
+  check "rejected '$BAD' (named rule)"  "grep -q 'COMPANION_FILES entries must be bare reusable filenames' <<<\"\$OUT\""
+  check "rejected '$BAD' (no commit)"   "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+done
+
 echo "== merely NAMING a sibling workflow in a comment is not a second caller (BE-4523) =="
 # The multi-reusable check reads `uses:` lines only. A single-reusable caller that
 # mentions a sibling workflow in prose (or a docs URL, or a commented-out block)

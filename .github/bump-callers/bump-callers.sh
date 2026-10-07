@@ -80,6 +80,21 @@
 #                    fleet here uses wiring, so a stray `wire_bot: true` in that
 #                    fleet's roster is a harmless no-op with a warning, not a
 #                    failure — this keeps the script itself cursor-review-agnostic.
+#   COMPANION_FILES  Whitespace/newline-separated reusable FILENAMES (no path,
+#                    e.g. `cursor-approve.yml`) that ship as one family with
+#                    WORKFLOW_FILE and are pinned alongside it in the SAME caller
+#                    file (BE-19438: cursor-review's approve half — cursor-approve
+#                    plus the axis workflows — is called from the same file as
+#                    cursor-review itself, both halves loading assets from one
+#                    `workflows_ref`). A companion is treated as THIS fleet's own
+#                    reusable everywhere a pin is attributed: it does not make a
+#                    file "multi-reusable", its `uses:` pin moves with ours, and
+#                    the pre-/post-rewrite assertions cover it. Unset (every other
+#                    fleet) leaves behavior byte-identical. A malformed name is a
+#                    HARD ERROR, for the FILE_FILTER reason: a name that matches
+#                    nothing would silently turn the cursor-approve pins back into
+#                    a "sibling" the bump refuses to move — the split pin this
+#                    input exists to close.
 
 # NOTE: deliberately no `set -e`. Each caller is bumped independently in
 # bump_one(); a failure there returns non-zero and is downgraded to a per-repo
@@ -107,6 +122,41 @@ if [[ -n "$FILE_FILTER" && ! "$FILE_FILTER" =~ ^\.github/workflows/[A-Za-z0-9._-
   echo "::error::FILE_FILTER must be a .github/workflows/<name>.yml path (got '${FILE_FILTER}'). Fix this entrypoint's env — a filter that matches nothing would no-op the fleet silently."
   exit 1
 fi
+
+# The fleet's reusable FAMILY: WORKFLOW_FILE plus any COMPANION_FILES, validated
+# to the same `<name>.yml` shape a `uses:` scan below can yield (the GW_USES
+# grep keeps only `[A-Za-z0-9._-]+\.ya?ml` filenames), so a companion that could
+# never be seen there is rejected here instead of matching nothing forever.
+# FLEET_FILES_RE is the same set as a dot-escaped ERE alternation, for SHA_ADDR.
+# With no companions it is the bare escaped WORKFLOW_FILE, exactly what the
+# address used to interpolate.
+# `read -a` rather than an unquoted `for … in $COMPANION_FILES`: it splits on
+# whitespace without pathname expansion, so a stray `*.yml` is rejected by the
+# shape check below instead of globbing into whatever files sit in the cwd.
+FLEET_FILES=("$WORKFLOW_FILE")
+COMPANIONS_IN=()
+read -r -d '' -a COMPANIONS_IN <<<"${COMPANION_FILES-}" || true
+for COMPANION in ${COMPANIONS_IN[@]+"${COMPANIONS_IN[@]}"}; do
+  if [[ ! "$COMPANION" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+    echo "::error::COMPANION_FILES entries must be bare reusable filenames like cursor-approve.yml (got '${COMPANION}'). Fix this entrypoint's env — a companion that matches nothing would leave its pins un-bumped beside a bumped ${WORKFLOW_FILE}."
+    exit 1
+  fi
+  [[ "$COMPANION" == "$WORKFLOW_FILE" ]] || FLEET_FILES+=("$COMPANION")
+done
+FLEET_FILES_RE="${FLEET_FILES[0]//./\\.}"
+if (( ${#FLEET_FILES[@]} > 1 )); then
+  FLEET_FILES_RE="(${FLEET_FILES_RE}"
+  for COMPANION in "${FLEET_FILES[@]:1}"; do
+    FLEET_FILES_RE="${FLEET_FILES_RE}|${COMPANION//./\\.}"
+  done
+  FLEET_FILES_RE="${FLEET_FILES_RE})"
+fi
+# True when $1 (a reusable filename) is WORKFLOW_FILE or one of its companions.
+is_fleet_file() {
+  local F
+  for F in "${FLEET_FILES[@]}"; do [[ "$F" == "$1" ]] && return 0; done
+  return 1
+}
 
 SHORT="${NEW_SHA:0:7}"
 # Stable branch per (repo, TAG) — deliberately NOT SHA-stamped. A fixed head
@@ -626,9 +676,24 @@ bump_repo() {
       | sed -E 's|.*/||' | sort -u) || true
     # Provably ours alone → safe to rewrite unattributed marker comments.
     # Provably NOT ours alone → this file also calls a SIBLING fleet's reusable.
-    local GW_ONLY_OURS=0 GW_HAS_SIBLING=0
+    #
+    # "Ours" is the fleet's whole reusable FAMILY (WORKFLOW_FILE plus
+    # COMPANION_FILES), not WORKFLOW_FILE alone (BE-19438). A caller that pins
+    # cursor-review.yml, cursor-approve.yml (twice) and two axis workflows in one
+    # file is ONE fleet's caller — every one of those pins and every
+    # `workflows_ref:` belongs to the same release and has to move together. When
+    # the family was just WORKFLOW_FILE, that file read as multi-reusable, so
+    # rule 1 below was address-restricted to cursor-review.yml's line while the
+    # unaddressed rule 2 still moved every `workflows_ref:`: the companions'
+    # `uses:` stayed on the old SHA and their `workflows_ref:` moved to the new
+    # one — a split pin, shipped green. A companion therefore never counts as a
+    # sibling; only a reusable outside the family does.
+    local GW_ONLY_OURS=0 GW_HAS_SIBLING=0 GW_FILE
     if [[ -n "$GW_USES" ]]; then
-      if [[ "$GW_USES" == "$WORKFLOW_FILE" ]]; then GW_ONLY_OURS=1; else GW_HAS_SIBLING=1; fi
+      GW_ONLY_OURS=1
+      while IFS= read -r GW_FILE; do
+        is_fleet_file "$GW_FILE" || { GW_ONLY_OURS=0; GW_HAS_SIBLING=1; }
+      done <<<"$GW_USES"
     fi
 
     # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale pin
@@ -657,30 +722,40 @@ bump_repo() {
     #
     # In a file that also calls a SIBLING github-workflows reusable, rule 1 (the
     # `uses:` pin — token-anchored on repo name alone, not on WHICH reusable) is
-    # additionally address-restricted to OUR reusable's path via SHA_ADDR: without
-    # it, a caller pinning TWO github-workflows reusables would have BOTH `uses:`
-    # lines bumped to this fleet's SHA — a cross-fleet stamp that silently points
-    # the sibling caller at a commit its own fleet never shipped. Rules 4-6 (the
-    # `# main @` comment, below) ride on the SAME address, since the annotation
-    # belongs to whichever pin line it sits on. The tightening is inert for every
-    # caller today (all 23 call exactly one github-workflows reusable, so the
-    # address matches everywhere rule 1 would anyway); it exists so a caller that
-    # starts calling two cannot be corrupted.
+    # additionally address-restricted to OUR reusables' paths via SHA_ADDR — the
+    # whole family, WORKFLOW_FILE and every companion (BE-19438): without it, a
+    # caller pinning a sibling fleet's reusable too would have that `uses:` line
+    # bumped to this fleet's SHA — a cross-fleet stamp that silently points the
+    # sibling caller at a commit its own fleet never shipped. The companions are
+    # in the address so they still move WITH ours when a genuine sibling shares
+    # the file; restricting to WORKFLOW_FILE alone is what left cursor-approve
+    # and the axes behind. Rules 4-6 (the `# main @` comment, below) ride on the
+    # SAME address, since the annotation belongs to whichever pin line it sits on.
     #
     # Rule 2 (`workflows_ref:`) stays unaddressed in both cases: it is a `with:`
     # input carrying no workflow name, so telling OUR job's from a sibling job's
     # needs YAML block structure a line-wise sed does not have — and leaving ours
     # un-bumped (a `workflows_ref` disagreeing with its own `uses:` pin) is the
-    # worse failure. Unreachable while no caller calls two reusables; if one ever
-    # does, parse the YAML instead of extending this rule.
+    # worse failure. This used to say "unreachable while no caller calls two
+    # reusables"; that stopped being true when callers began pinning cursor-approve
+    # and the axes beside cursor-review, and it is exactly how the split pin above
+    # shipped. Counting companions as ours closes THAT case (the file is no longer
+    # multi-reusable, so every `workflows_ref:` is ours by construction). What is
+    # left is a GENUINE sibling that carries its own `workflows_ref:` (a groom or
+    # pr-risk call sharing a file with cursor-review): its input would still be
+    # moved to this fleet's SHA. No caller does that today; if one ever does, parse
+    # the YAML instead of extending this rule.
     # The address's filename half needs a LEFT delimiter. `github-workflows[^
     # [:space:]]*groom\.yml` is satisfied by a sibling caller pinning
     # `…/workflows/legacy-groom.yml` — the target name merely ENDS the token — so
     # that caller would be treated as ours, repinned to this fleet's SHA by rules
     # 1/4-6, and pass the address-filtered assertion. Requiring the `/` that
-    # starts the filename scopes it to the intended reusable. A right delimiter is
-    # unnecessary: `[^[:space:]]*` cannot cross whitespace, so the match is
-    # confined to the single `uses:` token, where `.yml` is followed by `@`.
+    # starts the filename scopes it to the intended reusable. It needs a RIGHT
+    # delimiter too, the `@` that starts the ref: `[^[:space:]]*` keeps the match
+    # inside one token, but not inside the PIN token — a sibling reusable named
+    # `axis-design.yml-v2.yml`, or a space-free URL in a sibling line's comment
+    # that names a family file, otherwise satisfies the address. With eight
+    # family names (BE-19438) rather than one, that is no longer far-fetched.
     #
     # SHA_ADDR is consumed two ways and needs two spellings. `grep -E` takes it
     # raw; sed takes it as a `/…/` ADDRESS, where an unescaped `/` would close the
@@ -690,7 +765,7 @@ bump_repo() {
     local SHA_ADDR SHA_ADDR_SED
     SHA_ADDR='github-workflows|workflows_ref'
     if (( GW_HAS_SIBLING )); then
-      SHA_ADDR="github-workflows[^[:space:]]*/${WORKFLOW_FILE//./\\.}|workflows_ref"
+      SHA_ADDR="github-workflows[^[:space:]]*/${FLEET_FILES_RE}@|workflows_ref"
     fi
     SHA_ADDR_SED="${SHA_ADDR//\//\\/}"
 
