@@ -193,6 +193,16 @@ ROWS = (
         expect_header_with=False,
     ),
     Row(workflow="assign-reviewers", sentinel="reviewer_config_path"),
+    # The cursor-approve family shares one guide, one Inputs table each. Their
+    # header comments document inputs in prose and leave `with:` to the guide;
+    # the base is never called by consumers, so it has no example at all.
+    Row(workflow="axis-conformance", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Axis inputs", expect_header_with=False),
+    Row(workflow="axis-correctness", sentinel="commit_sha", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Axis inputs", expect_header_with=False),
+    Row(workflow="cursor-approve", sentinel="workflows_ref", expect_header_with=False),
+    Row(workflow="cursor-axis-base", sentinel="axis", guide="docs/callers/cursor-approve.md",
+        inputs_heading="## Base inputs", expect_guide_with=False, expect_header_with=False),
     Row(workflow="coderabbit-config-validate", sentinel="workflows_ref"),
     Row(workflow="cursor-review-auto-label", sentinel="review_label"),
     # `## Configuration knobs` in the panel README is checked TWO-WAY, which is

@@ -662,6 +662,24 @@ class TestAnsweredSemantics(unittest.TestCase):
         )
         self.assertEqual(maint["thread"]["answered_count"], 1)
 
+    def test_the_auto_resolve_reply_is_not_an_answer(self):
+        """auto-approve.py's reply is posted under the approver — often a member
+        account — but gives no reason; counting it would spend the judge's repeat
+        budget on the bot answering its own finding."""
+        body = ("Resolved by auto-approve: Low finding, at or below the `low` threshold, "
+                f"on commit abc1234.\n\n{bl.AUTO_RESOLVE_MARKER}")
+        ledger, entry = self._entry(reply_comment(2001, 1001, "approver", body, association="MEMBER"))
+        self.assertEqual(entry["thread"]["reply_count"], 1)
+        self.assertEqual(entry["thread"]["answered_count"], 0)
+        self.assertEqual(ledger["unanswered_count"], 1)
+        self.assertIn("NOT an answer", bl.render_ledger_markdown(ledger, "judge"))
+        # A real maintainer answer on the same thread still counts.
+        _, both = self._entry(
+            reply_comment(2001, 1001, "approver", body, association="MEMBER"),
+            reply_comment(2002, 1001, "colleague", "Declining.", association="MEMBER"),
+        )
+        self.assertEqual(both["thread"]["answered_count"], 1)
+
     def test_unanswered_count_and_steering_key_on_answers(self):
         ledger, _ = self._entry(reply_comment(2001, 1001, "rando", "hmm", association="NONE"))
         self.assertEqual(ledger["unanswered_count"], 1)
