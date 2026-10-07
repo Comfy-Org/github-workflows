@@ -114,7 +114,7 @@ class Base(unittest.TestCase):
 
     def test_no_shell_denies_shell_and_write(self):
         run = self.steps["Run the axis"]
-        self.assertIn('["Shell(*)", "Write(**)"]', run)
+        self.assertIn('["Shell(*)", "Write(**)", "WebFetch(*)"]', run)
         self.assertIn("rm -rf -- .cursor", run)
 
     def test_business_and_design_require_no_shell_and_no_checkout(self):
@@ -122,6 +122,26 @@ class Base(unittest.TestCase):
         self.assertIn("business|design)", check)
         self.assertIn('[ "$NO_SHELL" != "true" ]', check)
         self.assertIn('[ "$REPO_PRIVATE" != "true" ]', check)
+
+    def test_non_fetching_axes_require_a_checkout(self):
+        check = self.steps["Check inputs"]
+        self.assertIn('the $AXIS axis requires checkout true', check)
+        self.assertIn("false/business|false/design)", self.steps["Render prompt"])
+
+    def test_context_sources_matched_as_a_whole_value(self):
+        self.assertIn('[[ "$CONTEXT_SOURCES" =~ ^', self.steps["Check inputs"])
+
+    def test_changed_files_one_page_json_paths_and_truncation_line(self):
+        fetch = self.steps["Fetch the change (no checkout)"]
+        self.assertNotIn("gh api --paginate", fetch)
+        self.assertIn(".filename | @json", fetch)
+        self.assertIn("[file list truncated", fetch)
+
+    def test_raw_stream_stays_out_of_the_uploaded_directory(self):
+        run = self.steps["Run the axis"]
+        self.assertIn('> "$RUNNER_TEMP/axis-stream.jsonl"', run)
+        self.assertNotIn('> "$out/transcript.jsonl"', run)
+        self.assertIn("no recognizable tool call", run)
 
     def test_transcript_artifact_never_matches_decides_download(self):
         upload = self.steps["Upload the transcript"]

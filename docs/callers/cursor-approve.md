@@ -167,10 +167,12 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `runs_on` | `"ubuntu-latest"` | As above. |
 | `checkout` | `false` | Full read-only checkout of the PR head (`persist-credentials: false`). |
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
-| `no_shell` | `false` | Deny cursor-agent's shell and file-write tools; the job fails if the transcript shows one was called. Required, with `checkout: false`, for business and design. |
+| `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
 
-Every axis also uploads `transcript-axis-<axis>` — the agent's full stream-json
-transcript, plus the proxy's call log for the context axes. Only the verdict
+Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
+transcript, plus the proxy's call log for the context axes. On a context axis
+each tool call in it is cut to the tool's name: no arguments and no results, so
+no Linear, Notion or Slack content. Only the verdict
 JSON (`verdict`, `confidence`, `summary` capped at 1200 characters) reaches
 `cursor-approve.yml`; its `axis-*` download never matches a transcript.
 
