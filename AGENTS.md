@@ -17,8 +17,9 @@ list below — is the authority on the exact command; read the matching one for
 whatever you touched.
 
 ```bash
-# Python suites — agents-md-integrity, coderabbit-config, cursor-review, groom,
-# linear-ticket, public-repo-hygiene, refresh-reviewers, workflow-pins:
+# Python suites — agents-md-integrity, coderabbit-config, cursor-approve,
+# cursor-review, groom, linear-ticket, public-repo-hygiene, refresh-reviewers,
+# workflow-pins:
 python3 -m unittest discover -s <dir>/tests -p 'test_*.py' -v
 # coderabbit-config first: pip install --require-hashes --only-binary=:all: -r <its requirements.txt>
 
@@ -49,6 +50,8 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
 - `.github/cursor-review/` — prompts + scripts behind `cursor-review.yml` (the
   multi-model panel + judge). `catalog-drift.py` reads the model pins *out of*
   `cursor-review.yml` — never duplicate that model list.
+- `.github/cursor-approve/` — the five axis prompts + `aggregate.py`, the pure
+  verdict aggregator behind the planned `cursor-approve.yml`; it never writes to GitHub.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
   this AGENTS.md standard, and the lint forbidding a `default:` on `workflows_ref`,
   requiring the empty-ref guard at every checkout, and SHA-pinning every `uses:`.
