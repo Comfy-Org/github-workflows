@@ -75,7 +75,7 @@ two fields on no other finding.
 - `body`: concise (1-3 sentences). Do NOT prefix the body with a
   severity word or emoji; the severity field drives the rendered badge. END
   with attribution like
-  `_Raised by 3 of N reviewers (gpt-5.6-sol-max adversarial, claude-opus-5-thinking-max edge-case, kimi-k3-high adversarial)._`
+  `_Raised by 3 of N reviewers (gpt-5.6-sol-max adversarial, claude-opus-5-5-xhigh edge-case, kimi-k3-high adversarial)._`
   where N is the number of panel cells listed in the PANEL FINDINGS block.
 
 Order findings most-severe first. If no findings rise to the bar, submit an

@@ -172,14 +172,24 @@ The build is then **verified, not trusted**, and against the reviewed diff's own
 | Lab | Model (Cursor catalog) |
 |---|---|
 | OpenAI | `gpt-5.6-sol-max` |
-| Anthropic | `claude-opus-5-thinking-max` |
+| Anthropic | `claude-opus-5-5-xhigh` |
 | Moonshot | `kimi-k3-high` |
 
 Gemini 3.1 Pro was dropped on 2026-08-27 after a spend review: across 1,450
 judge-kept findings its two cells were the sole raiser of 2.5% of findings and
 3 of 213 critical/high ones, at ~9% of every run's cost. Kimi moved from `-max`
-to `-high` and the judge from `-max` to `-xhigh` in the same review. Callers can
-override the panel list with the `panel_models` input (see below).
+to `-high` and the judge from `-max` to `-xhigh` in the same review.
+
+The Anthropic cell moved from Opus 5 `-thinking-max` to **Opus 5.5 `-xhigh`** on
+2026-10-07 — a newer model one reasoning notch down, on the same spend
+reasoning. Note that Opus 5.5 ships no `-thinking-` variants in the Cursor
+catalog (Opus 5 had both lines), so there is no literal counterpart to the old
+id; no `claude-opus-5-5-*` entry carries a NO-ZDR marker. The **judge** is still
+on Opus 5 (`claude-opus-5-thinking-xhigh`) — its default is replicated across
+`cursor-axis-base.yml` and the five `axis-*.yml` workflows, so moving it is a
+separate change.
+
+Callers can override the panel list with the `panel_models` input (see below).
 
 Each model runs **two review types**:
 
