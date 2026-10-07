@@ -68,6 +68,12 @@ class CardStates(unittest.TestCase):
         self.assertIn("red on correctness", body)
         self.assertIn("no red, at most 0 yellow", body)
 
+    def test_decide_vetoed_names_the_skip_label(self):
+        body = card.render_decide("1", "5", SHA, ["correctness"], decision(correctness="green"), "vetoed", "0", "")
+        self.assertIn("**Result: ❌ Not approved.**", body)
+        self.assertIn("- vetoed: the PR is labelled `skip-cursor-review`", body)
+        self.assertNotIn("no decision was reached", body)
+
     def test_malformed_decision_shows_no_result(self):
         body = card.render_decide("1", "5", SHA, ["correctness"], {"axes": "junk"}, "not_approved", "0", "")
         self.assertIn("| correctness | ⚠️ no result |", body)

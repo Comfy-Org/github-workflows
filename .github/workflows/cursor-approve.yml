@@ -17,7 +17,8 @@ name: Cursor approve
 #                    the commit_sha it stamped), posts the approval through
 #                    .github/cursor-review/auto-approve.py approve-external
 #                    (head and base re-read, reviewed-SHA marker, own stale
-#                    approvals withdrawn, never over needs-human-review)
+#                    approvals withdrawn, never over needs-human-review or
+#                    skip-cursor-review, both re-read live at decide time)
 #                    and rewrites the card with the verdicts.
 #
 # No job here checks out PR code; the only checkout is this repo at

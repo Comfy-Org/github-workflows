@@ -866,6 +866,13 @@ def pr_head_base(pr: dict) -> tuple:
     return _str_field(pr, "head", "sha"), _str_field(pr, "base", "ref")
 
 
+def live_labels_readable(pr: dict) -> bool:
+    """Whether the PR payload carries a label list at all. `has_label` reads a
+    missing or shapeless `labels` as "no labels", which fails OPEN for a veto
+    label; a caller that must fail closed checks this first."""
+    return isinstance(pr.get("labels"), list)
+
+
 def has_label(pr: dict, name: str) -> bool:
     # A truthy non-list `labels` (a number, `true`) is not iterable, and the
     # TypeError would escape every caller's `except (RuntimeError, ValueError)`.
@@ -1466,9 +1473,15 @@ def cmd_round_cap(args) -> int:
 # base ride in the body's markers (so `dismiss-stale` withdraws it on a push or
 # retarget like any other auto-approval), this identity's own earlier approvals
 # are withdrawn on every non-approval, and a `needs-human-review` PR is never
-# approved. The outcome is written as the step output `outcome` for the card.
+# approved. Nor is a PR labelled `skip-cursor-review`: a caller's label-keyed
+# concurrency group cannot cancel an in-flight decide when that veto lands
+# mid-axes, so decide re-reads it live. The outcome is written as the step
+# output `outcome` for the card.
 
-EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "own_pr", "error")
+EXTERNAL_OUTCOMES = ("approved", "not_approved", "superseded", "needs_human", "vetoed", "own_pr", "error")
+# cursor-review.yml's veto label (its gate and concurrency slot hardcode it too).
+SKIP_REVIEW_LABEL = "skip-cursor-review"
+SKIP_REVIEW_MESSAGE = f"The PR was labelled `{SKIP_REVIEW_LABEL}` — cursor-approve approval withdrawn."
 EXTERNAL_AXES = ("business", "design", "correctness", "completeness", "conformance")
 
 
@@ -1519,7 +1532,11 @@ def cmd_approve_external(args) -> int:
     try:
         pr = read_pr(args.repo, args.pr_number)
         live_head, live_base = pr_head_base(pr)
+        if not live_labels_readable(pr):
+            # The veto below must be read, not assumed absent.
+            raise ValueError("the PR payload carries no label list")
         human_review = has_label(pr, HUMAN_REVIEW_LABEL)
+        vetoed = has_label(pr, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError) as e:
         print(f"::error::Could not read the PR state: {e}")
         withdraw_own_approvals(args)
@@ -1532,6 +1549,8 @@ def cmd_approve_external(args) -> int:
         outcome, why = "superseded", "the PR base changed since the axes ran"
     elif human_review:
         outcome, why = "needs_human", f"the PR is labelled `{HUMAN_REVIEW_LABEL}`"
+    elif vetoed:
+        outcome, why = "vetoed", f"the PR is labelled `{SKIP_REVIEW_LABEL}`"
     elif not external_decision_approves(decision, axes):
         outcome, why = "not_approved", "the axes did not approve"
     else:
@@ -1544,6 +1563,8 @@ def cmd_approve_external(args) -> int:
             # is stale against the LIVE head and base, so a decide that finishes
             # late cannot dismiss an approval that run already posted.
             return withdraw_own_approvals(args, STALE_MESSAGE, live_head, live_base)
+        if outcome == "vetoed":
+            return withdraw_own_approvals(args, SKIP_REVIEW_MESSAGE)
         return withdraw_own_approvals(args)
 
     body = render_external_body(args.card_url, args.commit_sha, args.base_ref)
@@ -1568,14 +1589,22 @@ def cmd_approve_external(args) -> int:
         pr_now = read_pr(args.repo, args.pr_number)
         head_now, base_now = pr_head_base(pr_now)
         labelled_now = has_label(pr_now, HUMAN_REVIEW_LABEL)
+        # An unreadable label list cannot clear the veto: withdraw.
+        vetoed_now = not live_labels_readable(pr_now) or has_label(pr_now, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError):
         head_now = base_now = None
-        labelled_now = False
+        labelled_now = vetoed_now = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
-    if moved or labelled_now:
-        set_output("outcome", "superseded" if moved else "needs_human")
+    if moved or labelled_now or vetoed_now:
+        if moved:
+            outcome, message = "superseded", STALE_MESSAGE
+        elif labelled_now:
+            outcome, message = "needs_human", HUMAN_REVIEW_MESSAGE
+        else:
+            outcome, message = "vetoed", SKIP_REVIEW_MESSAGE
+        set_output("outcome", outcome)
         try:
-            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE if moved else HUMAN_REVIEW_MESSAGE)
+            dismiss(args.repo, args.pr_number, posted["id"], message)
         except RuntimeError as e:
             print(f"::error::The PR changed while the approval was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
             return 1

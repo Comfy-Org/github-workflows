@@ -19,9 +19,11 @@ AXES = "correctness,conformance"
 
 
 class FakeGitHub:
-    def __init__(self, head=SHA, labels=(), reviews=(), head_after=None, base="main"):
+    def __init__(self, head=SHA, labels=(), reviews=(), head_after=None, base="main",
+                 labels_after=None, read_error=False, pr_override=None):
         self.head, self.labels, self.reviews, self.base = head, list(labels), list(reviews), base
-        self.head_after = head_after
+        self.head_after, self.labels_after = head_after, labels_after
+        self.read_error, self.pr_override = read_error, pr_override
         self.posted, self.dismissed, self.reads = [], [], 0
 
     def __call__(self, args, payload=None):
@@ -40,9 +42,14 @@ class FakeGitHub:
             return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
                 "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}})
         self.reads += 1
+        if self.read_error:
+            raise RuntimeError("gh api: HTTP 502")
+        if self.pr_override is not None:
+            return json.dumps(self.pr_override)
         head = self.head_after if (self.head_after and self.reads > 1) else self.head
+        labels = self.labels_after if (self.labels_after is not None and self.reads > 1) else self.labels
         return json.dumps({"head": {"sha": head}, "base": {"ref": self.base},
-                           "labels": [{"name": n} for n in self.labels]})
+                           "labels": [{"name": n} for n in labels]})
 
 
 def prior_approval(sha="c" * 40, rid=42):
@@ -115,6 +122,66 @@ class ApproveExternal(unittest.TestCase):
         rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
         self.assertEqual((rc, outcome), (0, "needs_human"))
         self.assertEqual(fake.posted, [])
+
+    # --- the skip-cursor-review veto, re-read live at decide time ---
+
+    def test_skip_label_vetoes_all_green_and_withdraws_prior_approval(self):
+        fake = FakeGitHub(labels=["bug", aa.SKIP_REVIEW_LABEL], reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                                   threshold="low", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "vetoed"))
+        self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["42"])
+        self.assertEqual(self.resolve_calls, [])
+
+    def test_skip_label_is_read_live_not_from_the_event_payload(self):
+        # The run started on `labeled: cursor-review`; the veto landed mid-axes,
+        # so only the live PR read carries it.
+        fake = FakeGitHub(labels=["cursor-review", aa.SKIP_REVIEW_LABEL])
+        with tempfile.TemporaryDirectory() as tmp:
+            event = os.path.join(tmp, "event.json")
+            with open(event, "w", encoding="utf-8") as f:
+                json.dump({"action": "labeled", "label": {"name": "cursor-review"},
+                           "pull_request": {"number": 1, "head": {"sha": SHA},
+                                            "labels": [{"name": "cursor-review"}]}}, f)
+            with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": event}):
+                rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "vetoed"))
+        self.assertEqual(fake.posted, [])
+        self.assertGreaterEqual(fake.reads, 1)
+
+    def test_skip_label_match_is_exact(self):
+        fake = FakeGitHub(labels=["skip-cursor-review-later", "no-skip-cursor-review"])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(len(fake.posted), 1)
+
+    def test_label_read_failure_posts_nothing(self):
+        fake = FakeGitHub(read_error=True, reviews=[prior_approval()])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+        self.assertEqual((rc, outcome), (1, "error"))
+        self.assertEqual(fake.posted, [])
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_missing_label_list_fails_closed(self):
+        # A PR payload with no `labels` cannot prove the veto absent.
+        for labels in (None, "skip-cursor-review", 1):
+            pr = {"head": {"sha": SHA}, "base": {"ref": "main"}}
+            if labels is not None:
+                pr["labels"] = labels
+            fake = FakeGitHub(pr_override=pr)
+            rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"})
+            self.assertEqual((rc, outcome), (1, "error"), labels)
+            self.assertEqual(fake.posted, [], labels)
+
+    def test_skip_label_applied_during_post_withdraws(self):
+        fake = FakeGitHub(labels_after=[aa.SKIP_REVIEW_LABEL])
+        rc, outcome = self.run_cmd(fake, {"correctness": "green", "conformance": "green"},
+                                   threshold="low", poster="cr-bot[bot]")
+        self.assertEqual((rc, outcome), (0, "vetoed"))
+        self.assertEqual(len(fake.posted), 1)
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual(self.resolve_calls, [])
 
     def test_late_superseded_decide_keeps_an_approval_on_the_live_head(self):
         # An older run's decide finishing after a newer run approved the new head
