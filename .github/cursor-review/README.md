@@ -300,6 +300,7 @@ jobs:
 | Kind | Name | Required | Purpose |
 |---|---|---|---|
 | Secret | `CURSOR_API_KEY` | **yes** | Bills the panel + judge `cursor-agent` calls. |
+| Secret | `OPENAI_API_KEY` | no | Only with `openai_direct_model`: bills the optional direct-OpenAI cell. Use a project-scoped service-account key with a spend limit. |
 | Secret | `SLACK_BOT_TOKEN` | no | Enables start/complete DMs to the triggerer. |
 | Variable | `CURSOR_REVIEW_DM_EMAIL_MAP` | no | Maps GitHub logins → emails for Slack DM lookup. |
 
@@ -362,6 +363,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 |---|---|---|
 | `judge_model` | `claude-opus-5-5-xhigh` | Model that consolidates panel findings. |
 | `panel_models` | `''` (built-in list) | JSON array of Cursor model ids that **replaces** the panel list; each still runs both review types and is validated against the live catalog by preflight. For per-repo experiments (e.g. `-xhigh` vs `-max` tiers). |
+| `openai_direct_model` | `''` (off) | OPT-IN. An OpenAI model id reviewed through the OpenAI API directly (pinned Codex CLI, `package.json` here) as ONE extra **adversarial** cell on GitHub-hosted runners. Needs the `OPENAI_API_KEY` secret; without it the cell reports an errored record. Not part of `panel_models` (not in the Cursor catalog); advisory — the leg never fails the run. |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel when the PR author is a Bot **and** the head branch starts with one of these prefixes (machine pin bumps / catalog refreshes). `''` reviews every bot PR. |
 | `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |

@@ -52,6 +52,7 @@ Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-revi
 | | |
 |---|---|
 | `secrets.CURSOR_API_KEY` | **Required.** Org-level in Comfy-Org. |
+| `secrets.OPENAI_API_KEY` | Optional. Only read when `openai_direct_model` is set; use a project-scoped service-account key with a spend limit. |
 | `secrets.SLACK_BOT_TOKEN` | Optional. Without it the review still posts; only the DMs are skipped. |
 | `vars.REVIEW_BOT_APP_ID` + `secrets.BOT_APP_PRIVATE_KEY` | Optional. Posts the review as your App instead of `github-actions[bot]`. |
 | A review label | Default `cursor-review`. Create it in your repo. |
@@ -112,6 +113,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 |---|---|---|
 | `judge_model` | `claude-opus-5-5-xhigh` | Consolidates the panel into one review. |
 | `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight checks each one exists in the live catalog — existence only, not ZDR). Use for per-repo experiments such as a reasoning-tier A/B — and prefer wiring it to a **variable** rather than a literal, see [Running a model experiment](#running-a-model-experiment). |
+| `openai_direct_model` | `''` | Opt-in. An OpenAI model id reviewed directly through the OpenAI API (pinned Codex CLI) as one extra **adversarial** cell alongside the Cursor panel, always on GitHub-hosted `ubuntu-latest`. Requires `secrets.OPENAI_API_KEY`; without it the cell reports an errored record. Advisory: its findings reach the judge, but the leg never fails the run. |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. Under `blocking: true` it is also not green: an unreviewed PR cannot pass the gate. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
