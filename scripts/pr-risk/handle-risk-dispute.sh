@@ -140,20 +140,26 @@ case "$EVENT_NAME:$EVENT_ACTION" in
     fi
     source="comment"
     ;;
+  # EVENT_LABEL is matched case-INSENSITIVELY, like every other place a label name is compared
+  # here: the repo-side existence check, the snapshot filters (`test(…; "i")`, `ascii_downcase`)
+  # and the caller's own `if:`. A repo carrying `Risk-Dispute:R2` — which `ensure_dispute_labels`
+  # will not replace, precisely because ITS check is case-insensitive — otherwise started a run
+  # that exited 0 with no record, while the jq filters still matched that label and let the next
+  # tiered set strip the human's assessment with nothing written down.
   pull_request:labeled)
-    if [[ "$EVENT_LABEL" =~ ^risk-dispute:(R[0-3])$ ]]; then
-      tier="${BASH_REMATCH[1]}"
-    elif [ "$EVENT_LABEL" != "$DISPUTE_LABEL" ]; then
+    if [[ "${EVENT_LABEL,,}" =~ ^risk-dispute:(r[0-3])$ ]]; then
+      tier="${BASH_REMATCH[1]^^}"
+    elif [ "${EVENT_LABEL,,}" != "$DISPUTE_LABEL" ]; then
       exit 0
     fi
     action="set"
     source="label"
     ;;
   pull_request:unlabeled)
-    if [[ "$EVENT_LABEL" =~ ^risk-dispute:(R[0-3])$ ]]; then
-      tier="${BASH_REMATCH[1]}"
+    if [[ "${EVENT_LABEL,,}" =~ ^risk-dispute:(r[0-3])$ ]]; then
+      tier="${BASH_REMATCH[1]^^}"
       clear_scope="tiered"
-    elif [ "$EVENT_LABEL" = "$DISPUTE_LABEL" ]; then
+    elif [ "${EVENT_LABEL,,}" = "$DISPUTE_LABEL" ]; then
       clear_scope="legacy"
     else
       exit 0
@@ -275,7 +281,12 @@ else
     legacy)
       desired="$(jq -c '[.[] | select(ascii_downcase != "risk-dispute")]' <<<"$current")" ;;
     tiered)
-      desired="$(jq -c '[.[] | select(test("^risk-dispute:R[0-3]$"; "i") | not)]' <<<"$current")" ;;
+      # Remove the label that was REMOVED, not its whole class. Dropping every `risk-dispute:R*`
+      # here meant that swapping tiers in one UI interaction deleted the tier that was just
+      # filed: GitHub emits `unlabeled R3` and `labeled R2` with no ordering guarantee, so when
+      # the removal lands last it wipes the surviving R2 and logs it as `action: "clear"`.
+      desired="$(jq -c --arg gone "$EVENT_LABEL" \
+        '[.[] | select(ascii_downcase != ($gone | ascii_downcase))]' <<<"$current")" ;;
     *)
       desired="$(jq -c '[.[] | select(test("^risk-dispute(?::R[0-3])?$"; "i") | not)]' <<<"$current")" ;;
   esac || fail "could not clear dispute labels"

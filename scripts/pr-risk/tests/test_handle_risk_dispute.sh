@@ -141,6 +141,33 @@ eq "label removal records no current human tier" null \
 eq "label removal records the removed tier" '["R2"]' \
   "$(audit_record | jq -c '.previous_tiers')"
 
+echo "— removing one tiered dispute must not delete the other —"
+# Reachable in ONE UI interaction: swapping tiers emits `unlabeled R3` and `labeled R2` with no
+# ordering guarantee, so a removal landing last used to wipe the dispute that was just filed and
+# log it as action:"clear". The clear scope dropped the whole class instead of the one label.
+reset_case
+printf '%s\n' '["risk:R1","risk-dispute:R2","risk-dispute:R3"]' >"$LABELS"
+EVENT_NAME=pull_request EVENT_ACTION=unlabeled EVENT_LABEL=risk-dispute:R3 ACTOR=reviewer \
+  run_handler
+eq "removing R3 leaves R2 standing" '["risk:R1","risk-dispute:R2"]' \
+  "$(jq -c '.labels' "$LAST_PUT")"
+eq "…and records the removal, not a wipe" clear "$(audit_record | jq -r '.action')"
+
+reset_case
+printf '%s\n' '["risk:R1","risk-dispute:R2"]' >"$LABELS"
+EVENT_NAME=pull_request EVENT_ACTION=unlabeled EVENT_LABEL=Risk-Dispute:R2 ACTOR=reviewer \
+  run_handler
+eq "a differently-cased event label is still recognized" R2 \
+  "$(audit_record | jq -r '.previous_tiers[0]')"
+eq "…and removes it rather than exiting silently" '["risk:R1"]' \
+  "$(jq -c '.labels' "$LAST_PUT")"
+
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=pull_request EVENT_ACTION=labeled EVENT_LABEL=RISK-DISPUTE:R3 ACTOR=reviewer \
+  run_handler
+eq "a differently-cased label apply records the tier" R3 "$(audit_record | jq -r '.human_tier')"
+
 reset_case
 printf '%s\n' '["risk:R1","risk-dispute","risk-dispute:R2"]' >"$LABELS"
 EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
