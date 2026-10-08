@@ -84,8 +84,8 @@ permissions:
 env:
   # Same pin as cursor-review.yml's (a test keeps them equal); consumed by
   # .github/cursor-review/install-cursor-cli.sh.
-  CURSOR_CLI_VERSION: 2026.09.10-fd3934a
-  CURSOR_CLI_SHA256: 27997c8391ad853a5a732b1845db8ef82a8ba6afb0f7829cc739464f8966e96e
+  CURSOR_CLI_VERSION: 2026.10.01-e373342
+  CURSOR_CLI_SHA256: a79726c6e644520e993970be4c45775a6889802b67abe461a677a53219ae28e8
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_approve_assets/.github/cursor-review
   CURSOR_APPROVE_ASSETS: ${{ github.workspace }}/_cursor_approve_assets/.github/cursor-approve
 
