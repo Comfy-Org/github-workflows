@@ -277,6 +277,20 @@ on:
         type: string
         required: false
         default: ''
+      openai_direct_model:
+        description: >-
+          OPT-IN. An OpenAI model id (e.g. `gpt-6.1-sol`) reviewed through the
+          OpenAI API directly, via the Codex CLI, as ONE extra adversarial cell
+          alongside the Cursor panel. Empty (default) = the job is skipped and
+          nothing changes. Requires the `OPENAI_API_KEY` secret; set without it,
+          the cell reports an errored record rather than failing the panel.
+          Deliberately NOT part of `panel_models`: that list is validated
+          against the live CURSOR catalog, which a direct-API id is not in.
+          The cell is additive and advisory — its findings reach the judge like
+          any other cell's, but the leg never fails the run.
+        type: string
+        required: false
+        default: ''
       skip_bot_branch_prefixes:
         description: >-
           Space-separated head-branch prefixes that skip the review when the PR
@@ -454,6 +468,14 @@ on:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
         required: true
+      OPENAI_API_KEY:
+        description: >-
+          OpenAI API key for the optional direct-API review cell. Required only
+          when the `openai_direct_model` input is set; ignored otherwise. Use a
+          service-account key scoped to its own project with a spend limit, not
+          a user key — the cell bills per call against it directly rather than
+          against a pooled seat.
+        required: false
       SLACK_BOT_TOKEN:
         description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
         required: false
@@ -2629,6 +2651,279 @@ jobs:
             exit 1
           fi
           echo "Reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
+
+  review-openai-direct:
+    # An OPT-IN extra adversarial cell that reaches its model through the OpenAI
+    # API directly, via the Codex CLI, instead of through Cursor. Default OFF:
+    # `openai_direct_model` is '' unless a caller sets it, and this job is then
+    # skipped outright, so every enrolled repo sees exactly today's behaviour
+    # until it opts in.
+    #
+    # Why a SEPARATE job rather than another entry in the `review` matrix:
+    # that matrix's model list is validated against the live CURSOR catalog in
+    # `preflight`, and a delisted id there fails the run loud by design
+    # (BE-2627). A direct-API id is not in Cursor's catalog at all, so feeding
+    # it to that list would fail preflight for the right reason and the wrong
+    # cause. Separation also means a failure here can neither cancel nor skip
+    # a Cursor matrix leg.
+    #
+    # How the judge picks it up, with no change to `consolidate`: that job
+    # downloads `pattern: findings-*` and globs `findings-*/findings.json`, so
+    # this cell's artifact is read alongside the others purely by naming it to
+    # the same convention. It is deliberately NOT added to `consolidate`'s
+    # `expected` set (PANEL_MODELS x review types): that set exists to
+    # synthesise an error record for a Cursor cell whose artifact vanished, and
+    # an opt-in cell that is off for most callers must not be reported missing
+    # on every run.
+    #
+    # Credential posture is unchanged from the Cursor cells: `contents: read`
+    # only, no write-scoped token (see SECURITY.md), and the only PR-authored
+    # content the agent sees is the same nonce-fenced diff text — this job does
+    # NOT check out the PR.
+    #
+    # ADVISORY on purpose: there is no "fail the leg" step, unlike `review`.
+    # A new backend's first outing must not be able to turn a rollup red while
+    # it is still being characterised. `Panel integrity` is itself advisory by
+    # default, so an errored record here is visible without gating anything.
+    #
+    # v1 scope: adversarial only (not edge-case), one model, one round.
+    name: 'adversarial direct (${{ inputs.openai_direct_model }})'
+    needs: [gate, diff-size, preflight, ledger]
+    if: >-
+      inputs.openai_direct_model != ''
+      && needs.gate.outputs.should_run == 'true'
+      && needs.gate.outputs.already_reviewed != 'true'
+      && needs.diff-size.outputs.within_cap == 'true'
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
+    # Matches the `review` job's cap so the judge's budget reasoning (see
+    # `review`) holds for this cell too; the agent step caps lower, at 15.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Seed default findings artifact
+        # Same contract as the `review` job: pre-seed status=error so the cell
+        # ALWAYS appears in the panel summary even if a later step dies. The
+        # MCP output tool overwrites this on success.
+        env:
+          MODEL: ${{ inputs.openai_direct_model }}
+        run: |
+          mkdir -p /tmp/findings-out
+          python3 - <<'PY'
+          import json, os
+          record = {
+              "model": os.environ["MODEL"],
+              "review_type": "adversarial",
+              "status": "error",
+              "error": "Direct-API cell did not reach the submission step.",
+              "findings": [],
+          }
+          with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2)
+          PY
+
+      - name: Require a pinned workflows_ref
+        # Scripts and prompts must come from a SHA, not a moving ref: this cell
+        # loads executable Python from that checkout, so a branch name here
+        # would let the loaded code change under a pinned caller.
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          case "$WORKFLOWS_REF" in
+            *[!0-9a-f]*|"") bad=1 ;;
+            *) [ "${#WORKFLOWS_REF}" -eq 40 ] && bad=0 || bad=1 ;;
+          esac
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::workflows_ref must be a full 40-character commit SHA; got '${WORKFLOWS_REF}'."
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Download reviewed diff
+        # Built once in the diff-size job (generated files already excluded),
+        # shared here, so this cell needs no PR checkout of its own.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-diff
+          path: /tmp
+
+      - name: Check the API key is present
+        id: key
+        # A caller that sets the input but forgets the secret gets a clearly
+        # attributed errored record rather than a confusing CLI auth failure
+        # three steps later. Reported as a warning, not an error: the seeded
+        # artifact already carries the error status and this cell gates nothing.
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::warning::openai_direct_model is set but the OPENAI_API_KEY secret is absent, so the direct-API cell is skipped. Pass the secret through from the caller to enable it."
+            python3 -c 'import json; p = "/tmp/findings-out/findings.json"; r = json.load(open(p)); r["error"] = "OPENAI_API_KEY secret was not provided to the reusable workflow."; json.dump(r, open(p, "w"), indent=2)'
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Codex CLI
+        if: steps.key.outputs.present == 'true'
+        # The pin lives in .github/cursor-review/package.json in THIS repo and
+        # arrives with the assets checkout above, so it is resolved at the same
+        # SHA as the prompts and scripts. Mirrors the groom precedent exactly,
+        # including rejecting a non-exact pin: an inline `npm install -g
+        # pkg@1.2.3` is invisible to every dependency ecosystem.
+        run: |
+          manifest="$CURSOR_REVIEW_ASSETS/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the direct-API cell's CLI pin."
+            exit 1
+          fi
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@openai/codex"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the direct-API cell's CLI pin."
+            exit 1
+          fi
+          version="$(printf '%s' "$version" | tr -d '\r\n')"
+          case "$version" in
+            ""|*[!0-9.]*)
+              echo "::error::dependencies[\"@openai/codex\"] must be an EXACT version (digits and dots only, no ^ or ~); got a value this job will not install."
+              exit 1 ;;
+          esac
+          echo "CODEX_CLI_VERSION=$version" >> "$GITHUB_ENV"
+          npm install -g "@openai/codex@${version}"
+
+      - name: Verify Codex CLI version
+        if: steps.key.outputs.present == 'true'
+        # Re-asserted on the PATH-resolved binary immediately before the review,
+        # so a swap between install and use cannot hand the review to unpinned
+        # bits, and the version lands in the log for forensics.
+        run: |
+          installed="$(codex --version 2>&1 | tr -d '\r' | awk '{print $NF}')"
+          if [ "$installed" != "$CODEX_CLI_VERSION" ]; then
+            echo "::error::codex reports '${installed}', expected the pinned '${CODEX_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "codex ${installed}"
+
+      - name: Authenticate Codex CLI
+        if: steps.key.outputs.present == 'true'
+        # Piped from the environment on stdin, never passed as an argument: an
+        # argv value is visible in the runner's process list to anything else
+        # on the box, and `set -x` or a crash dump would put it in a public log.
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null
+
+      - name: Build prompt
+        if: steps.key.outputs.present == 'true'
+        # Byte-identical construction to the Cursor cells', so a finding
+        # difference is attributable to the model or the backend rather than to
+        # the prompt: the same prompt-adversarial.md, the same marker stripped
+        # and re-emitted by fence-diff.py, and a fresh per-prompt nonce minted
+        # into a shell variable (never a step `env:`) so a leaked marker from
+        # one cell cannot forge a fence in another.
+        run: |
+          cp "$CURSOR_REVIEW_ASSETS/prompt-adversarial.md" /tmp/prompt-head.txt
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/prompt-head.txt \
+            --marker '=== BEGIN DIFF ==='
+          diff_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
+          {
+            cat /tmp/prompt-head.txt
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/pr-diff.patch \
+              --label DIFF \
+              --nonce "$diff_nonce"
+          } > /tmp/prompt.txt
+
+      - name: Run direct-API review
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        # Capped well under the job so a hung agent trips the STEP and the
+        # seeded artifact still uploads below, rather than tripping the job and
+        # discarding the cell. Same 15 minutes the Cursor cells get.
+        timeout-minutes: 15
+        env:
+          MODEL: ${{ inputs.openai_direct_model }}
+        run: |
+          mkdir -p /tmp/findings-out
+          python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+            --mode reviewer \
+            --out /tmp/findings-out/findings.json \
+            --model "$MODEL" \
+            --review-type adversarial \
+            --init
+          # The SAME MCP submission tool the Cursor cells use, so the findings
+          # schema the judge reads is produced by one implementation for both
+          # backends. `default_tools_approval_mode=approve` is required: under
+          # `codex exec`'s default policy the tool calls are rejected and the
+          # cell submits nothing.
+          args_toml="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps([
+              os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
+              "--mode", "reviewer",
+              "--out", "/tmp/findings-out/findings.json",
+              "--model", os.environ["MODEL"],
+              "--review-type", "adversarial",
+          ]))
+          PY
+          )"
+          codex exec --json --ignore-user-config --skip-git-repo-check \
+            -s read-only \
+            -c model="$MODEL" \
+            -c model_reasoning_effort=max \
+            -c mcp_servers.cursor_review_output.command=python3 \
+            -c mcp_servers.cursor_review_output.default_tools_approval_mode=approve \
+            -c "mcp_servers.cursor_review_output.args=$args_toml" \
+            < /tmp/prompt.txt > /tmp/codex-events.jsonl
+
+      - name: Report cell outcome
+        if: always()
+        env:
+          MODEL: ${{ inputs.openai_direct_model }}
+        run: |
+          echo "=== Structured findings ==="
+          cat /tmp/findings-out/findings.json
+          echo ""
+          status=$(python3 - <<'PY'
+          import json, re
+          try:
+              with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
+                  cell = json.load(f)
+          except (OSError, ValueError):
+              cell = None
+          value = cell.get("status") if isinstance(cell, dict) else None
+          if not isinstance(value, str):
+              value = "error"
+          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error")
+          PY
+          )
+          if [ "$status" != "ok" ]; then
+            echo "::warning::Direct-API cell adversarial/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+          else
+            echo "Direct-API cell adversarial/${MODEL} submitted its findings."
+          fi
+
+      - name: Upload findings artifact
+        if: always()
+        # Named to the `findings-<review_type>-<model>` convention that
+        # `consolidate` globs, which is the whole integration.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: findings-adversarial-${{ inputs.openai_direct_model }}
+          path: /tmp/findings-out/findings.json
+          if-no-files-found: error
+          retention-days: 7
 
   consolidate:
     # Adjudicates the panel cell artifacts into one consolidated review.
