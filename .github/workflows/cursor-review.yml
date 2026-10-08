@@ -2891,6 +2891,14 @@ jobs:
           name: pr-diff
           path: /tmp
 
+      - name: Download prior-review ledger
+        # Same artifact, same tolerance as the `review` job: absent on round 1.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
       - name: Check the API key is present
         id: key
         # Belt and braces: preflight already keeps this job off when the key is
@@ -2954,24 +2962,40 @@ jobs:
 
       - name: Build prompt
         if: steps.key.outputs.present == 'true'
-        # Byte-identical construction to the Cursor cells', so a finding
-        # difference is attributable to the model or the backend rather than to
-        # the prompt: the same prompt-adversarial.md, the same marker stripped
-        # and re-emitted by fence-diff.py, and a fresh per-prompt nonce minted
-        # into a shell variable (never a step `env:`) so a leaked marker from
-        # one cell cannot forge a fence in another.
+        # Byte-identical construction to the Cursor cells' `Build prompt`, so a
+        # finding difference is attributable to the model or the backend rather
+        # than to the prompt: the same prompt-adversarial.md with the same
+        # prior-review ledger spliced in, the same marker stripped and
+        # re-emitted by fence-diff.py, the same new-hunks block from round 2
+        # on, and a fresh per-prompt nonce minted into a shell variable (never
+        # a step `env:`) so a leaked marker from one cell cannot forge a fence
+        # in another. See that step for the full rationale.
+        env:
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
-          cp "$CURSOR_REVIEW_ASSETS/prompt-adversarial.md" /tmp/prompt-head.txt
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-adversarial.md" \
+            --marker '=== BEGIN DIFF ===' \
+            --insert /tmp/ledger/ledger.md \
+            --out /tmp/prompt-head.txt
+          diff_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
           python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
             --file /tmp/prompt-head.txt \
             --marker '=== BEGIN DIFF ==='
-          diff_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
           {
             cat /tmp/prompt-head.txt
             python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
-              --body /tmp/pr-diff.patch \
-              --label DIFF \
-              --nonce "$diff_nonce"
+              --body /tmp/pr-diff.patch --label DIFF --nonce "$diff_nonce"
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "The block below is the subset of the diff above that changed since"
+              echo "the last reviewed commit. Prioritize it — but the full diff above"
+              echo "is still in scope."
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --body /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$diff_nonce"
+            fi
           } > /tmp/prompt.txt
 
       - name: Run direct-API review
@@ -2991,9 +3015,11 @@ jobs:
           CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           mkdir -p /tmp/findings-out
-          # A fresh, empty home: no stale credential or config from anything
-          # else that ran on this runner, and nothing persisted for the next.
-          CODEX_HOME="$(mktemp -d)"
+          # A fresh, empty home under RUNNER_TEMP (emptied after every job): no
+          # stale credential or config from anything else that ran on this
+          # runner, nothing persisted for the next, and not under /tmp, where
+          # 0.162.0 refuses to create its helper binaries.
+          CODEX_HOME="$(mktemp -d -p "$RUNNER_TEMP")"
           export CODEX_HOME
           python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
             --mode reviewer \
