@@ -14,13 +14,11 @@ name: Cursor axis (base)
 #   context_sources  comma list of linear,notion,slack: the context-proxy.py
 #               tools this axis gets (business/design/completeness only). Empty
 #               → no MCP server at all.
-#   no_shell    true → fail the job if the transcript shows a shell or
-#               file-write call (every axis is denied those tools; this checks
-#               the deny list held). Required (with checkout false) for
-#               business and design.
-#
-# No axis gets a shell. A checkout axis gets the merge-base diff, its
-# --name-status list and the PR's commit log, precomputed under pr/.git.
+#   no_shell    true → deny cursor-agent's shell and file-write tools, and fail
+#               the job if the transcript shows one was called anyway. Required
+#               (with checkout false) for business and design. false → the
+#               shell is ALLOWED (an explicit Shell(*) rule), and the job fails
+#               if every shell call in the transcript was rejected.
 # Secrets:
 #   CURSOR_API_KEY
 #   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
@@ -246,24 +244,6 @@ jobs:
           merge_base="$BASE_SHA"
           if [ "$CHECKOUT" = "true" ]; then
             merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
-            # The agent has no shell (see "Run the axis"), so the workflow runs
-            # the git it would have: the merge-base diff, the changed-file list
-            # and the PR's commits, beside the context file under .git. No
-            # textconv or external diff driver, so a PR's .gitattributes cannot
-            # make this step run anything.
-            git -C pr diff --no-color --no-ext-diff --no-textconv "$merge_base...$COMMIT_SHA" \
-              > "$RUNNER_TEMP/pr-full.diff"
-            limit=1048576
-            size="$(wc -c < "$RUNNER_TEMP/pr-full.diff")"
-            head -c "$limit" "$RUNNER_TEMP/pr-full.diff" > "$ctx_dir/cursor-approve.diff"
-            if [ "$size" -gt "$limit" ]; then
-              printf '\n[diff truncated: showing %s of %s bytes]\n' "$limit" "$size" >> "$ctx_dir/cursor-approve.diff"
-            fi
-            git -C pr diff --no-color --no-ext-diff --no-textconv --name-status "$merge_base...$COMMIT_SHA" \
-              > "$ctx_dir/cursor-approve-changed-files.txt"
-            git -C pr log --no-color --format='%H %an %s' "$merge_base..$COMMIT_SHA" \
-              > "$ctx_dir/cursor-approve-log.txt"
-            echo "diff bytes: $size"
           fi
           {
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
@@ -272,7 +252,6 @@ jobs:
               --base-ref "$BASE_REF" --context-file "${ctx#pr/}"
             case "$CHECKOUT/$AXIS" in
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
-              true/*) cat "$CURSOR_APPROVE_ASSETS/prompt-checkout.md" ;;
             esac
             if [ -n "$CONTEXT_SOURCES" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-context-tools.md"; fi
           } > "$RUNNER_TEMP/axis-prompt.txt"
@@ -367,16 +346,17 @@ jobs:
                        "slack": ("slack_search", "slack_history")}
               for source in os.environ["CONTEXT_SOURCES"].split(","):
                   allow += [f"Mcp(context:{tool})" for tool in tools[source]]
-          # Every axis is denied all three. Write(**) is the permission behind
-          # the edit and delete tools too; WebFetch(*) keeps an agent that has
-          # read company context, or holds CURSOR_API_KEY, off the network. A
-          # checkout axis was never really given a shell: --print rejects a
-          # command no allow rule matches, so with an empty list each one came
-          # back `rejected` and the agent fell back to reading files blind.
-          # Saying so here makes the boundary explicit; "Render prompt" hands a
-          # checkout axis the git output it needs instead. Allowing Shell(git)
-          # would be a full shell (`git -c alias.x='!sh' x`).
-          deny = ["Shell(*)", "Write(**)", "WebFetch(*)"]
+          # Write(**) is the permission behind the edit and delete tools too;
+          # WebFetch(*) keeps an agent that has read company context off the network.
+          deny = ["Shell(*)", "Write(**)", "WebFetch(*)"] if os.environ["NO_SHELL"] == "true" else []
+          # A checkout axis gets its shell by an explicit allow rule. --print
+          # has no one to approve a command, so with an empty allow list every
+          # shell call comes back `rejected` and the agent reviews blind; the
+          # transcript check below fails the job if that ever happens again.
+          # This is the same unsandboxed-shell-over-PR-code exposure the
+          # cursor-review panel already accepts (see its header).
+          if os.environ["NO_SHELL"] != "true":
+              allow.append("Shell(*)")
           for name, value in (("mcp.json", {"mcpServers": servers}),
                               ("cli.json", {"permissions": {"allow": allow, "deny": deny}})):
               with open(os.path.join(".cursor", name), "w", encoding="utf-8") as f:
@@ -395,9 +375,9 @@ jobs:
           # its own artifact. With no_shell, a shell or file-write tool call in
           # the transcript means this cursor-agent did not enforce the deny
           # list: fail rather than trust a verdict from an agent that had them.
-          # A no_shell agent must read the fetched change, so a transcript with
-          # NO recognizable tool call means the stream-json shape drifted and
-          # the guard cannot see: fail closed then too. With context tools, the
+          # Any agent must read the change, so a transcript with NO recognizable
+          # tool call means the stream-json shape drifted and the guards cannot
+          # see: fail closed then too, on every axis. With context tools, the
           # uploaded transcript keeps only each tool call's name, never its
           # arguments or results (Linear, Notion and Slack content). The raw
           # stream stays outside the uploaded directory, so a timeout or a
@@ -408,6 +388,7 @@ jobs:
           forbidden = ("shellToolCall", "writeToolCall", "editToolCall", "deleteToolCall")
           redact = bool(os.environ["CONTEXT_SOURCES"])
           result, called, recognized, kept = None, set(), 0, []
+          shell_ok, shell_rejected = 0, 0
           with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
               for line in f:
                   try:
@@ -423,6 +404,13 @@ jobs:
                       names = [k for k in call if k.endswith("ToolCall")]
                       recognized += bool(names)
                       called.update(k for k in call if k in forbidden)
+                      shell = call.get("shellToolCall")
+                      if event.get("subtype") == "completed" and isinstance(shell, dict):
+                          outcome = shell.get("result")
+                          if isinstance(outcome, dict) and "rejected" in outcome:
+                              shell_rejected += 1
+                          else:
+                              shell_ok += 1
                       if redact:
                           event = {"type": "tool_call", "subtype": event.get("subtype"),
                                    "call_id": event.get("call_id"), "tools": sorted(call)}
@@ -434,9 +422,16 @@ jobs:
           if os.environ["NO_SHELL"] == "true" and called:
               sys.exit(f"::error::no_shell is set but the agent called {', '.join(sorted(called))}; "
                        "this cursor-agent version does not enforce the deny list")
-          if os.environ["NO_SHELL"] == "true" and not recognized:
-              sys.exit("::error::no_shell is set but the transcript has no recognizable tool call; "
-                       "its stream-json shape may have changed, so the deny-list check cannot run")
+          # Every axis must read something, so no recognizable tool call means
+          # the stream-json shape drifted (or the agent judged blind): fail.
+          if not recognized:
+              sys.exit("::error::the transcript has no recognizable tool call; its stream-json "
+                       "shape may have changed, or the agent read nothing before its verdict")
+          # A checkout axis whose every shell call was rejected never ran the
+          # git its prompt points at: the allow rule above stopped working.
+          if os.environ["NO_SHELL"] != "true" and shell_rejected and not shell_ok:
+              sys.exit(f"::error::all {shell_rejected} shell call(s) were rejected; this axis is "
+                       "meant to have a shell, so its verdict would be blind")
           if result is None:
               sys.exit("::error::the cursor-agent transcript has no result event")
           with open(sys.argv[2], "w", encoding="utf-8") as f:

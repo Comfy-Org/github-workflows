@@ -343,7 +343,7 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `runs_on` | `"ubuntu-latest"` | As above. |
 | `checkout` | `false` | Full read-only checkout of the PR head (`persist-credentials: false`). |
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
-| `no_shell` | `false` | Fail the job if the transcript shows a shell or file-write call, or no recognizable tool call at all. Every axis is denied shell, file-write and web-fetch; this checks the deny list held. Required, with `checkout: false`, for business and design. |
+| `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
 
 Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
 transcript, plus the proxy's call log for the context axes. On a context axis
@@ -363,7 +363,7 @@ holds the tokens: the agent can search, but never holds a credential.
 |---|---|---|---|
 | business | PR title, body, changed-file list with line counts — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page`, `slack_search`, `slack_history` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN`, `SLACK_TOKEN` |
 | design | PR title, body, merge-base diff cut at 200 KB — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN` |
-| completeness | Full read-only checkout (`persist-credentials: false`) plus the precomputed merge-base diff, changed-file list and commit log — no shell | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
+| completeness | Full read-only checkout (`persist-credentials: false`), with a shell | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
 
 A missing token leaves that source unconfigured; the axis still runs. The tokens
 are read-only bot identities (Linear and Notion as the tools bot, Slack as the
@@ -432,12 +432,15 @@ context. A prompt injection in any of it can make the agent repeat that context
 into its verdict summary, which lands on the PR, or steer its verdict. That is
 acceptable on private repositories only, where everyone who can read the PR can
 already read the company, and is why the axes refuse to run on a public one.
-No axis has a shell. The checkout axes (correctness, conformance, completeness)
-read the workflow's precomputed `git diff`, `--name-status` list and commit log
-under `pr/.git/` instead, because allowing `Shell(git)` would allow any command
-(`git -c alias.x='!sh' x`). Until this was explicit, a checkout axis's empty
-allow list made `--print` reject every shell call, so the axes ran without the
-diff they were told to read.
+The checkout axes (correctness, conformance, completeness) have a shell, granted
+by an explicit `Shell(*)` allow rule: `--print` has no one to approve a command,
+so without that rule every shell call is rejected and the axis reviews without
+ever running `git`. The job fails if every shell call in a checkout axis's
+transcript was rejected, and on any axis whose transcript shows no tool call.
+That shell is the same unsandboxed exposure over PR code that the cursor-review
+panel already accepts. For completeness it also means: on a hosted runner
+(passwordless `sudo`) a hostile agent could read the running proxy's memory, so
+its Linear token is protected by policy and prompt, not by the sandbox.
 
 ## Trust model
 
