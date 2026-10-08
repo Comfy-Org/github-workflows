@@ -280,21 +280,24 @@ on:
       openai_direct_model:
         description: >-
           OPT-IN. An OpenAI model id (e.g. `gpt-6.1-sol`) reviewed through the
-          OpenAI API directly, via the Codex CLI, as ONE extra adversarial cell
-          alongside the Cursor panel. Empty (default) = the job is skipped and
-          nothing changes. Requires the `OPENAI_API_KEY` secret; set without it,
-          the cell reports an errored record rather than failing the panel.
+          OpenAI API directly, via the Codex CLI, as ONE adversarial cell.
+          Empty (default) = the job is skipped and nothing changes. Requires the
+          `OPENAI_API_KEY` secret and a plain id (`[A-Za-z0-9._-]`); set
+          without either, preflight warns, the cell stays off and the panel is
+          unchanged.
           Deliberately NOT part of `panel_models`: that list is validated
           against the live CURSOR catalog, which a direct-API id is not in.
           Advisory — its findings reach the judge like any other cell's, but the
-          leg never fails the run. By default it REPLACES the Cursor OpenAI cell
+          leg never fails the run and is not counted in `Panel integrity` or
+          the auto-approve gate. By default it REPLACES the Cursor OpenAI cell
           rather than adding to it; see `openai_direct_replaces_cursor_openai`.
         type: string
         required: false
         default: ''
       openai_direct_replaces_cursor_openai:
         description: >-
-          When `openai_direct_model` is set, drop the Cursor-hosted OpenAI cell
+          When the direct cell is in effect (`openai_direct_model` set, a plain
+          id, and its key present), drop the Cursor-hosted OpenAI cell
           from the panel so the lane is reviewed once rather than twice. Default
           true: the direct cell REPLACES it. Matching is by vendor prefix
           (`gpt-`) against the resolved panel list, which is how every OpenAI id
@@ -641,7 +644,20 @@ jobs:
       should_run: ${{ steps.check.outputs.should_run }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
       approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
+      openai_key_present: ${{ steps.openai_key.outputs.present }}
     steps:
+      - name: Resolve OPENAI_API_KEY presence
+        # A boolean for `preflight`, which cannot read the secret itself: it
+        # follows the caller's `runs_on` pool, and a `secrets.` expression is
+        # evaluated ON the runner, so even `!= ''` would ship the key there.
+        # This job is GitHub-hosted and checks out nothing, so the key meets
+        # no PR-authored code here. Only read when the direct cell is opted in.
+        id: openai_key
+        if: inputs.openai_direct_model != ''
+        env:
+          OPENAI_KEY_PRESENT: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: echo "present=${OPENAI_KEY_PRESENT}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve the auto-approve author opt-in
         # approve_authors, resolved ONCE here so the workflow-level
         # `approve_gate` output (which must say `off` on every event, round or
@@ -1966,6 +1982,12 @@ jobs:
       contents: read
     outputs:
       models: ${{ steps.models.outputs.models }}
+      # 'true' only when the direct-API cell can actually run: a model id is
+      # set, it is artifact-name safe, and OPENAI_API_KEY reached this
+      # workflow. `review-openai-direct` gates on THIS rather than on the raw
+      # input, so a misconfigured opt-in neither drops the Cursor OpenAI cell
+      # nor schedules a cell that can only error.
+      openai_direct: ${{ steps.models.outputs.openai_direct }}
     steps:
       - name: Define panel models
         id: models
@@ -2040,6 +2062,9 @@ jobs:
           # would leave consolidate expecting a cell that was never scheduled.
           OPENAI_DIRECT_MODEL: ${{ inputs.openai_direct_model }}
           OPENAI_DIRECT_REPLACES: ${{ inputs.openai_direct_replaces_cursor_openai }}
+          # Resolved in the hosted `gate` job: this one follows `runs_on`, so
+          # it must not reference the secret at all.
+          OPENAI_KEY_PRESENT: ${{ needs.gate.outputs.openai_key_present }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -2094,7 +2119,25 @@ jobs:
           # Cursor-hosted OpenAI cell comes OUT of the panel — otherwise that lane
           # is reviewed twice and billed twice. Applied after the override has
           # been resolved, so it filters whichever list actually won.
-          if [ -n "$(printf '%s' "${OPENAI_DIRECT_MODEL:-}" | tr -d '[:space:]')" ] \
+          #
+          # Resolved to ONE verdict first, because replacing the Cursor cell is
+          # only safe when the direct cell will genuinely run: a set input with
+          # no key, or an id `upload-artifact` would reject (a fine-tuned
+          # `ft:...` id carries `:`), would otherwise drop the OpenAI lane AND
+          # leave nothing reviewing it. Either case warns and leaves the panel
+          # exactly as it would be without the opt-in.
+          openai_direct=false
+          if [ -n "$(printf '%s' "${OPENAI_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
+            if ! printf '%s' "$OPENAI_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
+              echo "::warning::openai_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API cell is off for this run and the panel is unchanged."
+            elif [ "${OPENAI_KEY_PRESENT:-false}" != "true" ]; then
+              echo "::warning::openai_direct_model is set but the OPENAI_API_KEY secret did not reach this workflow, so the direct-API cell is off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
+            else
+              openai_direct=true
+            fi
+          fi
+          echo "openai_direct=${openai_direct}" >> "$GITHUB_OUTPUT"
+          if [ "$openai_direct" = "true" ] \
              && [ "${OPENAI_DIRECT_REPLACES:-true}" = "true" ]; then
             # ascii_downcase so a differently-cased id cannot slip past the
             # vendor match and leave a duplicate OpenAI cell running.
@@ -2714,30 +2757,32 @@ jobs:
     # cause. Separation also means a failure here can neither cancel nor skip
     # a Cursor matrix leg.
     #
-    # How the judge picks it up, with no change to `consolidate`: that job
-    # downloads `pattern: findings-*` and globs `findings-*/findings.json`, so
-    # this cell's artifact is read alongside the others purely by naming it to
-    # the same convention. It is deliberately NOT added to `consolidate`'s
-    # `expected` set (PANEL_MODELS x review types): that set exists to
-    # synthesise an error record for a Cursor cell whose artifact vanished, and
-    # an opt-in cell that is off for most callers must not be reported missing
-    # on every run.
+    # How the judge picks it up: `consolidate` downloads `pattern: findings-*`
+    # and globs `findings-*/findings.json`, so this cell's artifact
+    # (`findings-direct-...`) is read alongside the others, and `consolidate`
+    # lists this job in `needs:` so it never downloads before the upload
+    # lands. The `direct-` prefix is what `Aggregate panel findings` keys on
+    # to keep this cell OUT of the Cursor panel's `expected` set and its
+    # ok_count/total — the numbers `Panel integrity` and the auto-approve gate
+    # read — so an opt-in cell can inform the judge without ever gating.
     #
-    # Credential posture is unchanged from the Cursor cells: `contents: read`
-    # only, no write-scoped token (see SECURITY.md), and the only PR-authored
-    # content the agent sees is the same nonce-fenced diff text — this job does
-    # NOT check out the PR.
+    # Credential posture: `contents: read` only, no write-scoped token (see
+    # SECURITY.md), and the only PR-authored content the agent sees is the
+    # same nonce-fenced diff text — this job does NOT check out the PR. The
+    # OpenAI key reaches `codex exec` as CODEX_API_KEY in that ONE step's env
+    # and is never written to disk (no `codex login`, whose auth.json the
+    # read-only sandbox could still read), and the sandboxed shell's env is
+    # cut to the core set so the agent cannot echo it back.
     #
-    # ADVISORY on purpose: there is no "fail the leg" step, unlike `review`.
-    # A new backend's first outing must not be able to turn a rollup red while
-    # it is still being characterised. `Panel integrity` is itself advisory by
-    # default, so an errored record here is visible without gating anything.
+    # ADVISORY on purpose: `continue-on-error` at the JOB level, so no step in
+    # here — install, version check, prompt build, upload — can turn the
+    # caller's run red while this backend is still being characterised.
     #
     # v1 scope: adversarial only (not edge-case), one model, one round.
     name: 'adversarial direct (${{ inputs.openai_direct_model }})'
     needs: [gate, diff-size, preflight, ledger]
     if: >-
-      inputs.openai_direct_model != ''
+      needs.preflight.outputs.openai_direct == 'true'
       && needs.gate.outputs.should_run == 'true'
       && needs.gate.outputs.already_reviewed != 'true'
       && needs.diff-size.outputs.within_cap == 'true'
@@ -2745,6 +2790,7 @@ jobs:
     # OPENAI_API_KEY, and a pool is where a prompt-injected model cell may
     # have run. Only CURSOR_API_KEY-only, read-only jobs may follow `runs_on`.
     runs-on: ubuntu-latest
+    continue-on-error: true
     # Matches the `review` job's cap so the judge's budget reasoning (see
     # `review`) holds for this cell too; the agent step caps lower, at 15.
     timeout-minutes: 30
@@ -2847,10 +2893,9 @@ jobs:
 
       - name: Check the API key is present
         id: key
-        # A caller that sets the input but forgets the secret gets a clearly
-        # attributed errored record rather than a confusing CLI auth failure
-        # three steps later. Reported as a warning, not an error: the seeded
-        # artifact already carries the error status and this cell gates nothing.
+        # Belt and braces: preflight already keeps this job off when the key is
+        # absent. Should the two ever disagree, this attributes the errored
+        # record clearly rather than leaving a confusing CLI auth failure.
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -2898,21 +2943,14 @@ jobs:
         # so a swap between install and use cannot hand the review to unpinned
         # bits, and the version lands in the log for forensics.
         run: |
-          installed="$(codex --version 2>&1 | tr -d '\r' | awk '{print $NF}')"
+          # stdout only, first line (`codex-cli 0.162.0`): a stray stderr
+          # notice must not become the last field compared below.
+          installed="$(codex --version 2>/dev/null | head -n 1 | tr -d '\r' | awk '{print $NF}')"
           if [ "$installed" != "$CODEX_CLI_VERSION" ]; then
             echo "::error::codex reports '${installed}', expected the pinned '${CODEX_CLI_VERSION}'."
             exit 1
           fi
           echo "codex ${installed}"
-
-      - name: Authenticate Codex CLI
-        if: steps.key.outputs.present == 'true'
-        # Piped from the environment on stdin, never passed as an argument: an
-        # argv value is visible in the runner's process list to anything else
-        # on the box, and `set -x` or a crash dump would put it in a public log.
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null
 
       - name: Build prompt
         if: steps.key.outputs.present == 'true'
@@ -2945,8 +2983,18 @@ jobs:
         timeout-minutes: 15
         env:
           MODEL: ${{ inputs.openai_direct_model }}
+          # `codex exec` reads its API key from this variable, so the key lives
+          # only in this step's process env: never argv (visible in the process
+          # list), never a file (`codex login` writes ~/.codex/auth.json, which
+          # the read-only sandbox can still READ, so a prompt-injected agent
+          # could encode it into a finding). Verified against 0.162.0.
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           mkdir -p /tmp/findings-out
+          # A fresh, empty home: no stale credential or config from anything
+          # else that ran on this runner, and nothing persisted for the next.
+          CODEX_HOME="$(mktemp -d)"
+          export CODEX_HOME
           python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
             --mode reviewer \
             --out /tmp/findings-out/findings.json \
@@ -2957,7 +3005,8 @@ jobs:
           # schema the judge reads is produced by one implementation for both
           # backends. `default_tools_approval_mode=approve` is required: under
           # `codex exec`'s default policy the tool calls are rejected and the
-          # cell submits nothing.
+          # cell submits nothing. `shell_environment_policy.inherit=core` hands
+          # the agent's shell only HOME/PATH/etc., never CODEX_API_KEY.
           args_toml="$(python3 - <<'PY'
           import json, os
           print(json.dumps([
@@ -2971,6 +3020,7 @@ jobs:
           )"
           codex exec --json --ignore-user-config --skip-git-repo-check \
             -s read-only \
+            -c shell_environment_policy.inherit=core \
             -c model="$MODEL" \
             -c model_reasoning_effort=max \
             -c mcp_servers.cursor_review_output.command=python3 \
@@ -2982,11 +3032,12 @@ jobs:
         if: always()
         env:
           MODEL: ${{ inputs.openai_direct_model }}
+        # Status and a count only — NOT the findings verbatim, unlike the Cursor
+        # cells: the run log is public, and finding bodies are model output
+        # steered by PR-authored text. The full record still reaches the judge
+        # through the artifact below.
         run: |
-          echo "=== Structured findings ==="
-          cat /tmp/findings-out/findings.json
-          echo ""
-          status=$(python3 - <<'PY'
+          read -r status count < <(python3 - <<'PY'
           import json, re
           try:
               with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
@@ -2996,9 +3047,12 @@ jobs:
           value = cell.get("status") if isinstance(cell, dict) else None
           if not isinstance(value, str):
               value = "error"
-          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error")
+          findings = cell.get("findings") if isinstance(cell, dict) else None
+          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error",
+                len(findings) if isinstance(findings, list) else 0)
           PY
           )
+          echo "Direct-API cell: status=${status}, ${count} finding(s)."
           if [ "$status" != "ok" ]; then
             echo "::warning::Direct-API cell adversarial/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
           else
@@ -3007,11 +3061,13 @@ jobs:
 
       - name: Upload findings artifact
         if: always()
-        # Named to the `findings-<review_type>-<model>` convention that
-        # `consolidate` globs, which is the whole integration.
+        # `findings-*` so `consolidate` globs it; `direct-` so it can never
+        # collide with a Cursor cell's `findings-<review_type>-<model>` (with
+        # replacement off the two may share an id) and so `consolidate` can
+        # tell it apart. The id is charset-checked in preflight.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: findings-adversarial-${{ inputs.openai_direct_model }}
+          name: findings-direct-adversarial-${{ inputs.openai_direct_model }}
           path: /tmp/findings-out/findings.json
           if-no-files-found: error
           retention-days: 7
@@ -3025,7 +3081,10 @@ jobs:
     # "Credential isolation" note for why the judge must not share a job with
     # a write-scoped token.
     name: Consolidate panel
-    needs: [gate, diff-size, preflight, review, ledger]
+    # `review-openai-direct` is here only for ORDERING — its artifact must land
+    # before `Download panel findings` runs. Its result is never read: when it
+    # is skipped (the default) or fails, `!cancelled()` below still runs.
+    needs: [gate, diff-size, preflight, review, review-openai-direct, ledger]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
     # `post-review`, is itself `!cancelled()`. On a cancelled run — now an
@@ -3238,6 +3297,12 @@ jobs:
           import json, os, glob
 
           panel = []
+          # The opt-in direct-API cell (`findings-direct-*`). Its findings go to
+          # the judge like any cell's, but it is NOT a Cursor panel cell: it is
+          # kept out of `present` (so it cannot mask a missing Cursor cell with
+          # the same id) and out of ok_count/total, which `Panel integrity` and
+          # the auto-approve gate read — an advisory cell must not gate.
+          direct = []
           for path in sorted(glob.glob("/tmp/panel/findings-*/findings.json")):
               try:
                   with open(path, encoding="utf-8") as f:
@@ -3245,7 +3310,13 @@ jobs:
               except (OSError, json.JSONDecodeError):
                   continue
               if isinstance(cell, dict):
-                  panel.append(cell)
+                  if os.path.basename(os.path.dirname(path)).startswith("findings-direct-"):
+                      direct.append(cell)
+                  else:
+                      # Only THIS step may set the marker: a Cursor cell's own
+                      # record must never be able to excuse itself from the count.
+                      cell.pop("direct_api", None)
+                      panel.append(cell)
 
           expected = {
               (model, review_type)
@@ -3265,11 +3336,16 @@ jobs:
                   "findings": [],
               })
 
-          with open("/tmp/panel.json", "w", encoding="utf-8") as f:
-              json.dump(panel, f, indent=2)
-
           ok = sum(1 for c in panel if c.get("status") == "ok")
           print(f"Panel: {ok}/{len(panel)} cells contributed findings.")
+          for c in direct:
+              print(f"Direct-API cell (advisory, not counted): status={c.get('status')}.")
+              # Read by `Build consolidated findings file`, which keeps these
+              # out of the `panel` metadata auto-approve counts failures from.
+              c["direct_api"] = True
+
+          with open("/tmp/panel.json", "w", encoding="utf-8") as f:
+              json.dump(panel + direct, f, indent=2)
 
           # Emit metadata for the next step to gate on.
           with open(os.environ["GITHUB_OUTPUT"], "a") as g:
@@ -3396,9 +3472,13 @@ jobs:
 
           with open("/tmp/panel.json", encoding="utf-8") as f:
               panel = json.load(f)
+          # Cursor panel cells only: auto-approve counts failed reviewers from
+          # this list, and the advisory direct-API cell must not gate. Its
+          # findings still reach the degraded fallback below via `panel`.
           panel_meta = [
               {"model": c.get("model"), "review_type": c.get("review_type"), "status": c.get("status")}
               for c in panel
+              if c.get("direct_api") is not True
           ]
           with open("/tmp/judge-findings.json", encoding="utf-8") as f:
               judge = json.load(f)

@@ -141,6 +141,21 @@ updates:
       default-days: 7
       semver-major-days: 14
 
+  # Same pattern, same reasons, for the @openai/codex pin behind
+  # cursor-review.yml's opt-in direct-API cell. Its manifest installs nothing;
+  # the job reads the version out of it and rejects a non-exact pin at run
+  # time, hence `increase`. Without this entry the pin rots unwatched.
+  - package-ecosystem: "npm"
+    directory: "/.github/cursor-review"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies"]
+    versioning-strategy: "increase"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
   # The PyYAML + jsonschema pins the .coderabbit.yaml validator installs
   # (BE-7757). This is the repo's only Python dependency set, and it is
   # hash-pinned with `--require-hashes` — which is exactly why it needs watching:
