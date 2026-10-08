@@ -286,11 +286,27 @@ on:
           the cell reports an errored record rather than failing the panel.
           Deliberately NOT part of `panel_models`: that list is validated
           against the live CURSOR catalog, which a direct-API id is not in.
-          The cell is additive and advisory — its findings reach the judge like
-          any other cell's, but the leg never fails the run.
+          Advisory — its findings reach the judge like any other cell's, but the
+          leg never fails the run. By default it REPLACES the Cursor OpenAI cell
+          rather than adding to it; see `openai_direct_replaces_cursor_openai`.
         type: string
         required: false
         default: ''
+      openai_direct_replaces_cursor_openai:
+        description: >-
+          When `openai_direct_model` is set, drop the Cursor-hosted OpenAI cell
+          from the panel so the lane is reviewed once rather than twice. Default
+          true: the direct cell REPLACES it. Matching is by vendor prefix
+          (`gpt-`) against the resolved panel list, which is how every OpenAI id
+          in Cursor's catalog is spelled today — the other labs' ids are
+          untouched. Set false to run both for a side-by-side comparison of the
+          two backends on identical diffs, which is worth doing once before
+          trusting the replacement. Refuses to leave the Cursor panel empty: if
+          every remaining id would be dropped, preflight fails rather than
+          silently shrinking the panel to a single direct cell.
+        type: boolean
+        required: false
+        default: true
       skip_bot_branch_prefixes:
         description: >-
           Space-separated head-branch prefixes that skip the review when the PR
@@ -2018,6 +2034,12 @@ jobs:
           # Which of the two won, for the log line below. With two sources the
           # effective list alone no longer says where to go change it.
           PANEL_MODELS_INPUT: ${{ inputs.panel_models }}
+          # Drive the direct-cell replacement below. Read here rather than in
+          # the `review` job so ONE resolved list feeds the matrix, the judge's
+          # `expected` set and `Panel integrity` alike — filtering anywhere else
+          # would leave consolidate expecting a cell that was never scheduled.
+          OPENAI_DIRECT_MODEL: ${{ inputs.openai_direct_model }}
+          OPENAI_DIRECT_REPLACES: ${{ inputs.openai_direct_replaces_cursor_openai }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -2067,6 +2089,27 @@ jobs:
             # from one that was never set — the panel quietly reverts and the
             # rounds either side of it look the same.
             echo "panel_models not set (no input, no CURSOR_PANEL_MODELS variable) — using the built-in list: $(jq -c . /tmp/models.json)"
+          fi
+          # The direct-API cell reviews the OpenAI lane itself, so by default the
+          # Cursor-hosted OpenAI cell comes OUT of the panel — otherwise that lane
+          # is reviewed twice and billed twice. Applied after the override has
+          # been resolved, so it filters whichever list actually won.
+          if [ -n "$(printf '%s' "${OPENAI_DIRECT_MODEL:-}" | tr -d '[:space:]')" ] \
+             && [ "${OPENAI_DIRECT_REPLACES:-true}" = "true" ]; then
+            # ascii_downcase so a differently-cased id cannot slip past the
+            # vendor match and leave a duplicate OpenAI cell running.
+            dropped="$(jq -c '[.[] | select((ascii_downcase | startswith("gpt-")))]' /tmp/models.json)"
+            kept="$(jq -c '[.[] | select((ascii_downcase | startswith("gpt-")) | not)]' /tmp/models.json)"
+            if [ "$(printf '%s' "$dropped" | jq 'length')" -gt 0 ]; then
+              if [ "$(printf '%s' "$kept" | jq 'length')" -eq 0 ]; then
+                echo "::error::openai_direct_model is set and openai_direct_replaces_cursor_openai is true, but every id in the panel list is an OpenAI id, so replacing them would leave no Cursor cell at all. Set openai_direct_replaces_cursor_openai: false, or widen panel_models."
+                exit 1
+              fi
+              printf '%s' "$kept" > /tmp/models.json
+              echo "direct-API cell is on, so the Cursor OpenAI cell(s) $dropped were dropped from the panel; remaining: $kept"
+            else
+              echo "direct-API cell is on, but the panel list carries no Cursor OpenAI id to replace; panel unchanged."
+            fi
           fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
@@ -2653,8 +2696,12 @@ jobs:
           echo "Reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
 
   review-openai-direct:
-    # An OPT-IN extra adversarial cell that reaches its model through the OpenAI
-    # API directly, via the Codex CLI, instead of through Cursor. Default OFF:
+    # An OPT-IN adversarial cell that reaches its model through the OpenAI API
+    # directly, via the Codex CLI, instead of through Cursor. By default it
+    # REPLACES the Cursor-hosted OpenAI cell (preflight drops that id from the
+    # panel list) so the lane is reviewed once, not twice; set
+    # `openai_direct_replaces_cursor_openai: false` to run both for a
+    # side-by-side comparison. Default OFF:
     # `openai_direct_model` is '' unless a caller sets it, and this job is then
     # skipped outright, so every enrolled repo sees exactly today's behaviour
     # until it opts in.
