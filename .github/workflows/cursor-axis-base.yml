@@ -14,9 +14,13 @@ name: Cursor axis (base)
 #   context_sources  comma list of linear,notion,slack: the context-proxy.py
 #               tools this axis gets (business/design/completeness only). Empty
 #               → no MCP server at all.
-#   no_shell    true → deny cursor-agent's shell and file-write tools, and fail
-#               the job if the transcript shows one was called anyway. Required
-#               (with checkout false) for business and design.
+#   no_shell    true → fail the job if the transcript shows a shell or
+#               file-write call (every axis is denied those tools; this checks
+#               the deny list held). Required (with checkout false) for
+#               business and design.
+#
+# No axis gets a shell. A checkout axis gets the merge-base diff, its
+# --name-status list and the PR's commit log, precomputed under pr/.git.
 # Secrets:
 #   CURSOR_API_KEY
 #   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
@@ -242,6 +246,24 @@ jobs:
           merge_base="$BASE_SHA"
           if [ "$CHECKOUT" = "true" ]; then
             merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
+            # The agent has no shell (see "Run the axis"), so the workflow runs
+            # the git it would have: the merge-base diff, the changed-file list
+            # and the PR's commits, beside the context file under .git. No
+            # textconv or external diff driver, so a PR's .gitattributes cannot
+            # make this step run anything.
+            git -C pr diff --no-color --no-ext-diff --no-textconv "$merge_base...$COMMIT_SHA" \
+              > "$RUNNER_TEMP/pr-full.diff"
+            limit=1048576
+            size="$(wc -c < "$RUNNER_TEMP/pr-full.diff")"
+            head -c "$limit" "$RUNNER_TEMP/pr-full.diff" > "$ctx_dir/cursor-approve.diff"
+            if [ "$size" -gt "$limit" ]; then
+              printf '\n[diff truncated: showing %s of %s bytes]\n' "$limit" "$size" >> "$ctx_dir/cursor-approve.diff"
+            fi
+            git -C pr diff --no-color --no-ext-diff --no-textconv --name-status "$merge_base...$COMMIT_SHA" \
+              > "$ctx_dir/cursor-approve-changed-files.txt"
+            git -C pr log --no-color --format='%H %an %s' "$merge_base..$COMMIT_SHA" \
+              > "$ctx_dir/cursor-approve-log.txt"
+            echo "diff bytes: $size"
           fi
           {
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
@@ -250,6 +272,7 @@ jobs:
               --base-ref "$BASE_REF" --context-file "${ctx#pr/}"
             case "$CHECKOUT/$AXIS" in
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
+              true/*) cat "$CURSOR_APPROVE_ASSETS/prompt-checkout.md" ;;
             esac
             if [ -n "$CONTEXT_SOURCES" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-context-tools.md"; fi
           } > "$RUNNER_TEMP/axis-prompt.txt"
@@ -344,9 +367,16 @@ jobs:
                        "slack": ("slack_search", "slack_history")}
               for source in os.environ["CONTEXT_SOURCES"].split(","):
                   allow += [f"Mcp(context:{tool})" for tool in tools[source]]
-          # Write(**) is the permission behind the edit and delete tools too;
-          # WebFetch(*) keeps an agent that has read company context off the network.
-          deny = ["Shell(*)", "Write(**)", "WebFetch(*)"] if os.environ["NO_SHELL"] == "true" else []
+          # Every axis is denied all three. Write(**) is the permission behind
+          # the edit and delete tools too; WebFetch(*) keeps an agent that has
+          # read company context, or holds CURSOR_API_KEY, off the network. A
+          # checkout axis was never really given a shell: --print rejects a
+          # command no allow rule matches, so with an empty list each one came
+          # back `rejected` and the agent fell back to reading files blind.
+          # Saying so here makes the boundary explicit; "Render prompt" hands a
+          # checkout axis the git output it needs instead. Allowing Shell(git)
+          # would be a full shell (`git -c alias.x='!sh' x`).
+          deny = ["Shell(*)", "Write(**)", "WebFetch(*)"]
           for name, value in (("mcp.json", {"mcpServers": servers}),
                               ("cli.json", {"permissions": {"allow": allow, "deny": deny}})):
               with open(os.path.join(".cursor", name), "w", encoding="utf-8") as f:

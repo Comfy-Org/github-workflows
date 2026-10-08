@@ -117,6 +117,27 @@ class Base(unittest.TestCase):
         self.assertIn('["Shell(*)", "Write(**)", "WebFetch(*)"]', run)
         self.assertIn("rm -rf -- .cursor", run)
 
+    def test_every_axis_is_denied_a_shell(self):
+        # A checkout axis once got deny=[] and an empty allow list, which
+        # --print turns into a silent rejection of every shell call. The deny
+        # list is now unconditional, so it is never tied to no_shell again.
+        run = self.steps["Run the axis"]
+        self.assertIn('deny = ["Shell(*)", "Write(**)", "WebFetch(*)"]\n', run)
+        self.assertNotIn('if os.environ["NO_SHELL"] == "true" else []', run)
+
+    def test_checkout_axes_get_the_git_output_precomputed(self):
+        render = self.steps["Render prompt"]
+        for name in ("cursor-approve.diff", "cursor-approve-changed-files.txt",
+                     "cursor-approve-log.txt"):
+            self.assertIn(f'"$ctx_dir/{name}"', render, name)
+        # A PR's .gitattributes must not be able to run a diff driver here.
+        diffs = [ln for ln in render.split("\n") if "git -C pr diff" in ln]
+        self.assertEqual(len(diffs), 2)
+        for ln in diffs:
+            self.assertIn("--no-ext-diff --no-textconv", ln)
+        self.assertIn('"$merge_base...$COMMIT_SHA"', render)
+        self.assertIn("true/*) cat \"$CURSOR_APPROVE_ASSETS/prompt-checkout.md\" ;;", render)
+
     def test_business_and_design_require_no_shell_and_no_checkout(self):
         check = self.steps["Check inputs"]
         self.assertIn("business|design)", check)
