@@ -171,7 +171,7 @@ The build is then **verified, not trusted**, and against the reviewed diff's own
 
 | Lab | Model (Cursor catalog) |
 |---|---|
-| OpenAI | `gpt-5.6-sol-max` |
+| OpenAI | `gpt-5.6-sol-xhigh` |
 | Anthropic | `claude-opus-5-5-xhigh` |
 | Moonshot | `kimi-k3-high` |
 
@@ -187,6 +187,10 @@ catalog (Opus 5 had both lines), so there is no literal counterpart to the old
 id; no `claude-opus-5-5-*` entry carries a NO-ZDR marker. The **judge** moved to
 `claude-opus-5-5-xhigh` on the same day, along with the five cursor-approve axes
 and `cursor-axis-base.yml`, which share that one default.
+
+The OpenAI cell moved from `gpt-5.6-sol-max` to `gpt-5.6-sol-xhigh`: one
+reasoning notch down, to reduce timeouts and run-to-cap failures on that lane.
+`gpt-5.6-sol-xhigh` is a real catalog id.
 
 Callers can override the panel list with the `panel_models` input (see below).
 
