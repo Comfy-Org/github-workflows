@@ -363,7 +363,7 @@ holds the tokens: the agent can search, but never holds a credential.
 |---|---|---|---|
 | business | PR title, body, changed-file list with line counts — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page`, `slack_search`, `slack_history` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN`, `SLACK_TOKEN` |
 | design | PR title, body, merge-base diff cut at 200 KB — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN` |
-| completeness | Full read-only checkout (`persist-credentials: false`), shell allowed for `git` | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
+| completeness | Full read-only checkout (`persist-credentials: false`), with a shell | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
 
 A missing token leaves that source unconfigured; the axis still runs. The tokens
 are read-only bot identities (Linear and Notion as the tools bot, Slack as the
@@ -432,9 +432,15 @@ context. A prompt injection in any of it can make the agent repeat that context
 into its verdict summary, which lands on the PR, or steer its verdict. That is
 acceptable on private repositories only, where everyone who can read the PR can
 already read the company, and is why the axes refuse to run on a public one.
-The completeness axis keeps a shell for `git`: on a hosted runner (passwordless
-`sudo`) a hostile agent could read the running proxy's memory, so its Linear
-token is protected by policy and prompt, not by the sandbox.
+The checkout axes (correctness, conformance, completeness) have a shell, granted
+by an explicit `Shell(*)` allow rule: `--print` has no one to approve a command,
+so without that rule every shell call is rejected and the axis reviews without
+ever running `git`. The job fails if every shell call in a checkout axis's
+transcript was rejected, and on any axis whose transcript shows no tool call.
+That shell is the same unsandboxed exposure over PR code that the cursor-review
+panel already accepts. For completeness it also means: on a hosted runner
+(passwordless `sudo`) a hostile agent could read the running proxy's memory, so
+its Linear token is protected by policy and prompt, not by the sandbox.
 
 ## Trust model
 

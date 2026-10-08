@@ -116,6 +116,21 @@ class Base(unittest.TestCase):
         run = self.steps["Run the axis"]
         self.assertIn('["Shell(*)", "Write(**)", "WebFetch(*)"]', run)
         self.assertIn("rm -rf -- .cursor", run)
+        self.assertIn("rm -f -- .cursorignore .cursorindexingignore", run)
+
+    def test_checkout_axes_are_allowed_a_shell(self):
+        # An empty allow list makes --print reject every shell call, so a
+        # checkout axis reviewed without ever running git. The allow rule is
+        # explicit, and a transcript where every shell call was rejected fails.
+        run = self.steps["Run the axis"]
+        self.assertIn('if os.environ["NO_SHELL"] != "true":\n              allow.append("Shell(*)")', run)
+        self.assertIn('"rejected" in outcome', run)
+        self.assertIn('if os.environ["NO_SHELL"] != "true" and shell_rejected and not shell_ok:', run)
+
+    def test_every_axis_must_make_a_tool_call(self):
+        run = self.steps["Run the axis"]
+        self.assertIn("          if not recognized:\n", run)
+        self.assertNotIn('if os.environ["NO_SHELL"] == "true" and not recognized', run)
 
     def test_business_and_design_require_no_shell_and_no_checkout(self):
         check = self.steps["Check inputs"]
