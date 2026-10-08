@@ -12,7 +12,8 @@ name: Cursor axis (business)
 # notice. See docs/callers/cursor-approve.md for the caller and accepted risk.
 #
 # Inputs (passed through): commit_sha, model, runs_on.
-# Secrets: CURSOR_API_KEY, LINEAR_KEY, NOTION_TOKEN.
+# Secrets: CURSOR_API_KEY, LINEAR_KEY, NOTION_TOKEN. SLACK_TOKEN is still declared,
+# and ignored, so a caller that passes it is not rejected at startup.
 
 on:
   workflow_call:
@@ -32,6 +33,10 @@ on:
       LINEAR_KEY:
         required: false
       NOTION_TOKEN:
+        required: false
+      # Deprecated and unused: never forwarded. Kept so an existing caller's
+      # `SLACK_TOKEN:` line does not fail its whole workflow file.
+      SLACK_TOKEN:
         required: false
 
 permissions:

@@ -363,8 +363,11 @@ No axis reads Slack. Slack is where people debate before they decide, not a
 record of what was decided: the decision lands in a ticket, a PRD or a TDD.
 Treating a thread as evidence that a change was wanted rewards opening a thread
 to get a PR approved, and anyone in a channel can post the text an approver
-then reads. The proxy still implements `slack_search` / `slack_history` and the
-base still accepts `SLACK_TOKEN`; no shipped axis enables them.
+then reads. The proxy still implements `slack_search` / `slack_history`, but
+`cursor-axis-base.yml` rejects `slack` in `context_sources`, so no caller can
+enable them. `axis-business.yml` still declares an optional `SLACK_TOKEN` that it
+never forwards, so a caller that passes one keeps working; drop the line when
+convenient.
 
 | Axis | Agent sees | Context tools | Secrets (all but `CURSOR_API_KEY` optional) |
 |---|---|---|---|
