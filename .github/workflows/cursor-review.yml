@@ -2472,6 +2472,15 @@ jobs:
         # the PR's rollup instead of a silent hole in the panel count. Keeping
         # the absorption HERE rather than dropping `continue-on-error` is what
         # lets the artifact upload still run, so the panel keeps consolidating.
+        #
+        # The cap is for cells that never submit. A cell that HAS submitted —
+        # its findings.json parses and reads `status: ok` — is ended by
+        # stop-on-submit.py within 30 seconds of the submission instead of
+        # idling to the cap (some agents keep running after
+        # `cursor_review_finish`). The wrapper only READS findings.json, so the
+        # artifact is byte-for-byte what the MCP tool wrote; it exits 0 on that
+        # path, and a cell that never reaches `status: ok` is not stopped, so
+        # it still runs to this cap and fails its leg exactly as before.
         continue-on-error: true
         timeout-minutes: 15
         env:
@@ -2487,12 +2496,15 @@ jobs:
           #
           # Capture the exit code without tripping the shell's `set -e`. If the
           # agent fails before finishing its MCP submission, the pre-seeded
-          # structured artifact remains status=error.
-          cursor-agent \
-            --print \
-            --trust \
-            --approve-mcps \
-            --model "$MODEL" \
+          # structured artifact remains status=error. stop-on-submit.py writes
+          # its own `stop-on-submit:` status lines into the stderr capture.
+          python3 "$CURSOR_REVIEW_ASSETS/stop-on-submit.py" \
+            --findings /tmp/findings-out/findings.json -- \
+            cursor-agent \
+              --print \
+              --trust \
+              --approve-mcps \
+              --model "$MODEL" \
             < /tmp/prompt.txt \
             > /tmp/review-raw.txt 2>/tmp/review-stderr.txt \
             && CURSOR_EXIT=0 || CURSOR_EXIT=$?
