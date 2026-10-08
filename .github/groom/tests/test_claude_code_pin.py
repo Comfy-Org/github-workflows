@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -661,6 +662,57 @@ class TestPinnedDependencyShape(unittest.TestCase):
         if _in_ci():
             self.fail(message)
         self.skipTest(message)
+
+    def test_finder_budget_flag_is_supported_by_pinned_cli(self):
+        """Install the exact pin and ask its real argument parser for the flag.
+
+        A textual workflow assertion cannot catch an option removed by a CLI
+        bump. This uses the same npm package, registry and install-script path as
+        groom.yml, then executes only `--help` (no auth and no API request).
+        """
+        npm = shutil.which("npm")
+        if npm is None:
+            self._fail_or_skip(self.spec, "no `npm` on PATH", True)
+        try:
+            with tempfile.TemporaryDirectory() as prefix:
+                install = subprocess.run(
+                    [
+                        npm,
+                        "install",
+                        "--prefix",
+                        prefix,
+                        "--no-audit",
+                        "--no-fund",
+                        self.spec,
+                        *_REGISTRY_FLAGS,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    stdin=subprocess.DEVNULL,
+                )
+                if install.returncode != 0:
+                    self._fail_or_skip(
+                        self.spec,
+                        f"`npm install` exited {install.returncode}: {install.stderr[-500:]}",
+                        False,
+                    )
+                cli = os.path.join(prefix, "node_modules", ".bin", "claude")
+                help_result = subprocess.run(
+                    [cli, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    stdin=subprocess.DEVNULL,
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._fail_or_skip(self.spec, f"could not run pinned CLI `--help`: {exc}", False)
+        self.assertEqual(0, help_result.returncode, help_result.stderr[-500:])
+        self.assertIn(
+            "--max-budget-usd <amount>",
+            help_result.stdout,
+            f"{self.spec} does not advertise the finder budget flag in `claude --help`",
+        )
 
     def _positive_control(self):
         """Prove this npm/registry pair answers about the pinned spec at all.
