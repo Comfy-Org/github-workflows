@@ -355,21 +355,25 @@ JSON (`verdict`, `confidence`, `summary` capped at 1200 characters) reaches
 ## Context axes
 
 `axis-business.yml`, `axis-design.yml` and `axis-completeness.yml` judge a PR
-against company context, not just its code. They read Linear, Notion and Slack
+against company context, not just its code. They read Linear and Notion
 through `.github/cursor-approve/context-proxy.py`, a read-only MCP server that
 holds the tokens: the agent can search, but never holds a credential.
 
+No axis reads Slack. Slack is where people debate before they decide, not a
+record of what was decided: the decision lands in a ticket, a PRD or a TDD.
+Treating a thread as evidence that a change was wanted rewards opening a thread
+to get a PR approved, and anyone in a channel can post the text an approver
+then reads. The proxy still implements `slack_search` / `slack_history` and the
+base still accepts `SLACK_TOKEN`; no shipped axis enables them.
+
 | Axis | Agent sees | Context tools | Secrets (all but `CURSOR_API_KEY` optional) |
 |---|---|---|---|
-| business | PR title, body, changed-file list with line counts — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page`, `slack_search`, `slack_history` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN`, `SLACK_TOKEN` |
+| business | PR title, body, changed-file list with line counts — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN` |
 | design | PR title, body, merge-base diff cut at 200 KB — no checkout, no shell | `linear_search`, `linear_get_issue`, `notion_search`, `notion_get_page` | `CURSOR_API_KEY`, `LINEAR_KEY`, `NOTION_TOKEN` |
 | completeness | Full read-only checkout (`persist-credentials: false`), shell allowed for `git` | `linear_search`, `linear_get_issue` | `CURSOR_API_KEY`, `LINEAR_KEY` |
 
 A missing token leaves that source unconfigured; the axis still runs. The tokens
-are read-only bot identities (Linear and Notion as the tools bot, Slack as the
-cursor-approver app). The Slack bot cannot call `search.messages`, so the proxy
-loads the last 30 days of every public channel the bot is a member of and
-searches that.
+are read-only bot identities (Linear and Notion as the tools bot).
 
 How a token reaches the proxy without reaching the agent:
 
@@ -402,7 +406,6 @@ Business and design fetch the change from the GitHub compare API, which
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
 
   axis-design:
     needs: [cursor-review, approve-start]

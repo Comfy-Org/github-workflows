@@ -10,8 +10,8 @@ WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
 TOKENS = ("LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN")
 
 AXES = {
-    "business": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"],
-                 "checkout": "false", "no_shell": "true", "sources": "linear,notion,slack"},
+    "business": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN"],
+                 "checkout": "false", "no_shell": "true", "sources": "linear,notion"},
     "design": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN"],
                "checkout": "false", "no_shell": "true", "sources": "linear,notion"},
     "completeness": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY"],

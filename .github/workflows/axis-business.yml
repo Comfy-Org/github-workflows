@@ -3,14 +3,16 @@ name: Cursor axis (business)
 # The business axis of cursor-approve: a thin wrapper over cursor-axis-base.yml.
 # No checkout and no shell: the agent sees the PR title, body and
 # changed-file list with line counts, fetched by the workflow.
-# Company context comes through context-proxy.py (tools: linear,notion,slack), which
-# holds the tokens; the agent never does. Declares ONLY the secrets below, all
+# Company context comes through context-proxy.py (tools: linear,notion), which
+# holds the tokens; the agent never does. No Slack: it is where people debate
+# before deciding, not a record of the decision, and anyone can post in it, so
+# it is neither evidence of business intent nor safe to feed an approver. Declares ONLY the secrets below, all
 # but CURSOR_API_KEY optional (a missing token leaves that tool unconfigured).
 # Runs only on same-repo PRs in a PRIVATE repo; otherwise it skips with a
 # notice. See docs/callers/cursor-approve.md for the caller and accepted risk.
 #
 # Inputs (passed through): commit_sha, model, runs_on.
-# Secrets: CURSOR_API_KEY, LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN.
+# Secrets: CURSOR_API_KEY, LINEAR_KEY, NOTION_TOKEN.
 
 on:
   workflow_call:
@@ -30,8 +32,6 @@ on:
       LINEAR_KEY:
         required: false
       NOTION_TOKEN:
-        required: false
-      SLACK_TOKEN:
         required: false
 
 permissions:
@@ -55,7 +55,7 @@ jobs:
       axis: business
       checkout: false
       no_shell: true
-      context_sources: linear,notion,slack
+      context_sources: linear,notion
       commit_sha: ${{ inputs.commit_sha }}
       model: ${{ inputs.model }}
       runs_on: ${{ inputs.runs_on }}
@@ -63,4 +63,3 @@ jobs:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       LINEAR_KEY: ${{ secrets.LINEAR_KEY }}
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
