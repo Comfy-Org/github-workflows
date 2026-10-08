@@ -2498,6 +2498,24 @@ jobs:
           # agent fails before finishing its MCP submission, the pre-seeded
           # structured artifact remains status=error. stop-on-submit.py writes
           # its own `stop-on-submit:` status lines into the stderr capture.
+          #
+          # The step cap and a run cancel signal THIS shell, which would die
+          # without passing the signal on, leaving the wrapper and the agent's
+          # own process group running past the step and still able to write
+          # findings.json while the always() steps below read and upload it.
+          # So the wrapper runs in the background with the signals forwarded,
+          # and the shell waits it out (a trapped signal interrupts `wait`, so
+          # keep waiting until the wrapper is actually gone, then collect its
+          # real status).
+          CURSOR_PID=
+          CURSOR_SIGNALLED=
+          forward_signal() {
+            CURSOR_SIGNALLED=1
+            if [ -n "$CURSOR_PID" ]; then kill "-$1" "$CURSOR_PID" 2>/dev/null || true; fi
+          }
+          trap 'forward_signal INT' INT
+          trap 'forward_signal TERM' TERM
+          trap 'forward_signal HUP' HUP
           python3 "$CURSOR_REVIEW_ASSETS/stop-on-submit.py" \
             --findings /tmp/findings-out/findings.json -- \
             cursor-agent \
@@ -2506,8 +2524,13 @@ jobs:
               --approve-mcps \
               --model "$MODEL" \
             < /tmp/prompt.txt \
-            > /tmp/review-raw.txt 2>/tmp/review-stderr.txt \
-            && CURSOR_EXIT=0 || CURSOR_EXIT=$?
+            > /tmp/review-raw.txt 2>/tmp/review-stderr.txt &
+          CURSOR_PID=$!
+          while kill -0 "$CURSOR_PID" 2>/dev/null; do
+            wait "$CURSOR_PID" || true
+          done
+          wait "$CURSOR_PID" && CURSOR_EXIT=0 || CURSOR_EXIT=$?
+          trap - INT TERM HUP
           echo "$CURSOR_EXIT" > /tmp/review-exit-code
           echo "cursor-agent exit code: $CURSOR_EXIT"
 
@@ -2516,6 +2539,8 @@ jobs:
           echo ""
           echo "=== Stderr ==="
           cat /tmp/review-stderr.txt
+          # A signalled step still fails as one, as it did before the wrapper.
+          if [ -n "$CURSOR_SIGNALLED" ]; then exit "$CURSOR_EXIT"; fi
 
       - name: Show structured findings
         if: always()

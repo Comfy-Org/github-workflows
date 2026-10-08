@@ -79,6 +79,23 @@ class SubmittedTest(unittest.TestCase):
         os.mkdir(self.path)
         self.assertFalse(stop_on_submit.submitted(self.path))
 
+    def test_a_fifo_is_not_submitted_and_does_not_block(self):
+        # A blocking open() on a FIFO with no writer would hang the poll forever.
+        os.mkfifo(self.path)
+        self.assertFalse(stop_on_submit.submitted(self.path))
+
+    def test_a_symlink_is_not_submitted(self):
+        target = os.path.join(self.dir.name, "real.json")
+        with open(target, "w") as f:
+            json.dump(OK, f)
+        os.symlink(target, self.path)
+        self.assertFalse(stop_on_submit.submitted(self.path))
+
+    def test_an_oversized_file_is_not_submitted(self):
+        padding = "x" * (stop_on_submit.MAX_FINDINGS_BYTES)
+        self.write(json.dumps({"status": "ok", "pad": padding}))
+        self.assertFalse(stop_on_submit.submitted(self.path))
+
 
 class WrapperTest(unittest.TestCase):
     def setUp(self):
@@ -261,6 +278,59 @@ class WrapperTest(unittest.TestCase):
         self.assertEqual(code, 128 + signal.SIGTERM, err)
         self.assert_gone(self.pids()[0])
 
+    def wait_for_pids(self, count):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if os.path.exists(self.pidfile) and len(self.pids()) >= count:
+                return
+            time.sleep(0.05)
+        self.fail(f"stub never recorded {count} pid(s)")
+
+    def test_signal_trapping_agent_is_killed_and_reported_as_signalled(self):
+        # An agent that traps the forwarded signal and stays up must not hold
+        # the wrapper (and the step) until the runner's unforwardable kill; one
+        # that traps it and exits 0 must not read as success either.
+        proc = self.wrap("""\
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            kid = subprocess.Popen([sys.executable, "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"])
+            record_pid(kid.pid)
+            time.sleep(600)
+            """, extra=["--poll", "5", "--linger", "5", "--grace", "0.5"])
+        self.wait_for_pids(2)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        code, err, _ = self.finish(proc, cap=10)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertLess(time.monotonic() - started, 3, "signal not noticed mid-poll")
+        self.assertIn("sending SIGKILL", err)
+        for pid in self.pids():
+            self.assert_gone(pid)
+
+    def test_agent_that_exits_on_its_own_leaves_nothing_behind(self):
+        # A grandchild still in the agent's group could rewrite findings.json
+        # after the upload; the wrapper reaps the group on this path too.
+        proc = self.wrap("""\
+            kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+            record_pid(kid.pid)
+            sys.exit(4)
+            """)
+        code, err, _ = self.finish(proc, cap=10)
+        self.assertEqual(code, 4, err)
+        for pid in self.pids():
+            self.assert_gone(pid)
+
+    def test_non_finite_timings_are_a_usage_error(self):
+        for flag in ("--poll", "--linger", "--grace"):
+            for value in ("nan", "inf", "0", "-1"):
+                with self.subTest(flag=flag, value=value):
+                    result = subprocess.run(
+                        [sys.executable, SCRIPT, "--findings", self.path, flag, value,
+                         "--", sys.executable, "-c", "pass"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_missing_command_is_a_usage_error(self):
         result = subprocess.run(
             [sys.executable, SCRIPT, "--findings", self.path, "--"],
@@ -279,6 +349,12 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIn('python3 "$CURSOR_REVIEW_ASSETS/stop-on-submit.py"', step)
         self.assertIn("--findings /tmp/findings-out/findings.json --", step)
         self.assertLess(step.index("stop-on-submit.py"), step.index("cursor-agent \\"))
+        # The runner signals the step's shell, not the wrapper: the shell must
+        # run the wrapper in the background and forward the signals to it.
+        self.assertIn("> /tmp/review-raw.txt 2>/tmp/review-stderr.txt &\n", step)
+        for sig in ("INT", "TERM", "HUP"):
+            self.assertIn(f"trap 'forward_signal {sig}' {sig}", step)
+        self.assertLess(step.index("trap 'forward_signal TERM'"), step.index("stop-on-submit.py\""))
         self.assertIn("timeout-minutes: 15", step)
 
 
