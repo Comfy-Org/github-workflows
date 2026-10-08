@@ -331,6 +331,9 @@ jobs:
           # PR-authored .cursor/mcp.json or cli.json, so the proxy is the ONLY
           # MCP server and the PR cannot widen the permissions below.
           rm -rf -- .cursor
+          # A PR-authored ignore file could hide its own changes from the
+          # read and search tools of the reviewer judging it.
+          rm -f -- .cursorignore .cursorindexingignore
           mkdir -m 700 .cursor
           python3 - "$fifo_dir" <<'PY'
           import json, os, sys

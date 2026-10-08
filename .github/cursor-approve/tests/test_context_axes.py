@@ -116,6 +116,7 @@ class Base(unittest.TestCase):
         run = self.steps["Run the axis"]
         self.assertIn('["Shell(*)", "Write(**)", "WebFetch(*)"]', run)
         self.assertIn("rm -rf -- .cursor", run)
+        self.assertIn("rm -f -- .cursorignore .cursorindexingignore", run)
 
     def test_checkout_axes_are_allowed_a_shell(self):
         # An empty allow list makes --print reject every shell call, so a
