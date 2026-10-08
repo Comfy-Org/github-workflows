@@ -65,7 +65,8 @@ Tests: `python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.
 ## `context-proxy.py`
 
 A read-only stdio MCP server that gives the business, design and completeness
-axes Linear, Notion and Slack context without the agent ever holding a token.
+axes Linear and Notion context without the agent ever holding a token. It still
+implements Slack tools, but the base workflow refuses `slack`: no axis reads it.
 It reads a token file once, deletes it, and sends every request through one
 guard function that allow-lists each read endpoint before anything goes out.
 

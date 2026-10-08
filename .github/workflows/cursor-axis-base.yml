@@ -125,6 +125,12 @@ jobs:
           if ! [[ "$CONTEXT_SOURCES" =~ ^((linear|notion|slack)(,(linear|notion|slack))*)?$ ]]; then
             echo "::error::context_sources must be a comma list of linear, notion, slack"; exit 1
           fi
+          # No axis reads Slack (docs/callers/cursor-approve.md, "Context
+          # axes"): enforced here, not only in the wrappers, so a direct caller
+          # of this public base cannot turn it back on.
+          case ",$CONTEXT_SOURCES," in
+            *,slack,*) echo "::error::context_sources may not include slack: no axis reads Slack"; exit 1 ;;
+          esac
           if [ -n "$CONTEXT_SOURCES" ]; then
             case "$AXIS" in
               business|design|completeness) ;;

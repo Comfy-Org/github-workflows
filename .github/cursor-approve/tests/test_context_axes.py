@@ -10,8 +10,10 @@ WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
 TOKENS = ("LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN")
 
 AXES = {
-    "business": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"],
-                 "checkout": "false", "no_shell": "true", "sources": "linear,notion,slack"},
+    # `declared` adds secrets a wrapper accepts for compatibility but never uses.
+    "business": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN"],
+                 "declared": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"],
+                 "checkout": "false", "no_shell": "true", "sources": "linear,notion"},
     "design": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN"],
                "checkout": "false", "no_shell": "true", "sources": "linear,notion"},
     "completeness": {"secrets": ["CURSOR_API_KEY", "LINEAR_KEY"],
@@ -55,9 +57,18 @@ class Wrappers(unittest.TestCase):
             text = read(f"axis-{axis}.yml")
             on_call = block(text, "workflow_call:", 2)
             secrets = block("\n".join(on_call), "secrets:", 4)
-            self.assertEqual(keys(secrets, 6), want["secrets"], axis)
+            self.assertEqual(keys(secrets, 6), want.get("declared", want["secrets"]), axis)
             self.assertEqual(set(re.findall(r"secrets\.([A-Za-z_]+)", text)), set(want["secrets"]), axis)
             self.assertNotIn("secrets: inherit", text, axis)
+
+    def test_no_wrapper_enables_slack(self):
+        for axis in AXES:
+            sources = re.search(r"context_sources: *(\S*)", read(f"axis-{axis}.yml")).group(1)
+            self.assertNotIn("slack", sources.split(","), axis)
+
+    def test_base_rejects_slack(self):
+        base = read("cursor-axis-base.yml")
+        self.assertIn('*,slack,*) echo "::error::context_sources may not include slack', base)
 
     def test_checkout_no_shell_and_sources(self):
         for axis, want in AXES.items():
