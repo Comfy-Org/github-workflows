@@ -140,11 +140,11 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 ```bash
 # one repo
 gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
-  --body '["gpt-5.6-sol-max","claude-opus-5-5-max","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-high"]'
 
 # or the whole fleet at once (visibility must include private repos)
 gh variable set CURSOR_PANEL_MODELS --org <org> --visibility all \
-  --body '["gpt-5.6-sol-max","claude-opus-5-5-max","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-high"]'
 ```
 
 These examples deliberately differ from the built-in list by exactly one axis:
