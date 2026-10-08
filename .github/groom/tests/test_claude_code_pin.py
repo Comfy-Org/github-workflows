@@ -503,12 +503,23 @@ class DependabotTest(unittest.TestCase):
         # checks would still pass if the npm block were moved off the manifest
         # while some other ecosystem entry happened to point at
         # `/.github/groom`, masking exactly the regression this guards.
+        self._assert_one_exact_npm_entry("/.github/groom")
+
+    def test_npm_entry_watches_the_cursor_review_manifest(self):
+        # The same contract for cursor-review.yml's direct-API cell pin
+        # (`@openai/codex`), whose manifest mirrors groom's.
+        self._assert_one_exact_npm_entry("/.github/cursor-review")
+
+    def _assert_one_exact_npm_entry(self, directory):
         entries = _dependabot_entries(_read(_DEPENDABOT))
-        npm = [e for e in entries if e.get("package-ecosystem") == "npm"]
+        npm = [
+            e for e in entries
+            if e.get("package-ecosystem") == "npm" and e.get("directory") == directory
+        ]
         self.assertEqual(
-            1, len(npm), f"expected exactly one npm entry, found {len(npm)}"
+            1, len(npm),
+            f"expected exactly one npm entry for {directory}, found {len(npm)}",
         )
-        self.assertEqual("/.github/groom", npm[0].get("directory"))
         # The workflow guard rejects a range at run time, so the updater must be
         # told to keep an exact requirement exact rather than widening it.
         self.assertEqual("increase", npm[0].get("versioning-strategy"))

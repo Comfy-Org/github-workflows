@@ -3504,7 +3504,7 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            22,
+            23,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) site picked up merging "
             "main + cursor-review.yml's diff-size job's check-pr-size-tool "
@@ -3535,7 +3535,11 @@ class GuardCoverageTests(unittest.TestCase):
             "byte-identical copy of cursor-review.yml's guard. The 22nd is "
             "cursor-review.yml's `auto-retry` job (BE-19526): the round's "
             "relabel runs last, loads auto-approve.py from `workflows_ref` in "
-            "its own job, and carries its own copy of the guard.",
+            "its own job, and carries its own copy of the guard. The 23rd is "
+            "cursor-review.yml's opt-in `review-openai-direct` job (BE-19639): "
+            "the direct-OpenAI cell loads its prompt, fence-diff.py and "
+            "review-output-mcp.py from `workflows_ref` in its own job and "
+            "carries its own copy of the guard.",
         )
 
     WORKFLOWS_DIR = os.path.normpath(
