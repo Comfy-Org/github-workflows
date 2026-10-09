@@ -27,7 +27,10 @@ name: Cursor approve
 #                    on not_approved / error / superseded / retargeted it leaves a
 #                    standing REQUEST_CHANGES instead; on needs_human /
 #                    vetoed it withdraws its own instead) and rewrites the
-#                    card with the verdicts.
+#                    card with the verdicts. The card shows ONE line per
+#                    axis (its `headline`); the same step writes the full
+#                    summaries and confidences to this run's job summary,
+#                    which is where the card's "workflow run" link leads.
 #
 # No job here checks out PR code; the only checkout is this repo at
 # workflows_ref, for the scripts.

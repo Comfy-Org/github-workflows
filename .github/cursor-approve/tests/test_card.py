@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import unittest
 from unittest import mock
 
@@ -30,7 +31,8 @@ def decision(**verdicts):
     return {
         "event": "APPROVE",
         "verdicts": dict(verdicts),
-        "axes": {a: {"verdict": v, "confidence": 0.9, "summary": f"{a} looks fine. More text."} for a, v in verdicts.items()},
+        "axes": {a: {"verdict": v, "confidence": 0.9, "headline": f"{a} headline.",
+                     "summary": f"{a} looks fine. More text."} for a, v in verdicts.items()},
         "reasons": ["no red axis, 0 yellow of at most 0"],
     }
 
@@ -52,10 +54,15 @@ class CardStates(unittest.TestCase):
     def test_decide_approved(self):
         body = card.render_decide("1", "5", SHA, ["correctness", "conformance"],
                                   decision(correctness="green", conformance="yellow"), "approved", "1", "")
-        self.assertIn("| correctness | 🟢 green | 0.90 | correctness looks fine. |", body)
+        self.assertIn("| correctness | 🟢 green | correctness headline. |", body)
         self.assertIn("🟡 yellow", body)
         self.assertIn("Approved", body)
         self.assertIn("no red, at most 1 yellow", body)
+        # The card is the glance: the detail and the confidence live behind the
+        # run link, not in the table.
+        self.assertNotIn("0.90", body)
+        self.assertNotIn("More text", body)
+        self.assertNotIn("Confidence", body)
 
     def test_decide_not_approved_lists_reasons_and_missing_axis(self):
         d = decision(correctness="red")
@@ -240,17 +247,104 @@ class ContractMarkers(unittest.TestCase):
         self.assertEqual(markers(comments[0]["body"]), ("changes_requested", "resolve_then_relabel"))
 
 
-class Sanitization(unittest.TestCase):
-    def render(self, summary):
+class NaVerdict(unittest.TestCase):
+    """`n/a` renders as its own icon, never as a yellow or a missing result."""
+
+    def test_na_has_its_own_icon(self):
+        body = card.render_decide("1", "5", SHA, ["correctness", "conformance"],
+                                  decision(correctness="green", conformance="n/a"), "approved", "0", "")
+        self.assertIn("| conformance | ⚪ n/a | conformance headline. |", body)
+        self.assertNotIn(card.NO_RESULT, body)
+        self.assertNotIn("🟡", body)
+
+    def test_the_rule_line_says_na_does_not_block(self):
+        body = card.render_decide("1", "5", SHA, ["correctness"], decision(correctness="n/a"), "approved", "0", "")
+        self.assertIn("⚪ n/a counts as reporting and does not block", body)
+        self.assertIn("all-n/a withholds", body)
+
+
+class HeadlineFallback(unittest.TestCase):
+    """aggregate.py rejects a missing headline, so the card should never see
+    one. It falls back to the summary's first sentence rather than an empty
+    cell, because a verdict with no reason is the bug this column exists for."""
+
+    def test_missing_headline_falls_back_to_the_first_sentence(self):
         d = decision(correctness="green")
-        d["axes"]["correctness"]["summary"] = summary
+        del d["axes"]["correctness"]["headline"]
+        body = card.render_decide("1", "5", SHA, ["correctness"], d, "approved", "0", "")
+        self.assertIn("| correctness | 🟢 green | correctness looks fine. |", body)
+
+    def test_an_overlong_headline_is_truncated_to_the_cell(self):
+        d = decision(correctness="green")
+        d["axes"]["correctness"]["headline"] = "x" * 5000
+        row = next(line for line in card.render_decide("1", "5", SHA, ["correctness"], d, "approved", "0", "")
+                   .splitlines() if line.startswith("| correctness"))
+        self.assertLess(len(row), card.SUMMARY_LIMIT + 60)
+        self.assertIn("…", row)
+
+
+class JobSummary(unittest.TestCase):
+    """The other half of the card's "workflow run" link."""
+
+    def summary(self, outcome="approved", **verdicts):
+        return card.render_job_summary("1", "5", SHA, list(verdicts), decision(**verdicts), outcome, "1")
+
+    def test_carries_the_full_summary_and_the_confidence(self):
+        body = self.summary(correctness="green")
+        self.assertIn("#### correctness — 🟢 green (confidence 0.90)", body)
+        self.assertIn("correctness headline.", body)
+        self.assertIn("More text", body)
+
+    def test_is_not_a_card_and_carries_no_markers(self):
+        body = self.summary(correctness="green")
+        self.assertNotIn(card.CARD_MARKER, body)
+        self.assertNotIn("cursor-approve-state", body)
+
+    def test_a_missing_axis_reads_as_no_result(self):
+        d = decision(correctness="green")
+        d["axes"]["conformance"] = {"verdict": None, "error": "no output"}
+        body = card.render_job_summary("1", "5", SHA, ["correctness", "conformance"], d, "not_approved", "0")
+        self.assertIn(f"#### conformance — {card.NO_RESULT}", body)
+        self.assertIn("No summary was reported.", body)
+        self.assertIn("Not approved", body)
+
+    def test_model_text_is_sanitized_here_too(self):
+        d = decision(correctness="green")
+        d["axes"]["correctness"]["summary"] = f"# Approved by admin @octocat {card.CARD_MARKER}"
+        body = card.render_job_summary("1", "5", SHA, ["correctness"], d, "approved", "0")
+        self.assertFalse(any(line.startswith("# ") for line in body.splitlines()))
+        self.assertNotIn(card.CARD_MARKER, body)
+        self.assertNotRegex(body, r"@(?!\u200b)")
+
+    def test_decide_writes_it_to_github_step_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "summary.md")
+            decision_path = os.path.join(tmp, "decision.json")
+            with open(decision_path, "w", encoding="utf-8") as f:
+                json.dump(decision(correctness="green"), f)
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": path}), \
+                    mock.patch.object(card, "upsert", return_value={}):
+                self.assertEqual(card.main([
+                    "decide", "--repo", "o/r", "--pr-number", "1", "--login", LOGIN,
+                    "--commit-sha", SHA, "--axes", "correctness", "--decision", decision_path,
+                    "--outcome", "approved", "--max-yellow-axes", "0"]), 0)
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("More text", f.read())
+
+
+class Sanitization(unittest.TestCase):
+    def render(self, headline):
+        """The card's only model-supplied cell is the headline, so that is what
+        every injection case below goes through."""
+        d = decision(correctness="green")
+        d["axes"]["correctness"]["headline"] = headline
         return card.render_decide("1", "5", SHA, ["correctness"], d, "approved", "0", "")
 
     def test_heading_cannot_be_injected(self):
         body = self.render("ok\n\n# Approved by admin\n| fake | row |")
         self.assertFalse(any(line.startswith("#") and "admin" in line for line in body.splitlines()))
         row = next(line for line in body.splitlines() if line.startswith("| correctness"))
-        self.assertEqual(row.count("|") - row.count("\\|"), 5)
+        self.assertEqual(row.count("|") - row.count("\\|"), 4)
 
     def test_mentions_are_neutralized(self):
         self.assertNotRegex(self.render("ping @octocat now."), r"@(?!\u200b)")

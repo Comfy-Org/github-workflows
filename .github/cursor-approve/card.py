@@ -18,6 +18,11 @@ round:
 ``decide`` (after auto-approve.py ``approve-external``)
     The per-axis verdicts from ``aggregate.py decide``, the overall result and
     the rule applied — or "Superseded by a newer commit" when the head moved.
+    Each axis shows its `headline` only — ONE line naming what decided the
+    verdict. The same phase writes ``render_job_summary`` to
+    ``GITHUB_STEP_SUMMARY``: the full summaries and confidences, which is what
+    the card's "workflow run" link now leads to. The card is the glance; the
+    job summary is the record.
 
 cursor-review's ``auto-approve.py decide`` writes it too, through
 ``render_round`` and ``upsert``, on every round it decides for an author
@@ -48,8 +53,12 @@ import sys
 
 CARD_MARKER = "<!-- cursor-approve-card -->"
 SUMMARY_LIMIT = 200
+# The job summary behind the run link is the detail surface, so an axis
+# summary is not cut to one table cell there.
+SUMMARY_DETAIL_LIMIT = 2000
 AXES = ("business", "design", "correctness", "completeness", "conformance")
-VERDICT_ICONS = {"green": "🟢 green", "yellow": "🟡 yellow", "red": "🔴 red"}
+VERDICT_ICONS = {"green": "🟢 green", "yellow": "🟡 yellow", "red": "🔴 red",
+                 "n/a": "⚪ n/a"}
 NO_RESULT = "⚠️ no result"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -280,8 +289,8 @@ def render_start(round_no, max_rounds, sha: str, axes: list, approve_gate: str, 
         lines.append("**Round limit reached, needs a human.**")
         lines += ["", f"**Next step:** {NEXT_HUMAN_CAPPED_TEXT}"]
     else:
-        lines += ["| Axis | Verdict | Confidence | Summary |", "|---|---|---|---|"]
-        lines += [f"| {axis} | ⏳ pending | | |" for axis in axes]
+        lines += ["| Axis | Verdict | Why |", "|---|---|---|"]
+        lines += [f"| {axis} | ⏳ pending | |" for axis in axes]
     lines += ["", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
 
@@ -290,6 +299,43 @@ def _confidence(value) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1:
         return f"{value:.2f}"
     return ""
+
+
+def render_job_summary(round_no, max_rounds, sha: str, axes: list, decision, outcome: str,
+                       max_yellow: str) -> str:
+    """The detail the card's "workflow run" link leads to, for GITHUB_STEP_SUMMARY.
+
+    The card is the glance: one icon and one `headline` per axis. Everything an
+    axis actually wrote — the full `summary`, its confidence — lands here, so
+    the link is worth following and the card does not have to carry both jobs.
+
+    Same `sanitize` as the card: this renders model text into markdown GitHub
+    displays, and a summary must not be able to open a heading or fire a mention
+    here either. No contract markers — a job summary is not the card, and
+    nothing parses this.
+    """
+    detail = decision.get("axes") if isinstance(decision, dict) else None
+    detail = detail if isinstance(detail, dict) else {}
+    lines = [heading(round_no, max_rounds, sha), ""]
+    lines.append("**Approved.**" if outcome == OUTCOME_APPROVED else "**Not approved.**")
+    if outcome != OUTCOME_APPROVED:
+        lines += [f"- {r}" for r in decide_reasons(outcome, decision)]
+    for axis in axes:
+        entry = detail.get(axis)
+        entry = entry if isinstance(entry, dict) else {}
+        verdict = entry.get("verdict")
+        icon = VERDICT_ICONS.get(verdict, NO_RESULT)
+        confidence = _confidence(entry.get("confidence"))
+        lines += ["", f"#### {axis} — {icon}" + (f" (confidence {confidence})" if confidence else "")]
+        headline = sanitize(entry.get("headline"))
+        if headline:
+            lines.append(f"**{headline}**")
+        summary = sanitize(entry.get("summary"), SUMMARY_DETAIL_LIMIT)
+        lines += ["", summary or "_No summary was reported._"]
+    limit = _int_or_q(max_yellow)
+    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report "
+              "(⚪ n/a counts as reporting and does not block, but all-n/a withholds)._"]
+    return "\n".join(lines) + "\n"
 
 
 def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome: str,
@@ -304,15 +350,22 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None
     detail = detail if isinstance(detail, dict) else {}
-    lines += ["| Axis | Verdict | Confidence | Summary |", "|---|---|---|---|"]
+    # Three columns, and the third is the axis's `headline` — ONE line stating
+    # what decided the verdict. It used to be the first sentence of `summary`,
+    # which is where the models put their process log ("Checked the only
+    # changed file...", "I read root AGENTS.md and CLAUDE.md..."), so the card
+    # showed what the axis DID and never why it ruled as it did. The full
+    # summary and the confidence now live in the run's job summary, one click
+    # behind the link below — this card is the glance, not the record.
+    lines += ["| Axis | Verdict | Why |", "|---|---|---|"]
     for axis in axes:
         entry = detail.get(axis)
         verdict = entry.get("verdict") if isinstance(entry, dict) else None
         if verdict not in VERDICT_ICONS:
-            lines.append(f"| {axis} | {NO_RESULT} | | |")
+            lines.append(f"| {axis} | {NO_RESULT} | |")
             continue
-        summary = sanitize(first_sentence(entry.get("summary")))
-        lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {_confidence(entry.get('confidence'))} | {summary} |")
+        why = sanitize(entry.get("headline") or first_sentence(entry.get("summary")))
+        lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {why} |")
     lines.append("")
     if outcome == OUTCOME_APPROVED:
         lines.append("**Result: ✅ Approved.**")
@@ -321,7 +374,9 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         lines += [f"- {r}" for r in decide_reasons(outcome, decision)]
         lines += ["", f"**Next step:** {next_text}"]
     limit = _int_or_q(max_yellow)
-    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report. {_run_link(run_url)}_",
+    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report "
+              f"(⚪ n/a counts as reporting and does not block, but all-n/a withholds). "
+              f"{_run_link(run_url)}_",
               "", _reviewed_line(sha, "")]
     return "\n".join(lines) + "\n"
 
@@ -448,6 +503,17 @@ def upsert(repo: str, pr_number, login: str, body: str) -> dict:
                          {"body": body}))
 
 
+def _write_job_summary(body: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(body)
+    except OSError as e:
+        print(f"::warning::Could not write the cursor-approve job summary: {e}")
+
+
 def _write_output(key: str, value: str) -> None:
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
@@ -501,6 +567,11 @@ def main(argv=None) -> int:
             decision = {}
         body = render_decide(args.round, args.max_rounds, args.commit_sha, axes, decision, args.outcome,
                              args.max_yellow_axes, args.run_url)
+        # The other half of the card's "workflow run" link. Written before the
+        # card so a GitHub API failure below cannot cost us the detail too, and
+        # a failure HERE is never fatal: the card is what the author reads.
+        _write_job_summary(render_job_summary(args.round, args.max_rounds, args.commit_sha, axes,
+                                              decision, args.outcome, args.max_yellow_axes))
     try:
         upsert(args.repo, args.pr_number, args.login, body)
     except (RuntimeError, ValueError) as e:

@@ -68,6 +68,12 @@ class DecideCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def write(self, axis, content):
+        # A dict fixture gets a default `headline` so every case written before
+        # that field existed still exercises what it was written for. A case
+        # ABOUT the headline passes a raw JSON string instead, which is written
+        # through untouched (see HeadlineTest).
+        if isinstance(content, dict) and "headline" not in content:
+            content = {"headline": f"{axis} headline", **content}
         with open(os.path.join(self.dir, f"{axis}.json"), "w", encoding="utf-8") as f:
             f.write(content if isinstance(content, str) else json.dumps(content))
 
@@ -524,7 +530,8 @@ class ExtractCli(unittest.TestCase):
         return run(["extract", "--raw", self.raw, "--out", self.out, "--commit-sha", sha])
 
     def test_stamps_the_judged_commit(self):
-        code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok", "commit_sha": "b"}')
+        code, _, err = self.extract(
+            '{"verdict": "green", "confidence": 1, "headline": "h", "summary": "ok", "commit_sha": "b"}')
         self.assertEqual(code, 0, err)
         with open(self.out, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["commit_sha"], SHA)
@@ -563,13 +570,105 @@ class CommitBindingTest(DecideCase):
         self.assertEqual(code, 2)
 
 
+class HeadlineTest(DecideCase):
+    """The headline is the ONE line the PR card shows, so a verdict without one
+    is untrusted rather than silently rendered as a reason-free row."""
+
+    def raw(self, **fields):
+        return json.dumps({"verdict": "green", "confidence": 0.9, "summary": "s", **fields})
+
+    def test_a_missing_headline_is_untrusted(self):
+        self.write_all()
+        self.write("business", '{"verdict": "green", "confidence": 0.9, "summary": "s"}')
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("headline is missing or empty", result["reasons"][0])
+
+    def test_a_blank_headline_is_untrusted(self):
+        self.write_all()
+        self.write("business", self.raw(headline="   "))
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
+    def test_a_non_string_headline_is_untrusted(self):
+        self.write_all()
+        self.write("business", self.raw(headline=["a"]))
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
+    def test_an_overlong_headline_is_rejected_not_truncated(self):
+        # Truncating would reintroduce the reason-free row one step later.
+        self.write_all()
+        self.write("business", self.raw(headline="x" * (AG.HEADLINE_MAX + 1)))
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn(f"over the {AG.HEADLINE_MAX} limit", result["reasons"][0])
+
+    def test_the_limit_itself_is_accepted(self):
+        self.write_all()
+        self.write("business", self.raw(headline="x" * AG.HEADLINE_MAX))
+        self.assertEqual(self.decide()["event"], AG.APPROVE)
+
+    def test_whitespace_is_folded_to_one_line(self):
+        self.write_all()
+        self.write("business", self.raw(headline="two\n\nlines   here"))
+        result = self.decide()
+        self.assertEqual(result["axes"]["business"]["headline"], "two lines here")
+
+    def test_the_folded_length_is_what_is_measured(self):
+        # 200 newlines fold to nothing, so this is well inside the cap.
+        self.write_all()
+        self.write("business", self.raw(headline="a" + "\n" * 200 + "b"))
+        self.assertEqual(self.decide()["event"], AG.APPROVE)
+
+
+class NaTest(DecideCase):
+    """`n/a` means "nothing on my axis applies here" — it reports (so it is not
+    a missing result) but it is not a concern (so it is not a yellow)."""
+
+    def test_na_does_not_count_against_the_yellow_limit(self):
+        self.write_all(correctness={"verdict": "n/a", "confidence": 0.9, "summary": "s"},
+                       conformance={"verdict": "n/a", "confidence": 0.9, "summary": "s"})
+        result = self.decide("--max-yellow-axes", "0")
+        self.assertEqual(result["event"], AG.APPROVE)
+
+    def test_na_is_named_in_the_reason(self):
+        self.write_all(conformance={"verdict": "n/a", "confidence": 0.9, "summary": "s"})
+        reason = self.decide("--max-yellow-axes", "0")["reasons"][0]
+        self.assertIn("n/a on conformance", reason)
+        self.assertIn("4 axes judged", reason)
+
+    def test_all_na_withholds(self):
+        # Nothing was actually judged, so there is nothing to approve on.
+        self.write_all(verdict="n/a")
+        result = self.decide("--max-yellow-axes", "3")
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIn("nothing was actually judged", result["reasons"][0])
+
+    def test_na_does_not_rescue_a_red(self):
+        self.write_all(verdict="n/a", correctness={"verdict": "red", "confidence": 0.9, "summary": "s"})
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
+    def test_na_does_not_excuse_a_missing_axis(self):
+        self.write_all(verdict="n/a", axes=AG.AXES[:4])
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIsNone(result["verdicts"]["conformance"])
+
+    def test_the_spelling_is_exact(self):
+        for spelling in ("n-a", "N/A", "na", "not applicable"):
+            with self.subTest(spelling=spelling):
+                self.write_all()
+                self.write("business", json.dumps(
+                    {"verdict": spelling, "confidence": 0.9, "headline": "h", "summary": "s"}))
+                self.assertEqual(self.decide()["event"], AG.NONE)
+
+
 class ArtifactDirsTest(DecideCase):
     def test_reads_only_each_axis_own_artifact_dir(self):
         axes = ("correctness", "conformance")
         for axis in axes:
             os.makedirs(os.path.join(self.dir, f"axis-{axis}"))
             with open(os.path.join(self.dir, f"axis-{axis}", f"{axis}.json"), "w", encoding="utf-8") as f:
-                json.dump({"verdict": "green", "confidence": 1, "summary": ""}, f)
+                json.dump({"verdict": "green", "confidence": 1, "headline": "h", "summary": ""}, f)
         self.assertEqual(self.decide("--axes", ",".join(axes), "--artifact-dirs")["event"], AG.APPROVE)
 
     def test_a_flat_or_misnamed_artifact_is_missing(self):
