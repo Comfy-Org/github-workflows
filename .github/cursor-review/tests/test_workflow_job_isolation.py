@@ -323,12 +323,29 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         body = code_lines(self.jobs["review-anthropic-direct"])
         invocations = [l for l in body if "claude -p" in l]
         self.assertEqual(len(invocations), 1, invocations)
-        for flag in ("--bare", "--restricted", '--setting-sources ""'):
+        for flag in ("--restricted", '--setting-sources ""'):
             self.assertIn(flag, invocations[0])
         self.assertTrue(
             any("rm -rf" in l and "_pr/.claude" in l and "_pr/.mcp.json" in l for l in body),
             "review-anthropic-direct no longer removes the PR's .claude/ and .mcp.json",
         )
+
+    def test_the_anthropic_cells_keep_their_search_tools(self):
+        # On the pinned CLI `--bare` silently drops Grep and Glob from
+        # `--tools "Read,Grep,Glob"`, leaving Read alone: the agent could open
+        # files it already knows of but never search the checkout, which is
+        # the reason it reads the checkout at all. `--setting-sources ""` and
+        # the fresh CLAUDE_CONFIG_DIR already cover what `--bare` would skip.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        start = next(i for i, l in enumerate(body) if "claude -p" in l)
+        argv = []
+        for line in body[start:]:
+            argv.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        argv = " ".join(argv)
+        self.assertNotIn("--bare", argv)
+        self.assertIn('--tools "Read,Grep,Glob"', argv)
 
     def test_the_anthropic_cells_deny_proc_independently_of_restricted(self):
         # ANTHROPIC_API_KEY is in the env of the process serving Read/Grep/Glob,

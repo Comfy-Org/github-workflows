@@ -3587,8 +3587,10 @@ jobs:
         # cwd, so a PR-planted `.claude/settings*.json` (env such as
         # ANTHROPIC_BASE_URL, hooks, extra directories) or `.mcp.json` must
         # never be there to load. `--restricted` and `--setting-sources ""`
-        # already ignore them; this removes them outright. CLAUDE.md stays —
-        # `--bare` skips its auto-discovery, and it is ordinary review context.
+        # already ignore them; this removes them outright. CLAUDE.md stays:
+        # `--setting-sources ""` keeps it from loading as instructions (on the
+        # pinned CLI a planted "reply with one word" CLAUDE.md was ignored),
+        # and the agent can still Read it as ordinary review context.
         run: rm -rf _pr/.claude _pr/.mcp.json _pr/CLAUDE.local.md
 
       - name: Download reviewed diff
@@ -3663,7 +3665,7 @@ jobs:
           # or renamed one fails HERE, by name, rather than at argv parsing
           # mid-review — or, worse, by silently running unconfined.
           help="$(claude --help 2>&1)"
-          for flag in --bare --restricted --setting-sources --strict-mcp-config \
+          for flag in --restricted --setting-sources --strict-mcp-config \
                       --disallowedTools --permission-prompts --no-session-persistence; do
             if ! printf '%s\n' "$help" | grep -qE -- "(^|[[:space:],])${flag}([[:space:],]|$)"; then
               echo "::error::claude ${installed} does not advertise ${flag}, which the direct-API cell's confinement relies on."
@@ -3762,7 +3764,15 @@ jobs:
           )"
           # The result JSON goes to a file that is never echoed: the run log
           # is public and the result is model output steered by PR text.
-          claude -p --bare --restricted --setting-sources "" \
+          # Deliberately NOT `--bare`: on the pinned CLI it drops Grep and Glob
+          # from `--tools`, leaving the agent Read alone, which cannot search
+          # the checkout. What `--bare` would skip is already off here: no
+          # settings, hooks or plugins (`--setting-sources ""` and a fresh
+          # CLAUDE_CONFIG_DIR, which also keep CLAUDE.md from loading as
+          # instructions), no other MCP server (`--strict-mcp-config`), no
+          # telemetry (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC), and auth is
+          # the env key alone.
+          claude -p --restricted --setting-sources "" \
             --tools "Read,Grep,Glob" \
             --strict-mcp-config --mcp-config "$mcp_config" \
             --allowedTools "Read,Grep,Glob,mcp__cursor-review-output__cursor_review_record_finding,mcp__cursor-review-output__cursor_review_finish" \
@@ -3896,11 +3906,12 @@ jobs:
     # a write-scoped token.
     name: Consolidate panel
     # `review-openai-direct` and `review-anthropic-direct` are here for
-    # ORDERING — their artifacts must land before `Download panel findings` runs. It never gates this job: when it
-    # is skipped (the default) or fails, `!cancelled()` below still runs, and
-    # a failed cell is counted from its artifact (or its absence) instead. Its
-    # result is read once, by `Aggregate panel findings`, as a consistency
-    # check on those artifacts (see aggregate-panel.py).
+    # ORDERING — their artifacts must land before `Download panel findings`
+    # runs. Neither gates this job: when one is skipped (the default) or
+    # fails, `!cancelled()` below still runs, and a failed cell is counted
+    # from its artifact (or its absence) instead. Each one's result is read
+    # once, by `Aggregate panel findings`, as a consistency check on those
+    # artifacts (see aggregate-panel.py).
     needs: [gate, diff-size, preflight, review, review-openai-direct, review-anthropic-direct, ledger]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
