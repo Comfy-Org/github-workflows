@@ -34,11 +34,12 @@ the context axes (business, design, completeness) are not available yet.
 3. Each axis runs only when `approve_gate == 'pass'`, after the start phase: a
    read-only checkout of the PR head, one `cursor-agent` call over
    `.github/cursor-approve/`'s prompt, and one `axis-<name>` artifact holding
-   `{"verdict", "confidence", "summary", "commit_sha"}`. A failed axis uploads
-   nothing, and an axis refuses to run on a fork PR.
+   `{"verdict", "confidence", "headline", "summary", "commit_sha"}`. A failed
+   axis uploads nothing, and an axis refuses to run on a fork PR.
 4. `cursor-approve` with `phase: decide` runs `aggregate.py decide` (any
-   missing/malformed axis, one not stamped with `commit_sha`, any red, or more
-   yellow than `max_yellow_axes` → no approval), reading each axis only from its
+   missing/malformed axis, one not stamped with `commit_sha`, one with no
+   `headline`, any red, more yellow than `max_yellow_axes`, or every axis
+   `n/a` → no approval), reading each axis only from its
    own `axis-<name>` artifact, then `auto-approve.py approve-external`: it
    re-reads the head and base and withholds when either moved since the axes
    ran, never approves a PR labelled `needs-human-review` or
@@ -48,11 +49,39 @@ the context axes (business, design, completeness) are not available yet.
    records the reviewed SHA in the review body, and withdraws this identity's
    own earlier approvals whenever it does not approve. An approval is one line
    linking the card. The card is rewritten with the verdicts, the result and
-   the rule — or "Superseded by a newer commit" when the head moved.
+   the rule — or "Superseded by a newer commit" when the head moved. The same
+   step writes the axes' full summaries and confidences to **this run's job
+   summary**, which is what the card's "workflow run" link leads to.
 
 Every model-supplied string on the card goes through post-review.py's
 `neutralize_mentions` plus markdown/HTML escaping, so a summary cannot add a
 heading, fire a mention or forge the card marker.
+
+### What an axis verdict means
+
+| Verdict | Meaning | Effect |
+|---|---|---|
+| 🟢 `green` | the axis checked its remit and found it clean | approves |
+| 🟡 `yellow` | a material concern, or the axis could not reach a judgement | approves only while within `max_yellow_axes` |
+| 🔴 `red` | the axis should block this change | never approves |
+| ⚪ `n/a` | nothing on this axis applies to this change | approves; does not count against `max_yellow_axes` |
+| ⚠️ no result | the axis uploaded nothing, or something untrusted | never approves |
+
+`n/a` is deliberately not a `green`: an axis with no applicable guidance has
+not given this PR a clean bill, and recording that as one would quietly approve
+the gap the day guidance appears. It is also not a `yellow`, because a yellow
+is a *concern* and this is the absence of one — conflating them is what made
+"⚠️ why is this yellow?" the normal reaction to the card. A round where EVERY
+axis reports `n/a` is withheld: nothing was actually judged. An `n/a` must name
+what the axis looked for and where; one that does not is untrusted.
+
+The card shows ONE line per axis — the axis's `headline`, capped at 100
+characters and required, which has to state **what decided the verdict** rather
+than what the axis read. The full `summary` and the confidence are in the job
+summary behind the run link; the card is the glance, not the record. A missing
+or over-long headline makes that axis untrusted rather than being truncated,
+since a verdict with no reason beside it is the exact failure the field was
+added to fix.
 
 ## The status card contract
 
@@ -88,7 +117,8 @@ Read them from the start of the comment body. A released value is not renamed (t
 | `capped` | cursor-review decide, or this workflow's start phase | Needs a human (`needs-human-review`, or the round limit) | `human` | A human is needed: the bot withdraws its own request for changes on this hand-off, so a human's review decides this PR — if one still shows, its withdrawal failed (see the run log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the round count. |
 
 The decide phase maps its outcome onto the same contract: `approved` →
-`pass`/`none`; `not_approved` (an axis was red, missing, or too many yellow) →
+`pass`/`none`; `not_approved` (an axis was red, missing, had no headline, too
+many were yellow, or every one was `n/a`) →
 `changes_requested`/`relabel`; `superseded` (the head moved) → `no_decision`/`relabel`;
 `retargeted` (the base alone changed) and `error` → `no_decision`/`push_then_relabel`;
 `needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
@@ -374,7 +404,7 @@ rollup, if at all; telling which leg failed needs per-job conclusions
 | `phase` | — (required) | `start` (card with pending axes) or `decide` (aggregate, approve, final card). |
 | `commit_sha` | — (required) | The PR head the axes judged. |
 | `axes` | — (required) | Comma-separated axes the caller ran, e.g. `correctness,conformance`. |
-| `max_yellow_axes` | `0` | Yellow axes tolerated (0–3, strictly below the number of axes). |
+| `max_yellow_axes` | `0` | Yellow axes tolerated (0–3, strictly below the number of axes). `n/a` axes are not counted. |
 | `round` | `''` | cursor-review's `round` output, for the card heading. |
 | `max_rounds` | `''` | cursor-review's `max_rounds` output, for the card heading. |
 | `approve_gate` | `''` | cursor-review's `approve_gate` output; `capped` makes the start card say a human is needed. |
@@ -415,8 +445,9 @@ Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
 transcript, plus the proxy's call log for the context axes. On a context axis
 each tool call in it is cut to the tool's name: no arguments and no results, so
 no Linear, Notion or Slack content. Only the verdict
-JSON (`verdict`, `confidence`, `summary` capped at 1200 characters) reaches
-`cursor-approve.yml`; its `axis-*` download never matches a transcript.
+JSON (`verdict`, `confidence`, `headline` capped at 100 characters, `summary`
+capped at 1200) reaches `cursor-approve.yml`; its `axis-*` download never
+matches a transcript.
 
 ## Context axes
 

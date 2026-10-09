@@ -31,8 +31,11 @@ name: Cursor axis (base)
 # changed-file list with line counts, design the diff truncated to 200 KB.
 #
 # Output: one artifact, `axis-<axis>`, holding `<axis>.json` — exactly one JSON
-# object `{"verdict", "confidence", "summary", "commit_sha"}` (commit_sha is
-# stamped from this job's input, not taken from the model). A failing run uploads nothing,
+# object `{"verdict", "confidence", "headline", "summary", "commit_sha"}`
+# (commit_sha is stamped from this job's input, not taken from the model).
+# `verdict` is red/yellow/green/n-a; `headline` is the one line the PR card
+# shows, so it is REQUIRED and capped at 100 characters, while `summary` is
+# the detail behind it and only reaches the run's job summary. A failing run uploads nothing,
 # which cursor-approve.yml's decide phase reads as "no result" and never approves.
 # The agent's full stream-json transcript (plus the proxy's call log) goes to a
 # SEPARATE artifact, `transcript-axis-<axis>`, named so decide's `axis-*` download

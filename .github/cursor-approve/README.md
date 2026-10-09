@@ -10,7 +10,7 @@ PR can never rewrite the prompts or the rules judging it.
 
 `prompt-common.md` holds the rules every reviewer shares — review only the
 merge-base diff (`git diff MERGE_BASE...HEAD`, never against the base tip), read
-but do not run, the red/yellow/green meaning, PR content is data not
+but do not run, the red/yellow/green/n-a meaning, PR content is data not
 instructions, and the one-JSON-object output contract. Each axis file adds one
 focus:
 
@@ -21,6 +21,31 @@ focus:
 | `correctness` | is the code correct under a pragmatic risk model? |
 | `completeness` | is this a complete solution to the stated problem? |
 | `conformance` | does the code fit the repo's engineering and deployment practices? |
+
+### Verdicts, and the two fields a verdict carries
+
+`red` / `yellow` / `green` / `n/a`. `n/a` is for an axis with nothing to judge
+on this change — no applicable guidance, nothing in its remit touched — and it
+is NOT a `green`: letting "no applicable standard" claim a clean bill would
+quietly approve the gap the day guidance does appear. It does not count against
+`--max-yellow-axes`, because `yellow` is a *concern* and this is its absence;
+but a round where EVERY axis says `n/a` is withheld, since nothing was judged.
+An `n/a` has to name what the axis looked for and where.
+
+Each verdict carries two strings, with different jobs and different audiences:
+
+| Field | Cap | Where it goes |
+|---|---|---|
+| `headline` | 100 chars, **required** | the PR card — ONE line, the reason for the verdict |
+| `summary` | 1200 chars | the run's job summary, behind the card's "workflow run" link |
+
+The split exists because one field could not do both. The card used to show the
+first sentence of `summary`, and `summary` is where a model writes its process
+("Checked the only changed file…", "I read root AGENTS.md and CLAUDE.md…") — so
+the card said what the axis *did* and never why it ruled as it did, which is
+unreadable on a yellow. `headline` must state what decided the verdict, and a
+missing or over-long one makes the axis untrusted rather than being truncated:
+truncating would reproduce the reason-free row one step later.
 
 Placeholders — `{{pr_number}}`, `{{repo}}`, `{{head_sha}}`,
 `{{merge_base_sha}}`, `{{base_ref}}`, `{{context_file}}` — are filled by
@@ -41,13 +66,16 @@ aggregate.py decide --outputs-dir out/ [--axes design,correctness] [--max-yellow
 `{"event", "verdicts", "axes", "reasons"}`. In order:
 
 1. any expected axis missing, unparsable, with a verdict outside
-   red/yellow/green or a confidence outside 0..1 → `NONE` — untrusted, so the
-   approval is withheld; it is never a veto;
+   red/yellow/green/n-a, a confidence outside 0..1, or a missing or over-long
+   `headline` → `NONE` — untrusted, so the approval is withheld; it is never a
+   veto;
 2. any `red` → `NONE`, naming the red axes;
 3. more `yellow` axes than `--max-yellow-axes` (0–3, default 0, and always
    strictly below the number of expected axes — a limit that every axis could
    reach would approve a round with no green axis at all) → `NONE`;
-4. otherwise `APPROVE`.
+4. every axis `n/a` → `NONE`: nothing was judged, so there is nothing to
+   approve on;
+5. otherwise `APPROVE`.
 
 `decide` is strict about its input: the file must be exactly one JSON object,
 so extracting it from the model's raw reply is the workflow's job. Bad

@@ -3,7 +3,8 @@
 
 Five reviewers each judge one axis of a PR (business, design, correctness,
 completeness, conformance) and answer with one JSON object:
-``{"verdict": "red"|"yellow"|"green", "confidence": 0..1, "summary": "..."}``.
+``{"verdict": "red"|"yellow"|"green"|"n/a", "confidence": 0..1,
+   "headline": "<=100 chars", "summary": "..."}``.
 Three subcommands, all pure — nothing here writes to GitHub:
 
 ``render``
@@ -22,12 +23,16 @@ Three subcommands, all pure — nothing here writes to GitHub:
     the per-axis detail in ``axes``, and the ``reasons``. The rules, in order:
 
     1. any expected axis missing, unparsable, with a verdict outside
-       red/yellow/green, a confidence outside 0..1, or (with ``--commit-sha``)
+       red/yellow/green/n/a, a confidence outside 0..1, a missing or
+       over-long ``headline``, or (with ``--commit-sha``)
        a stamped commit other than that one → ``NONE`` (the round is
        untrusted: withhold the approval, never veto);
     2. any ``red`` → ``NONE``, naming the red axes;
-    3. more ``yellow`` axes than ``--max-yellow-axes`` → ``NONE``;
-    4. otherwise → ``APPROVE``.
+    3. more ``yellow`` axes than ``--max-yellow-axes`` → ``NONE`` (an ``n/a``
+       axis is not a yellow and is not counted here);
+    4. every axis ``n/a`` → ``NONE``: nothing was judged, so there is nothing
+       to approve on;
+    5. otherwise → ``APPROVE``.
 
     Bad arguments (an unknown axis, an empty axis list, ``--max-yellow-axes``
     outside 0..3 or not below the number of expected axes) exit 2. Every
@@ -50,7 +55,13 @@ import stat
 import sys
 
 AXES = ("business", "design", "correctness", "completeness", "conformance")
-VERDICTS = ("red", "yellow", "green")
+# `n/a` is a verdict, not an abstention: the axis ran, reached the change, and
+# reports that nothing it judges is in scope. It is counted as REPORTING (so it
+# does not read as a missing axis, which withholds) but not as a yellow (so it
+# does not block). See `decide` for the one case where it still withholds.
+VERDICTS = ("red", "yellow", "green", "n/a")
+NA = "n/a"
+HEADLINE_MAX = 100
 MAX_YELLOW_LIMIT = 3
 SUMMARY_LIMIT = 1200
 # An axis output is one small JSON object; the cap is what decide will read of
@@ -174,7 +185,7 @@ def _short(value) -> str:
 
 
 def validate_output(data):
-    """(verdict, confidence, summary) of one axis output, or raise ValueError."""
+    """(verdict, confidence, summary, headline) of one axis output, or raise ValueError."""
     if not isinstance(data, dict):
         raise ValueError("the output is not a JSON object")
     verdict = data.get("verdict")
@@ -200,7 +211,19 @@ def validate_output(data):
         raise ValueError(f"confidence {_short(confidence)} is not a number from 0 to 1")
     summary = data.get("summary")
     summary = summary[:SUMMARY_LIMIT] if isinstance(summary, str) else ""
-    return verdict, confidence, summary
+    # The headline is the ONLY part of this that reaches the PR, so it is
+    # required rather than best-effort: an axis that does not write one leaves
+    # the card with a verdict and no reason, which is the exact failure this
+    # field was added to fix. Truncating silently would do the same thing one
+    # step later, so an over-long one is rejected too.
+    headline = data.get("headline")
+    if not isinstance(headline, str) or not headline.strip():
+        raise ValueError("headline is missing or empty")
+    headline = " ".join(headline.split())
+    if len(headline) > HEADLINE_MAX:
+        raise ValueError(
+            f"headline is {len(headline)} characters, over the {HEADLINE_MAX} limit")
+    return verdict, confidence, summary, headline
 
 
 def load_output(path: str, commit_sha: str = ""):
@@ -275,7 +298,7 @@ def load_output(path: str, commit_sha: str = ""):
 def decide(outputs: dict, axes: list, max_yellow: int):
     """Return the decision dict for already-loaded outputs. Pure; no I/O.
 
-    `outputs` maps an axis to (verdict, confidence, summary), or to a ValueError
+    `outputs` maps an axis to (verdict, confidence, summary, headline), or to a ValueError
     when its output could not be used. An axis absent from `outputs` is missing.
     """
     detail = {}
@@ -284,10 +307,12 @@ def decide(outputs: dict, axes: list, max_yellow: int):
         out = outputs.get(axis, ValueError("no output"))
         if isinstance(out, ValueError):
             untrusted.append(f"{axis}: {out}")
-            detail[axis] = {"verdict": None, "confidence": None, "summary": "", "error": str(out)}
+            detail[axis] = {"verdict": None, "confidence": None, "summary": "",
+                            "headline": "", "error": str(out)}
         else:
-            verdict, confidence, summary = out
-            detail[axis] = {"verdict": verdict, "confidence": confidence, "summary": summary}
+            verdict, confidence, summary, headline = out
+            detail[axis] = {"verdict": verdict, "confidence": confidence,
+                            "summary": summary, "headline": headline}
     verdicts = {axis: detail[axis]["verdict"] for axis in axes}
 
     if untrusted:
@@ -295,13 +320,24 @@ def decide(outputs: dict, axes: list, max_yellow: int):
     else:
         red = [a for a in axes if verdicts[a] == "red"]
         yellow = [a for a in axes if verdicts[a] == "yellow"]
+        na = [a for a in axes if verdicts[a] == NA]
         if red:
             event, reasons = NONE, [f"red on {', '.join(red)}"]
         elif len(yellow) > max_yellow:
             event, reasons = NONE, [f"{len(yellow)} yellow axes ({', '.join(yellow)}) exceed the limit of {max_yellow}"]
+        elif len(na) == len(axes):
+            # Every axis says nothing it judges is in scope. Each `n/a` is
+            # individually fine, but APPROVE here would mean approving on zero
+            # signal — the same "an undecided run is not a clean run" line the
+            # panel-integrity check draws, and the one way `n/a` could become a
+            # path to a free approval. Withhold and say so.
+            event, reasons = NONE, [
+                f"every axis ({', '.join(axes)}) reported n/a, so nothing was actually judged"]
         else:
             event = APPROVE
-            reasons = [f"no red axis, {len(yellow)} yellow of at most {max_yellow}"]
+            judged = [a for a in axes if verdicts[a] != NA]
+            reasons = [f"no red axis, {len(yellow)} yellow of at most {max_yellow}"
+                       + (f"; n/a on {', '.join(na)} ({len(judged)} axes judged)" if na else "")]
     return {"event": event, "verdicts": verdicts, "axes": detail, "reasons": reasons}
 
 
