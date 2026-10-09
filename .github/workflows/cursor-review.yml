@@ -357,6 +357,36 @@ on:
         type: boolean
         required: false
         default: true
+      judge_direct_model:
+        description: >-
+          OPT-IN. An Anthropic model id (e.g. `claude-opus-5-5`) that runs the
+          JUDGE through the Anthropic API directly, via the same pinned Claude
+          Code CLI and `ANTHROPIC_API_KEY` secret as `anthropic_direct_model`,
+          instead of `judge_model` through Cursor. Empty (default) = the judge
+          stays on Cursor and nothing changes. Requires a plain id
+          (`[A-Za-z0-9._-]`, at most 100) and the key; set without either,
+          preflight warns and the Cursor judge runs. Same prompt, same
+          structured-output tool, same timeout and same degraded panel-union
+          fallback as the Cursor judge. The agent reads the PR checkout with
+          Read, Grep and Glob alone — no Bash or other code-running tool —
+          confined to it by `--restricted`. It runs in its own `judge-direct`
+          job on GitHub-hosted `ubuntu-latest`, whatever `runs_on` says, so the
+          key never reaches `consolidate`. This judge reads private-repo diffs
+          and the workflow cannot check the Anthropic organization's
+          data-retention terms, so a caller on a private repo must use a key
+          from an organization with zero data retention.
+        type: string
+        required: false
+        default: ''
+      judge_direct_effort:
+        description: >-
+          Reasoning effort for the direct judge (`--effort`): one of `low`,
+          `medium`, `high`, `xhigh`, `max`. Any other value warns and falls
+          back to `xhigh`, the default. Ignored unless `judge_direct_model` is
+          in effect.
+        type: string
+        required: false
+        default: xhigh
       skip_bot_branch_prefixes:
         description: >-
           Space-separated head-branch prefixes that skip the review when the PR
@@ -552,9 +582,10 @@ on:
           '["self-hosted", "linux", "x64"]'. Every other job — the gate, the
           ledger, the Slack notices, and every job that mints the App token or
           holds `pull-requests: write` — stays on GitHub-hosted `ubuntu-latest`
-          regardless, so a pool never sees a write credential. Review and
-          consolidate run models with unsandboxed shell over the PR's code, so
-          pick a pool that gives each job a fresh pod (fresh filesystem and
+          regardless, so a pool never sees a write credential, as do the
+          direct-API cells and the direct judge, which hold a model key.
+          Review and consolidate run models with unsandboxed shell over the
+          PR's code, so pick a pool that gives each job a fresh pod (fresh filesystem and
           $HOME), carries no cloud identity or service-account token, and
           cannot reach private networks or the metadata server — anything a
           prompt-injected PR runs there can reach whatever the runner can. The
@@ -578,11 +609,14 @@ on:
         required: false
       ANTHROPIC_API_KEY:
         description: >-
-          Anthropic API key for the optional direct-API Anthropic review cells.
-          Required only when the `anthropic_direct_model` input is set; ignored
-          otherwise. Use a key scoped to its own Anthropic workspace with a
-          spend limit, never a personal key — the cells bill per call against
-          it directly rather than against a pooled seat.
+          Anthropic API key for the optional direct-API Anthropic review cells
+          and direct judge. Required only when the `anthropic_direct_model` or
+          `judge_direct_model` input is set; ignored otherwise. Only the gate
+          (a presence check), the direct cells and the `judge-direct` job read
+          it, all on GitHub-hosted `ubuntu-latest`. Use a key scoped to its
+          own Anthropic workspace with a spend limit, never a personal key —
+          the cells and judge bill per call against it directly rather than
+          against a pooled seat.
         required: false
       SLACK_BOT_TOKEN:
         description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
@@ -750,9 +784,9 @@ jobs:
 
       - name: Resolve ANTHROPIC_API_KEY presence
         # Same as `Resolve OPENAI_API_KEY presence` above, for the direct
-        # Anthropic cells.
+        # Anthropic cells and the direct judge.
         id: anthropic_key
-        if: inputs.anthropic_direct_model != ''
+        if: inputs.anthropic_direct_model != '' || inputs.judge_direct_model != ''
         env:
           ANTHROPIC_KEY_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         run: echo "present=${ANTHROPIC_KEY_PRESENT}" >> "$GITHUB_OUTPUT"
@@ -2097,6 +2131,12 @@ jobs:
       anthropic_direct_counts: ${{ steps.models.outputs.anthropic_direct_counts }}
       # `anthropic_direct_effort`, validated: always one of the allowed levels.
       anthropic_direct_effort: ${{ steps.models.outputs.anthropic_direct_effort }}
+      # 'true' only when the judge can actually run direct: `judge_direct_model`
+      # is a plain id and ANTHROPIC_API_KEY reached this workflow. `consolidate`
+      # switches its runner and its judge steps on THIS, never the raw input.
+      judge_direct: ${{ steps.models.outputs.judge_direct }}
+      # `judge_direct_effort`, validated: always one of the allowed levels.
+      judge_direct_effort: ${{ steps.models.outputs.judge_direct_effort }}
       # The caps DERIVED from `cell_timeout_minutes`, computed here because
       # Actions expressions have no arithmetic: `${{ x + 15 }}` is a parse
       # error that fails the workflow at load for every caller. Consumers
@@ -2267,6 +2307,9 @@ jobs:
           ANTHROPIC_DIRECT_REPLACES: ${{ inputs.anthropic_direct_replaces_cursor_anthropic }}
           ANTHROPIC_DIRECT_EFFORT: ${{ inputs.anthropic_direct_effort }}
           ANTHROPIC_KEY_PRESENT: ${{ needs.gate.outputs.anthropic_key_present }}
+          # The direct judge (touches no panel list).
+          JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
+          JUDGE_DIRECT_EFFORT: ${{ inputs.judge_direct_effort }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -2418,6 +2461,32 @@ jobs:
             fi
           fi
           echo "anthropic_direct_counts=${anthropic_direct_counts}" >> "$GITHUB_OUTPUT"
+          # The direct judge, by the cells' rules: a plain id (no whitespace at
+          # all) and the key present, or it warns and the Cursor judge runs.
+          # No collision check — the judge uploads no per-model artifact.
+          judge_direct=false
+          if [ -n "$(printf '%s' "${JUDGE_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
+            case "$JUDGE_DIRECT_MODEL" in *[[:space:]]*) judge_ws=true ;; *) judge_ws=false ;; esac
+            if [ "$judge_ws" = "true" ] \
+               || ! printf '%s' "$JUDGE_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
+              echo "::warning::judge_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the judge runs on Cursor (judge_model) for this run."
+            elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
+              echo "::warning::judge_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the judge runs on Cursor (judge_model) for this run. Pass the secret through from the caller to enable it."
+            else
+              judge_direct=true
+              echo "The judge runs direct through the Anthropic API ($JUDGE_DIRECT_MODEL)."
+            fi
+          fi
+          echo "judge_direct=${judge_direct}" >> "$GITHUB_OUTPUT"
+          case "${JUDGE_DIRECT_EFFORT:-}" in
+            low|medium|high|xhigh|max) judge_direct_effort="$JUDGE_DIRECT_EFFORT" ;;
+            *)
+              judge_direct_effort=xhigh
+              if [ "$judge_direct" = "true" ]; then
+                echo "::warning::judge_direct_effort is not one of low, medium, high, xhigh, max, so the direct judge uses xhigh."
+              fi ;;
+          esac
+          echo "judge_direct_effort=${judge_direct_effort}" >> "$GITHUB_OUTPUT"
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
       - name: Require a pinned workflows_ref
@@ -3995,9 +4064,431 @@ jobs:
           fi
           echo "Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
 
+  judge-direct:
+    # The direct-Anthropic judge (`judge_direct_model`, preflight's
+    # `judge_direct`): `consolidate`'s Cursor judge, through `claude -p` and
+    # the Anthropic API. Its own job so ANTHROPIC_API_KEY — sent to a job for
+    # every step that references it, skipped steps included — reaches ONLY a
+    # job whose one agent has Read, Grep and Glob and no shell, on
+    # GitHub-hosted `ubuntu-latest`, never `consolidate` (a Cursor shell agent
+    # over PR text, on the caller's `runs_on` pool).
+    #
+    # It rebuilds the judge's input exactly as `consolidate` does — the
+    # `Aggregate panel findings` and `Build judge prompt` steps are
+    # byte-identical to consolidate's (pinned by test_workflow_judge_direct.py)
+    # — then hands back ONE file, /tmp/judge-findings.json, as the
+    # `cursor-review-judge-direct` artifact. `consolidate` adopts it over its
+    # own seed, so everything downstream (the degraded fallback, the
+    # consolidated file, the post) is the Cursor judge's path unchanged.
+    name: Direct judge
+    needs: [gate, diff-size, preflight, review, review-openai-direct, review-anthropic-direct, ledger]
+    # `consolidate`'s condition, plus the direct judge being in effect.
+    if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' && needs.preflight.outputs.judge_direct == 'true' }}
+    # Holds ANTHROPIC_API_KEY: never the caller's `runs_on` pool.
+    runs-on: ubuntu-latest
+    # `consolidate`'s cap, for the same reason: the judge step below trips
+    # first and is absorbed, so the upload always runs. The 10m slack covers
+    # this job's overhead — checkout, three downloads, the CLI install
+    # (itself capped at 5m) and its check (2m), and the upload.
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_job_timeout) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Download reviewed diff
+        # Same generated-file-excluded diff (plus the incremental "hunks new
+        # since the last reviewed round" diff) the panel reviewed, built once
+        # in diff-size — so the judge adjudicates against exactly what the
+        # panel saw, and this job needs no PR checkout.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-diff
+          path: /tmp
+
+      - name: Install Claude Code CLI
+        id: claude_install
+        # `review-anthropic-direct`'s install, verbatim: the pin is read out of
+        # .github/cursor-review/package.json, its one home. Absorbed, unlike
+        # there: a judge that cannot start must cost the adjudication only, so
+        # `Run judge (direct)` is skipped and the seed takes the degraded
+        # panel-union path, as a failed Cursor judge does. Time-boxed for the
+        # same reason: a hung registry fetch must trip this step, not the job
+        # cap, whose kill never reaches the upload below.
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          manifest="$CURSOR_REVIEW_ASSETS/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the direct judge's CLI pin."
+            exit 1
+          fi
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@anthropic-ai/claude-code"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the direct judge's CLI pin."
+            exit 1
+          fi
+          version="$(printf '%s' "$version" | tr -d '\r\n')"
+          case "$version" in
+            ""|*[!0-9.]*)
+              echo "::error::dependencies[\"@anthropic-ai/claude-code\"] must be an EXACT version (digits and dots only, no ^ or ~); got a value this job will not install."
+              exit 1 ;;
+          esac
+          echo "CLAUDE_CLI_VERSION=$version" >> "$GITHUB_ENV"
+          npm install -g "@anthropic-ai/claude-code@${version}"
+
+      - name: Verify Claude Code CLI version
+        id: claude_verify
+        if: steps.claude_install.outcome == 'success'
+        # `review-anthropic-direct`'s check, verbatim, and absorbed for the
+        # same reason as the install: a CLI that is off-pin, or no longer
+        # advertises a flag the confinement relies on, never runs.
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          installed="$(claude --version 2>/dev/null | head -n 1 | tr -d '\r' | awk '{print $1}')"
+          if [ "$installed" != "$CLAUDE_CLI_VERSION" ]; then
+            echo "::error::claude reports '${installed}', expected the pinned '${CLAUDE_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "claude ${installed}"
+          help="$(claude --help 2>&1)"
+          for flag in --restricted --setting-sources --strict-mcp-config \
+                      --disallowedTools --permission-prompts --no-session-persistence; do
+            if ! printf '%s\n' "$help" | grep -qE -- "(^|[[:space:],])${flag}([[:space:],]|$)"; then
+              echo "::error::claude ${installed} does not advertise ${flag}, which the direct judge's confinement relies on."
+              exit 1
+            fi
+          done
+
+      - name: Download prior-review ledger
+        id: ledger_download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
+      - name: Download panel findings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/panel
+          pattern: findings-*
+
+      - name: Configure structured final review
+        # The `--init` seed, as in `consolidate`: a judge that never submits
+        # leaves status=error, and `consolidate` takes the degraded path.
+        env:
+          JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
+        run: |
+          python3 -I "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+            --mode judge \
+            --out /tmp/judge-findings.json \
+            --model "$JUDGE_DIRECT_MODEL (direct)" \
+            --review-type judge \
+            --init
+
+      - name: Aggregate panel findings
+        id: aggregate
+        env:
+          PANEL_MODELS: ${{ needs.preflight.outputs.models }}
+          # The direct-API cells COUNT only when they replace the Cursor OpenAI
+          # lane; side by side they stay advisory. See aggregate-panel.py.
+          DIRECT_MODEL: ${{ needs.preflight.outputs.openai_direct == 'true' && inputs.openai_direct_model || '' }}
+          DIRECT_COUNTS: ${{ needs.preflight.outputs.openai_direct_counts }}
+          # The matrices' RESULTS, not their artifacts: a cell can upload under
+          # another cell's name, but it cannot turn the honest leg's 409 green.
+          # `Fail the leg when the cell did not submit` reds every non-ok cell,
+          # so a red matrix whose artifacts all read ok is a forgery or a
+          # post-review failure — either way, panel_inconsistent=true.
+          REVIEW_RESULT: ${{ needs.review.result }}
+          DIRECT_RESULT: ${{ needs.review-openai-direct.result }}
+          # The same three for the direct Anthropic cells, counted per lab.
+          ANTHROPIC_DIRECT_MODEL: ${{ needs.preflight.outputs.anthropic_direct == 'true' && inputs.anthropic_direct_model || '' }}
+          ANTHROPIC_DIRECT_COUNTS: ${{ needs.preflight.outputs.anthropic_direct_counts }}
+          ANTHROPIC_DIRECT_RESULT: ${{ needs.review-anthropic-direct.result }}
+        run: |
+          # Each artifact directory contains one findings.json. Combine into
+          # a single panel.json array preserving cell metadata, and emit the
+          # ok_count/total/panel_inconsistent `Panel integrity` and auto-approve
+          # gate on.
+          python3 "$CURSOR_REVIEW_ASSETS/aggregate-panel.py" \
+            --panel-dir /tmp/panel \
+            --models "$PANEL_MODELS" \
+            --direct-model "$DIRECT_MODEL" \
+            --direct-counts "${DIRECT_COUNTS:-false}" \
+            --review-result "$REVIEW_RESULT" \
+            --direct-result "${DIRECT_RESULT:-skipped}" \
+            --anthropic-direct-model "$ANTHROPIC_DIRECT_MODEL" \
+            --anthropic-direct-counts "${ANTHROPIC_DIRECT_COUNTS:-false}" \
+            --anthropic-direct-result "${ANTHROPIC_DIRECT_RESULT:-skipped}" \
+            --out /tmp/panel.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build judge prompt
+        if: steps.aggregate.outputs.ok_count != '0'
+        env:
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
+        run: |
+          # The judge is the repeat-policy enforcement point, so it gets the
+          # judge-flavored ledger block (repeat_of requirement + the per-review
+          # repeat cap). Byte-identical to the old prompt when there's no ledger.
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-judge.md" \
+            --marker '=== BEGIN PANEL FINDINGS ===' \
+            --insert /tmp/ledger/ledger-judge.md \
+            --out /tmp/judge-prompt-head.txt
+
+          # Nonce'd fences as in the panel (BE-7645) — the judge reads the same
+          # attacker-authored diff, so it gets the same delimiting. Its nonce is
+          # minted HERE and is its OWN: the panel jobs never see it. That is
+          # what stops a laundering path — panel.json is model output produced
+          # with the panel's nonce in context, and it is spliced ABOVE the diff
+          # here, so a shared value could be echoed by a steered panel model into
+          # a region the judge has been told is authoritative and used to forge a
+          # close/open fence pair around a fake diff.
+          #
+          # panel.json is fenced with the same nonce for the same reason: it is
+          # model output derived from the untrusted diff, so "only a marker
+          # carrying this nonce ends a region" has to hold for it too, not just
+          # for the diff. Today only json.dump's newline escaping keeps a forged
+          # marker off a line start — that is not a control to rely on.
+          judge_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
+
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/judge-prompt-head.txt \
+            --marker '=== BEGIN PANEL FINDINGS ==='
+
+          {
+            cat /tmp/judge-prompt-head.txt
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/panel.json --label "PANEL FINDINGS" --nonce "$judge_nonce"
+            echo ""
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/pr-diff.patch --label DIFF --nonce "$judge_nonce"
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --body /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$judge_nonce"
+            fi
+          } > /tmp/judge-prompt.txt
+
+          echo "Judge prompt size: $(wc -c < /tmp/judge-prompt.txt) bytes"
+
+      - name: Run judge (direct)
+        # `consolidate`'s `Run judge`, through the Anthropic API instead of Cursor: the
+        # same /tmp/judge-prompt.txt, the same `review-output-mcp.py --mode
+        # judge` writing the same /tmp/judge-findings.json, the same step cap
+        # and the same absorption — a judge that fails, times out or never
+        # submits leaves the seed, and `Build consolidated findings file` takes
+        # the degraded panel-union path exactly as it does for Cursor. Skipped
+        # (seed left in place, same path) when the CLI did not install clean.
+        #
+        # Confinement, as in `review-anthropic-direct`: ANTHROPIC_API_KEY is
+        # in this ONE step's env (never argv, never a file), and the agent has
+        # Read, Grep and Glob — no Bash or other code-running tool — confined
+        # to the PR checkout (its cwd) by `--restricted`, with /proc and /sys
+        # denied independently of that flag, since /proc/self/environ is the
+        # key. The result JSON is never echoed: the run log is public and the
+        # result is model output steered by PR text.
+        if: steps.aggregate.outputs.ok_count != '0' && steps.claude_verify.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_step_timeout) }}
+        env:
+          JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
+          JUDGE_DIRECT_EFFORT: ${{ needs.preflight.outputs.judge_direct_effort }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # No telemetry or error report may carry private-diff context.
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            # Belt and braces: preflight already required the key.
+            echo "::warning::judge_direct_model is in effect but ANTHROPIC_API_KEY is empty here, so the judge did not run."
+            exit 0
+          fi
+          # A planted symlink could lead the file tools outside the tree, and
+          # a planted .claude/settings*.json or .mcp.json must never be there
+          # to load (`--restricted` and `--setting-sources ""` ignore them
+          # already; this removes them outright).
+          find . -type l -delete
+          rm -rf ./.claude ./.mcp.json ./CLAUDE.local.md
+          CLAUDE_CONFIG_DIR="$(mktemp -d -p "$RUNNER_TEMP")"
+          export CLAUDE_CONFIG_DIR
+          # `-I`: the cwd is the PR checkout, and a stdin script puts '' first
+          # on sys.path, so a PR-planted json.py would run beside the key.
+          mcp_config="$(python3 -I - <<'PY'
+          import json, os
+          print(json.dumps({"mcpServers": {"cursor-review-output": {
+              "command": "python3",
+              "args": [
+                  "-I",
+                  os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
+                  "--mode", "judge",
+                  "--out", "/tmp/judge-findings.json",
+                  "--model", os.environ["JUDGE_DIRECT_MODEL"] + " (direct)",
+                  "--review-type", "judge",
+              ],
+          }}}))
+          PY
+          )"
+          # Deliberately NOT `--bare`: on the pinned CLI it drops Grep and
+          # Glob from `--tools` (see `review-anthropic-direct`). What it would
+          # skip is already off: `--setting-sources ""` and a fresh
+          # CLAUDE_CONFIG_DIR, `--strict-mcp-config`, and
+          # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
+          claude -p --restricted --setting-sources "" \
+            --tools "Read,Grep,Glob" \
+            --strict-mcp-config --mcp-config "$mcp_config" \
+            --allowedTools "Read,Grep,Glob,mcp__cursor-review-output__cursor_review_submit_final" \
+            --disallowedTools "Read(//proc/**),Read(//sys/**)" \
+            --permission-prompts none \
+            --model "$JUDGE_DIRECT_MODEL" --effort "$JUDGE_DIRECT_EFFORT" \
+            --output-format json --no-session-persistence \
+            < /tmp/judge-prompt.txt > /tmp/judge-claude-result.json \
+            && JUDGE_EXIT=0 || JUDGE_EXIT=$?
+          echo "claude (judge) exit code: $JUDGE_EXIT"
+
+      - name: Refuse a judge review carrying the API key
+        # The direct cells' exfil guard, for the judge: should a
+        # prompt-injected judge get the key into its final review, replace the
+        # review with the `--init` error seed, so the degraded path posts the
+        # panel union instead. Literal match only. `always()`, so a judge
+        # killed by its step cap AFTER submitting is still checked. Then the
+        # status and finding count — never the review itself (see above).
+        if: always()
+        env:
+          JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -uo pipefail
+          out=/tmp/judge-findings.json
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$out" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$out"; then
+            echo "::error::the direct judge's final review contains ANTHROPIC_API_KEY — refusing to publish it (possible prompt-injection exfil); the panel union is posted instead."
+            python3 -I "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+              --mode judge \
+              --out "$out" \
+              --model "$JUDGE_DIRECT_MODEL (direct)" \
+              --review-type judge \
+              --init
+          fi
+          # `-I`, as everywhere in this job: the cwd is the PR checkout, and a
+          # stdin script puts '' first on sys.path, so a PR-planted json.py
+          # would run beside the key.
+          python3 -I - <<'PY'
+          import json
+          try:
+              with open("/tmp/judge-findings.json", encoding="utf-8") as f:
+                  record = json.load(f)
+          except (OSError, ValueError):
+              record = {}
+          if not isinstance(record, dict):
+              record = {}
+          status = record.get("status")
+          findings = record.get("findings")
+          # Fixed vocabulary only: `status` is written by a tool the agent
+          # drives, so anything else is reported as `?`, never echoed.
+          status = status if status in ("ok", "error") else "?"
+          count = len(findings) if isinstance(findings, list) else 0
+          print(f"Direct judge: status={status}, {count} finding(s).")
+          PY
+
+      - name: Upload direct judge review
+        # Always, so `consolidate` sees the seed rather than nothing on a
+        # judge that did not submit. NOT absorbed: a failed upload (a 409
+        # because something else took the name first included) fails this
+        # job, and `consolidate` adopts only from a job that succeeded.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cursor-review-judge-direct
+          path: /tmp/judge-findings.json
+          if-no-files-found: error
+          retention-days: 7
+
   consolidate:
     # Adjudicates the panel cell artifacts into one consolidated review.
-    # Calls cursor-agent one more time as the judge, with prompt-judge.md.
+    # Calls cursor-agent one more time as the judge, with prompt-judge.md —
+    # or, with `judge_direct_model` in effect (preflight's `judge_direct`),
+    # adopts the review the `judge-direct` job above wrote instead: same
+    # prompt, same structured-output tool, same file, same degraded fallback.
+    # That judge runs in its OWN job so ANTHROPIC_API_KEY never shares one
+    # with this job's Cursor judge (an unsandboxed shell agent over PR text)
+    # or its `runs_on` pool.
     #
     # Holds no write credential: the payload is handed to the `post-review` job
     # below as an artifact, and that job does the mint + post. See the header's
@@ -4006,12 +4497,13 @@ jobs:
     name: Consolidate panel
     # `review-openai-direct` and `review-anthropic-direct` are here for
     # ORDERING — their artifacts must land before `Download panel findings`
-    # runs. Neither gates this job: when one is skipped (the default) or
+    # runs (and `judge-direct`'s before `Download direct judge review`). None
+    # gates this job: when one is skipped (the default) or
     # fails, `!cancelled()` below still runs, and a failed cell is counted
     # from its artifact (or its absence) instead. Each one's result is read
     # once, by `Aggregate panel findings`, as a consistency check on those
     # artifacts (see aggregate-panel.py).
-    needs: [gate, diff-size, preflight, review, review-openai-direct, review-anthropic-direct, ledger]
+    needs: [gate, diff-size, preflight, review, review-openai-direct, review-anthropic-direct, ledger, judge-direct]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
     # `post-review`, is itself `!cancelled()`. On a cancelled run — now an
@@ -4160,6 +4652,10 @@ jobs:
           path: /tmp
 
       - name: Install Cursor agent CLI
+        # Not needed when the judge runs direct, and a transient Cursor
+        # download failure here would fail this job before the degraded
+        # panel-union path, discarding a completed panel.
+        if: needs.preflight.outputs.judge_direct != 'true'
         run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Download prior-review ledger
@@ -4177,11 +4673,21 @@ jobs:
           pattern: findings-*
 
       - name: Configure structured final review
+        env:
+          # The seed names the judge that will run: `<id> (direct)` for the
+          # direct judge, so a judge that never submits is not attributed to
+          # the Cursor model.
+          JUDGE_DIRECT: ${{ needs.preflight.outputs.judge_direct }}
+          JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
         run: |
+          judge_label="$JUDGE_MODEL"
+          if [ "$JUDGE_DIRECT" = "true" ]; then
+            judge_label="$JUDGE_DIRECT_MODEL (direct)"
+          fi
           python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
             --mode judge \
             --out /tmp/judge-findings.json \
-            --model "$JUDGE_MODEL" \
+            --model "$judge_label" \
             --review-type judge \
             --init
 
@@ -4313,7 +4819,7 @@ jobs:
           echo "Judge prompt size: $(wc -c < /tmp/judge-prompt.txt) bytes"
 
       - name: Run judge
-        if: steps.aggregate.outputs.ok_count != '0'
+        if: steps.aggregate.outputs.ok_count != '0' && needs.preflight.outputs.judge_direct != 'true'
         # Time-boxed BELOW the job cap and absorbed, so a hung judge loses only
         # the adjudication: the steps below then read the `--init` seed left by
         # `Configure structured final review` (status=error), take the degraded
@@ -4355,6 +4861,44 @@ jobs:
           echo "=== Structured final review ==="
           cat /tmp/judge-findings.json
           echo ""
+
+      - name: Download direct judge review
+        # Only from a `judge-direct` job that SUCCEEDED. A panel cell runs an
+        # agent over PR code before that job starts and could upload an
+        # artifact under this name first; the job's own upload then 409s, the
+        # job fails, and nothing is adopted — the seed below stays and the
+        # degraded panel-union path posts instead.
+        if: steps.aggregate.outputs.ok_count != '0' && needs.preflight.outputs.judge_direct == 'true' && needs.judge-direct.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-judge-direct
+          path: /tmp/judge-direct
+
+      - name: Adopt direct judge review
+        # Over the `--init` seed `Configure structured final review` wrote,
+        # and only when it is a JSON object: anything else leaves the seed,
+        # so `Build consolidated findings file` takes the degraded path
+        # exactly as for a Cursor judge that never submitted.
+        if: steps.aggregate.outputs.ok_count != '0' && needs.preflight.outputs.judge_direct == 'true'
+        run: |
+          python3 -I - <<'PY'
+          import json, os, shutil
+
+          src = "/tmp/judge-direct/judge-findings.json"
+          try:
+              if os.path.islink(src):
+                  raise ValueError("symlink")
+              with open(src, encoding="utf-8") as f:
+                  record = json.load(f)
+          except (OSError, ValueError):
+              record = None
+          if isinstance(record, dict):
+              shutil.copyfile(src, "/tmp/judge-findings.json")
+              print("Adopted the direct judge's review.")
+          else:
+              print("No usable direct judge review — the seed stays (degraded panel-union path).")
+          PY
 
       - name: Build consolidated findings file
         id: consolidated

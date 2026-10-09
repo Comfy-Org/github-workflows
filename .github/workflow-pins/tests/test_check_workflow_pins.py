@@ -3504,7 +3504,7 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            24,
+            25,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) site picked up merging "
             "main + cursor-review.yml's diff-size job's check-pr-size-tool "
@@ -3540,7 +3540,11 @@ class GuardCoverageTests(unittest.TestCase):
             "the direct-OpenAI cell loads its prompt, fence-diff.py and "
             "review-output-mcp.py from `workflows_ref` in its own job and "
             "carries its own copy of the guard. The 24th is its Anthropic twin, "
-            "`review-anthropic-direct` (BE-19913), which carries its own copy too.",
+            "`review-anthropic-direct` (BE-19913), which carries its own copy too. "
+            "The 25th is cursor-review.yml's opt-in `judge-direct` job (BE-19914): "
+            "the direct-Anthropic judge runs in its own job so ANTHROPIC_API_KEY "
+            "never reaches `consolidate`, loads its prompt and scripts from "
+            "`workflows_ref` and carries its own copy of the guard.",
         )
 
     WORKFLOWS_DIR = os.path.normpath(

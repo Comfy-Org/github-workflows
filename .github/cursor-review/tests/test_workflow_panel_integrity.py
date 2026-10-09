@@ -681,7 +681,7 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
 
-CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github)(?:\.[A-Za-z0-9_-]+)+")
+CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github|secrets)(?:\.[A-Za-z0-9_-]+)+")
 
 
 def evaluate(expression, context):
@@ -1248,7 +1248,10 @@ class AnthropicDirectCellsGateWhenTheyReplaceTest(DirectCellsGateWhenTheyReplace
     def test_the_judge_model_is_untouched(self):
         step = self.step(self.preflight, PANEL_MODELS_STEP)
         self.assertFalse(
-            any("judge" in line.lower() for line in code_lines(step) if "anthropic" in line.lower()),
+            # `anthropic_direct`, not `anthropic`: the direct JUDGE's own
+            # resolution in this step names ANTHROPIC_API_KEY beside
+            # `judge_direct_model`, and is not the cells' replacement.
+            any("judge" in line.lower() for line in code_lines(step) if "anthropic_direct" in line.lower()),
             "the Anthropic replacement reaches the judge model",
         )
 

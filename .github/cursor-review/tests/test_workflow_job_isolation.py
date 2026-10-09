@@ -304,16 +304,18 @@ class WorkflowJobIsolationTest(unittest.TestCase):
                                    "auto-retry"})
 
     def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
-        # `gate` only resolves a presence boolean; the cells are the one
-        # consumer, and they hold a model key beside a PR checkout, so they
-        # must stay GitHub-hosted.
+        # `gate` only resolves a presence boolean; the cells and the direct
+        # judge (`judge-direct`, never `consolidate` and its Cursor shell
+        # agent) are the consumers, and they hold a model key beside a PR
+        # checkout, so they must stay GitHub-hosted.
         holders = {
             name for name, body in self.jobs.items()
             if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
         }
-        self.assertEqual(holders, {"gate", "review-anthropic-direct"})
-        runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
-        self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
+        self.assertEqual(holders, {"gate", "review-anthropic-direct", "judge-direct"})
+        for name in ("review-anthropic-direct", "judge-direct"):
+            runs_on = [l.strip() for l in self.jobs[name] if l.startswith("    runs-on:")]
+            self.assertEqual(runs_on, ["runs-on: ubuntu-latest"], name)
 
     def test_the_anthropic_cells_load_no_pr_authored_claude_config(self):
         # `claude` runs with the PR checkout as cwd, so PR-authored
