@@ -2042,7 +2042,8 @@ jobs:
         # moved from Opus 5 `-thinking-max` to Opus 5.5 `-xhigh` on
         # 2026-10-07 for the same reason: a newer model one reasoning notch
         # down. That is deliberately TWO axes at once (version + tier) — it
-        # is a default change, not an attribution experiment. The
+        # is a default change, not an attribution experiment.
+        #
         # Kimi went BACK to `-max` on 2026-10-09. The `-high` tier turned
         # capacity-bound, not slow: cells died in ~25 seconds with
         # `RetriableError: [resource_exhausted]` after three internal
@@ -2075,7 +2076,7 @@ jobs:
         # `4.7-high` was tried on 2026-10-09 and raised 0 unique findings in 17
         # while timing out on 11 of 20 cells.
         #
-        # `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
+        # The `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
         # env block below — overrides this list for A/B experiments.
         #
         # The OpenAI cell moved from `gpt-5.6-sol-max` to `gpt-5.6-sol-xhigh`:
