@@ -1,15 +1,17 @@
 """The optional direct-Anthropic judge in cursor-review.yml (`judge_direct_model`).
 
-Three properties, each one a single line in the workflow that nothing else
+Four properties, each one a single line in the workflow that nothing else
 would notice breaking:
 
   * preflight's resolution — `judge_direct=true` only for a plain id with the
     key present, else a warning and the Cursor judge. EXECUTED: the real
     `Define panel models` script, run by test_workflow_panel_integrity's helper.
-  * job isolation — `consolidate` follows `runs_on`, so ANTHROPIC_API_KEY must
-    appear only in steps gated on the direct judge, and the job's `runs-on:`
-    must resolve to `ubuntu-latest` whenever it can hold the key (the key is
-    sent for every step that references it, skipped ones included).
+  * job isolation — a job is sent every secret its steps reference, skipped
+    ones included, so ANTHROPIC_API_KEY lives in its own `judge-direct` job
+    (hosted, no shell agent, every stdin Python `-I`) and never in
+    `consolidate`, which follows `runs_on` and runs the Cursor shell agent.
+  * the hand-back — `consolidate` adopts the `judge-direct` review over its
+    seed only from a job that succeeded, and only a JSON object. EXECUTED.
   * the exfil guard — a final review carrying the key is replaced by the
     `--init` error seed, so `Build consolidated findings file` takes the
     degraded panel-union path. EXECUTED, both steps.
@@ -45,13 +47,21 @@ from test_workflow_panel_integrity import (
 JUDGE_MODEL = "claude-opus-5-5"
 CURSOR_JUDGE = "claude-opus-4-8-thinking-max"
 KEY = "sk-ant-test-0123456789abcdef"
-RUNS_ON_INPUT = "fromJSON(inputs.runs_on || '\"ubuntu-latest\"')"
 
 CONFIGURE_STEP = "Configure structured final review"
 CURSOR_JUDGE_STEP = "Run judge"
 DIRECT_JUDGE_STEP = "Run judge (direct)"
 GUARD_STEP = "Refuse a judge review carrying the API key"
 BUILD_STEP = "Build consolidated findings file"
+ADOPT_STEP = "Adopt direct judge review"
+DOWNLOAD_STEP = "Download direct judge review"
+UPLOAD_STEP = "Upload direct judge review"
+ARTIFACT = "cursor-review-judge-direct"
+# Rebuilt in `judge-direct` exactly as in `consolidate`, so both judges read
+# the same prompt over the same panel.
+SHARED_STEPS = ("Checkout PR repo", "Load cursor-review assets", "Download reviewed diff",
+                "Download prior-review ledger", "Download panel findings",
+                AGGREGATE_STEP, "Build judge prompt")
 
 
 def jobs():
@@ -144,56 +154,73 @@ class PreflightResolvesTheDirectJudgeTest(unittest.TestCase):
         self.assertIn("::warning::judge_direct_effort", log)
 
 
-class ConsolidateJobIsolationTest(unittest.TestCase):
+class JudgeDirectJobIsolationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.consolidate = jobs()["consolidate"]
-        cls.steps = split_steps(cls.consolidate)
+        all_jobs = jobs()
+        cls.consolidate = all_jobs["consolidate"]
+        cls.direct = all_jobs["judge-direct"]
 
-    def runs_on(self, judge_direct, key_present):
-        line = next(l for l in code_lines(self.consolidate) if l.startswith("    runs-on:"))
-        expression = line.split(":", 1)[1].strip()
-        self.assertIn(RUNS_ON_INPUT, expression, "the runs_on fallback is no longer today's")
-        # `fromJSON` is outside `evaluate`'s grammar; a sentinel string stands
-        # in for whatever pool the caller's `runs_on` names.
-        expression = expression.replace(RUNS_ON_INPUT, "'POOL'")
-        return evaluate(expression, {
-            "needs.preflight.outputs.judge_direct": judge_direct,
-            "needs.gate.outputs.anthropic_key_present": key_present,
-        })
+    def job_scalar(self, job_lines, key):
+        line = next(l for l in code_lines(job_lines) if l.startswith(f"    {key}:"))
+        return line.split(":", 1)[1].strip()
 
-    def test_it_is_hosted_whenever_it_can_hold_the_key(self):
-        self.assertEqual(self.runs_on("true", "true"), "ubuntu-latest")
-        self.assertEqual(self.runs_on("true", ""), "ubuntu-latest")
-        # Key passed for the cells only: the direct judge's steps still
-        # reference it, so it is still sent to this job.
-        self.assertEqual(self.runs_on("false", "true"), "ubuntu-latest")
+    def test_the_key_never_reaches_consolidate(self):
+        self.assertFalse(any("ANTHROPIC_API_KEY" in l for l in code_lines(self.consolidate)))
+        self.assertIn("runs-on: ${{ fromJSON(inputs.runs_on", "\n".join(code_lines(self.consolidate)))
 
-    def test_without_the_key_it_follows_runs_on_as_today(self):
-        self.assertEqual(self.runs_on("false", "false"), "POOL")
-        self.assertEqual(self.runs_on("", ""), "POOL")
+    def test_the_direct_job_is_hosted_and_read_only(self):
+        self.assertEqual(self.job_scalar(self.direct, "runs-on"), "ubuntu-latest")
+        self.assertEqual(block_mapping(self.direct, "    permissions:", 6), {"contents": "read"})
+        self.assertEqual(self.job_scalar(self.direct, "timeout-minutes"),
+                         self.job_scalar(self.consolidate, "timeout-minutes"))
 
-    def test_the_key_is_only_in_steps_gated_on_the_direct_judge(self):
-        holders = []
-        for name, body in self.steps:
-            if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body)):
-                holders.append(name)
-                self.assertIn("needs.preflight.outputs.judge_direct == 'true'", step_scalar(body, "if") or "", name)
-        self.assertEqual(sorted(holders), sorted([DIRECT_JUDGE_STEP, GUARD_STEP]))
+    def test_the_direct_job_runs_no_shell_agent_and_no_bare_stdin_python(self):
+        body = code_lines(self.direct)
+        self.assertFalse(any("cursor-agent" in l or "install-cursor-cli" in l for l in body))
+        # A stdin script puts the cwd — the PR checkout — first on sys.path.
+        self.assertFalse([l for l in body if re.search(r"python3 -(\s|$)", l)])
+        self.assertEqual([l.strip().split()[0] for l in body if re.search(r"python3 -I -", l)],
+                         ["mcp_config=\"$(python3", "python3"])
 
-    def test_exactly_one_judge_step_runs(self):
-        context = {"steps.aggregate.outputs.ok_count": "3", "steps.claude_verify.outcome": "success"}
-        for judge_direct, expected in (("true", DIRECT_JUDGE_STEP), ("false", CURSOR_JUDGE_STEP), ("", CURSOR_JUDGE_STEP)):
-            ran = [
-                name for name in (CURSOR_JUDGE_STEP, DIRECT_JUDGE_STEP)
-                if evaluate(step_scalar(step(self.consolidate, name), "if"),
-                            {**context, "needs.preflight.outputs.judge_direct": judge_direct})
-            ]
-            self.assertEqual(ran, [expected], judge_direct)
+    def test_it_runs_only_when_consolidate_would_and_the_judge_is_direct(self):
+        direct_if = self.job_scalar(self.direct, "if")
+        consolidate_if = self.job_scalar(self.consolidate, "if")
+        self.assertEqual(direct_if, consolidate_if.replace(
+            " }}", " && needs.preflight.outputs.judge_direct == 'true' }}"))
+        self.assertEqual(self.job_scalar(self.direct, "needs"),
+                         self.job_scalar(self.consolidate, "needs").replace(", judge-direct]", "]"))
+
+    def test_the_rebuilt_judge_input_is_consolidates(self):
+        for name in SHARED_STEPS:
+            with self.subTest(step=name):
+                self.assertEqual(step(self.direct, name), step(self.consolidate, name))
+
+    def test_exactly_one_judge_runs(self):
+        context = {"steps.aggregate.outputs.ok_count": "3"}
+        for judge_direct, cursor_runs in (("true", False), ("false", True), ("", True)):
+            ctx = {**context, "needs.preflight.outputs.judge_direct": judge_direct}
+            self.assertEqual(bool(evaluate(step_scalar(step(self.consolidate, CURSOR_JUDGE_STEP), "if"), ctx)),
+                             cursor_runs, judge_direct)
+            self.assertEqual(bool(evaluate(step_scalar(step(self.consolidate, ADOPT_STEP), "if"), ctx)),
+                             not cursor_runs, judge_direct)
         # A CLI that did not install or verify clean never runs: the seed then
         # takes the degraded path, like a failed Cursor judge.
-        self.assertFalse(evaluate(step_scalar(step(self.consolidate, DIRECT_JUDGE_STEP), "if"), {
-            **context, "needs.preflight.outputs.judge_direct": "true", "steps.claude_verify.outcome": "failure"}))
+        run_if = step_scalar(step(self.direct, DIRECT_JUDGE_STEP), "if")
+        self.assertTrue(evaluate(run_if, {**context, "steps.claude_verify.outcome": "success"}))
+        self.assertFalse(evaluate(run_if, {**context, "steps.claude_verify.outcome": "failure"}))
+
+    def test_the_review_is_adopted_only_from_a_job_that_succeeded(self):
+        download = step(self.consolidate, DOWNLOAD_STEP)
+        base = {"steps.aggregate.outputs.ok_count": "3", "needs.preflight.outputs.judge_direct": "true"}
+        self.assertTrue(evaluate(step_scalar(download, "if"), {**base, "needs.judge-direct.result": "success"}))
+        for result in ("failure", "cancelled", "skipped"):
+            self.assertFalse(evaluate(step_scalar(download, "if"), {**base, "needs.judge-direct.result": result}))
+        self.assertIn(f"name: {ARTIFACT}", "\n".join(code_lines(download)))
+        upload = step(self.direct, UPLOAD_STEP)
+        self.assertIn(f"name: {ARTIFACT}", "\n".join(code_lines(upload)))
+        # A 409 on the name must fail the job, so it is never absorbed.
+        self.assertIsNone(step_scalar(upload, "continue-on-error"))
 
     def test_the_cursor_judge_step_is_unchanged_otherwise(self):
         body = code_lines(step(self.consolidate, CURSOR_JUDGE_STEP))
@@ -202,12 +229,12 @@ class ConsolidateJobIsolationTest(unittest.TestCase):
         self.assertEqual(step_scalar(step(self.consolidate, CURSOR_JUDGE_STEP), "continue-on-error"), "true")
 
     def test_the_direct_judge_matches_the_cursor_judges_cap_and_absorption(self):
-        cursor, direct = step(self.consolidate, CURSOR_JUDGE_STEP), step(self.consolidate, DIRECT_JUDGE_STEP)
+        cursor, direct = step(self.consolidate, CURSOR_JUDGE_STEP), step(self.direct, DIRECT_JUDGE_STEP)
         for key in ("timeout-minutes", "continue-on-error"):
             self.assertEqual(step_scalar(direct, key), step_scalar(cursor, key), key)
 
     def test_the_direct_judge_is_confined(self):
-        body = code_lines(step(self.consolidate, DIRECT_JUDGE_STEP))
+        body = code_lines(step(self.direct, DIRECT_JUDGE_STEP))
         start = next(i for i, l in enumerate(body) if l.strip().startswith("claude -p"))
         argv = []
         for line in body[start:]:
@@ -230,27 +257,30 @@ class ConsolidateJobIsolationTest(unittest.TestCase):
         self.assertIn('--mode", "judge"', script)
         self.assertIn('"--out", "/tmp/judge-findings.json"', script)
         self.assertIn('mktemp -d -p "$RUNNER_TEMP"', script)
-        env = block_mapping(step(self.consolidate, DIRECT_JUDGE_STEP), "        env:", 10)
+        env = block_mapping(step(self.direct, DIRECT_JUDGE_STEP), "        env:", 10)
         self.assertEqual(env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), "'1'")
         # The result is model output steered by PR text: never echoed.
         self.assertFalse(any(re.search(r"\b(cat|head|tail)\b.*judge-claude-result", l) for l in body))
 
-    def test_the_cli_is_installed_from_the_manifest_only_when_direct(self):
-        for name in ("Install Claude Code CLI", "Verify Claude Code CLI version"):
-            body = step(self.consolidate, name)
-            self.assertIn("needs.preflight.outputs.judge_direct == 'true'", step_scalar(body, "if"))
-        install = "\n".join(code_lines(step(self.consolidate, "Install Claude Code CLI")))
+    def test_the_cli_is_installed_from_the_manifest_and_time_boxed(self):
+        for name, cap in (("Install Claude Code CLI", "5"), ("Verify Claude Code CLI version", "2")):
+            body = step(self.direct, name)
+            self.assertEqual(step_scalar(body, "continue-on-error"), "true", name)
+            self.assertEqual(step_scalar(body, "timeout-minutes"), cap, name)
+        install = "\n".join(code_lines(step(self.direct, "Install Claude Code CLI")))
         self.assertIn('manifest="$CURSOR_REVIEW_ASSETS/package.json"', install)
         self.assertNotRegex(install, r"claude-code@\d")
-        # The Cursor CLI install is untouched and unconditional.
+        # The Cursor CLI is installed only for the Cursor judge.
         cursor = step(self.consolidate, "Install Cursor agent CLI")
-        self.assertIsNone(step_scalar(cursor, "if"))
+        self.assertEqual(step_scalar(cursor, "if"), "needs.preflight.outputs.judge_direct != 'true'")
 
 
 class ExfilGuardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.consolidate = jobs()["consolidate"]
+        all_jobs = jobs()
+        cls.consolidate = all_jobs["consolidate"]
+        cls.direct = all_jobs["judge-direct"]
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -281,9 +311,25 @@ class ExfilGuardTest(unittest.TestCase):
         return record
 
     def guard(self):
-        body = step(self.consolidate, GUARD_STEP)
-        self.assertTrue(evaluate(step_scalar(body, "if"), self.context))
+        body = step(self.direct, GUARD_STEP)
+        self.assertEqual(step_scalar(body, "if"), "always()")
         return run_step(body, self.context, self.workdir)[0]
+
+    def hand_back(self, record=None):
+        """`judge-direct`'s file into consolidate's seed via `Adopt direct
+        judge review`. `record` replaces the uploaded file when given."""
+        src = os.path.join(self.workdir, "judge-direct")
+        os.makedirs(src, exist_ok=True)
+        if record is not None:
+            with open(os.path.join(src, "judge-findings.json"), "w", encoding="utf-8") as f:
+                f.write(record)
+        else:
+            shutil.copyfile(os.path.join(self.workdir, "judge-findings.json"),
+                            os.path.join(src, "judge-findings.json"))
+        self.configure("true")
+        done = run_step(step(self.consolidate, ADOPT_STEP), self.context, self.workdir)[0]
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done
 
     def build(self):
         with open(os.path.join(self.workdir, "panel.json"), "w", encoding="utf-8") as f:
@@ -313,6 +359,7 @@ class ExfilGuardTest(unittest.TestCase):
         self.assertEqual(record["findings"], [])
         self.assertEqual(record["model"], f"{JUDGE_MODEL} (direct)")
         self.assertNotIn(KEY, json.dumps(record))
+        self.hand_back()
         outputs, consolidated = self.build()
         self.assertEqual(outputs["degraded"], "true")
         self.assertEqual([f["body"] for f in consolidated["findings"]], ["panel finding"])
@@ -326,6 +373,8 @@ class ExfilGuardTest(unittest.TestCase):
         # Status and count only: the run log is public.
         self.assertIn("Direct judge: status=ok, 1 finding(s).", done.stdout)
         self.assertNotIn("a real finding", done.stdout)
+        self.hand_back()
+        self.assertEqual(self.read(), submitted)
         outputs, consolidated = self.build()
         self.assertEqual(outputs["degraded"], "false")
         self.assertEqual(consolidated["findings"], submitted["findings"])
@@ -335,6 +384,7 @@ class ExfilGuardTest(unittest.TestCase):
         done = self.guard()
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("Direct judge: status=error, 0 finding(s).", done.stdout)
+        self.hand_back()
         outputs, _ = self.build()
         self.assertEqual(outputs["degraded"], "true")
 
@@ -344,6 +394,20 @@ class ExfilGuardTest(unittest.TestCase):
         done = self.guard()
         self.assertIn("Direct judge: status=?, 0 finding(s).", done.stdout)
         self.assertNotIn("forged", done.stdout)
+
+    def test_a_non_object_or_missing_hand_back_leaves_the_seed(self):
+        for record in ("[1, 2]", "not json", '"ok"'):
+            with self.subTest(record=record):
+                done = self.hand_back(record)
+                self.assertIn("seed stays", done.stdout)
+                self.assertEqual(self.read()["status"], "error")
+                outputs, _ = self.build()
+                self.assertEqual(outputs["degraded"], "true")
+        os.remove(os.path.join(self.workdir, "judge-direct", "judge-findings.json"))
+        self.configure("true")
+        done = run_step(step(self.consolidate, ADOPT_STEP), self.context, self.workdir)[0]
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.read()["status"], "error")
 
 
 if __name__ == "__main__":

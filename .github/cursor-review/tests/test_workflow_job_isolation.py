@@ -305,16 +305,17 @@ class WorkflowJobIsolationTest(unittest.TestCase):
 
     def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
         # `gate` only resolves a presence boolean; the cells and the direct
-        # judge (`consolidate`) are the consumers, and they hold a model key
-        # beside a PR checkout, so they must be GitHub-hosted whenever they can
-        # hold it — pinned for `consolidate` in test_workflow_judge_direct.py.
+        # judge (`judge-direct`, never `consolidate` and its Cursor shell
+        # agent) are the consumers, and they hold a model key beside a PR
+        # checkout, so they must stay GitHub-hosted.
         holders = {
             name for name, body in self.jobs.items()
             if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
         }
-        self.assertEqual(holders, {"gate", "review-anthropic-direct", "consolidate"})
-        runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
-        self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
+        self.assertEqual(holders, {"gate", "review-anthropic-direct", "judge-direct"})
+        for name in ("review-anthropic-direct", "judge-direct"):
+            runs_on = [l.strip() for l in self.jobs[name] if l.startswith("    runs-on:")]
+            self.assertEqual(runs_on, ["runs-on: ubuntu-latest"], name)
 
     def test_the_anthropic_cells_load_no_pr_authored_claude_config(self):
         # `claude` runs with the PR checkout as cwd, so PR-authored
@@ -388,17 +389,9 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         for name in routed:
             body = self.jobs[name]
             self.assertFalse(references_bot_key(body), name)
-            # `consolidate` may also read ANTHROPIC_API_KEY, for the direct
-            # judge, ONLY because its runs-on leaves the pool whenever that key
-            # is passed (test_workflow_judge_direct.py executes that switch).
-            allowed = ("CURSOR_API_KEY", "ANTHROPIC_API_KEY") if name == "consolidate" else ("CURSOR_API_KEY",)
-            if name == "consolidate":
-                runs_on = next(l for l in body if l.startswith("    runs-on:"))
-                self.assertIn("needs.gate.outputs.anthropic_key_present == 'true'", runs_on)
-                self.assertIn("&& 'ubuntu-latest' ||", runs_on)
             self.assertFalse(
-                any("secrets." in l and not any(k in l for k in allowed) for l in code_lines(body)),
-                f"job `{name}` follows runs_on but reads a secret other than {', '.join(allowed)}",
+                any("secrets." in l and "CURSOR_API_KEY" not in l for l in code_lines(body)),
+                f"job `{name}` follows runs_on but reads a secret other than CURSOR_API_KEY",
             )
             for scope, value in sorted((job_permissions(body) or {"": "missing"}).items()):
                 self.assertIn(value, READ_ONLY_VALUES, f"`{name}` grants `{scope}: {value}`")
