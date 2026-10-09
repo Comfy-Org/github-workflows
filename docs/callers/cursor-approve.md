@@ -350,9 +350,14 @@ cell's real upload fails and its leg goes red while consolidate reads the
 forgery. A bare `needs:` used to skip the axes on that red leg. With
 `!cancelled()` the round goes on to the axes, which still review the change
 independently, and decide still withholds on any red axis (or more yellow
-than `max_yellow_axes`). Treat the panel count
-as tamper-evident only in the rollup (the red leg stays visible), not in the
-gate.
+than `max_yellow_axes`). The gate now reads that red leg too: when a reviewer
+leg did not succeed although every counted cell artifact reads `ok`, the panel
+is marked inconsistent and `approve_gate` is `untrusted` — not re-run
+automatically, since the forged artifact would survive the retry — and Panel
+integrity fails naming it. The residual is a forger that also errors its own
+cell under `approve_max_failed_reviewers` > 0, so the honest red leg is
+explained by a tolerated error: there the count stays tamper-evident only in
+the rollup.
 
 ## Inputs
 

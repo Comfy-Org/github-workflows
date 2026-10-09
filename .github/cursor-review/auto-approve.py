@@ -111,6 +111,11 @@ none: the label already hands the PR to a human. A round is untrusted when:
   while every review type (``PANEL_REVIEW_TYPES``) still has an ``ok`` cell. A
   non-dict cell, a missing or unknown status, or an empty panel always
   withholds. Tolerated cells are named in the decision's reason;
+* a reviewer leg did not succeed although every panel cell reports ``ok``
+  (the consolidated file's ``panel_inconsistent``, set by aggregate-panel.py
+  from the matrices' results): a cell can upload a forged ``ok`` under another
+  cell's artifact name, and the honest leg's own upload then fails. Not
+  re-run automatically — the forged artifact persists across re-run attempts;
 * the review did not land as resolvable threads (`delivered` is not ``true``,
   or any finding reached the review body only — ``ungated_findings`` > 0 — where
   the open-thread check below cannot see it);
@@ -627,6 +632,7 @@ def decide(
     human_review: bool = False,
     scope=None,
     max_failed_reviewers: int = 0,
+    panel_inconsistent: bool = False,
 ):
     """Return (event, reasons, blocking_findings). Pure; no I/O.
 
@@ -639,6 +645,7 @@ def decide(
         threshold, findings, panel, judge_status, delivered, reviewed_sha,
         live_head_sha, open_thread_severities, ungated, human_review,
         reviewed_diff_empty, reviewed_base, live_base, scope, max_failed_reviewers,
+        panel_inconsistent,
     )
     return event, reasons, blocking
 
@@ -650,10 +657,15 @@ REASON_NOT_DELIVERED = "the review did not land on the PR as resolvable threads"
 REASON_UNGATED_TAIL = "finding(s) reached the review body only, not as resolvable threads"
 REASON_EMPTY_DIFF = ("the reviewed diff is empty — every changed path was excluded from review, "
                      "so nothing a reviewer saw can earn an approval")
+# Structural too: artifacts are immutable once uploaded, so a forged one under
+# another cell's name survives a re-run attempt and the honest leg 409s again.
+REASON_PANEL_INCONSISTENT = ("a reviewer leg did not succeed although every panel cell reports ok, "
+                             "so a cell's artifact may not be its own")
 STRUCTURAL_CAUSES = (
     (REASON_NOT_DELIVERED, "the findings did not land as resolvable threads"),
     (REASON_UNGATED_TAIL, "some findings reached the review body only, not as resolvable threads"),
     (REASON_EMPTY_DIFF, "the reviewed diff is empty (every changed path was excluded from review)"),
+    (REASON_PANEL_INCONSISTENT, "a reviewer leg failed although every panel cell reports ok (see the red leg checks)"),
 )
 
 # The two causes a fresh round on the LIVE head actually fixes, and the only
@@ -684,6 +696,7 @@ def decide_gate(
     live_base: str = "",
     scope=None,
     max_failed_reviewers: int = 0,
+    panel_inconsistent: bool = False,
 ):
     """decide(), plus the approve_gate value: (event, gate, reasons, blocking).
 
@@ -704,6 +717,8 @@ def decide_gate(
     panel_reason, tolerated = panel_gate(panel, max_failed_reviewers)
     if panel_reason:
         reasons.append(panel_reason)
+    if panel_inconsistent:
+        reasons.append(REASON_PANEL_INCONSISTENT)
     if not delivered:
         reasons.append(REASON_NOT_DELIVERED)
     elif ungated:
@@ -1708,6 +1723,9 @@ def cmd_decide(args) -> int:
         data = json.load(f)
     findings = data.get("findings") or []
     panel = data.get("panel") or []
+    # A JSON bool written by `Build consolidated findings file`; absent (an
+    # older payload) reads as consistent, exactly as before.
+    panel_inconsistent = data.get("panel_inconsistent") is True
     try:
         ungated = int(args.ungated or 0)
     except ValueError:
@@ -1744,6 +1762,7 @@ def cmd_decide(args) -> int:
             live_base,
             scope,
             max_failed,
+            panel_inconsistent,
         )
     set_output("approve_gate", gate)
     if event != NONE:

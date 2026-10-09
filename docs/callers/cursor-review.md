@@ -343,6 +343,7 @@ the job log:
 | Cause | What it means |
 |---|---|
 | Panel incomplete | Fewer cells submitted findings than ran. The consolidated review was adjudicated over a short panel. The individual leg checks (`adversarial (<model>)` / `edge-case (<model>)`) are red for exactly the cells that did not submit — almost always the 15-minute agent cap. |
+| Panel inconsistent | A reviewer leg is red although every counted cell's findings artifact reads `ok`. A leg reds only when its cell is not `ok`, so this means an artifact under a cell's name was uploaded by something other than that cell (a prompt-injected cell claiming another's name; the honest upload then fails) or the upload failed after the review. Auto-approve withholds (`untrusted`) and does not re-run on it. |
 | Unanchored findings | Findings the review could not anchor to a line of the reviewed diff, so they were demoted to the review **body** and have no thread. The Blocking gate cannot see them; read the body. |
 | Nothing delivered | No review carrying resolvable finding threads reached the PR — a read-only token, a rejected inline payload, or a post that could not be confirmed. The findings are in the `Post review` job summary. |
 | Judge degraded | The judge model never adjudicated; the review is the raw union of the cells' findings, so duplicates and false positives were not filtered out. |
@@ -613,7 +614,8 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   severity;
 - **no decision** when the round can't be trusted: the judge did not adjudicate, a
   panel reviewer did not complete (beyond what `approve_max_failed_reviewers`
-  tolerates — see below), the review did not land as threads (or some
+  tolerates — see below), a reviewer leg failed although every panel cell
+  reports `ok` (Panel inconsistent, above), the review did not land as threads (or some
   finding reached the review body only), the head moved or the base was
   retargeted mid-run, the PR state
   could not be read, an earlier round's thread above the threshold is still
@@ -880,7 +882,7 @@ jobs:
 |---|---|
 | `pass` | The auto-approve decision was APPROVE (posted, unless `defer_approval` left it to cursor-approve). |
 | `fail` | REQUEST_CHANGES, or an earlier round's open thread above the threshold withheld approval. |
-| `untrusted` | The judge was degraded, a panel cell failed (beyond what `approve_max_failed_reviewers` tolerates), the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
+| `untrusted` | The judge was degraded, a panel cell failed (beyond what `approve_max_failed_reviewers` tolerates), a reviewer leg failed although every panel cell reports `ok` (a cell's artifact may not be its own — see Panel integrity), the review was not delivered, or the head moved — and also any run that delivered no round at all (an unrelated event, an already-reviewed head, an over-cap diff). |
 | `capped` | The round cap was hit by this run, or the PR carries `needs-human-review` (while `max_rounds` or `approve_max_severity` is set). Wins over `off`. |
 | `off` | `approve_max_severity` is empty, or `approve_authors` does not list the PR's author (and the cap was not hit). |
 

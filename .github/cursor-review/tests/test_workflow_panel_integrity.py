@@ -109,6 +109,7 @@ CAUSE_READS = (
     "needs.consolidate.outputs.ok_count",
     "needs.consolidate.outputs.total",
     "needs.consolidate.outputs.degraded",
+    "needs.consolidate.outputs.panel_inconsistent",
     "needs.post-review.outputs.delivered",
     "needs.post-review.outputs.ungated_findings",
     "needs.diff-size.outputs.incremental_subset",
@@ -289,6 +290,7 @@ class ConsolidateExposesPanelCountsTest(unittest.TestCase):
         for key, source in (
             ("ok_count", "steps.aggregate.outputs.ok_count"),
             ("total", "steps.aggregate.outputs.total"),
+            ("panel_inconsistent", "steps.aggregate.outputs.panel_inconsistent"),
             ("degraded", "steps.consolidated.outputs.degraded"),
             ("judge_status", "steps.consolidated.outputs.judge_status"),
         ):
@@ -306,8 +308,24 @@ class ConsolidateExposesPanelCountsTest(unittest.TestCase):
         script = os.path.join(os.path.dirname(WORKFLOW), "..", "cursor-review", "aggregate-panel.py")
         with open(script, encoding="utf-8") as f:
             source = f.read()
-        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={total}\\n")'):
+        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={total}\\n")',
+                        'g.write(f"panel_inconsistent='):
             self.assertIn(written, source)
+
+    def test_the_aggregate_step_reads_the_matrix_results(self):
+        # The leg-result cross-check: without these the script sees its
+        # defaults (`success` / `skipped`) and can never flag a forgery.
+        step = "\n".join(code_lines(step_named(self.jobs["consolidate"], "Aggregate panel findings")))
+        self.assertIn("REVIEW_RESULT: ${{ needs.review.result }}", step)
+        self.assertIn("DIRECT_RESULT: ${{ needs.review-openai-direct.result }}", step)
+        self.assertIn('--review-result "$REVIEW_RESULT"', step)
+        self.assertIn('--direct-result "${DIRECT_RESULT:-skipped}"', step)
+
+    def test_the_consolidated_file_carries_panel_inconsistent(self):
+        # From the step output, written before the judge ran in this job.
+        step = "\n".join(code_lines(step_named(self.jobs["consolidate"], "Build consolidated findings file")))
+        self.assertIn("PANEL_INCONSISTENT: ${{ steps.aggregate.outputs.panel_inconsistent }}", step)
+        self.assertIn('"panel_inconsistent": panel_inconsistent', step)
 
 
 class PanelIntegrityJobTest(unittest.TestCase):
@@ -373,6 +391,14 @@ class PanelIntegrityJobTest(unittest.TestCase):
                 self.body,
                 f"`{PANEL_JOB}` no longer reads `{read}`",
             )
+
+    def test_an_inconsistent_panel_is_a_failing_cause(self):
+        self.assertIn("PANEL_INCONSISTENT: ${{ needs.consolidate.outputs.panel_inconsistent }}", self.body)
+        self.assertRegex(
+            self.body,
+            r'if \[ "\$PANEL_INCONSISTENT" = "true" \]; then\n\s+echo "::error::A reviewer leg did not succeed'
+            r'[^\n]*"\n\s+causes=\$\(\(causes \+ 1\)\)',
+        )
 
     def test_a_discarded_incremental_block_is_not_a_failing_cause(self):
         # `incremental_subset` is `false` only when the incremental block was

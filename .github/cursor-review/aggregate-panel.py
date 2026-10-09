@@ -22,9 +22,32 @@ output and must never be able to excuse itself from the count: `direct_api`
 (this cell came through the direct backend) and `advisory` (keep it out of the
 panel metadata auto-approve counts failures from).
 
+Two cross-checks against what a cell's record claims, both because a `review`
+cell runs its agent `--trust` with shell access over PR-authored text and can
+upload an artifact under ANOTHER cell's name before that cell does (the honest
+leg's own upload then 409s and goes red):
+
+- name vs record: a cell's identity is its artifact NAME,
+  `findings-<review_type>-<model>` / `findings-direct-<review_type>-<model>`,
+  which the workflow chose. A record whose own `model` / `review_type` disagree
+  with it (or sits under a name that does not parse) gets `status: "mismatch"`
+  — not `ok`, and not the `error` auto-approve may tolerate — so it counts as
+  a failed reviewer.
+- leg result vs records (`--review-result`, `--direct-result`, the
+  `needs.<job>.result` of each matrix): `Fail the leg when the cell did not
+  submit` reds every leg whose cell is not `ok`, so a matrix that did not
+  succeed while EVERY counted cell of it reads `ok` is inconsistent — some leg
+  failed after its agent ran, by an upload conflict (the forgery signature) or
+  a post-review infrastructure failure. Either way the count cannot be
+  trusted: `panel_inconsistent=true` is written for auto-approve and `Panel
+  integrity` to withhold on. The cell records are left as they are, so the
+  judge still reads every finding. The direct matrix is checked only when its
+  cells count; advisory, its legs absorb their own failures.
+
 Stdlib only. Usage:
   aggregate-panel.py --panel-dir /tmp/panel --models '<json list>' \
       [--direct-model <id> --direct-counts true|false] \
+      [--review-result <result> --direct-result <result>] \
       --out /tmp/panel.json [--github-output "$GITHUB_OUTPUT"]
 """
 
@@ -38,6 +61,23 @@ import sys
 REVIEW_TYPES = ("adversarial", "edge-case")
 DIRECT_PREFIX = "findings-direct-"
 MARKERS = ("direct_api", "advisory")
+# The status a record gets when it disagrees with the artifact name it sits
+# under. Deliberately not auto-approve's tolerable `error`.
+MISMATCH_STATUS = "mismatch"
+
+
+def identity_from_name(artifact):
+    """(review_type, model) the workflow named this artifact for, or (None, None)."""
+    for prefix in (DIRECT_PREFIX, "findings-"):
+        if artifact.startswith(prefix):
+            rest = artifact[len(prefix):]
+            break
+    else:
+        return None, None
+    for review_type in REVIEW_TYPES:
+        if rest.startswith(review_type + "-") and len(rest) > len(review_type) + 1:
+            return review_type, rest[len(review_type) + 1:]
+    return None, None
 
 
 def load_cells(panel_dir):
@@ -53,7 +93,16 @@ def load_cells(panel_dir):
             continue
         for marker in MARKERS:
             cell.pop(marker, None)
-        if os.path.basename(os.path.dirname(path)).startswith(DIRECT_PREFIX):
+        artifact = os.path.basename(os.path.dirname(path))
+        review_type, model = identity_from_name(artifact)
+        if (cell.get("review_type"), cell.get("model")) != (review_type, model) or review_type is None:
+            print(
+                f"::warning::Findings artifact {_log_safe(artifact, 100)} holds a record for "
+                f"{_log_safe(cell.get('review_type'))}/{_log_safe(cell.get('model'))}, not the cell "
+                f"it is named for; counted as status={MISMATCH_STATUS}."
+            )
+            cell["status"] = MISMATCH_STATUS
+        if artifact.startswith(DIRECT_PREFIX):
             direct.append(cell)
         else:
             cursor.append(cell)
@@ -74,8 +123,17 @@ def fill_missing(cells, models, error):
         })
 
 
-def aggregate(panel_dir, models, direct_model="", direct_counts=False):
-    """Return (cells, ok_count, total). `cells` is everything the judge reads."""
+def _all_ok(cells):
+    return all(c.get("status") == "ok" for c in cells)
+
+
+def aggregate(panel_dir, models, direct_model="", direct_counts=False,
+              review_result="success", direct_result="skipped"):
+    """Return (cells, ok_count, total, inconsistent).
+
+    `cells` is everything the judge reads; `inconsistent` is the leg-result
+    cross-check in the module docstring.
+    """
     panel, direct = load_cells(panel_dir)
     fill_missing(panel, models, "Cell findings artifact was not uploaded.")
     counts = bool(direct_counts and direct_model)
@@ -88,12 +146,15 @@ def aggregate(panel_dir, models, direct_model="", direct_counts=False):
             c["advisory"] = True
     counted = panel + direct if counts else panel
     ok = sum(1 for c in counted if c.get("status") == "ok")
-    return panel + direct, ok, len(counted)
+    inconsistent = (review_result != "success" and _all_ok(panel)) or (
+        counts and direct_result not in ("success", "skipped") and _all_ok(direct)
+    )
+    return panel + direct, ok, len(counted), inconsistent
 
 
-def _log_safe(value):
+def _log_safe(value, limit=32):
     """A cell-written value made safe for a ::workflow command::-parsing log line."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))[:32] or "?"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))[:limit] or "?"
 
 
 def main(argv=None):
@@ -102,15 +163,27 @@ def main(argv=None):
     p.add_argument("--models", required=True, help="JSON list of Cursor panel model ids")
     p.add_argument("--direct-model", default="")
     p.add_argument("--direct-counts", default="false")
+    p.add_argument("--review-result", default="success", help="needs.review.result")
+    p.add_argument("--direct-result", default="skipped", help="needs.review-openai-direct.result")
     p.add_argument("--out", required=True)
     p.add_argument("--github-output", default="")
     args = p.parse_args(argv)
 
     counts = args.direct_counts.strip().lower() == "true"
-    cells, ok, total = aggregate(
-        args.panel_dir, json.loads(args.models), args.direct_model.strip(), counts
+    review_result = args.review_result.strip()
+    direct_result = args.direct_result.strip()
+    cells, ok, total, inconsistent = aggregate(
+        args.panel_dir, json.loads(args.models), args.direct_model.strip(), counts,
+        review_result, direct_result,
     )
     print(f"Panel: {ok}/{total} cells contributed findings.")
+    if inconsistent:
+        print(
+            f"::warning::A reviewer matrix did not succeed (review={_log_safe(review_result)}, "
+            f"direct={_log_safe(direct_result)}) although every counted cell artifact of it reads "
+            "ok: an artifact may not be its own cell's. The panel count is untrusted "
+            "(panel_inconsistent=true)."
+        )
     for c in cells:
         if c.get("direct_api"):
             role = "advisory, not counted" if c.get("advisory") else "counted"
@@ -125,6 +198,7 @@ def main(argv=None):
         with open(args.github_output, "a", encoding="utf-8") as g:
             g.write(f"ok_count={ok}\n")
             g.write(f"total={total}\n")
+            g.write(f"panel_inconsistent={'true' if inconsistent else 'false'}\n")
     return 0
 
 

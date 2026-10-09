@@ -3199,10 +3199,12 @@ jobs:
     # "Credential isolation" note for why the judge must not share a job with
     # a write-scoped token.
     name: Consolidate panel
-    # `review-openai-direct` is here only for ORDERING — its artifacts must land
-    # before `Download panel findings` runs. Its result is never read: when it
+    # `review-openai-direct` is here for ORDERING — its artifacts must land
+    # before `Download panel findings` runs. It never gates this job: when it
     # is skipped (the default) or fails, `!cancelled()` below still runs, and
-    # a failed cell is counted from its artifact (or its absence) instead.
+    # a failed cell is counted from its artifact (or its absence) instead. Its
+    # result is read once, by `Aggregate panel findings`, as a consistency
+    # check on those artifacts (see aggregate-panel.py).
     needs: [gate, diff-size, preflight, review, review-openai-direct, ledger]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
@@ -3250,6 +3252,10 @@ jobs:
     outputs:
       ok_count: ${{ steps.aggregate.outputs.ok_count }}
       total: ${{ steps.aggregate.outputs.total }}
+      # 'true' when a reviewer matrix did not succeed although every counted
+      # cell artifact of it reads `ok` — an artifact may not be its own cell's.
+      # Written by aggregate-panel.py BEFORE the judge runs in this job.
+      panel_inconsistent: ${{ steps.aggregate.outputs.panel_inconsistent }}
       degraded: ${{ steps.consolidated.outputs.degraded }}
       # Untrusted: this is whatever string the judge agent's own tool wrote as
       # `status` in /tmp/judge-findings.json, in a job running `cursor-agent
@@ -3413,15 +3419,25 @@ jobs:
           # lane; side by side they stay advisory. See aggregate-panel.py.
           DIRECT_MODEL: ${{ needs.preflight.outputs.openai_direct == 'true' && inputs.openai_direct_model || '' }}
           DIRECT_COUNTS: ${{ needs.preflight.outputs.openai_direct_counts }}
+          # The matrices' RESULTS, not their artifacts: a cell can upload under
+          # another cell's name, but it cannot turn the honest leg's 409 green.
+          # `Fail the leg when the cell did not submit` reds every non-ok cell,
+          # so a red matrix whose artifacts all read ok is a forgery or a
+          # post-review failure — either way, panel_inconsistent=true.
+          REVIEW_RESULT: ${{ needs.review.result }}
+          DIRECT_RESULT: ${{ needs.review-openai-direct.result }}
         run: |
           # Each artifact directory contains one findings.json. Combine into
           # a single panel.json array preserving cell metadata, and emit the
-          # ok_count/total `Panel integrity` and auto-approve gate on.
+          # ok_count/total/panel_inconsistent `Panel integrity` and auto-approve
+          # gate on.
           python3 "$CURSOR_REVIEW_ASSETS/aggregate-panel.py" \
             --panel-dir /tmp/panel \
             --models "$PANEL_MODELS" \
             --direct-model "$DIRECT_MODEL" \
             --direct-counts "${DIRECT_COUNTS:-false}" \
+            --review-result "$REVIEW_RESULT" \
+            --direct-result "${DIRECT_RESULT:-skipped}" \
             --out /tmp/panel.json \
             --github-output "$GITHUB_OUTPUT"
 
@@ -3519,6 +3535,9 @@ jobs:
         id: consolidated
         env:
           OK_COUNT: ${{ steps.aggregate.outputs.ok_count }}
+          # From the step output, not /tmp/panel.json: the judge ran in this job
+          # since `Aggregate panel findings` wrote it, and can rewrite the file.
+          PANEL_INCONSISTENT: ${{ steps.aggregate.outputs.panel_inconsistent }}
         run: |
           # If no cells completed, short-circuit — post-review.py will render
           # a "no contributors" review with the panel summary. Otherwise the
@@ -3579,7 +3598,10 @@ jobs:
                       seen.add(key)
                       findings.append(fnd)
 
-          consolidated = {"findings": findings, "panel": panel_meta}
+          # auto-approve withholds on it (a reviewer leg did not succeed
+          # although every panel cell reports ok).
+          panel_inconsistent = os.environ.get("PANEL_INCONSISTENT") == "true"
+          consolidated = {"findings": findings, "panel": panel_meta, "panel_inconsistent": panel_inconsistent}
           with open("/tmp/consolidated.json", "w", encoding="utf-8") as f:
               json.dump(consolidated, f)
 
@@ -4562,6 +4584,7 @@ jobs:
         env:
           OK_COUNT: ${{ needs.consolidate.outputs.ok_count }}
           TOTAL: ${{ needs.consolidate.outputs.total }}
+          PANEL_INCONSISTENT: ${{ needs.consolidate.outputs.panel_inconsistent }}
           DEGRADED: ${{ needs.consolidate.outputs.degraded }}
           JUDGE_STATUS: ${{ needs.consolidate.outputs.judge_status }}
           DELIVERED: ${{ needs.post-review.outputs.delivered }}
@@ -4651,6 +4674,13 @@ jobs:
             causes=$((causes + 1))
           elif [ "$OK_COUNT" != "$TOTAL" ]; then
             echo "::error::Panel incomplete: $(flatten "$OK_COUNT") of $(flatten "$TOTAL") reviewer cells submitted a review. The consolidated review was adjudicated over a short panel — see the red leg checks for which cells did not submit."
+            causes=$((causes + 1))
+          fi
+
+          # Separate from the counts: here they MATCH, and that is the problem.
+          # See aggregate-panel.py's leg-result cross-check.
+          if [ "$PANEL_INCONSISTENT" = "true" ]; then
+            echo "::error::A reviewer leg did not succeed although every findings artifact reads ok: an artifact under a cell's name was uploaded by something other than that cell, or its upload failed after the review. The panel count is untrusted; see the red leg checks."
             causes=$((causes + 1))
           fi
 
