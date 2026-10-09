@@ -47,7 +47,9 @@ unreadable on a yellow. `headline` must state what decided the verdict, and a
 missing one makes the axis untrusted. An over-long one is clamped to the cap at
 a word boundary with "…", not rejected: the model's length is not
 deterministic, and rejecting turned a sound verdict's axis job red on length
-alone. The opening words carry the reason, so the clamp keeps it.
+alone. The opening words carry the reason, so the clamp keeps it — falling
+back to a hard cut when the last fitting space is in the first half, and
+rejecting one that leaves nothing but punctuation before the "…".
 
 Placeholders — `{{pr_number}}`, `{{repo}}`, `{{head_sha}}`,
 `{{merge_base_sha}}`, `{{base_ref}}`, `{{context_file}}` — are filled by

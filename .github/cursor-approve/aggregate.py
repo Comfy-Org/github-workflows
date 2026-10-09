@@ -229,16 +229,21 @@ def validate_output(data):
 def clamp_headline(headline: str) -> str:
     """`headline` cut to HEADLINE_MAX characters, at a word boundary, with "…".
 
-    Falls back to a hard cut when the first HEADLINE_MAX - 1 characters hold no
-    space, so one long token still yields a bounded, non-empty line.
+    Falls back to a hard cut when the last space that fits sits in the first
+    half (one long token, or "Fix: <long path>"), so the clamp never throws
+    away most of the reason. Raises ValueError when nothing but separators
+    survives: a bare "…" is the reason-free row the headline exists to prevent.
     """
     if len(headline) <= HEADLINE_MAX:
         return headline
-    cut = headline[:HEADLINE_MAX - 1]
-    space = cut.rfind(" ")
-    if space > 0:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:-") + "…"
+    hard = headline[:HEADLINE_MAX - 1]
+    space = headline.rfind(" ", 0, HEADLINE_MAX)
+    candidates = [headline[:space], hard] if space >= HEADLINE_MAX // 2 else [hard]
+    for cut in candidates:
+        cut = cut.rstrip(" ,;:-")
+        if cut.strip(" ,;:-"):
+            return cut + "…"
+    raise ValueError("headline is over the limit and holds no reason to keep")
 
 
 def load_output(path: str, commit_sha: str = ""):

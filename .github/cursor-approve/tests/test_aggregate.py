@@ -635,7 +635,14 @@ class HeadlineTest(DecideCase):
     def test_the_clamp_cuts_at_a_word_boundary(self):
         headline = AG.clamp_headline("word " * 30)
         self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
-        self.assertEqual(headline, ("word " * 19).rstrip() + "…")
+        self.assertEqual(headline, ("word " * 20).rstrip() + "…")
+        self.assertEqual(len(headline), AG.HEADLINE_MAX)
+
+    def test_the_clamp_hard_cuts_when_the_only_space_is_early(self):
+        # "Fix…" would keep almost none of the reason.
+        long = "Fix: " + "x" * 200
+        headline = AG.clamp_headline(long)
+        self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
 
     def test_the_clamp_hard_cuts_one_long_token(self):
         headline = AG.clamp_headline("x" * (AG.HEADLINE_MAX * 2))
@@ -645,6 +652,21 @@ class HeadlineTest(DecideCase):
         headline = AG.clamp_headline("a" * 90 + ", " + "b" * 20)
         self.assertEqual(headline, "a" * 90 + "…")
 
+    def test_the_clamp_rejects_a_separator_only_headline(self):
+        for long in ("-" * 101, ";" * 150, ", " * 80):
+            with self.subTest(long=long[:10]):
+                with self.assertRaises(ValueError):
+                    AG.clamp_headline(long)
+
+    def test_a_separator_only_overlong_headline_is_untrusted(self):
+        self.write_all()
+        self.write("business", self.raw(headline="-" * 101))
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
+    def test_the_clamp_falls_back_when_the_word_cut_is_all_separators(self):
+        long = "-" * 60 + " " + "abc" * 20
+        headline = AG.clamp_headline(long)
+        self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
 
     def test_the_limit_itself_is_accepted(self):
         self.write_all()
