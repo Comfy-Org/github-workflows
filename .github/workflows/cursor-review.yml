@@ -470,10 +470,12 @@ on:
           cannot be set separately, which is what keeps the panel and its judge
           in step: each cell's JOB cap is this + 15 (checkout, CLI install,
           artifact up/download — overhead outside the agent step), the judge's
-          `Run judge` step cap is this x 2 (it reads EVERY cell's findings at the
-          same reasoning tier, so it needs more than any one of them), and the
-          judge's job cap is its step + 10. At the default that reproduces
-          today's 30 / 15 / 30 / 40 exactly. Bounded 5-45 by preflight, which
+          `Run judge` step cap is this x 2 but never below 30 (it reads EVERY
+          cell's findings at the same reasoning tier, so it needs more than any
+          one of them, and its workload scales with the panel, not with this
+          cap), and the judge's job cap is its step + 10. At the default that
+          reproduces today's 30 / 15 / 30 / 40 exactly. Bounded 10-45 by
+          preflight, which
           fails before any cell spends rather than letting a typo mint an
           hours-long job.
         type: number
@@ -2048,29 +2050,41 @@ jobs:
         #
         # Bounded rather than clamped, deliberately: silently correcting a
         # caller's 600 to 45 would review a long diff on a budget nobody chose
-        # and report success. The floor is 5 because a cell has never submitted
-        # faster than ~1 minute and the retry backoff alone spends 2; the
-        # ceiling is 45 because that is already a 100-minute judge job, and
-        # anything needing more is a diff-size problem, not a timeout problem.
+        # and report success. The floor is 10 because `Run cursor review`'s
+        # wrapper may start its last `resource_exhausted` retry as late as 300s
+        # in (`--retry-window 300`), and that attempt still needs room for a
+        # healthy 3-7 minute review; at 5 a retried cell was all but certain to
+        # hit the cap. The ceiling is 45 because that is already a 100-minute
+        # judge job, and anything needing more is a diff-size problem, not a
+        # timeout problem. The length check runs first because an all-digit
+        # value too long for a 64-bit integer makes `[ -lt ]` error, and an
+        # erroring test inside `if` reads as false, so it would pass.
         env:
           CELL_TIMEOUT: ${{ inputs.cell_timeout_minutes }}
         run: |
           set -euo pipefail
           case "$CELL_TIMEOUT" in
             ''|*[!0-9]*)
-              echo "::error::cell_timeout_minutes must be a whole number of minutes between 5 and 45; got '${CELL_TIMEOUT}'."
+              echo "::error::cell_timeout_minutes must be a whole number of minutes between 10 and 45; got '${CELL_TIMEOUT}'."
               exit 1
               ;;
           esac
-          if [ "$CELL_TIMEOUT" -lt 5 ] || [ "$CELL_TIMEOUT" -gt 45 ]; then
-            echo "::error::cell_timeout_minutes must be between 5 and 45; got ${CELL_TIMEOUT}. The judge's job cap is twice this plus 10, so the ceiling is what keeps a typo from minting an hours-long job."
+          if [ "${#CELL_TIMEOUT}" -gt 2 ] || [ "$CELL_TIMEOUT" -lt 10 ] || [ "$CELL_TIMEOUT" -gt 45 ]; then
+            echo "::error::cell_timeout_minutes must be between 10 and 45; got ${CELL_TIMEOUT}. The judge's job cap is twice this plus 10, so the ceiling is what keeps a typo from minting an hours-long job."
             exit 1
           fi
-          echo "::notice::Cell agent cap ${CELL_TIMEOUT}m; cell job $((CELL_TIMEOUT + 15))m; judge step $((CELL_TIMEOUT * 2))m; judge job $((CELL_TIMEOUT * 2 + 10))m."
+          # 10# forces base 10; a two-digit value with a leading zero is < 10
+          # and already rejected above, but this keeps "08" from reading as octal.
+          cell=$((10#$CELL_TIMEOUT))
+          judge_step=$((cell * 2))
+          # Never below 30: the judge's workload grows with the panel, not with
+          # the cell cap, so tightening cells to fail fast must not starve it.
+          if [ "$judge_step" -lt 30 ]; then judge_step=30; fi
+          echo "::notice::Cell agent cap ${cell}m; cell job $((cell + 15))m; judge step ${judge_step}m; judge job $((judge_step + 10))m."
           {
-            echo "cell_job=$((CELL_TIMEOUT + 15))"
-            echo "judge_step=$((CELL_TIMEOUT * 2))"
-            echo "judge_job=$((CELL_TIMEOUT * 2 + 10))"
+            echo "cell_job=$((cell + 15))"
+            echo "judge_step=${judge_step}"
+            echo "judge_job=$((judge_step + 10))"
           } >> "$GITHUB_OUTPUT"
 
       - name: Define panel models
@@ -2690,7 +2704,8 @@ jobs:
         # (~25s in, before recording anything) is re-run after 30s, then 90s.
         # Only a cell with no recorded findings is re-run, and no retry starts
         # later than 300s in, so the last attempt still has all but ~5 min of
-        # this cap for a full review — which is why the cap's floor is 5. Each retry is a `::warning::` naming the cell; a
+        # this cap for a full review — which is why the cap's floor is 10, not
+        # lower. Each retry is a `::warning::` naming the cell; a
         # cell that exhausts them fails its leg exactly as before. A retry
         # re-reads the whole prompt because the wrapper rewinds its stdin, so
         # keep feeding it as `< /tmp/prompt.txt`: a pipe cannot be rewound,
@@ -2907,9 +2922,9 @@ jobs:
     # failed Cursor cell.
     continue-on-error: ${{ needs.preflight.outputs.openai_direct_counts != 'true' }}
     # Matches the `review` job's cap so the judge's budget reasoning (see
-    # `review`) holds for this cell too; the agent step caps lower, at 15.
-    # DERIVED from `cell_timeout_minutes`, the same +15 as the Cursor cells
-    # above and for the same overhead; see that job's note.
+    # `review`) holds for this cell too; the agent step caps lower, at
+    # `cell_timeout_minutes`. DERIVED from that input, the same +15 as the
+    # Cursor cells above and for the same overhead; see that job's note.
     timeout-minutes: ${{ fromJSON(needs.preflight.outputs.cell_job_timeout) }}
     permissions:
       contents: read
@@ -3126,7 +3141,7 @@ jobs:
         continue-on-error: true
         # Capped well under the job so a hung agent trips the STEP and the
         # seeded artifact still uploads below, rather than tripping the job and
-        # discarding the cell. Same 15 minutes the Cursor cells get.
+        # discarding the cell. Same `cell_timeout_minutes` the Cursor cells get.
         timeout-minutes: ${{ inputs.cell_timeout_minutes }}
         env:
           MODEL: ${{ inputs.openai_direct_model }}
@@ -3312,7 +3327,8 @@ jobs:
     # which a panel cell does not all pay, so the judge's effective MODEL
     # budget is the step cap, not this one.
     #
-    # DERIVED from `cell_timeout_minutes` (step x 2, + 10 slack), so raising a
+    # DERIVED from `cell_timeout_minutes` (step = max(30, x 2), job = step
+    # + 10 slack), so raising a
     # cell's cap carries the judge with it instead of leaving it behind.
     timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_job_timeout) }}
     # contents: read ONLY. This job checks out PR-authored code and runs the
@@ -3576,18 +3592,21 @@ jobs:
         # Time-boxed BELOW the job cap and absorbed, so a hung judge loses only
         # the adjudication: the steps below then read the `--init` seed left by
         # `Configure structured final review` (status=error), take the degraded
-        # panel-union path and still post what the cells found. Equal to the
-        # `review` panel cap so the judge is never given less model time than
-        # one of the cells it reads. `continue-on-error` is what makes the
+        # panel-union path and still post what the cells found. At least the
+        # `review` job cap at the default (30) and always at least twice the
+        # cell step cap, so the judge is never given less model time than one of
+        # the cells it reads. `continue-on-error` is what makes the
         # timeout absorbable — without it the step failure fails the job and
         # lands back on the all-cells-discarded outcome this is fixing. It
         # hides no real signal: the cursor-agent exit code is already captured
         # in-script, and a judge that did not submit is reported to the PR as
         # `judge_status` by `Post review`.
         continue-on-error: true
-        # DERIVED: twice `cell_timeout_minutes`. The judge adjudicates EVERY
-        # cell's findings at the same reasoning tier, so a budget equal to one
-        # cell's is the floor, not the target.
+        # DERIVED: twice `cell_timeout_minutes`, never below 30. The judge
+        # adjudicates EVERY cell's findings at the same reasoning tier, so a
+        # budget equal to one cell's is the floor, not the target — and its
+        # workload scales with the panel, so a tightened cell cap must not
+        # shrink it below today's 30.
         timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_step_timeout) }}
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}

@@ -52,7 +52,12 @@ WORKFLOW = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "cursor-review.yml")
 )
 
-FLOOR, CEILING, DEFAULT = 5, 45, 15
+# The floor is 10, not lower: `Run cursor review` may start its last
+# `resource_exhausted` retry as late as `--retry-window 300` (5 min) in, and
+# that attempt still needs room for a healthy review.
+FLOOR, CEILING, DEFAULT = 10, 45, 15
+RETRY_WINDOW_S = 300
+JUDGE_STEP_FLOOR = 30
 
 # site -> the expression that must be there. `None` for the step sites means
 # "the bare input", spelled out per-site so a copy-paste between jobs fails.
@@ -104,8 +109,8 @@ def derive(cell):
     return {
         "cell_step": cell,
         "cell_job": cell + 15,
-        "judge_step": cell * 2,
-        "judge_job": cell * 2 + 10,
+        "judge_step": max(JUDGE_STEP_FLOOR, cell * 2),
+        "judge_job": max(JUDGE_STEP_FLOOR, cell * 2) + 10,
     }
 
 
@@ -229,6 +234,18 @@ class DerivationInvariants(unittest.TestCase):
                 self.assertGreater(d["judge_job"], d["judge_step"])
                 # The judge must never have less model budget than one cell.
                 self.assertGreaterEqual(d["judge_step"], d["cell_step"])
+                # ...nor less than today's, whatever the cell cap: its
+                # workload scales with the panel, not with the cell cap.
+                self.assertGreaterEqual(d["judge_step"], HISTORICAL["judge_step"])
+
+    def test_floor_leaves_a_late_retry_room_for_a_full_review(self):
+        # A retry can start as late as the retry window; the attempt it starts
+        # must still get at least as long as the window itself.
+        self.assertGreaterEqual(FLOOR * 60 - RETRY_WINDOW_S, RETRY_WINDOW_S)
+
+    def test_floor_constant_tracks_the_wrappers_retry_window(self):
+        step = step_block(job_block(text(), "review"), "Run cursor review")
+        self.assertIn("--retry-window %d " % RETRY_WINDOW_S, step)
 
 
 class PreflightBoundCheck(unittest.TestCase):
@@ -280,7 +297,7 @@ class PreflightBoundCheck(unittest.TestCase):
 
     def test_writes_the_derived_caps_the_jobs_consume(self):
         # These ARE the timeouts now; the notice above is only for humans.
-        for cell in (FLOOR, DEFAULT, CEILING):
+        for cell in (FLOOR, 14, DEFAULT, 16, CEILING):
             d = derive(cell)
             with self.subTest(cell=cell):
                 r = self.run_guard(cell)
@@ -299,7 +316,7 @@ class PreflightBoundCheck(unittest.TestCase):
                 self.assertEqual(self.run_guard(v).outputs, {})
 
     def test_rejects_out_of_range(self):
-        for v in (0, FLOOR - 1, CEILING + 1, 600):
+        for v in (0, 5, FLOOR - 1, CEILING + 1, 600, "015", "08"):
             with self.subTest(v=v):
                 r = self.run_guard(v)
                 self.assertEqual(r.returncode, 1, r.stdout)
@@ -312,6 +329,16 @@ class PreflightBoundCheck(unittest.TestCase):
                 r = self.run_guard(v)
                 self.assertEqual(r.returncode, 1, (v, r.stdout, r.stderr))
                 self.assertIn("::error::", r.stdout)
+
+    def test_rejects_digits_too_long_for_a_64_bit_integer(self):
+        # `[ -lt ]` errors on these, and an erroring test inside `if` reads as
+        # false, so without a length check both bounds would pass it.
+        for v in ("99999999999999999999", "0" * 30 + "15"):
+            with self.subTest(v=v):
+                r = self.run_guard(v)
+                self.assertEqual(r.returncode, 1, (v, r.stdout, r.stderr))
+                self.assertIn("::error::", r.stdout)
+                self.assertEqual(r.outputs, {})
 
     def test_the_guard_names_the_value_it_rejected(self):
         r = self.run_guard(600)
