@@ -44,8 +44,10 @@ first sentence of `summary`, and `summary` is where a model writes its process
 ("Checked the only changed file…", "I read root AGENTS.md and CLAUDE.md…") — so
 the card said what the axis *did* and never why it ruled as it did, which is
 unreadable on a yellow. `headline` must state what decided the verdict, and a
-missing or over-long one makes the axis untrusted rather than being truncated:
-truncating would reproduce the reason-free row one step later.
+missing one makes the axis untrusted. An over-long one is clamped to the cap at
+a word boundary with "…", not rejected: the model's length is not
+deterministic, and rejecting turned a sound verdict's axis job red on length
+alone. The opening words carry the reason, so the clamp keeps it.
 
 Placeholders — `{{pr_number}}`, `{{repo}}`, `{{head_sha}}`,
 `{{merge_base_sha}}`, `{{base_ref}}`, `{{context_file}}` — are filled by
@@ -66,7 +68,7 @@ aggregate.py decide --outputs-dir out/ [--axes design,correctness] [--max-yellow
 `{"event", "verdicts", "axes", "reasons"}`. In order:
 
 1. any expected axis missing, unparsable, with a verdict outside
-   red/yellow/green/n-a, a confidence outside 0..1, or a missing or over-long
+   red/yellow/green/n-a, a confidence outside 0..1, or a missing or empty
    `headline` → `NONE` — untrusted, so the approval is withheld; it is never a
    veto;
 2. any `red` → `NONE`, naming the red axes;
