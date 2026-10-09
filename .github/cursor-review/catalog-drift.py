@@ -133,7 +133,7 @@ _NO_ZDR = re.compile(r"no[\s_-]*zdr", re.IGNORECASE)
 # whole file) stops an unrelated `last checked` elsewhere in cursor-review.yml
 # from shadowing the real pin-adjacent date; the real-workflow test guards the
 # window from being too tight.
-LAST_CHECKED_WINDOW = 40
+LAST_CHECKED_WINDOW = 50
 
 # The reasoning/speed suffixes Cursor appends to a model family, and the ONE
 # place they are enumerated. Cursor ships a family at every reasoning tier and

@@ -304,14 +304,15 @@ class WorkflowJobIsolationTest(unittest.TestCase):
                                    "auto-retry"})
 
     def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
-        # `gate` only resolves a presence boolean; the cells are the one
-        # consumer, and they hold a model key beside a PR checkout, so they
-        # must stay GitHub-hosted.
+        # `gate` only resolves a presence boolean; the cells and the direct
+        # judge (`consolidate`) are the consumers, and they hold a model key
+        # beside a PR checkout, so they must be GitHub-hosted whenever they can
+        # hold it — pinned for `consolidate` in test_workflow_judge_direct.py.
         holders = {
             name for name, body in self.jobs.items()
             if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
         }
-        self.assertEqual(holders, {"gate", "review-anthropic-direct"})
+        self.assertEqual(holders, {"gate", "review-anthropic-direct", "consolidate"})
         runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
         self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
 
@@ -387,9 +388,17 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         for name in routed:
             body = self.jobs[name]
             self.assertFalse(references_bot_key(body), name)
+            # `consolidate` may also read ANTHROPIC_API_KEY, for the direct
+            # judge, ONLY because its runs-on leaves the pool whenever that key
+            # is passed (test_workflow_judge_direct.py executes that switch).
+            allowed = ("CURSOR_API_KEY", "ANTHROPIC_API_KEY") if name == "consolidate" else ("CURSOR_API_KEY",)
+            if name == "consolidate":
+                runs_on = next(l for l in body if l.startswith("    runs-on:"))
+                self.assertIn("needs.gate.outputs.anthropic_key_present == 'true'", runs_on)
+                self.assertIn("&& 'ubuntu-latest' ||", runs_on)
             self.assertFalse(
-                any("secrets." in l and "CURSOR_API_KEY" not in l for l in code_lines(body)),
-                f"job `{name}` follows runs_on but reads a secret other than CURSOR_API_KEY",
+                any("secrets." in l and not any(k in l for k in allowed) for l in code_lines(body)),
+                f"job `{name}` follows runs_on but reads a secret other than {', '.join(allowed)}",
             )
             for scope, value in sorted((job_permissions(body) or {"": "missing"}).items()):
                 self.assertIn(value, READ_ONLY_VALUES, f"`{name}` grants `{scope}: {value}`")
