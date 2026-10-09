@@ -79,9 +79,10 @@ The card shows ONE line per axis — the axis's `headline`, capped at 100
 characters and required, which has to state **what decided the verdict** rather
 than what the axis read. The full `summary` and the confidence are in the job
 summary behind the run link; the card is the glance, not the record. A missing
-or over-long headline makes that axis untrusted rather than being truncated,
-since a verdict with no reason beside it is the exact failure the field was
-added to fix.
+headline makes that axis untrusted, since a verdict with no reason beside it is
+the exact failure the field was added to fix. An over-long one is clamped to the
+cap at a word boundary with "…" rather than rejected, because the model's length
+is not deterministic; one with nothing but punctuation to keep is untrusted.
 
 ## The status card contract
 

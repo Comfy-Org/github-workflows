@@ -546,6 +546,19 @@ class ExtractCli(unittest.TestCase):
         with open(self.out, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["headline"], "Both branches handle an empty payload.")
 
+    def test_an_overlong_headline_is_clamped_in_the_artifact(self):
+        """The axis job's "Extract the verdict" step used to exit 1 here on a
+        headline a few characters over the cap, failing the whole axis job."""
+        long = "The handler " + "reads the payload twice " * 5 + "on the retry path."
+        self.assertGreater(len(long), AG.HEADLINE_MAX)
+        code, _, err = self.extract(json.dumps(
+            {"verdict": "green", "confidence": 1, "headline": long, "summary": "ok"}))
+        self.assertEqual(code, 0, err)
+        with open(self.out, encoding="utf-8") as f:
+            headline = json.load(f)["headline"]
+        self.assertEqual(headline, AG.clamp_headline(long))
+        self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
+
     def test_rejects_a_bad_commit_sha(self):
         code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok"}', sha="main")
         self.assertEqual(code, 1)
@@ -604,13 +617,56 @@ class HeadlineTest(DecideCase):
         self.write("business", self.raw(headline=["a"]))
         self.assertEqual(self.decide()["event"], AG.NONE)
 
-    def test_an_overlong_headline_is_rejected_not_truncated(self):
-        # Truncating would reintroduce the reason-free row one step later.
+    def test_an_overlong_headline_is_clamped_not_rejected(self):
+        # A sound verdict must not go untrusted because its reason ran long:
+        # the model's length is not deterministic, so the cap is enforced here.
         self.write_all()
-        self.write("business", self.raw(headline="x" * (AG.HEADLINE_MAX + 1)))
+        long = ("The new retry loop drops the context deadline on the second "
+                "attempt, so a cancelled request keeps retrying past its budget.")
+        self.assertGreater(len(long), AG.HEADLINE_MAX)
+        self.write("business", self.raw(headline=long))
         result = self.decide()
-        self.assertEqual(result["event"], AG.NONE)
-        self.assertIn(f"over the {AG.HEADLINE_MAX} limit", result["reasons"][0])
+        self.assertEqual(result["event"], AG.APPROVE)
+        headline = result["axes"]["business"]["headline"]
+        self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
+        self.assertTrue(headline.endswith("…"))
+        self.assertTrue(long.startswith(headline[:-1]))
+
+    def test_the_clamp_cuts_at_a_word_boundary(self):
+        headline = AG.clamp_headline("word " * 30)
+        self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
+        self.assertEqual(headline, ("word " * 20).rstrip() + "…")
+        self.assertEqual(len(headline), AG.HEADLINE_MAX)
+
+    def test_the_clamp_hard_cuts_when_the_only_space_is_early(self):
+        # "Fix…" would keep almost none of the reason.
+        long = "Fix: " + "x" * 200
+        headline = AG.clamp_headline(long)
+        self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
+
+    def test_the_clamp_hard_cuts_one_long_token(self):
+        headline = AG.clamp_headline("x" * (AG.HEADLINE_MAX * 2))
+        self.assertEqual(headline, "x" * (AG.HEADLINE_MAX - 1) + "…")
+
+    def test_the_clamp_drops_trailing_punctuation_before_the_ellipsis(self):
+        headline = AG.clamp_headline("a" * 90 + ", " + "b" * 20)
+        self.assertEqual(headline, "a" * 90 + "…")
+
+    def test_the_clamp_rejects_a_separator_only_headline(self):
+        for long in ("-" * 101, ";" * 150, ", " * 80):
+            with self.subTest(long=long[:10]):
+                with self.assertRaises(ValueError):
+                    AG.clamp_headline(long)
+
+    def test_a_separator_only_overlong_headline_is_untrusted(self):
+        self.write_all()
+        self.write("business", self.raw(headline="-" * 101))
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
+    def test_the_clamp_falls_back_when_the_word_cut_is_all_separators(self):
+        long = "-" * 60 + " " + "abc" * 20
+        headline = AG.clamp_headline(long)
+        self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
 
     def test_the_limit_itself_is_accepted(self):
         self.write_all()

@@ -24,7 +24,8 @@ Three subcommands, all pure — nothing here writes to GitHub:
 
     1. any expected axis missing, unparsable, with a verdict outside
        red/yellow/green/n/a, a confidence outside 0..1, a missing or
-       over-long ``headline``, or (with ``--commit-sha``)
+       empty ``headline`` (an over-long one is clamped to the cap, not
+       rejected), or (with ``--commit-sha``)
        a stamped commit other than that one → ``NONE`` (the round is
        untrusted: withhold the approval, never veto);
     2. any ``red`` → ``NONE``, naming the red axes;
@@ -214,16 +215,35 @@ def validate_output(data):
     # The headline is the ONLY part of this that reaches the PR, so it is
     # required rather than best-effort: an axis that does not write one leaves
     # the card with a verdict and no reason, which is the exact failure this
-    # field was added to fix. Truncating silently would do the same thing one
-    # step later, so an over-long one is rejected too.
+    # field was added to fix. An over-long one is clamped, not rejected: the
+    # model's word count is not deterministic, and failing a sound verdict
+    # because its reason ran a few words over turned the axis job red on
+    # length alone. The clamp keeps the opening words, which carry the reason.
     headline = data.get("headline")
     if not isinstance(headline, str) or not headline.strip():
         raise ValueError("headline is missing or empty")
-    headline = " ".join(headline.split())
-    if len(headline) > HEADLINE_MAX:
-        raise ValueError(
-            f"headline is {len(headline)} characters, over the {HEADLINE_MAX} limit")
+    headline = clamp_headline(" ".join(headline.split()))
     return verdict, confidence, summary, headline
+
+
+def clamp_headline(headline: str) -> str:
+    """`headline` cut to HEADLINE_MAX characters, at a word boundary, with "…".
+
+    Falls back to a hard cut when the last space that fits sits in the first
+    half (one long token, or "Fix: <long path>"), so the clamp never throws
+    away most of the reason. Raises ValueError when nothing but separators
+    survives: a bare "…" is the reason-free row the headline exists to prevent.
+    """
+    if len(headline) <= HEADLINE_MAX:
+        return headline
+    hard = headline[:HEADLINE_MAX - 1]
+    space = headline.rfind(" ", 0, HEADLINE_MAX)
+    candidates = [headline[:space], hard] if space >= HEADLINE_MAX // 2 else [hard]
+    for cut in candidates:
+        cut = cut.rstrip(" ,;:-")
+        if cut.strip(" ,;:-"):
+            return cut + "…"
+    raise ValueError("headline is over the limit and holds no reason to keep")
 
 
 def load_output(path: str, commit_sha: str = ""):
@@ -394,7 +414,9 @@ def cmd_extract(args) -> int:
         if len(data) > MAX_RAW_BYTES:
             raise ValueError(f"the reply is larger than {MAX_RAW_BYTES} bytes")
         obj = extract_object(data.decode("utf-8", errors="replace"))
-        validate_output(obj)
+        # The artifact carries the clamped headline, so what is uploaded is
+        # already within the cap rather than relying on decide to re-clamp it.
+        obj["headline"] = validate_output(obj)[3]
     except (OSError, ValueError) as e:
         print(f"::error::{e}", file=sys.stderr)
         return 1
