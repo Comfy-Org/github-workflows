@@ -455,6 +455,30 @@ on:
         type: number
         required: false
         default: 0
+      cell_timeout_minutes:
+        description: >-
+          Wall-clock cap, in minutes, on ONE reviewer cell's agent step —
+          `Run cursor review` for a Cursor cell, `Run direct-API review` for a
+          direct-OpenAI one. 15 (default) is the historical value, so an unset
+          input changes nothing. A cell that runs out of clock exits 130,
+          uploads `status: error` with no findings, fails its leg and so fails
+          `Panel integrity` — the cap is a guillotine, not a safety net, and
+          raising it is the only way to review a diff that honestly needs
+          longer. It is also the budget a cell's RETRIES share
+          (`resource_exhausted` is retried in-step), so it bounds attempts plus
+          backoff, not one attempt. Three further caps are DERIVED from this and
+          cannot be set separately, which is what keeps the panel and its judge
+          in step: each cell's JOB cap is this + 15 (checkout, CLI install,
+          artifact up/download — overhead outside the agent step), the judge's
+          `Run judge` step cap is this x 2 (it reads EVERY cell's findings at the
+          same reasoning tier, so it needs more than any one of them), and the
+          judge's job cap is its step + 10. At the default that reproduces
+          today's 30 / 15 / 30 / 40 exactly. Bounded 5-45 by preflight, which
+          fails before any cell spends rather than letting a typo mint an
+          hours-long job.
+        type: number
+        required: false
+        default: 15
       max_rounds:
         description: >-
           Cap on review rounds per PR. Before the panel starts, the run counts
@@ -2006,6 +2030,36 @@ jobs:
       # ('false') they stay advisory.
       openai_direct_counts: ${{ steps.models.outputs.openai_direct_counts }}
     steps:
+      - name: Validate the cell timeout
+        # FIRST, and before a single cell spends. `type: number` buys only
+        # numeric-ness: 0, -5 and 600 all parse. The three derived caps make a
+        # bad value worse than it looks — the judge's job cap is 2x + 10, so a
+        # typo'd 600 mints a 20-hour job and a 0 makes every cell fail
+        # instantly with no clue why. Neither is visible in a diff of this
+        # file, because the numbers are expressions now.
+        #
+        # Bounded rather than clamped, deliberately: silently correcting a
+        # caller's 600 to 45 would review a long diff on a budget nobody chose
+        # and report success. The floor is 5 because a cell has never submitted
+        # faster than ~1 minute and the retry backoff alone spends 2; the
+        # ceiling is 45 because that is already a 100-minute judge job, and
+        # anything needing more is a diff-size problem, not a timeout problem.
+        env:
+          CELL_TIMEOUT: ${{ inputs.cell_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          case "$CELL_TIMEOUT" in
+            ''|*[!0-9]*)
+              echo "::error::cell_timeout_minutes must be a whole number of minutes between 5 and 45; got '${CELL_TIMEOUT}'."
+              exit 1
+              ;;
+          esac
+          if [ "$CELL_TIMEOUT" -lt 5 ] || [ "$CELL_TIMEOUT" -gt 45 ]; then
+            echo "::error::cell_timeout_minutes must be between 5 and 45; got ${CELL_TIMEOUT}. The judge's job cap is twice this plus 10, so the ceiling is what keeps a typo from minting an hours-long job."
+            exit 1
+          fi
+          echo "::notice::Cell agent cap ${CELL_TIMEOUT}m; cell job $((CELL_TIMEOUT + 15))m; judge step $((CELL_TIMEOUT * 2))m; judge job $((CELL_TIMEOUT * 2 + 10))m."
+
       - name: Define panel models
         id: models
         # Single source of truth for the per-lab model pins. The `review`
@@ -2322,14 +2376,17 @@ jobs:
     needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
-    # COUPLED to `consolidate` below — bump this and you must bump those too.
-    # The judge reads all of this panel's artifacts at the same reasoning
-    # tier, so it needs at least a cell's budget: its `Run judge` step cap
-    # tracks THIS number, and its job cap sits above the step so a hung judge
-    # trips the step (degraded fallback still posts) rather than the job (all
-    # panel cells discarded). Letting this cap outgrow them recreates exactly
-    # the silent skew that fix was for.
-    timeout-minutes: 30
+    # DERIVED from `cell_timeout_minutes`, and deliberately not settable alone.
+    # This coupling used to be a comment telling the next editor to bump three
+    # other numbers by hand: the judge reads all of this panel's artifacts at
+    # the same reasoning tier, so it needs at least a cell's budget, and its job
+    # cap must sit above its step cap so a hung judge trips the step (degraded
+    # fallback still posts) rather than the job (all panel cells discarded). A
+    # cell cap that outgrew them recreated exactly the silent skew that fix was
+    # for — so the arithmetic lives in the workflow now, where it cannot be
+    # half-applied. The +15 is this job's non-agent overhead: checkout, CLI
+    # install, artifact download and upload, none of which the step cap covers.
+    timeout-minutes: ${{ inputs.cell_timeout_minutes + 15 }}
     permissions:
       contents: read
     strategy:
@@ -2587,15 +2644,16 @@ jobs:
           echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
 
       - name: Run cursor review
-        # Step cap, absorbed by continue-on-error (same idiom as the judge
-        # step): healthy cells finish in 3-7 min and every cell's p90 is under
-        # 12 min, but a stalled agent — almost always one that never reaches
-        # its MCP submission — used to run to the 30-min JOB timeout, which
-        # GitHub reports as a cancelled job and a cancelled run, and stretched
-        # the whole review to 35+ min. Killing the step instead leaves the
-        # pre-seeded status=error artifact for the judge to count as a
-        # non-contributing cell, exactly what the job timeout produced, but
-        # 15 minutes sooner and without CANCELLING the run.
+        # Step cap (`cell_timeout_minutes`, default 15), absorbed by
+        # continue-on-error (same idiom as the judge step): healthy cells finish
+        # in 3-7 min and every cell's p90 is under 12 min, but a stalled agent —
+        # almost always one that never reaches its MCP submission — used to run
+        # to the JOB timeout, which GitHub reports as a cancelled job and a
+        # cancelled run, and stretched the whole review past it. Killing the
+        # step instead leaves the pre-seeded status=error artifact for the judge
+        # to count as a non-contributing cell, exactly what the job timeout
+        # produced, but a cap earlier and without CANCELLING the run. The job
+        # cap is derived as this + 15, so that ordering holds at every value.
         #
         # The cap is what this `continue-on-error` absorbs, and that is all it
         # absorbs: the LEG is not green on this path. `Fail the leg when the
@@ -2618,14 +2676,14 @@ jobs:
         # agent that exits non-zero with `RetriableError: [resource_exhausted]`
         # (~25s in, before recording anything) is re-run after 30s, then 90s.
         # Only a cell with no recorded findings is re-run, and no retry starts
-        # later than 300s in, so the last attempt still has ~10 min of this cap
-        # for a full review. Each retry is a `::warning::` naming the cell; a
+        # later than 300s in, so the last attempt still has all but ~5 min of
+        # this cap for a full review — which is why the cap's floor is 5. Each retry is a `::warning::` naming the cell; a
         # cell that exhausts them fails its leg exactly as before. A retry
         # re-reads the whole prompt because the wrapper rewinds its stdin, so
         # keep feeding it as `< /tmp/prompt.txt`: a pipe cannot be rewound,
         # and turns the retries off.
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: ${{ inputs.cell_timeout_minutes }}
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           MODEL: ${{ matrix.model }}
@@ -2837,7 +2895,9 @@ jobs:
     continue-on-error: ${{ needs.preflight.outputs.openai_direct_counts != 'true' }}
     # Matches the `review` job's cap so the judge's budget reasoning (see
     # `review`) holds for this cell too; the agent step caps lower, at 15.
-    timeout-minutes: 30
+    # DERIVED from `cell_timeout_minutes`, the same +15 as the Cursor cells
+    # above and for the same overhead; see that job's note.
+    timeout-minutes: ${{ inputs.cell_timeout_minutes + 15 }}
     permissions:
       contents: read
     strategy:
@@ -3054,7 +3114,7 @@ jobs:
         # Capped well under the job so a hung agent trips the STEP and the
         # seeded artifact still uploads below, rather than tripping the job and
         # discarding the cell. Same 15 minutes the Cursor cells get.
-        timeout-minutes: 15
+        timeout-minutes: ${{ inputs.cell_timeout_minutes }}
         env:
           MODEL: ${{ inputs.openai_direct_model }}
           REVIEW_TYPE: ${{ matrix.review_type }}
@@ -3238,7 +3298,10 @@ jobs:
     # checkout, the CLI install, three artifact downloads and the upload —
     # which a panel cell does not all pay, so the judge's effective MODEL
     # budget is the step cap, not this one.
-    timeout-minutes: 40
+    #
+    # DERIVED from `cell_timeout_minutes` (step x 2, + 10 slack), so raising a
+    # cell's cap carries the judge with it instead of leaving it behind.
+    timeout-minutes: ${{ inputs.cell_timeout_minutes * 2 + 10 }}
     # contents: read ONLY. This job checks out PR-authored code and runs the
     # judge agent over it, so it must carry nothing write-scoped — `post-review`
     # below holds pull-requests: write and the bot credentials instead.
@@ -3509,7 +3572,10 @@ jobs:
         # in-script, and a judge that did not submit is reported to the PR as
         # `judge_status` by `Post review`.
         continue-on-error: true
-        timeout-minutes: 30
+        # DERIVED: twice `cell_timeout_minutes`. The judge adjudicates EVERY
+        # cell's findings at the same reasoning tier, so a budget equal to one
+        # cell's is the floor, not the target.
+        timeout-minutes: ${{ inputs.cell_timeout_minutes * 2 }}
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
