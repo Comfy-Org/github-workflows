@@ -97,7 +97,9 @@ class SubmittedTest(unittest.TestCase):
         self.assertFalse(stop_on_submit.submitted(self.path))
 
 
-class WrapperTest(unittest.TestCase):
+class AgentHarness(unittest.TestCase):
+    """Runs the real wrapper over a stub agent; holds no tests of its own."""
+
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.dir.name, "findings.json")
@@ -134,10 +136,12 @@ class WrapperTest(unittest.TestCase):
             """)
         return [sys.executable, "-c", prelude + textwrap.dedent(body)]
 
-    def wrap(self, body, *, cap=None, extra=TIMINGS):
+    def wrap(self, body, *, cap=None, extra=TIMINGS, stdin=None, stdout=None):
         return subprocess.Popen(
             [sys.executable, SCRIPT, "--findings", self.path, *extra, "--",
              *self.agent(body)],
+            stdin=stdin,
+            stdout=stdout,
             stderr=subprocess.PIPE,
             text=True,
         )
@@ -170,6 +174,7 @@ class WrapperTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"pid {pid} is still running")
 
+class WrapperTest(AgentHarness):
     def test_ok_cell_is_stopped_early_and_findings_are_untouched(self):
         proc = self.wrap(f"""\
             write({json.dumps(json.dumps(OK))})
@@ -307,6 +312,24 @@ class WrapperTest(unittest.TestCase):
         for pid in self.pids():
             self.assert_gone(pid)
 
+    def test_signal_while_stderr_drains_is_reported_as_signalled(self):
+        # A process that escaped the agent's group keeps its stderr open, so
+        # the wrapper is still draining it after the agent exited 0; the step
+        # cap landing then must end the wrapper at once, reported as a signal.
+        proc = self.wrap("""\
+            kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                                   start_new_session=True)
+            record_pid(kid.pid)
+            sys.exit(0)
+            """)
+        self.wait_for_pids(2)
+        time.sleep(1)  # the agent has exited; the wrapper is draining its stderr
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        code, err, _ = self.finish(proc, cap=10)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertLess(time.monotonic() - started, 2, "signal waited out the drain")
+
     def test_agent_that_exits_on_its_own_leaves_nothing_behind(self):
         # A grandchild still in the agent's group could rewrite findings.json
         # after the upload; the wrapper reaps the group on this path too.
@@ -339,6 +362,281 @@ class WrapperTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+SEEDED = {"status": "error", "error": "x", "findings": [], "model": "m",
+          "review_type": "adversarial"}
+EXHAUSTED = "RetriableError: [resource_exhausted] Error"
+RETRY = ["--retry-delays", "0.2,0.4", "--retry-window", "30",
+         "--cell", "adversarial/kimi-k3-high"]
+# A multi-line prompt about the size of a real diff review (~120 KB).
+PROMPT = b"Review this diff.\n" + b"+an added line\n" * 8192
+# What cursor-agent prints, then exits 1, when its stdin is empty.
+NO_PROMPT = "Error: No prompt provided for print mode"
+
+
+class RetryTest(AgentHarness):
+    """A non-zero exit carrying Cursor's retriable marker re-runs the agent.
+
+    The wrapper's stdin is the prompt, a regular file, as the workflow feeds
+    it (`< /tmp/prompt.txt`): a retry rewinds it, and a stdin that cannot seek
+    rules the retry out. Feeding it explicitly also keeps these tests off the
+    test runner's own stdin, which is a pipe on a GitHub runner.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with open(self.path, "w") as f:
+            json.dump(SEEDED, f)
+        self.prompt = os.path.join(self.dir.name, "prompt.txt")
+        with open(self.prompt, "wb") as f:
+            f.write(PROMPT)
+
+    def prompt_file(self, offset=0):
+        """The prompt opened for the wrapper's stdin, positioned at `offset`."""
+        source = open(self.prompt, "rb", buffering=0)
+        self.addCleanup(source.close)
+        source.seek(offset)
+        return source
+
+    def stub(self, attempt_body):
+        """An agent that counts its runs; `attempt_body` sees ATTEMPT (1-based)."""
+        return (f"ATTEMPT = len(open({self.pidfile!r}).read().split())\n"
+                + textwrap.dedent(attempt_body))
+
+    def reading(self, attempt_body):
+        """A stub that first reads its whole stdin, as cursor-agent does, keeps
+        a copy per attempt, and fails like cursor-agent when it is empty."""
+        return textwrap.dedent(f"""\
+            PROMPT_READ = sys.stdin.buffer.read()
+            with open(os.path.join({self.dir.name!r}, f"prompt-{{ATTEMPT}}"), "wb") as f:
+                f.write(PROMPT_READ)
+            if not PROMPT_READ:
+                print({NO_PROMPT!r}, file=sys.stderr)
+                sys.exit(1)
+            """) + textwrap.dedent(attempt_body)
+
+    def prompts_read(self):
+        """What each attempt of a `reading` stub read from its stdin, in order."""
+        reads = []
+        for attempt in range(1, len(self.pids()) + 1):
+            with open(os.path.join(self.dir.name, f"prompt-{attempt}"), "rb") as f:
+                reads.append(f.read())
+        return reads
+
+    def retry(self, attempt_body, extra=None, stdin=None):
+        proc = self.wrap(self.stub(attempt_body), extra=TIMINGS + (extra or RETRY),
+                         stdin=self.prompt_file() if stdin is None else stdin)
+        return self.finish(proc, cap=20)
+
+    def test_resource_exhausted_then_success_is_retried(self):
+        code, err, _ = self.retry(f"""\
+            if ATTEMPT == 1:
+                print({EXHAUSTED!r}, file=sys.stderr)
+                sys.exit(1)
+            write({json.dumps(json.dumps(OK))})
+            sys.exit(0)
+            """)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.pids()), 2)
+        warnings = [l for l in err.splitlines() if l.startswith("::warning::")]
+        self.assertEqual(warnings, [
+            "::warning::Reviewer cell adversarial/kimi-k3-high: attempt 1/3 failed "
+            "with Cursor's retriable error [resource_exhausted] (exit 1); retrying in 0.2s"])
+        # The agent's own stderr still reaches the wrapper's, unchanged, and
+        # one that already ended its line gets no blank line before the warning.
+        self.assertIn(EXHAUSTED + "\n::warning::", err)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f)["status"], "ok")
+
+    def test_every_retry_reads_the_whole_prompt_again(self):
+        # Each attempt inherits the same stdin, offset included, and the first
+        # reads it to EOF: without a rewind every retry would get an empty
+        # prompt and fail at once, so a retry could never recover a cell.
+        code, err, _ = self.retry(self.reading(f"""\
+            if ATTEMPT < 3:
+                print({EXHAUSTED!r}, file=sys.stderr)
+                sys.exit(1)
+            write({json.dumps(json.dumps(OK))})
+            """))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(NO_PROMPT, err)
+        self.assertEqual(self.prompts_read(), [PROMPT] * 3)
+
+    def test_the_prompt_is_replayed_from_where_stdin_started(self):
+        # The rewind goes back to the offset stdin had when the wrapper
+        # started, not to the start of the file.
+        start = len(b"Review this diff.\n")
+        code, err, _ = self.retry(self.reading(f"""\
+            if ATTEMPT == 1:
+                print({EXHAUSTED!r}, file=sys.stderr)
+                sys.exit(1)
+            write({json.dumps(json.dumps(OK))})
+            """), stdin=self.prompt_file(start))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.prompts_read(), [PROMPT[start:]] * 2)
+
+    def test_a_stdin_that_cannot_seek_rules_the_retry_out(self):
+        # A pipe cannot be replayed, so a retry could only run on an empty
+        # prompt: the first failure stands, and the wrapper logs why, once.
+        prompt = PROMPT[:1024]  # fits the pipe buffer, so the write cannot block
+        read_end, write_end = os.pipe()
+        os.write(write_end, prompt)
+        os.close(write_end)
+        try:
+            code, err, _ = self.retry(self.reading(f"""\
+                print({EXHAUSTED!r}, file=sys.stderr)
+                sys.exit(1)
+                """), stdin=read_end)
+        finally:
+            os.close(read_end)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(self.prompts_read(), [prompt])
+        self.assertNotIn("::warning::", err)
+        self.assertEqual(err.count("cannot be rewound to replay the prompt"), 1, err)
+        self.assertIn("not retrying", err)
+
+    def test_the_warning_starts_a_line_after_an_unterminated_stderr(self):
+        # The runner only parses `::warning::` at the start of a line; an agent
+        # whose last stderr write has no newline must not swallow it.
+        code, err, _ = self.retry(f"""\
+            if ATTEMPT == 1:
+                sys.stderr.write({EXHAUSTED!r})
+                sys.exit(1)
+            write({json.dumps(json.dumps(OK))})
+            """)
+        self.assertEqual(code, 0, err)
+        self.assertIn(EXHAUSTED + "\n::warning::Reviewer cell adversarial/kimi-k3-high: "
+                      "attempt 1/3 failed", err)
+
+    def test_marker_on_stdout_is_not_retried_and_stdout_passes_through(self):
+        # stdout is the model's own text, which the PR under review can steer;
+        # only the agent's stderr may call for a retry.
+        proc = self.wrap(self.stub(f"""\
+            print("out-" + str(ATTEMPT))
+            print({EXHAUSTED!r})
+            sys.exit(1)
+            """), extra=TIMINGS + RETRY, stdin=self.prompt_file(),
+            stdout=subprocess.PIPE)
+        out, err = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 1, err)
+        self.assertEqual(out, "out-1\n" + EXHAUSTED + "\n")
+        self.assertEqual(len(self.pids()), 1)
+        self.assertNotIn("::warning::", err)
+        self.assertNotIn("not retrying", err)
+
+    def test_persistent_resource_exhausted_exhausts_retries(self):
+        code, err, took = self.retry(f"""\
+            print({EXHAUSTED!r}, file=sys.stderr)
+            sys.exit(1)
+            """)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.pids()), 3)
+        warnings = [l for l in err.splitlines() if l.startswith("::warning::")]
+        self.assertEqual(len(warnings), 2, err)
+        self.assertIn("attempt 2/3", warnings[1])
+        self.assertIn("retrying in 0.4s", warnings[1])
+        self.assertGreaterEqual(took, 0.6)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f), SEEDED)
+
+    def test_other_errors_are_not_retried(self):
+        code, err, _ = self.retry("""\
+            print("Error: invalid model", file=sys.stderr)
+            sys.exit(1)
+            """)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.pids()), 1)
+        self.assertNotIn("::warning::", err)
+
+    def test_marker_with_exit_zero_or_signal_death_is_not_retried(self):
+        for ending, expected in (("sys.exit(0)", 0),
+                                 ("os.kill(os.getpid(), signal.SIGKILL)", 128 + 9)):
+            with self.subTest(ending=ending):
+                open(self.pidfile, "w").close()
+                code, err, _ = self.retry(f"""\
+                    print({EXHAUSTED!r}, file=sys.stderr, flush=True)
+                    {ending}
+                    """)
+                self.assertEqual(code, expected, err)
+                self.assertEqual(len(self.pids()), 1)
+                self.assertNotIn("::warning::", err)
+
+    def test_no_retry_without_retry_delays(self):
+        code, err, _ = self.retry(f"""\
+            print({EXHAUSTED!r}, file=sys.stderr)
+            sys.exit(1)
+            """, extra=["--cell", "a/b"])
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.pids()), 1)
+
+    def test_submitted_or_partially_recorded_cells_are_never_rerun(self):
+        records = (
+            OK,
+            {"status": "error", "findings": [{"file": "a.py", "line": 1}]},
+            "not json",
+        )
+        for record in records:
+            with self.subTest(record=record):
+                open(self.pidfile, "w").close()
+                text = record if isinstance(record, str) else json.dumps(record)
+                code, err, _ = self.retry(f"""\
+                    write({text!r})
+                    print({EXHAUSTED!r}, file=sys.stderr)
+                    sys.exit(1)
+                    """)
+                self.assertEqual(code, 1, err)
+                self.assertEqual(len(self.pids()), 1)
+                self.assertNotIn("::warning::", err)
+
+    def test_retry_that_would_start_past_the_window_is_skipped(self):
+        code, err, _ = self.retry(f"""\
+            print({EXHAUSTED!r}, file=sys.stderr)
+            sys.exit(1)
+            """, extra=["--retry-delays", "5", "--retry-window", "1", "--cell", "a/b"])
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.pids()), 1)
+        self.assertIn("retry window", err)
+
+    def test_signal_during_backoff_ends_the_wrapper_without_retrying(self):
+        # The step cap landing mid-backoff: no further attempt may start.
+        proc = self.wrap(self.stub(f"""\
+            print({EXHAUSTED!r}, file=sys.stderr)
+            sys.exit(1)
+            """), extra=TIMINGS + ["--retry-delays", "30", "--retry-window", "60"],
+            stdin=self.prompt_file())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (
+                os.path.exists(self.pidfile) and self.pids()):
+            time.sleep(0.05)
+        time.sleep(1)  # the stub exits at once; the wrapper is now backing off
+        proc.send_signal(signal.SIGTERM)
+        code, err, _ = self.finish(proc, cap=5)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertIn("::warning::", err)
+        self.assertIn("during the retry backoff", err)
+        self.assertEqual(len(self.pids()), 1)
+
+    def test_cell_label_is_sanitized_in_the_warning(self):
+        code, err, _ = self.retry(f"""\
+            if ATTEMPT == 1:
+                print({EXHAUSTED!r}, file=sys.stderr)
+                sys.exit(1)
+            write({json.dumps(json.dumps(OK))})
+            """, extra=["--retry-delays", "0", "--retry-window", "30",
+                        "--cell", "a/b\n::error::x"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("::warning::Reviewer cell a/b___error__x:", err)
+        self.assertNotIn("\n::error::", err)
+
+    def test_bad_retry_delays_are_a_usage_error(self):
+        for value in ("x", "-1", "nan"):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    [sys.executable, SCRIPT, "--findings", self.path,
+                     "--retry-delays", value, "--", "true"],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+
+
 class WorkflowWiringTest(unittest.TestCase):
     def test_run_step_wraps_the_reviewer_agent(self):
         workflow = os.path.normpath(os.path.join(
@@ -356,6 +654,14 @@ class WorkflowWiringTest(unittest.TestCase):
             self.assertIn(f"trap 'forward_signal {sig}' {sig}", step)
         self.assertLess(step.index("trap 'forward_signal TERM'"), step.index("stop-on-submit.py\""))
         self.assertIn("timeout-minutes: 15", step)
+        # Transient Cursor capacity errors are retried, named per cell.
+        self.assertIn("--retry-delays 30,90", step)
+        self.assertIn('--cell "$REVIEW_TYPE/$MODEL"', step)
+        self.assertIn("REVIEW_TYPE: ${{ matrix.review_type }}", step)
+        # A retry replays the prompt by rewinding the wrapper's stdin, so the
+        # prompt must arrive as a file redirect: a pipe cannot be rewound, and
+        # would turn every retry off.
+        self.assertIn("< /tmp/prompt.txt \\\n", step)
 
 
 if __name__ == "__main__":

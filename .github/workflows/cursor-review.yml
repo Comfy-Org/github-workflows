@@ -2593,11 +2593,23 @@ jobs:
         # artifact is byte-for-byte what the MCP tool wrote; it exits 0 on that
         # path, and a cell that never reaches `status: ok` is not stopped, so
         # it still runs to this cap and fails its leg exactly as before.
+        #
+        # The wrapper also retries Cursor's own transient capacity error: an
+        # agent that exits non-zero with `RetriableError: [resource_exhausted]`
+        # (~25s in, before recording anything) is re-run after 30s, then 90s.
+        # Only a cell with no recorded findings is re-run, and no retry starts
+        # later than 300s in, so the last attempt still has ~10 min of this cap
+        # for a full review. Each retry is a `::warning::` naming the cell; a
+        # cell that exhausts them fails its leg exactly as before. A retry
+        # re-reads the whole prompt because the wrapper rewinds its stdin, so
+        # keep feeding it as `< /tmp/prompt.txt`: a pipe cannot be rewound,
+        # and turns the retries off.
         continue-on-error: true
         timeout-minutes: 15
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           MODEL: ${{ matrix.model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
         run: |
           # --sandbox is intentionally omitted. The hosted runner is already
           # an ephemeral VM — and a `runs_on` pool must be one too: one job per
@@ -2629,6 +2641,8 @@ jobs:
           trap 'forward_signal TERM' TERM
           trap 'forward_signal HUP' HUP
           python3 "$CURSOR_REVIEW_ASSETS/stop-on-submit.py" \
+            --retry-delays 30,90 --retry-window 300 \
+            --cell "$REVIEW_TYPE/$MODEL" \
             --findings /tmp/findings-out/findings.json -- \
             cursor-agent \
               --print \

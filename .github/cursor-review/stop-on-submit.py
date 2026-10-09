@@ -22,28 +22,56 @@ What it deliberately does NOT do:
     exiting by itself and an exception here, ends with SIGKILL to the group,
     so nothing the agent left running can rewrite the findings afterwards.
 
+Retry on a transient Cursor capacity error (`--retry-delays`): when the agent
+exits non-zero by itself and the tail of its stderr carries Cursor's retriable
+marker (`[resource_exhausted]` or `RetriableError`), the agent is run again
+after the next delay, up to one retry per delay. Only stderr is matched: stdout
+is the model's own text, which the PR under review can steer. A retry happens
+only when the findings file still reads as an untouched, unsubmitted record — a
+parseable object, status not "ok", and NO recorded findings — because the MCP
+tool appends to that file, so re-running a cell that already recorded findings
+would duplicate them. It is also skipped once `--retry-window` seconds
+(measured from the wrapper's start, including the delay) would be exceeded, so
+a retry starts only while a full review still fits inside the step cap.
+Anything else — exit 0, a different error, death by signal, a forwarded signal
+(the step cap) — is reported exactly as without retries. Each retry prints one
+`::warning::` line, on a line of its own, naming the `--cell`, the attempt and
+the matched marker. The agent's stdout is inherited untouched; its stderr still
+reaches this wrapper's stderr unchanged, only teed through here so its tail can
+be matched.
+
+The prompt is the agent's stdin (`< /tmp/prompt.txt`), one open file whose
+offset every attempt shares, and the first attempt reads it to EOF. So the
+offset stdin has at startup is recorded, and stdin is put back there before
+every retry; without that, the retry would read an empty prompt and fail at
+once. A stdin that cannot seek (a pipe, a tty) cannot be replayed, so it rules
+the retry out, and the wrapper logs why.
+
 A SIGINT/SIGTERM/SIGHUP to this wrapper (the step cap, a run cancel) is passed
 to the agent's group; the agent then gets at most 5 seconds before SIGKILL —
 inside the runner's own SIGINT -> SIGTERM -> kill escalation — and the wrapper
 exits 128+signal whatever the agent's own status was.
 
-Exit status: the agent's own exit code when it exits by itself (before or
-after submitting); 0 when this wrapper stopped it after a verified submission;
-128+signal when a forwarded signal ended it.
+Exit status: the (last attempt's) agent's own exit code when it exits by
+itself (before or after submitting); 0 when this wrapper stopped it after a
+verified submission; 128+signal when a forwarded signal ended it.
 Status lines go to stderr with a `stop-on-submit:` prefix.
 
 Usage:
-  stop-on-submit.py --findings /tmp/findings-out/findings.json -- cursor-agent ...
+  stop-on-submit.py --findings /tmp/findings-out/findings.json \
+    [--retry-delays 30,90 --cell adversarial/model] -- cursor-agent ...
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -56,14 +84,28 @@ MAX_FINDINGS_BYTES = 8 * 1024 * 1024
 SIGNAL_GRACE = 5.0
 # How often a wait re-checks for a forwarded signal.
 WAIT_SLICE = 0.1
+# Cursor's own label for a transient capacity error, e.g.
+# `RetriableError: [resource_exhausted] Error`. Matched on raw bytes; the
+# warning names only the fixed marker, never agent-printed text.
+# The specific code is preferred over the generic class when both appear.
+RETRIABLE = (
+    ("resource_exhausted", re.compile(rb"\[resource_exhausted\]")),
+    ("RetriableError", re.compile(rb"\bRetriableError\b")),
+)
+# How much of the end of the agent's stderr is kept for the match. The marker
+# is the last thing a failed run prints.
+TAIL_BYTES = 64 * 1024
+# How long to wait for stderr to drain after the agent's group is killed.
+# Bounded so a stray process that escaped the group cannot hang the wrapper.
+DRAIN_TIMEOUT = 5.0
 
 
 def log(message):
     print(f"stop-on-submit: {message}", file=sys.stderr, flush=True)
 
 
-def submitted(path):
-    """True only for a complete, parseable JSON object with status == "ok".
+def read_findings(path):
+    """The findings record as a dict, or None for anything that is not one.
 
     The file is agent-writable (the agent runs `--trust` with a shell), so
     every failure mode reads as "not submitted" rather than raising or
@@ -76,18 +118,133 @@ def submitted(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
-        return False
+        return None
     try:
         with open(fd, "rb") as source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                return False
+                return None
             data = source.read(MAX_FINDINGS_BYTES + 1)
         if len(data) > MAX_FINDINGS_BYTES:
-            return False
+            return None
         record = json.loads(data.decode("utf-8"))
     except (OSError, ValueError, RecursionError, MemoryError):
-        return False
-    return isinstance(record, dict) and record.get("status") == "ok"
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def submitted(path):
+    """True only for a complete, parseable JSON object with status == "ok"."""
+    record = read_findings(path)
+    return record is not None and record.get("status") == "ok"
+
+
+def retry_safe(path):
+    """True only for an unsubmitted record with no findings recorded yet.
+
+    review-output-mcp.py appends each recorded finding to the file, so a re-run
+    on top of a partial review would duplicate findings; and an unreadable file
+    is not known to be untouched. Both are left to fail as they always did.
+    """
+    record = read_findings(path)
+    return (record is not None and record.get("status") != "ok"
+            and record.get("findings") == [])
+
+
+class Tee:
+    """Copy a child's pipe to `sink_fd` unchanged, keeping its last TAIL_BYTES."""
+
+    def __init__(self, source, sink_fd):
+        self.source = source
+        self.sink_fd = sink_fd
+        self.tail = b""
+        self.thread = threading.Thread(target=self.pump, daemon=True)
+        self.thread.start()
+
+    def pump(self):
+        fd = self.source.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.tail = (self.tail + chunk)[-TAIL_BYTES:]
+            view = memoryview(chunk)
+            while view:
+                try:
+                    view = view[os.write(self.sink_fd, view):]
+                except OSError:
+                    break
+
+    def drain(self, interrupted=lambda: False):
+        """The kept tail, once the pipe hits EOF, DRAIN_TIMEOUT passes, or
+        `interrupted()` turns true — a forwarded signal must not wait it out."""
+        deadline = time.monotonic() + DRAIN_TIMEOUT
+        while self.thread.is_alive() and not interrupted():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.thread.join(min(WAIT_SLICE, remaining))
+        return self.tail
+
+
+def retriable_marker(stderr_tail):
+    """The fixed marker name Cursor's retriable error carries, or None.
+
+    Only the agent's stderr is searched, never its stdout: that is the model's
+    own output, which text in the PR under review can steer.
+    """
+    for name, pattern in RETRIABLE:
+        if pattern.search(stderr_tail):
+            return name
+    return None
+
+
+def fresh_line(stderr_tail):
+    """A newline when the agent's stderr ended mid-line, else nothing.
+
+    The agent's stderr is copied into the wrapper's, and its last write may
+    lack a newline; a `::warning::` glued onto it is not a workflow command
+    (the runner only parses one at the start of a line).
+    """
+    return "" if not stderr_tail or stderr_tail.endswith(b"\n") else "\n"
+
+
+class Prompt:
+    """The agent's stdin, put back where it started before each retry.
+
+    Every attempt inherits the same open stdin, offset included, and the first
+    one reads it to EOF, so a retry left alone reads an empty prompt (and
+    cursor-agent fails at once with "No prompt provided for print mode"). The
+    offset is recorded before the first attempt; a stdin that cannot seek — a
+    pipe, a tty, a closed descriptor — cannot be replayed, and `problem` says
+    why.
+    """
+
+    def __init__(self, fd=0):
+        self.fd = fd
+        self.problem = None
+        try:
+            self.offset = os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError as exc:
+            self.offset, self.problem = None, exc.strerror or repr(exc)
+
+    def rewind(self):
+        """True once stdin is back at the offset it had at startup."""
+        if self.offset is None:
+            return False
+        try:
+            os.lseek(self.fd, self.offset, os.SEEK_SET)
+        except OSError as exc:
+            self.problem = exc.strerror or repr(exc)
+            return False
+        return True
+
+
+def safe_label(text):
+    """A ::warning:: -safe rendering of a caller-supplied cell label."""
+    return re.sub(r"[^A-Za-z0-9._/@+-]", "_", text)[:200]
 
 
 def signal_group(pgid, signum):
@@ -109,33 +266,92 @@ def wait(child, timeout, interrupted=lambda: False):
                 return None
 
 
-def run(command, findings, poll, linger, grace):
+def run(command, findings, poll, linger, grace,
+        retry_delays=(), retry_window=0.0, cell="cell"):
     received = []
-    child = None
+    current = [None]
+    started = time.monotonic()
+    # Recorded before the first attempt can move the shared offset.
+    prompt = Prompt()
 
     # The step cap and a run cancel signal THIS process; pass them on, so a cell
     # that never submits still dies at the cap exactly as it did unwrapped.
     # Installed BEFORE the spawn, so no signal can kill the wrapper in between
-    # and orphan the agent; one landing before `child` is set is forwarded by
-    # stop_on_signal instead.
+    # and orphan the agent; one landing before a child is set is forwarded by
+    # stop_on_signal instead, and one landing during a retry backoff ends the
+    # wrapper before the next attempt starts.
     def forward(signum, _frame):
         received.append(signum)
-        if child is not None:
-            signal_group(child.pid, signum)
+        if current[0] is not None:
+            signal_group(current[0].pid, signum)
 
     for signum in FORWARDED_SIGNALS:
         signal.signal(signum, forward)
 
+    attempts = len(retry_delays) + 1
+    for attempt in range(1, attempts + 1):
+        code, stderr_tail = attempt_once(
+            command, findings, poll, linger, grace, received, current)
+        # A signal that lands after the agent exited — while its stderr drains
+        # — still ends the wrapper as signalled, whatever the agent returned.
+        if received:
+            return -received[0]
+        marker = retriable_marker(stderr_tail)
+        if attempt == attempts or code <= 0 or marker is None:
+            return code
+        # Everything printed below follows the agent's own stderr, whose last
+        # write may lack a newline; the `::warning::` must start a line.
+        print(fresh_line(stderr_tail), end="", file=sys.stderr, flush=True)
+        if not retry_safe(findings):
+            log(f"agent exited {code} with [{marker}], but findings were already "
+                "recorded or the file is unreadable; not retrying")
+            return code
+        delay = retry_delays[attempt - 1]
+        if time.monotonic() - started + delay > retry_window:
+            log(f"agent exited {code} with [{marker}], but a retry after {delay:g}s "
+                f"would start past the {retry_window:g}s retry window; not retrying")
+            return code
+        # Nothing reads stdin between here and the next attempt: the agent's
+        # whole group is dead, and this wrapper never reads it.
+        if not prompt.rewind():
+            log(f"agent exited {code} with [{marker}], but its stdin cannot be "
+                f"rewound to replay the prompt ({prompt.problem}); not retrying")
+            return code
+        print(f"::warning::Reviewer cell {safe_label(cell)}: attempt {attempt}/"
+              f"{attempts} failed with Cursor's retriable error [{marker}] "
+              f"(exit {code}); retrying in {delay:g}s",
+              file=sys.stderr, flush=True)
+        deadline = time.monotonic() + delay
+        while not received and time.monotonic() < deadline:
+            time.sleep(min(WAIT_SLICE, max(0.0, deadline - time.monotonic())))
+        if received:
+            log(f"received signal {received[0]} during the retry backoff; not retrying")
+            return -received[0]
+    raise AssertionError("unreachable")
+
+
+def attempt_once(command, findings, poll, linger, grace, received, current):
+    """Run the agent once: (its status, the last TAIL_BYTES of its stderr)."""
     # Own process group, so a stop reaches cursor-agent's children too (the
     # MCP server, any shell it spawned) — not just the top-level process.
-    child = subprocess.Popen(command, start_new_session=True)
+    # stdin and stdout are inherited as they are. stderr is piped through here
+    # only so a retriable error can be recognised; every byte is copied on to
+    # this wrapper's own stderr.
+    child = subprocess.Popen(command, start_new_session=True,
+                             stderr=subprocess.PIPE)
+    current[0] = child
+    tee = Tee(child.stderr, sys.stderr.fileno())
     try:
-        return supervise(child, findings, poll, linger, grace, received)
+        code = supervise(child, findings, poll, linger, grace, received)
     finally:
         # Every path out — the agent exiting by itself, a stop, an exception
         # here: nothing left in the agent's group may outlive the wrapper and
         # rewrite the findings after the upload and leg check read them.
         signal_group(child.pid, signal.SIGKILL)
+        current[0] = None
+    stderr_tail = tee.drain(lambda: bool(received))
+    child.stderr.close()
+    return code, stderr_tail
 
 
 def stop_on_signal(child, signum, grace):
@@ -197,6 +413,14 @@ def main(argv=None):
     parser.add_argument("--poll", type=float, default=5.0)
     parser.add_argument("--linger", type=float, default=15.0)
     parser.add_argument("--grace", type=float, default=10.0)
+    parser.add_argument("--retry-delays", default="",
+                        help="comma-separated backoff seconds, one retry each "
+                             "(default: none, never retry)")
+    parser.add_argument("--retry-window", type=float, default=300.0,
+                        help="no retry may start later than this many seconds "
+                             "after the wrapper started")
+    parser.add_argument("--cell", default="cell",
+                        help="<review_type>/<model>, named in the retry warning")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -206,7 +430,16 @@ def main(argv=None):
         value = getattr(args, name)
         if not (math.isfinite(value) and value > 0):
             parser.error(f"--{name} must be a positive finite number")
-    code = run(command, args.findings, args.poll, args.linger, args.grace)
+    try:
+        delays = tuple(float(d) for d in args.retry_delays.split(",") if d.strip())
+    except ValueError:
+        parser.error("--retry-delays must be comma-separated numbers")
+    if not all(math.isfinite(d) and d >= 0 for d in delays):
+        parser.error("--retry-delays must be non-negative finite numbers")
+    if not (math.isfinite(args.retry_window) and args.retry_window >= 0):
+        parser.error("--retry-window must be a non-negative finite number")
+    code = run(command, args.findings, args.poll, args.linger, args.grace,
+               delays, args.retry_window, args.cell)
     # A signal death reads as the shell would report it (143 for SIGTERM), not
     # as Python's negative returncode wrapped mod 256.
     return 128 - code if code < 0 else code
