@@ -322,8 +322,9 @@ on:
           Cursor model gets. The Anthropic twin of `openai_direct_model`, with
           the same rules: empty (default) = the job is skipped and nothing
           changes; requires the `ANTHROPIC_API_KEY` secret and a plain id
-          (`[A-Za-z0-9._-]`), and set without either, preflight warns, the
-          cells stay off and the panel is unchanged. Unlike the OpenAI cells,
+          (`[A-Za-z0-9._-]`) other than `openai_direct_model`'s, and set
+          without any of those, preflight warns, the cells stay off and the
+          panel is unchanged. Unlike the OpenAI cells,
           which see the diff only, the agent also reads a read-only checkout of
           the PR with Read, Grep and Glob alone — no Bash or other
           code-running tool — and `--restricted` confines those file tools to
@@ -2329,7 +2330,12 @@ jobs:
           # exactly as it would be without the opt-in.
           openai_direct=false
           if [ -n "$(printf '%s' "${OPENAI_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
-            if ! printf '%s' "$OPENAI_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
+            # `grep -x` matches line by line, so a multi-line value would pass
+            # on any one clean line; refuse every whitespace character (a
+            # newline included, which a grep could not see) first.
+            case "$OPENAI_DIRECT_MODEL" in *[[:space:]]*) openai_ws=true ;; *) openai_ws=false ;; esac
+            if [ "$openai_ws" = "true" ] \
+               || ! printf '%s' "$OPENAI_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
               echo "::warning::openai_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API cell is off for this run and the panel is unchanged."
             elif [ "${OPENAI_KEY_PRESENT:-false}" != "true" ]; then
               echo "::warning::openai_direct_model is set but the OPENAI_API_KEY secret did not reach this workflow, so the direct-API cell is off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
@@ -2364,10 +2370,22 @@ jobs:
           # never touched — the judge stays on Cursor.
           anthropic_direct=false
           if [ -n "$(printf '%s' "${ANTHROPIC_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
-            if ! printf '%s' "$ANTHROPIC_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
+            # `grep -x` matches line by line, so a multi-line value would pass
+            # on any one clean line; refuse every whitespace character (a
+            # newline included, which a grep could not see) first.
+            case "$ANTHROPIC_DIRECT_MODEL" in *[[:space:]]*) anthropic_ws=true ;; *) anthropic_ws=false ;; esac
+            if [ "$anthropic_ws" = "true" ] \
+               || ! printf '%s' "$ANTHROPIC_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
               echo "::warning::anthropic_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API Anthropic cells are off for this run and the panel is unchanged."
             elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
               echo "::warning::anthropic_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
+            elif [ "$openai_direct" = "true" ] \
+                 && [ "$(printf '%s' "$ANTHROPIC_DIRECT_MODEL" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$OPENAI_DIRECT_MODEL" | tr 'A-Z' 'a-z')" ]; then
+              # Both direct jobs name their artifact findings-direct-<type>-<id>,
+              # so one id in both lanes collides (one upload fails) and the
+              # aggregator, which assigns by model id, credits every record to
+              # the OpenAI lab.
+              echo "::warning::anthropic_direct_model is the same id as openai_direct_model, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Give each lane its own lab's model id."
             else
               anthropic_direct=true
             fi
@@ -3547,10 +3565,12 @@ jobs:
           persist-credentials: false
 
       - name: Checkout PR repo
-        # The read-only tree the agent's file tools read: the default ref, so
-        # the same commit the Cursor cells review. No credential persisted.
+        # The read-only tree the agent's file tools read: the PR head, the
+        # RIGHT side of the reviewed diff (the default merge ref would mix in
+        # base-only changes and shift line numbers). No credential persisted.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           path: _pr
           fetch-depth: 1
           persist-credentials: false
@@ -3687,7 +3707,10 @@ jobs:
           # A fresh, empty config dir under RUNNER_TEMP, as CODEX_HOME is.
           CLAUDE_CONFIG_DIR="$(mktemp -d -p "$RUNNER_TEMP")"
           export CLAUDE_CONFIG_DIR
-          python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+          # `-I` on every python3 here: the cwd is the PR checkout, and a stdin
+          # script puts '' (the cwd) first on sys.path, so a PR-planted json.py
+          # would run with ANTHROPIC_API_KEY in its env. Isolated mode drops it.
+          python3 -I "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
             --mode reviewer \
             --out /tmp/findings-out/findings.json \
             --model "$MODEL" \
@@ -3697,11 +3720,12 @@ jobs:
           # only MCP server (`--strict-mcp-config`). The agent's tools are
           # Read, Grep and Glob, confined to this checkout by `--restricted`,
           # plus the two submission calls.
-          mcp_config="$(python3 - <<'PY'
+          mcp_config="$(python3 -I - <<'PY'
           import json, os
           print(json.dumps({"mcpServers": {"cursor-review-output": {
               "command": "python3",
               "args": [
+                  "-I",
                   os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
                   "--mode", "reviewer",
                   "--out", "/tmp/findings-out/findings.json",
