@@ -10,10 +10,11 @@ rewrite the check).
 - **`check_agents_md.py`** — the check. Operates on a repo tree and exits
   non-zero (with GitHub annotations) when any hard check fails. Enforces the
   Comfy `AGENTS.md` standard ("AGENTS.md, done right", Comfy Engineering Guide
-  §10): a thin top-level `AGENTS.md` source of truth under a hard line ceiling,
-  a one-line `@AGENTS.md` `CLAUDE.md` shim, no divergent `.cursorrules`,
+  §10): a thin top-level `AGENTS.md` source of truth under a hard line ceiling
+  and character limits (root and nested), a one-line `@AGENTS.md` `CLAUDE.md` shim, no divergent `.cursorrules`,
   per-subtree shims in monorepos, and a CODEOWNERS DRI. Inputs come from env
-  vars (`MAX_LINES`, `WARN_LINES`, `FORBID_CURSORRULES`, `CHECK_NESTED`,
+  vars (`MAX_LINES`, `WARN_LINES`, `MAX_CHARS`, `WARN_CHARS`,
+  `MAX_LINE_CHARS`, `FORBID_CURSORRULES`, `CHECK_NESTED`, `REQUIRE_SHIM`,
   `REQUIRE_CODEOWNERS`, `AGENTS_FILE`) plus the `--exclude` flag; see the
   workflow header for the mapping.
 - **`tests/`** — `unittest` suite, run by
@@ -71,3 +72,28 @@ with:
   to nothing (`/`, `.`, `//`) and a glob made only of wildcard segments (`*`,
   `**`, `*/**`, `*/*`) — the latter would otherwise prune every top-level
   directory while `check_nested` still read `true`. Name the subtree.
+
+## Character limits (`max_chars` / `warn_chars` / `max_line_chars`)
+
+The line ceiling does not bound size: a paragraph is one line, so a file can sit
+at 111 lines and still carry 200k+ characters, all of it auto-loaded into every
+session through the `@AGENTS.md` shim. Three limits close that, applied to the
+root file **and** every nested one the walk finds:
+
+| Env / input | Default | Over it |
+|---|---|---|
+| `MAX_CHARS` / `max_chars` | `0` (off) | **fails** |
+| `WARN_CHARS` / `warn_chars` | `25000` | warns |
+| `MAX_LINE_CHARS` / `max_line_chars` | `3000` | warns |
+
+`0` turns a limit off. A value that is not a whole number (`40k`, `40000.5`)
+is a config error (exit 2), never a silent fallback — falling back would turn
+the default-off hard ceiling off. The hard ceiling defaults off so a caller
+bumping its pin never goes red on the bump; `40000` is the suggested value,
+matching the size at which Claude Code starts warning about an oversized memory
+file. Characters are decoded characters, newlines included (a CRLF counts as
+two); lines split on CRLF / LF / CR only, so `L<n>` matches an editor. Every
+finding names the file, its size (with a chars/4 token estimate) and its
+longest lines, and points at the remedy: move rationale into `docs/agents/` and
+leave a one-line pointer — a plain link, not an `@` import, which Claude Code
+would still expand at session start.

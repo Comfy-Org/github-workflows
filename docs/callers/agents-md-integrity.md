@@ -8,6 +8,11 @@ Checks that your repo follows the org's agent-instructions standard:
 
 - a top-level `AGENTS.md` **exists** and stays under a hard line ceiling
   (`max_lines`, default 200; warns over `warn_lines`, default 150)
+- every agents file, root and nested, stays within **character** limits — a
+  paragraph is one line, so a 111-line file can still carry 200k chars. A file
+  over `warn_chars` (default 25000) or with any line over `max_line_chars`
+  (default 3000) warns; `max_chars` (default off) turns total size into a
+  failure. Each finding names the file, its size and its longest lines.
 - a root `CLAUDE.md` **exists** and is a thin `@AGENTS.md` shim rather than a
   divergent copy. With the default `require_shim: true`, a repo that has
   `AGENTS.md` and *no* `CLAUDE.md` **fails** — Claude Code reads only `CLAUDE.md`
@@ -61,6 +66,9 @@ contents: read
 |---|---|---|
 | `max_lines` | `200` | Hard ceiling. Over this fails. |
 | `warn_lines` | `150` | Warns without failing. |
+| `max_chars` | `0` | Hard ceiling on each agents file's total characters (root and nested). Over this fails. `0` = off, so a pin bump never turns you red; `40000` matches Claude Code's oversized-memory-file floor. |
+| `warn_chars` | `25000` | Total-character target per agents file. Warns without failing. `0` = off. |
+| `max_line_chars` | `3000` | Per-line character ceiling. A longer line (a paragraph kept on one line) warns without failing. `0` = off. |
 | `forbid_cursorrules` | `true` | Fail on a legacy `.cursorrules`. |
 | `check_nested` | `true` | Also check nested monorepo `AGENTS.md` files. |
 | `exclude_paths` | `''` | Newline- or comma-separated path globs carved out of the **nested** scan (e.g. `plugins/**`, for a repo that ships agent instructions as distributable payload). Excluded subtrees are never scanned, and every exclusion is reported in the run log. A glob that would match the root agents file or `CLAUDE.md`, or whose every segment is exactly `*` or `**`, is rejected — the root pair is never excludable. That second check is literal, not semantic: a wildcard-equivalent spelling like `?*/?*` is not caught by it, and would silently exclude every nested path while leaving `check_nested: true` green. Name the subtree (`plugins/**`); do not get clever. |
@@ -84,6 +92,13 @@ and makes `CLAUDE.md` a two-line pointer. This repo's own is the reference:
 **Adopt on `pull_request` before adding it as a required check.** An existing repo
 with a 400-line `AGENTS.md` fails immediately; you want that visible on a PR, not
 blocking the queue.
+
+**Character limits are warn-first.** Read the warnings after a pin bump; once
+every agents file is under `warn_chars`, set `max_chars: 40000` to make the
+ceiling stick. The fix for an oversized file is the same whether it is long or
+wide: move rationale into `docs/agents/` and leave a one-line pointer (a
+plain link — an `@` import is still expanded at session start). A limit that
+is not a whole number fails the run with exit 2 rather than switching off.
 
 **`check_nested: true` on a large monorepo** can surface a lot at once. Land the
 top-level fix first, then switch it on.

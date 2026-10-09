@@ -6,7 +6,10 @@ top-level `AGENTS.md` is the single source of truth, `CLAUDE.md` is a REQUIRED
 one-line `@AGENTS.md` shim (optionally with a few Claude-only lines below —
 Claude Code reads only CLAUDE.md and does not fall back), there are no
 divergent `.cursorrules`, and the file stays under a hard line ceiling (200,
-per Anthropic guidance) with an aspirational target (150). In a monorepo every
+per Anthropic guidance) with an aspirational target (150). Lines alone do not
+bound size — a paragraph is one line — so total and per-line CHARACTER limits
+apply too (env MAX_CHARS / WARN_CHARS / MAX_LINE_CHARS; the hard character
+ceiling is off unless set, the other two only warn). In a monorepo every
 nested `AGENTS.md` gets a sibling `CLAUDE.md` shim so Claude Code picks it up in
 that subtree, and the file is owned by a DRI via CODEOWNERS.
 
@@ -22,7 +25,8 @@ nested check everywhere else. Exclusions are always echoed to the log, and a
 glob that would exclude the ROOT agents file or `CLAUDE.md` is rejected: root
 compliance is the non-negotiable part of the standard.
 
-Exit codes: 0 pass, 1 one or more checks failed, 2 bad `--exclude` config.
+Exit codes: 0 pass, 1 one or more checks failed, 2 bad config (an `--exclude`
+glob, or a character limit that is not a whole number).
 
 Run locally:
     python3 .github/agents-md-integrity/check_agents_md.py --root .
@@ -31,6 +35,7 @@ Run locally:
 """
 
 import argparse
+import heapq
 import os
 import re
 import sys
@@ -65,6 +70,10 @@ SKIP_DIRS = frozenset(
 
 class ExcludeConfigError(Exception):
     """An `--exclude` glob is not usable (today: it would exclude the root)."""
+
+
+class LimitConfigError(Exception):
+    """A character-limit env value is set but is not a whole number."""
 
 
 def _split_patterns(values):
@@ -191,10 +200,114 @@ def _validate_excludes(excludes, agents_file):
                 )
 
 
-def _count_lines(path):
-    """Line count of a text file (a trailing newline doesn't add a phantom line)."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return len(f.read().splitlines())
+# How many over-limit lines a size finding names. Enough to point at the
+# offending paragraphs without turning one annotation into a wall.
+LONGEST_LINES_SHOWN = 3
+
+# The remedy every character finding points at. A file can stay under the line
+# ceiling while carrying unbounded text (a paragraph is one line), and the fix
+# is the same either way: rationale belongs in docs the agent reads on demand.
+SIZE_REMEDY = (
+    "Move rationale into docs/agents/ and leave a one-line pointer in its "
+    "place (a plain link, not an @ import, which still loads at session start)."
+)
+
+
+def _measure(path):
+    """(lines, chars, line_lengths) of a text file.
+
+    `chars` counts decoded characters (newlines included), the unit Claude
+    Code's oversized-memory-file warning is expressed in. `line_lengths`
+    excludes the line terminator. `newline=""` turns off universal-newline
+    translation, so each CRLF counts as the two characters it is on disk —
+    otherwise a CRLF file reads one char short per line and slips under the
+    ceiling. Lines split on CRLF / LF / CR only — not `splitlines()`, which
+    also breaks on `\f`, NEL, U+2028 and friends, so it would let a pasted
+    paragraph carrying U+2028 slip under `max_line_chars` in pieces and make
+    the `L<n>` numbers drift from what an editor shows.
+    """
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        text = f.read()
+    lines = re.split(r"\r\n|[\r\n]", text)
+    if lines[-1] == "":
+        lines.pop()  # a trailing newline doesn't add a phantom line
+    lengths = [len(line) for line in lines]
+    return len(lengths), len(text), lengths
+
+
+def _longest_lines(lengths, floor=0):
+    """Describe the longest lines over `floor`, longest first, as `L12 (89015 chars)`."""
+    ranked = heapq.nsmallest(
+        LONGEST_LINES_SHOWN,
+        ((-n, i + 1) for i, n in enumerate(lengths) if n > floor),
+    )
+    return ", ".join(f"L{ln} ({-n} chars)" for n, ln in ranked)
+
+
+def _size_findings(label, path, config, nested):
+    """Line + character ceilings for one agents file -> (failures, warnings).
+
+    `label` is how the file is named in messages (`'AGENTS.md'` or
+    `nested 'pkg/AGENTS.md'`). The line checks are exactly the pre-existing
+    ones: root fails over `max_lines` and warns over `warn_lines`; nested fails
+    over `max_lines` only. The character checks apply identically to both. A
+    character limit of 0 (or less) is OFF.
+    """
+    failures = []
+    warnings = []
+    max_lines = config["max_lines"]
+    warn_lines = config["warn_lines"]
+    max_chars = config.get("max_chars", 0)
+    warn_chars = config.get("warn_chars", 0)
+    max_line_chars = config.get("max_line_chars", 0)
+
+    n, chars, lengths = _measure(path)
+    if n > max_lines:
+        if nested:
+            failures.append(
+                f"{label} is {n} lines, over the hard ceiling of {max_lines}."
+            )
+        else:
+            failures.append(
+                f"{label} is {n} lines, over the hard ceiling of "
+                f"{max_lines}. Trim it — AGENTS.md must stay thin."
+            )
+    elif not nested and n > warn_lines:
+        warnings.append(
+            f"{label} is {n} lines, over the aspirational target "
+            f"of {warn_lines} (hard ceiling {max_lines})."
+        )
+
+    def longest():
+        # Name the over-long lines when there are any (they are the likely
+        # culprit), else just the longest few. Only built when a finding fires.
+        return (
+            max_line_chars > 0 and _longest_lines(lengths, max_line_chars)
+        ) or _longest_lines(lengths)
+
+    size = f"{chars} chars (~{chars // 4} est. tokens) across {n} lines"
+    if max_chars > 0 and chars > max_chars:
+        failures.append(
+            f"{label} is {size}, over the hard character ceiling of "
+            f"{max_chars}. Longest lines: {longest()}. {SIZE_REMEDY}"
+        )
+    elif warn_chars > 0 and chars > warn_chars:
+        ceiling = f"hard ceiling {max_chars}" if max_chars > 0 else "no hard ceiling set"
+        warnings.append(
+            f"{label} is {size}, over the character target of {warn_chars} "
+            f"({ceiling}). Longest lines: {longest()}. {SIZE_REMEDY}"
+        )
+
+    if max_line_chars > 0:
+        over = [x for x in lengths if x > max_line_chars]
+        if over:
+            warnings.append(
+                f"{label} has {len(over)} line(s) over the per-line ceiling of "
+                f"{max_line_chars} chars — a paragraph kept on one line slips "
+                f"past the line count. Longest: "
+                f"{_longest_lines(lengths, max_line_chars)}. {SIZE_REMEDY}"
+            )
+    return failures, warnings
 
 
 def _has_import(path, import_token):
@@ -328,8 +441,6 @@ def run_checks(root, config):
     agents_file = config["agents_file"]
     agents_basename = os.path.basename(agents_file)
     import_token = "@" + agents_basename
-    max_lines = config["max_lines"]
-    warn_lines = config["warn_lines"]
 
     # Validated unconditionally — a root-excluding glob is a config error even
     # when `check_nested` is off and the globs would never have been consulted.
@@ -357,18 +468,10 @@ def run_checks(root, config):
         # anchor on, but CODEOWNERS/cursorrules are still worth reporting, so
         # keep going rather than returning early.
     else:
-        # 2. Line ceiling (+ aspirational warn).
-        n = _count_lines(agents_path)
-        if n > max_lines:
-            failures.append(
-                f"'{agents_file}' is {n} lines, over the hard ceiling of "
-                f"{max_lines}. Trim it — AGENTS.md must stay thin."
-            )
-        elif n > warn_lines:
-            warnings.append(
-                f"'{agents_file}' is {n} lines, over the aspirational target "
-                f"of {warn_lines} (hard ceiling {max_lines})."
-            )
+        # 2. Line + character ceilings (+ aspirational warns).
+        f, w = _size_findings(f"'{agents_file}'", agents_path, config, nested=False)
+        failures.extend(f)
+        warnings.extend(w)
 
     # 3. CLAUDE.md shim. Claude Code reads only CLAUDE.md and does NOT fall
     # back to AGENTS.md, so a missing root shim means the repo's instructions
@@ -419,12 +522,9 @@ def run_checks(root, config):
                     f"'{import_token}', so Claude Code won't pick it up in that "
                     f"subtree. Add a one-line shim next to it."
                 )
-            n = _count_lines(nested_path)
-            if n > max_lines:
-                failures.append(
-                    f"nested '{rel}' is {n} lines, over the hard ceiling of "
-                    f"{max_lines}."
-                )
+            f, w = _size_findings(f"nested '{rel}'", nested_path, config, nested=True)
+            failures.extend(f)
+            warnings.extend(w)
 
     # 6. CODEOWNERS / DRI (warn unless require_codeowners).
     checked, owned = _codeowners_owns(root, agents_file)
@@ -462,6 +562,34 @@ def _env_int(name, default):
         return int(val)
     except ValueError:
         return default
+
+
+def _env_limit(name, default):
+    """A character limit from the env; unset/empty -> `default`.
+
+    Stricter than `_env_int`: the hard ceiling defaults to 0 (OFF), so falling
+    back on a value that won't parse (`40k`, `40000.5`) would silently switch
+    off the very ceiling the caller asked for. A whole number in float form
+    (`40000.0`, which a `type: number` input may render as) is accepted;
+    anything else raises LimitConfigError (exit 2).
+    """
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        num = float(val)
+    except ValueError:
+        num = None
+    if num is not None and num.is_integer():
+        return int(num)
+    raise LimitConfigError(
+        f"{name}={val!r} is not a whole number of characters. Set an integer "
+        f"(0 turns the limit off)."
+    )
 
 
 def _esc_cmd(text):
@@ -535,10 +663,27 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    try:
+        char_limits = {
+            # Character limits: 0 is OFF. The hard ceiling defaults OFF so a
+            # caller bumping its pin never goes red on the bump; the two
+            # warn-only limits default ON.
+            "max_chars": _env_limit("MAX_CHARS", 0),
+            "warn_chars": _env_limit("WARN_CHARS", 25000),
+            "max_line_chars": _env_limit("MAX_LINE_CHARS", 3000),
+        }
+    except LimitConfigError as exc:
+        msg = _esc_cmd(exc)
+        print(f"FAIL: {msg}")
+        print(f"::error::AGENTS.md integrity: {msg}")
+        print("\nResult: invalid character-limit configuration.")
+        return 2
+
     config = {
         "agents_file": os.environ.get("AGENTS_FILE", "AGENTS.md") or "AGENTS.md",
         "max_lines": _env_int("MAX_LINES", 200),
         "warn_lines": _env_int("WARN_LINES", 150),
+        **char_limits,
         "forbid_cursorrules": _env_bool("FORBID_CURSORRULES", True),
         "check_nested": _env_bool("CHECK_NESTED", True),
         "require_shim": _env_bool("REQUIRE_SHIM", True),
