@@ -315,6 +315,21 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
         self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
 
+    def test_the_anthropic_cells_load_no_pr_authored_claude_config(self):
+        # `claude` runs with the PR checkout as cwd, so PR-authored
+        # `.claude/settings*.json` or `.mcp.json` could re-point the API key at
+        # another host. Pin both halves: no setting source is loaded, and the
+        # files are removed from the checkout before the agent runs.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        invocations = [l for l in body if "claude -p" in l]
+        self.assertEqual(len(invocations), 1, invocations)
+        for flag in ("--bare", "--restricted", '--setting-sources ""'):
+            self.assertIn(flag, invocations[0])
+        self.assertTrue(
+            any("rm -rf" in l and "_pr/.claude" in l and "_pr/.mcp.json" in l for l in body),
+            "review-anthropic-direct no longer removes the PR's .claude/ and .mcp.json",
+        )
+
     def test_only_credential_free_jobs_follow_the_runs_on_input(self):
         # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected
         # model cell may have run. Anything holding the bot key, a write scope,

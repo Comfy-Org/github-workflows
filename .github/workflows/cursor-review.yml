@@ -3580,6 +3580,15 @@ jobs:
         # tree (e.g. to the runner's home), so none survive into the review.
         run: find _pr -type l -delete
 
+      - name: Remove PR-authored Claude config
+        # The Cursor cells' `rm -rf .cursor`, for this CLI: `_pr` is claude's
+        # cwd, so a PR-planted `.claude/settings*.json` (env such as
+        # ANTHROPIC_BASE_URL, hooks, extra directories) or `.mcp.json` must
+        # never be there to load. `--restricted` and `--setting-sources ""`
+        # already ignore them; this removes them outright. CLAUDE.md stays —
+        # `--bare` skips its auto-discovery, and it is ordinary review context.
+        run: rm -rf _pr/.claude _pr/.mcp.json _pr/CLAUDE.local.md
+
       - name: Download reviewed diff
         # Built once in the diff-size job (generated files already excluded),
         # shared here, so this cell needs no PR checkout of its own.
@@ -3737,7 +3746,7 @@ jobs:
           )"
           # The result JSON goes to a file that is never echoed: the run log
           # is public and the result is model output steered by PR text.
-          claude -p --bare --restricted \
+          claude -p --bare --restricted --setting-sources "" \
             --tools "Read,Grep,Glob" \
             --strict-mcp-config --mcp-config "$mcp_config" \
             --allowedTools "Read,Grep,Glob,mcp__cursor-review-output__cursor_review_record_finding,mcp__cursor-review-output__cursor_review_finish" \
