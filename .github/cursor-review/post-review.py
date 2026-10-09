@@ -2427,8 +2427,12 @@ def build_panel_summary(panel: list[dict]) -> str:
     failed = [c for c in panel if c.get("status") != "ok"]
     parts = [f"_Panel: {ok}/{len(panel)} reviewers contributed findings._"]
     if failed:
+        # A direct-API cell (counted only when it replaces the Cursor OpenAI
+        # lane) is named with its backend, so a reader can tell it from a
+        # Cursor cell of the same model id.
         names = ", ".join(
-            f"{c.get('model','?')}:{c.get('review_type','?')} ({c.get('status','?')})"
+            f"{c.get('model','?')}:{c.get('review_type','?')} "
+            f"({'direct, ' if c.get('direct') is True else ''}{c.get('status','?')})"
             for c in failed
         )
         parts.append(f"_Reviewers that did not contribute: {names}_")

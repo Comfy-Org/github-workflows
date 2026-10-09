@@ -26,10 +26,12 @@ the block splitter below needs.
 Run: python3 .github/cursor-review/tests/test_workflow_panel_integrity.py
 """
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 WORKFLOW = os.path.normpath(
@@ -297,8 +299,15 @@ class ConsolidateExposesPanelCountsTest(unittest.TestCase):
             )
 
     def test_the_aggregate_step_still_writes_both_counts(self):
-        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={len(panel)}\\n")'):
-            self.assertIn(written, self.consolidate)
+        # The counting lives in aggregate-panel.py (behaviour tested in
+        # test_aggregate_panel.py); the step must still hand it GITHUB_OUTPUT.
+        self.assertIn('aggregate-panel.py"', self.consolidate)
+        self.assertIn('--github-output "$GITHUB_OUTPUT"', self.consolidate)
+        script = os.path.join(os.path.dirname(WORKFLOW), "..", "cursor-review", "aggregate-panel.py")
+        with open(script, encoding="utf-8") as f:
+            source = f.read()
+        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={total}\\n")'):
+            self.assertIn(written, source)
 
 
 class PanelIntegrityJobTest(unittest.TestCase):
@@ -638,37 +647,42 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
 
-NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)\.(result|outputs\.[A-Za-z0-9_]+)")
+CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix)(?:\.[A-Za-z0-9_-]+)+")
+
+
+def evaluate(expression, context):
+    """Evaluate an expression built only from context reads, string literals,
+    `always()`, `==`/`!=`, `&&`/`||` and parentheses.
+
+    `context` maps a dotted read (`needs.gate.result`, `inputs.<name>`,
+    `steps.<id>.outputs.<name>`, `matrix.<key>`) to its value. A read it does
+    not list is '' — exactly what GitHub hands back for a FAILED or SKIPPED
+    job's outputs. `&&`/`||` return an operand, in GitHub as in Python, so
+    `a == 'true' && inputs.b || ''` yields a string. Anything outside that
+    small grammar fails the translation loudly rather than evaluating to a
+    guess.
+    """
+    expr = expression.strip()
+    if expr.startswith("${{") and expr.endswith("}}"):
+        expr = expr[3:-2].strip()
+    py = CONTEXT_REF.sub(lambda match: repr(context.get(match.group(0), "")), expr)
+    py = py.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
+    leftover = re.sub(r"'[^']*'|\b(True|False|and|or)\b|==|!=|[()\s]", "", py)
+    if leftover:  # pragma: no cover - only on a grammar this helper does not know
+        raise AssertionError("cannot evaluate expression remainder %r" % leftover)
+    return eval(py, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
 
 
 def evaluate_if(condition, needs):
-    """Evaluate a job `if:` built only from `always()`, `needs.*` reads, string
-    literals, `==`/`!=`, `&&`/`||` and parentheses.
-
-    `needs` maps a job to `{"result": ..., "outputs": {...}}`. A job absent from
-    it, or an output it does not declare, reads as '' — which is exactly what
-    GitHub hands a FAILED or SKIPPED job's outputs. Anything outside that small
-    grammar fails the translation loudly rather than evaluating to a guess.
-    """
-    expr = condition.strip()
-    if expr.startswith("${{") and expr.endswith("}}"):
-        expr = expr[3:-2].strip()
-
-    def read(match):
-        job, field = match.group(1), match.group(2)
-        entry = needs.get(job, {})
-        if field == "result":
-            value = entry.get("result", "")
-        else:
-            value = entry.get("outputs", {}).get(field.split(".", 1)[1], "")
-        return repr(value)
-
-    py = NEEDS_REF.sub(read, expr)
-    py = py.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
-    leftover = re.sub(r"'[^']*'|\b(True|and|or)\b|==|!=|[()\s]", "", py)
-    if leftover:  # pragma: no cover - only on a grammar this helper does not know
-        raise AssertionError("cannot evaluate `if:` remainder %r" % leftover)
-    return eval(py, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
+    """Evaluate a job `if:` against `needs`, which maps a job to
+    `{"result": ..., "outputs": {...}}`. A job absent from it, or an output it
+    does not declare, reads as '' (see `evaluate`)."""
+    context = {}
+    for job, entry in needs.items():
+        context["needs.%s.result" % job] = entry.get("result", "")
+        for name, value in entry.get("outputs", {}).items():
+            context["needs.%s.outputs.%s" % (job, name)] = value
+    return evaluate(condition, context)
 
 
 class RoundCapIsADecisionJobTest(unittest.TestCase):
@@ -880,6 +894,299 @@ class FlattenEscapesWorkflowCommandsTest(unittest.TestCase):
         # definition it relies on is the escaping one.
         self.assertIn("%25", self.definition, "flatten() no longer escapes `%`")
         self.assertIn("tr -d", self.definition, "flatten() no longer strips newlines")
+
+
+DIRECT_JOB = "review-openai-direct"
+PANEL_MODELS_STEP = "Define panel models"
+AGGREGATE_STEP = "Aggregate panel findings"
+SEED_STEP = "Seed default findings artifact"
+REVIEW_TYPES = ("adversarial", "edge-case")
+ASSETS = os.path.normpath(os.path.join(os.path.dirname(WORKFLOW), "..", "cursor-review"))
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}")
+
+
+def step_scalar(step_lines, key):
+    """The scalar value of a step-level `        <key>:`, or None when absent."""
+    prefix = "        %s:" % key
+    for line in code_lines(step_lines):
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return None
+
+
+def block_mapping(lines, header, indent):
+    """{key: raw value} for the one-line `key: value` entries under `header`.
+
+    `header` is the whole line opening the block (`        env:` in a step,
+    `    outputs:` in a job) and its entries sit `indent` spaces deep; the block
+    ends at the first line indented less than that.
+    """
+    entry = re.compile(r"^%s([A-Za-z0-9_-]+):\s*(.*)$" % (" " * indent))
+    mapping, inside = {}, False
+    for line in code_lines(lines):
+        if not inside:
+            inside = line == header
+        elif line.strip():
+            if len(line) - len(line.lstrip()) < indent:
+                break
+            match = entry.match(line)
+            if match:
+                mapping[match.group(1)] = match.group(2).strip()
+    return mapping
+
+
+def render(value, context):
+    """A one-line YAML value as the runner hands it on: unquoted, and every
+    `${{ … }}` in it replaced by its value (a boolean becomes `true`/`false`)."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+
+    def substitute(match):
+        result = evaluate(match.group(1), context)
+        if isinstance(result, bool):
+            return "true" if result else "false"
+        return str(result)
+
+    return EXPRESSION.sub(substitute, value)
+
+
+def run_block(step_lines):
+    """A step's `run: |` script, de-indented the way YAML hands it to bash."""
+    script, inside = [], False
+    for line in step_lines:
+        if not inside:
+            inside = line == "        run: |"
+        elif line.strip() and not line.startswith(" " * 10):
+            break
+        else:
+            script.append(line[10:])
+    if not inside:
+        raise AssertionError("the step has no `run: |` block")
+    return "\n".join(script).rstrip("\n") + "\n"
+
+
+def run_step(step_lines, context, workdir):
+    """Execute a step for real: its `env:` rendered from `context`, its script
+    run as the runner runs it (`bash -e`) with `/tmp/` re-rooted under
+    `workdir`. Returns (CompletedProcess, {output: value} it wrote)."""
+    script = run_block(step_lines)
+    if "/tmp/" not in script:  # pragma: no cover - re-rooting would be a no-op
+        raise AssertionError("the step no longer works under /tmp/; re-root its new path here")
+    output = os.path.join(workdir, "github-output")
+    open(output, "w", encoding="utf-8").close()
+    env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": output, "CURSOR_REVIEW_ASSETS": ASSETS}
+    for name, value in block_mapping(step_lines, "        env:", 10).items():
+        env[name] = render(value, context)
+    done = subprocess.run(
+        [shutil.which("bash"), "-e", "-c", script.replace("/tmp/", workdir + "/")],
+        env=env,
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    outputs = {}
+    with open(output, encoding="utf-8") as f:
+        for line in f:
+            key, _, value = line.rstrip("\n").partition("=")
+            outputs[key] = value
+    return done, outputs
+
+
+class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
+    """With `openai_direct_replaces_cursor_openai` on, the direct-API cells ARE
+    the panel's OpenAI lane, so they must gate like the Cursor cells they
+    replace: counted in ok_count/total, and a leg that goes red when its cell
+    did not submit.
+
+    That rests on a few one-line links across three jobs: `preflight` setting
+    `openai_direct_counts=true`, `Aggregate panel findings` handing that flag
+    and the direct model id to aggregate-panel.py, and the direct leg check's
+    `exit 1`. Break any one and the cells quietly fall back to advisory — a
+    failed one costs nothing against `approve_max_failed_reviewers` and its leg
+    stays green — while the workflow still parses and lints, and
+    test_aggregate_panel.py, which calls the script with the flags already set,
+    still passes. So the chain is EXECUTED here, from the inputs to the counts
+    and the leg's exit status, rather than pattern-matched.
+    """
+
+    DIRECT_MODEL = "gpt-6.1-sol"
+
+    @classmethod
+    def setUpClass(cls):
+        for tool in ("bash", "jq", "python3"):
+            if shutil.which(tool) is None:
+                raise AssertionError(f"`{tool}` is required to execute the workflow steps")
+        jobs = split_jobs(read_workflow())
+        cls.preflight = jobs["preflight"]
+        cls.review = jobs[MATRIX_JOB]
+        cls.direct = jobs[DIRECT_JOB]
+        cls.consolidate = jobs["consolidate"]
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def step(self, job_lines, name):
+        body = step_named(job_lines, name)
+        self.assertIsNotNone(body, f"step `{name}` is gone")
+        return body
+
+    def preflight_outputs(self, replace, key_present="true"):
+        """`needs.preflight.outputs.*` once `Define panel models` has run."""
+        done, step_outputs = run_step(
+            self.step(self.preflight, PANEL_MODELS_STEP),
+            {
+                "inputs.openai_direct_model": self.DIRECT_MODEL,
+                "inputs.openai_direct_replaces_cursor_openai": replace,
+                "needs.gate.outputs.openai_key_present": key_present,
+            },
+            tempfile.mkdtemp(dir=self.tmp),
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        steps = {"steps.models.outputs.%s" % k: v for k, v in step_outputs.items()}
+        return {
+            "needs.preflight.outputs.%s" % name: render(value, steps)
+            for name, value in block_mapping(self.preflight, "    outputs:", 6).items()
+        }
+
+    def downstream(self, replace):
+        """The context the direct legs and `consolidate` evaluate against."""
+        context = self.preflight_outputs(replace)
+        context["inputs.openai_direct_model"] = self.DIRECT_MODEL
+        return context
+
+    def upload(self, panel, job_lines, cell_context, model, review_type, status):
+        """Lay one cell's record out as `Download panel findings` unpacks it:
+        a directory per artifact, named by that leg's own upload step."""
+        name = block_mapping(self.step(job_lines, UPLOAD_STEP), "        with:", 10)["name"]
+        artifact = os.path.join(panel, render(name, cell_context))
+        os.makedirs(artifact)
+        with open(os.path.join(artifact, "findings.json"), "w", encoding="utf-8") as f:
+            json.dump({"model": model, "review_type": review_type, "status": status, "findings": []}, f)
+
+    def aggregate(self, context, direct_statuses):
+        """(ok_count, total, Cursor cell count) from `Aggregate panel findings`
+        over every Cursor cell `ok` plus the direct cells given."""
+        workdir = tempfile.mkdtemp(dir=self.tmp)
+        panel = os.path.join(workdir, "panel")
+        models = json.loads(context["needs.preflight.outputs.models"])
+        for model in models:
+            for rt in REVIEW_TYPES:
+                self.upload(panel, self.review, {"matrix.model": model, "matrix.review_type": rt}, model, rt, "ok")
+        for rt, status in direct_statuses.items():
+            self.upload(panel, self.direct, {**context, "matrix.review_type": rt}, self.DIRECT_MODEL, rt, status)
+        done, outputs = run_step(self.step(self.consolidate, AGGREGATE_STEP), context, workdir)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return int(outputs["ok_count"]), int(outputs["total"]), 2 * len(models)
+
+    def leg(self, context, review_type, submitted):
+        """The direct leg check for one cell, after `Seed default findings
+        artifact` and — when `submitted` — the `ok` record a submission writes
+        over the seed. None when the step is skipped, else its process."""
+        context = {**context, "matrix.review_type": review_type}
+        workdir = tempfile.mkdtemp(dir=self.tmp)
+        done, _ = run_step(self.step(self.direct, SEED_STEP), context, workdir)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        if submitted:
+            # The seed's path, re-rooted the same way run_step re-roots /tmp/.
+            with open(os.path.join(workdir, "findings-out", "findings.json"), "w", encoding="utf-8") as f:
+                json.dump({"model": self.DIRECT_MODEL, "review_type": review_type, "status": "ok", "findings": []}, f)
+        check = self.step(self.direct, LEG_STEP)
+        if not evaluate(step_scalar(check, "if"), context):
+            return None
+        return run_step(check, context, workdir)[0]
+
+    def test_preflight_marks_replacing_cells_as_counted(self):
+        replacing = self.preflight_outputs(replace=True)
+        self.assertEqual(replacing["needs.preflight.outputs.openai_direct"], "true")
+        self.assertEqual(
+            replacing["needs.preflight.outputs.openai_direct_counts"],
+            "true",
+            "preflight no longer marks REPLACING direct cells as counted, so every "
+            "reader downstream treats them as advisory",
+        )
+        self.assertEqual(
+            [m for m in json.loads(replacing["needs.preflight.outputs.models"]) if m.startswith("gpt-")],
+            [],
+            "the Cursor OpenAI cells were not dropped from the panel",
+        )
+        for label, outputs in (
+            ("side by side", self.preflight_outputs(replace=False)),
+            ("no OPENAI_API_KEY", self.preflight_outputs(replace=True, key_present="false")),
+        ):
+            with self.subTest(label):
+                self.assertEqual(outputs["needs.preflight.outputs.openai_direct_counts"], "false")
+
+    def test_a_failed_replacing_cell_counts_against_the_panel(self):
+        ok, total, cursor = self.aggregate(
+            self.downstream(replace=True), {"adversarial": "ok", "edge-case": "error"}
+        )
+        self.assertEqual(
+            (ok, total),
+            (cursor + 1, cursor + 2),
+            "the replacing direct cells are missing from ok_count/total, so a failed "
+            "one is free against approve_max_failed_reviewers",
+        )
+
+    def test_side_by_side_cells_stay_out_of_the_count(self):
+        ok, total, cursor = self.aggregate(
+            self.downstream(replace=False), {"adversarial": "ok", "edge-case": "error"}
+        )
+        self.assertEqual(
+            (ok, total),
+            (cursor, cursor),
+            "side-by-side direct cells are counted, so a comparison run can withhold approval",
+        )
+
+    def test_a_replacing_cell_that_did_not_submit_fails_its_leg(self):
+        context = self.downstream(replace=True)
+        self.assertEqual(
+            render(job_scalar(self.direct, "continue-on-error") or "false", context),
+            "false",
+            f"`{DIRECT_JOB}` absorbs its own failure while it REPLACES the Cursor OpenAI lane",
+        )
+        for review_type in REVIEW_TYPES:
+            with self.subTest(review_type):
+                failed = self.leg(context, review_type, submitted=False)
+                self.assertIsNotNone(failed, f"`{LEG_STEP}` is skipped on a replacing cell")
+                self.assertNotEqual(
+                    failed.returncode, 0, f"`{LEG_STEP}` passed a direct cell that never submitted"
+                )
+                self.assertIn("::error::", failed.stdout)
+                passed = self.leg(context, review_type, submitted=True)
+                self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+
+    def test_a_side_by_side_leg_stays_advisory(self):
+        context = self.downstream(replace=False)
+        self.assertEqual(render(job_scalar(self.direct, "continue-on-error") or "false", context), "true")
+        self.assertIsNone(
+            self.leg(context, "adversarial", submitted=False),
+            f"`{LEG_STEP}` fails an ADVISORY side-by-side cell",
+        )
+
+    def test_the_leg_check_follows_the_upload_and_spares_its_sibling(self):
+        # Same shape as the `review` job's pins above: after the upload, so the
+        # errored record still reaches the judge; never absorbed itself; and a
+        # red adversarial leg must not cancel the edge-case one.
+        order = step_order(self.direct)
+        self.assertIn(UPLOAD_STEP, order)
+        self.assertIn(LEG_STEP, order)
+        self.assertLess(
+            order.index(UPLOAD_STEP),
+            order.index(LEG_STEP),
+            f"`{LEG_STEP}` must come AFTER `{UPLOAD_STEP}` in `{DIRECT_JOB}`",
+        )
+        self.assertIsNone(
+            step_scalar(self.step(self.direct, LEG_STEP), "continue-on-error"),
+            f"`{DIRECT_JOB}`'s `{LEG_STEP}` carries continue-on-error and can no longer turn the leg red",
+        )
+        self.assertIn(
+            "      fail-fast: false",
+            code_lines(self.direct),
+            f"`{DIRECT_JOB}` lost `fail-fast: false`: one red direct leg would cancel the other",
+        )
 
 
 if __name__ == "__main__":

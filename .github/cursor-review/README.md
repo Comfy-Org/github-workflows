@@ -217,6 +217,7 @@ the consolidated review's panel table. See [Panel integrity](#panel-integrity).
 
 | File | Role |
 |---|---|
+| [`aggregate-panel.py`](aggregate-panel.py) | Run by `consolidate`'s **Aggregate panel findings** step. Combines the cells' `findings-*` artifacts into the `panel.json` the judge reads, adds a `status=error` record for every expected cell whose artifact never arrived, and writes the `ok_count` / `total` that `Panel integrity` reads. The direct-OpenAI cells (`findings-direct-*`) count like Cursor cells when they replace the Cursor OpenAI lane (`openai_direct_replaces_cursor_openai: true`, so a failed one also counts against `approve_max_failed_reviewers`) and stay advisory side by side. Only this script sets the `direct_api` / `advisory` markers, so a cell's own record cannot excuse itself from the count. |
 | [`prompt-adversarial.md`](prompt-adversarial.md) | Prompt for the security/reliability review pass. |
 | [`prompt-edge-case.md`](prompt-edge-case.md) | Prompt for the correctness/logic review pass. |
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |
@@ -300,7 +301,7 @@ jobs:
 | Kind | Name | Required | Purpose |
 |---|---|---|---|
 | Secret | `CURSOR_API_KEY` | **yes** | Bills the panel + judge `cursor-agent` calls. |
-| Secret | `OPENAI_API_KEY` | no | Only with `openai_direct_model`: bills the optional direct-OpenAI cell. Use a project-scoped service-account key with a spend limit. |
+| Secret | `OPENAI_API_KEY` | no | Only with `openai_direct_model`: bills the optional direct-OpenAI cells. Use a project-scoped service-account key with a spend limit. |
 | Secret | `SLACK_BOT_TOKEN` | no | Enables start/complete DMs to the triggerer. |
 | Variable | `CURSOR_REVIEW_DM_EMAIL_MAP` | no | Maps GitHub logins → emails for Slack DM lookup. |
 
@@ -363,8 +364,8 @@ All optional except `workflows_ref` (required, no default) — pass them under
 |---|---|---|
 | `judge_model` | `claude-opus-5-5-xhigh` | Model that consolidates panel findings. |
 | `panel_models` | `''` (built-in list) | JSON array of Cursor model ids that **replaces** the panel list; each still runs both review types and is validated against the live catalog by preflight. For per-repo experiments (e.g. `-xhigh` vs `-max` tiers). |
-| `openai_direct_model` | `''` (off) | OPT-IN. An OpenAI model id reviewed through the OpenAI API directly (pinned Codex CLI, `package.json` here) as ONE **adversarial** cell on GitHub-hosted runners, by default **replacing** the Cursor `gpt-*` cell (next row). Needs the `OPENAI_API_KEY` secret and a plain id (`[A-Za-z0-9._-]`); without either, preflight warns and leaves the cell off and the panel unchanged. Not part of `panel_models` (not in the Cursor catalog); advisory — the leg never fails the run and is not counted in `Panel integrity` / the auto-approve gate. |
-| `openai_direct_replaces_cursor_openai` | `true` | When the direct cell is in effect, drop the Cursor `gpt-*` cell(s) so the OpenAI lane is reviewed once. `false` runs both for a side-by-side backend comparison. Preflight fails rather than leave the Cursor panel empty. |
+| `openai_direct_model` | `''` (off) | OPT-IN. An OpenAI model id reviewed through the OpenAI API directly (pinned Codex CLI, `package.json` here) as two cells (**adversarial** + **edge-case**, the Cursor cells' prompts) on GitHub-hosted runners, by default **replacing** the Cursor `gpt-*` cells (next row). Needs the `OPENAI_API_KEY` secret and a plain id (`[A-Za-z0-9._-]`); without either, preflight warns and leaves the cells off and the panel unchanged. Not part of `panel_models` (not in the Cursor catalog). Whether the cells gate depends on the next row. |
+| `openai_direct_replaces_cursor_openai` | `true` | When the direct cells are in effect, drop the Cursor `gpt-*` cell(s) so the OpenAI lane is reviewed once — the direct cells then **gate** like the Cursor cells they replace: counted in `Panel integrity` and the auto-approve gate, a failed one red in the rollup and named `(direct, <status>)` in the review's "did not contribute" line. `false` runs both for a side-by-side backend comparison, with the direct cells **advisory** (findings reach the judge; never counted, never red). Preflight fails rather than leave the Cursor panel empty. |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel when the PR author is a Bot **and** the head branch starts with one of these prefixes (machine pin bumps / catalog refreshes). `''` reviews every bot PR. |
 | `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |

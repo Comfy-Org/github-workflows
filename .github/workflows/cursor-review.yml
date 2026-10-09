@@ -280,33 +280,37 @@ on:
       openai_direct_model:
         description: >-
           OPT-IN. An OpenAI model id (e.g. `gpt-6.1-sol`) reviewed through the
-          OpenAI API directly, via the Codex CLI, as ONE adversarial cell.
+          OpenAI API directly, via the Codex CLI, as two cells — adversarial
+          and edge-case, the same passes and prompts a Cursor model gets.
           Empty (default) = the job is skipped and nothing changes. Requires the
           `OPENAI_API_KEY` secret and a plain id (`[A-Za-z0-9._-]`); set
-          without either, preflight warns, the cell stays off and the panel is
+          without either, preflight warns, the cells stay off and the panel is
           unchanged.
           Deliberately NOT part of `panel_models`: that list is validated
           against the live CURSOR catalog, which a direct-API id is not in.
-          Advisory — its findings reach the judge like any other cell's, but the
-          leg never fails the run and is not counted in `Panel integrity` or
-          the auto-approve gate. By default it REPLACES the Cursor OpenAI cell
-          rather than adding to it; see `openai_direct_replaces_cursor_openai`.
+          By default the cells REPLACE the Cursor OpenAI cells rather than
+          adding to them, and then GATE like them; see
+          `openai_direct_replaces_cursor_openai`.
         type: string
         required: false
         default: ''
       openai_direct_replaces_cursor_openai:
         description: >-
-          When the direct cell is in effect (`openai_direct_model` set, a plain
-          id, and its key present), drop the Cursor-hosted OpenAI cell
+          When the direct cells are in effect (`openai_direct_model` set, a
+          plain id, and its key present), drop the Cursor-hosted OpenAI cells
           from the panel so the lane is reviewed once rather than twice. Default
-          true: the direct cell REPLACES it. Matching is by vendor prefix
+          true: the direct cells REPLACE them, and so gate exactly as the Cursor
+          cells would — counted in `Panel integrity` and the auto-approve gate
+          (`approve_max_failed_reviewers`), a failed one red in the rollup and
+          named in the review's "did not contribute" line. Matching is by vendor prefix
           (`gpt-`) against the resolved panel list, which is how every OpenAI id
           in Cursor's catalog is spelled today — the other labs' ids are
           untouched. Set false to run both for a side-by-side comparison of the
-          two backends on identical diffs, which is worth doing once before
-          trusting the replacement. Refuses to leave the Cursor panel empty: if
+          two backends on identical diffs; the direct cells are then ADVISORY —
+          their findings reach the judge, but the legs never fail the run and
+          are not counted. Refuses to leave the Cursor panel empty: if
           every remaining id would be dropped, preflight fails rather than
-          silently shrinking the panel to a single direct cell.
+          silently shrinking the panel to the direct cells alone.
         type: boolean
         required: false
         default: true
@@ -1988,6 +1992,11 @@ jobs:
       # input, so a misconfigured opt-in neither drops the Cursor OpenAI cell
       # nor schedules a cell that can only error.
       openai_direct: ${{ steps.models.outputs.openai_direct }}
+      # 'true' when the direct-API cells are in effect AND replace the Cursor
+      # OpenAI lane: they are then that lane, so they gate exactly like Cursor
+      # cells (counted in ok_count/total, leg red on failure). Side by side
+      # ('false') they stay advisory.
+      openai_direct_counts: ${{ steps.models.outputs.openai_direct_counts }}
     steps:
       - name: Define panel models
         id: models
@@ -2137,8 +2146,10 @@ jobs:
             fi
           fi
           echo "openai_direct=${openai_direct}" >> "$GITHUB_OUTPUT"
+          openai_direct_counts=false
           if [ "$openai_direct" = "true" ] \
              && [ "${OPENAI_DIRECT_REPLACES:-true}" = "true" ]; then
+            openai_direct_counts=true
             # ascii_downcase so a differently-cased id cannot slip past the
             # vendor match and leave a duplicate OpenAI cell running.
             dropped="$(jq -c '[.[] | select((ascii_downcase | startswith("gpt-")))]' /tmp/models.json)"
@@ -2154,6 +2165,7 @@ jobs:
               echo "direct-API cell is on, but the panel list carries no Cursor OpenAI id to replace; panel unchanged."
             fi
           fi
+          echo "openai_direct_counts=${openai_direct_counts}" >> "$GITHUB_OUTPUT"
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
       - name: Require a pinned workflows_ref
@@ -2753,9 +2765,10 @@ jobs:
           echo "Reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
 
   review-openai-direct:
-    # An OPT-IN adversarial cell that reaches its model through the OpenAI API
-    # directly, via the Codex CLI, instead of through Cursor. By default it
-    # REPLACES the Cursor-hosted OpenAI cell (preflight drops that id from the
+    # An OPT-IN pair of cells (adversarial + edge-case, the same two passes and
+    # prompts as a Cursor model) that reach their model through the OpenAI API
+    # directly, via the Codex CLI, instead of through Cursor. By default they
+    # REPLACE the Cursor-hosted OpenAI cells (preflight drops that id from the
     # panel list) so the lane is reviewed once, not twice; set
     # `openai_direct_replaces_cursor_openai: false` to run both for a
     # side-by-side comparison. Default OFF:
@@ -2776,9 +2789,7 @@ jobs:
     # (`findings-direct-...`) is read alongside the others, and `consolidate`
     # lists this job in `needs:` so it never downloads before the upload
     # lands. The `direct-` prefix is what `Aggregate panel findings` keys on
-    # to keep this cell OUT of the Cursor panel's `expected` set and its
-    # ok_count/total — the numbers `Panel integrity` and the auto-approve gate
-    # read — so an opt-in cell can inform the judge without ever gating.
+    # to tell these cells apart from the Cursor ones (aggregate-panel.py).
     #
     # Credential posture: `contents: read` only, no write-scoped token (see
     # SECURITY.md), and the only PR-authored content the agent sees is the
@@ -2788,12 +2799,21 @@ jobs:
     # read-only sandbox could still read), and the sandboxed shell's env is
     # cut to the core set so the agent cannot echo it back.
     #
-    # ADVISORY on purpose: `continue-on-error` at the JOB level, so no step in
-    # here — install, version check, prompt build, upload — can turn the
-    # caller's run red while this backend is still being characterised.
+    # Gating follows the role (preflight's `openai_direct_counts`):
+    # - REPLACING the Cursor OpenAI lane: these cells ARE that lane, so they
+    #   gate exactly like a Cursor cell — counted in ok_count/total, which
+    #   `Panel integrity` and the auto-approve gate read, and the leg goes red
+    #   when the cell did not submit. While they were advisory, a failed
+    #   direct cell cost nothing against `approve_max_failed_reviewers`, so a
+    #   run could approve with the OpenAI lane silent; counted, it spends that
+    #   allowance like a failed Cursor cell, so the gate covers the full panel
+    #   again.
+    # - SIDE BY SIDE (replace false): ADVISORY, as when the backend was first
+    #   characterised — job-level `continue-on-error`, never counted — since
+    #   the Cursor OpenAI cells already gate that lane.
     #
-    # v1 scope: adversarial only (not edge-case), one model, one round.
-    name: 'adversarial direct (${{ inputs.openai_direct_model }})'
+    # Scope: one model, one round, no retry.
+    name: '${{ matrix.review_type }} direct (${{ inputs.openai_direct_model }})'
     needs: [gate, diff-size, preflight, ledger]
     if: >-
       needs.preflight.outputs.openai_direct == 'true'
@@ -2804,12 +2824,18 @@ jobs:
     # OPENAI_API_KEY, and a pool is where a prompt-injected model cell may
     # have run. Only CURSOR_API_KEY-only, read-only jobs may follow `runs_on`.
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Advisory only side by side; when replacing, a failed cell is as red as a
+    # failed Cursor cell.
+    continue-on-error: ${{ needs.preflight.outputs.openai_direct_counts != 'true' }}
     # Matches the `review` job's cap so the judge's budget reasoning (see
     # `review`) holds for this cell too; the agent step caps lower, at 15.
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        review_type: [adversarial, edge-case]
     steps:
       - name: Seed default findings artifact
         # Same contract as the `review` job: pre-seed status=error so the cell
@@ -2817,13 +2843,14 @@ jobs:
         # MCP output tool overwrites this on success.
         env:
           MODEL: ${{ inputs.openai_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
         run: |
           mkdir -p /tmp/findings-out
           python3 - <<'PY'
           import json, os
           record = {
               "model": os.environ["MODEL"],
-              "review_type": "adversarial",
+              "review_type": os.environ["REVIEW_TYPE"],
               "status": "error",
               "error": "Direct-API cell did not reach the submission step.",
               "findings": [],
@@ -2978,17 +3005,18 @@ jobs:
         if: steps.key.outputs.present == 'true'
         # Byte-identical construction to the Cursor cells' `Build prompt`, so a
         # finding difference is attributable to the model or the backend rather
-        # than to the prompt: the same prompt-adversarial.md with the same
+        # than to the prompt: the same prompt-<review_type>.md with the same
         # prior-review ledger spliced in, the same marker stripped and
         # re-emitted by fence-diff.py, the same new-hunks block from round 2
         # on, and a fresh per-prompt nonce minted into a shell variable (never
         # a step `env:`) so a leaked marker from one cell cannot forge a fence
         # in another. See that step for the full rationale.
         env:
+          REVIEW_TYPE: ${{ matrix.review_type }}
           LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
           python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
-            --prompt "$CURSOR_REVIEW_ASSETS/prompt-adversarial.md" \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md" \
             --marker '=== BEGIN DIFF ===' \
             --insert /tmp/ledger/ledger.md \
             --out /tmp/prompt-head.txt
@@ -3021,6 +3049,7 @@ jobs:
         timeout-minutes: 15
         env:
           MODEL: ${{ inputs.openai_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
           # `codex exec` reads its API key from this variable, so the key lives
           # only in this step's process env: never argv (visible in the process
           # list), never a file (`codex login` writes ~/.codex/auth.json, which
@@ -3039,7 +3068,7 @@ jobs:
             --mode reviewer \
             --out /tmp/findings-out/findings.json \
             --model "$MODEL" \
-            --review-type adversarial \
+            --review-type "$REVIEW_TYPE" \
             --init
           # The SAME MCP submission tool the Cursor cells use, so the findings
           # schema the judge reads is produced by one implementation for both
@@ -3054,7 +3083,7 @@ jobs:
               "--mode", "reviewer",
               "--out", "/tmp/findings-out/findings.json",
               "--model", os.environ["MODEL"],
-              "--review-type", "adversarial",
+              "--review-type", os.environ["REVIEW_TYPE"],
           ]))
           PY
           )"
@@ -3072,6 +3101,8 @@ jobs:
         if: always()
         env:
           MODEL: ${{ inputs.openai_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+          COUNTS: ${{ needs.preflight.outputs.openai_direct_counts }}
         # Status and a count only — NOT the findings verbatim, unlike the Cursor
         # cells: the run log is public, and finding bodies are model output
         # steered by PR-authored text. The full record still reaches the judge
@@ -3093,10 +3124,14 @@ jobs:
           PY
           )
           echo "Direct-API cell: status=${status}, ${count} finding(s)."
-          if [ "$status" != "ok" ]; then
-            echo "::warning::Direct-API cell adversarial/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+          if [ "$status" = "ok" ]; then
+            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
+          elif [ "$COUNTS" = "true" ]; then
+            # Failed AFTER the upload below, by `Fail the leg when the cell did
+            # not submit`, so the errored record still reaches the judge.
+            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor OpenAI lane, so it counts as a failed reviewer."
           else
-            echo "Direct-API cell adversarial/${MODEL} submitted its findings."
+            echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
           fi
 
       - name: Upload findings artifact
@@ -3107,10 +3142,45 @@ jobs:
         # tell it apart. The id is charset-checked in preflight.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: findings-direct-adversarial-${{ inputs.openai_direct_model }}
+          name: findings-direct-${{ matrix.review_type }}-${{ inputs.openai_direct_model }}
           path: /tmp/findings-out/findings.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Fail the leg when the cell did not submit
+        # Only when these cells REPLACE the Cursor OpenAI lane — the same
+        # rollup-visibility contract as the `review` job's step of this name
+        # (BE-15554), and like it deliberately AFTER the upload, so the errored
+        # record still reaches the judge and the consolidated review still
+        # posts. Side by side the cell is advisory and this step is skipped.
+        # Same availability-not-attestation scope as that step: the status is
+        # read from a file this cell's own agent could write.
+        if: always() && needs.preflight.outputs.openai_direct_counts == 'true'
+        env:
+          MODEL: ${{ inputs.openai_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          # Read defensively and sanitized for a ::workflow command:: line, as
+          # in the `review` job (`ValueError` covers invalid UTF-8 too).
+          status=$(python3 - <<'PY'
+          import json, re
+
+          try:
+              with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
+                  cell = json.load(f)
+          except (OSError, ValueError):
+              cell = None
+          value = cell.get("status") if isinstance(cell, dict) else None
+          if not isinstance(value, str):
+              value = "error"
+          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error")
+          PY
+          )
+          if [ "$status" != "ok" ]; then
+            echo "::error::Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} did not submit a review (status=$status). It replaces the Cursor OpenAI lane, so it counts as a failed reviewer; its findings artifact was uploaded and the panel still consolidates."
+            exit 1
+          fi
+          echo "Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
 
   consolidate:
     # Adjudicates the panel cell artifacts into one consolidated review.
@@ -3121,9 +3191,10 @@ jobs:
     # "Credential isolation" note for why the judge must not share a job with
     # a write-scoped token.
     name: Consolidate panel
-    # `review-openai-direct` is here only for ORDERING — its artifact must land
+    # `review-openai-direct` is here only for ORDERING — its artifacts must land
     # before `Download panel findings` runs. Its result is never read: when it
-    # is skipped (the default) or fails, `!cancelled()` below still runs.
+    # is skipped (the default) or fails, `!cancelled()` below still runs, and
+    # a failed cell is counted from its artifact (or its absence) instead.
     needs: [gate, diff-size, preflight, review, review-openai-direct, ledger]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
@@ -3330,68 +3401,21 @@ jobs:
         id: aggregate
         env:
           PANEL_MODELS: ${{ needs.preflight.outputs.models }}
+          # The direct-API cells COUNT only when they replace the Cursor OpenAI
+          # lane; side by side they stay advisory. See aggregate-panel.py.
+          DIRECT_MODEL: ${{ needs.preflight.outputs.openai_direct == 'true' && inputs.openai_direct_model || '' }}
+          DIRECT_COUNTS: ${{ needs.preflight.outputs.openai_direct_counts }}
         run: |
           # Each artifact directory contains one findings.json. Combine into
-          # a single panel.json array preserving cell metadata.
-          python3 - <<'PY'
-          import json, os, glob
-
-          panel = []
-          # The opt-in direct-API cell (`findings-direct-*`). Its findings go to
-          # the judge like any cell's, but it is NOT a Cursor panel cell: it is
-          # kept out of `present` (so it cannot mask a missing Cursor cell with
-          # the same id) and out of ok_count/total, which `Panel integrity` and
-          # the auto-approve gate read — an advisory cell must not gate.
-          direct = []
-          for path in sorted(glob.glob("/tmp/panel/findings-*/findings.json")):
-              try:
-                  with open(path, encoding="utf-8") as f:
-                      cell = json.load(f)
-              except (OSError, json.JSONDecodeError):
-                  continue
-              if isinstance(cell, dict):
-                  if os.path.basename(os.path.dirname(path)).startswith("findings-direct-"):
-                      direct.append(cell)
-                  else:
-                      # Only THIS step may set the marker: a Cursor cell's own
-                      # record must never be able to excuse itself from the count.
-                      cell.pop("direct_api", None)
-                      panel.append(cell)
-
-          expected = {
-              (model, review_type)
-              for model in json.loads(os.environ["PANEL_MODELS"])
-              for review_type in ("adversarial", "edge-case")
-          }
-          present = {
-              (cell.get("model"), cell.get("review_type"))
-              for cell in panel
-          }
-          for model, review_type in sorted(expected - present):
-              panel.append({
-                  "model": model,
-                  "review_type": review_type,
-                  "status": "error",
-                  "error": "Cell findings artifact was not uploaded.",
-                  "findings": [],
-              })
-
-          ok = sum(1 for c in panel if c.get("status") == "ok")
-          print(f"Panel: {ok}/{len(panel)} cells contributed findings.")
-          for c in direct:
-              print(f"Direct-API cell (advisory, not counted): status={c.get('status')}.")
-              # Read by `Build consolidated findings file`, which keeps these
-              # out of the `panel` metadata auto-approve counts failures from.
-              c["direct_api"] = True
-
-          with open("/tmp/panel.json", "w", encoding="utf-8") as f:
-              json.dump(panel + direct, f, indent=2)
-
-          # Emit metadata for the next step to gate on.
-          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
-              g.write(f"ok_count={ok}\n")
-              g.write(f"total={len(panel)}\n")
-          PY
+          # a single panel.json array preserving cell metadata, and emit the
+          # ok_count/total `Panel integrity` and auto-approve gate on.
+          python3 "$CURSOR_REVIEW_ASSETS/aggregate-panel.py" \
+            --panel-dir /tmp/panel \
+            --models "$PANEL_MODELS" \
+            --direct-model "$DIRECT_MODEL" \
+            --direct-counts "${DIRECT_COUNTS:-false}" \
+            --out /tmp/panel.json \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Build judge prompt
         if: steps.aggregate.outputs.ok_count != '0'
@@ -3512,14 +3536,18 @@ jobs:
 
           with open("/tmp/panel.json", encoding="utf-8") as f:
               panel = json.load(f)
-          # Cursor panel cells only: auto-approve counts failed reviewers from
-          # this list, and the advisory direct-API cell must not gate. Its
-          # findings still reach the degraded fallback below via `panel`.
-          panel_meta = [
-              {"model": c.get("model"), "review_type": c.get("review_type"), "status": c.get("status")}
-              for c in panel
-              if c.get("direct_api") is not True
-          ]
+          # Counted cells only: auto-approve counts failed reviewers from this
+          # list, so an ADVISORY direct-API cell must not appear here. A counted
+          # one does, tagged `direct` so the posted review names its backend.
+          # Advisory findings still reach the degraded fallback via `panel`.
+          panel_meta = []
+          for c in panel:
+              if c.get("advisory") is True:
+                  continue
+              meta = {"model": c.get("model"), "review_type": c.get("review_type"), "status": c.get("status")}
+              if c.get("direct_api") is True:
+                  meta["direct"] = True
+              panel_meta.append(meta)
           with open("/tmp/judge-findings.json", encoding="utf-8") as f:
               judge = json.load(f)
 
