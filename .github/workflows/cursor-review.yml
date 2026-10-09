@@ -439,7 +439,12 @@ on:
           metadata is missing, or a review type (`adversarial` or `edge-case`)
           has no reviewer that completed. Applies to the decision `defer_approval`
           hands to cursor-approve too. No effect unless `approve_max_severity`
-          is set.
+          is set. A tolerated errored cell still turns THIS WORKFLOW's called job
+          red (the leg itself, and `Panel integrity` with it), so a caller that
+          chains jobs off it — the cursor-approve axes above all — must guard
+          them with `!cancelled()` or GitHub's default `needs:` rule skips them
+          and the tolerance buys nothing. See docs/callers/cursor-approve.md
+          ("A red panel cell must not skip the axes").
         type: number
         required: false
         default: 0
@@ -4382,9 +4387,20 @@ jobs:
     # `edge-case (kimi-k3-high)` bricks every PR the day that pin moves.
     #
     # ADVISORY by default, exactly like `Blocking gate`: red here fails no other
-    # job, gates no merge, and does not gate `post-review` — a caller that wants
-    # it to block marks `<caller job id> / Panel integrity` a required check in
-    # its own ruleset. See docs/callers/cursor-review.md.
+    # job IN THIS WORKFLOW, gates no merge, and does not gate `post-review` — a
+    # caller that wants it to block marks `<caller job id> / Panel integrity` a
+    # required check in its own ruleset. See docs/callers/cursor-review.md.
+    #
+    # "Advisory" stops at this workflow's edge, and the distinction is not
+    # academic. Red here puts the CALLER's `uses:` job in `failure`, so any
+    # caller job chained off it with a bare `needs:` is skipped by GitHub's
+    # default rule — which is how one errored cell silently stopped the
+    # cursor-approve axes from running at all, and withheld every approval, on a
+    # caller that had set `approve_max_failed_reviewers: 1` precisely to tolerate
+    # it. A red matrix leg does this on its own too, so dropping the check would
+    # not have helped. Downstream caller jobs must be guarded with `!cancelled()`
+    # and gated on `approve_gate`, which already fails closed; see
+    # docs/callers/cursor-approve.md ("A red panel cell must not skip the axes").
     #
     # `always()`, and the same four gate conditions `consolidate` uses, so this
     # reports on exactly the runs where a panel was supposed to happen and stays

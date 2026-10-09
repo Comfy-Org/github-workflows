@@ -23,6 +23,12 @@ name: Test cursor-review scripts
 # deliberately NOT listed below — no suite this workflow runs reads it, and a
 # docs-only PR that deletes the `blocking` row (the #31 scenario) still fires
 # the alarm, over there.
+#
+# docs/callers/cursor-approve.md IS listed, for the opposite reason: a suite
+# here does read it. test_caller_doc_pattern.py pins the `if:` guards on the
+# caller snippet, because a copied caller is only as good as the snippet and
+# dropping `!cancelled()` from it silently withholds every approval (see that
+# file's docstring).
 
 on:
   pull_request:
@@ -36,6 +42,11 @@ on:
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
       - '.github/workflows/axis-*.yml'
+      # test_caller_doc_pattern.py reads the caller snippet out of this page and
+      # pins its `if:` guards. Unlike docs/callers/cursor-review.md (see the
+      # note above), a suite HERE parses it, and the regression it guards is a
+      # docs-only edit — dropping `!cancelled()` from a snippet a caller copies.
+      - 'docs/callers/cursor-approve.md'
       - '.github/workflows/test-cursor-review-scripts.yml'
   push:
     branches: [main]
@@ -49,6 +60,11 @@ on:
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
       - '.github/workflows/axis-*.yml'
+      # test_caller_doc_pattern.py reads the caller snippet out of this page and
+      # pins its `if:` guards. Unlike docs/callers/cursor-review.md (see the
+      # note above), a suite HERE parses it, and the regression it guards is a
+      # docs-only edit — dropping `!cancelled()` from a snippet a caller copies.
+      - 'docs/callers/cursor-approve.md'
       - '.github/workflows/test-cursor-review-scripts.yml'
 
 permissions:
