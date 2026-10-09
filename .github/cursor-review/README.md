@@ -192,7 +192,7 @@ to `-high` and the judge from `-max` to `-xhigh` in the same review.
 
 **Kimi moved back to `-max` on 2026-10-09.** The `-high` tier turned
 capacity-bound — cells dying in ~25s with `RetriableError:
-[resource_exhausted]`, 32% of them on one consumer, and the in-step retry does
+[resource_exhausted]`, 32% of cells red on one consumer, and the in-step retry does
 not rescue a sustained condition. Re-running the attribution above over 1,158
 judge-kept findings (82 PRs), normalised per finding raised: Kimi is the sole
 raiser of 1.05 findings per PR at **both** tiers and uniquely caught 3 of 58

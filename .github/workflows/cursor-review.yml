@@ -4491,7 +4491,7 @@ jobs:
     # not submit` in the `review` job is the per-cell half. This job is what a
     # gate should read, because a matrix leg's context name carries the model id
     # and therefore CHANGES whenever the panel list does — a required check on
-    # `edge-case (kimi-k3-high)` bricks every PR the day that pin moves.
+    # `edge-case (kimi-k3-max)` bricks every PR the day that pin moves.
     #
     # ADVISORY by default, exactly like `Blocking gate`: red here fails no other
     # job IN THIS WORKFLOW, gates no merge, and does not gate `post-review` — a
