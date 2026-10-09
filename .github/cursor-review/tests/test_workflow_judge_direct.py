@@ -1,6 +1,6 @@
 """The optional direct-Anthropic judge in cursor-review.yml (`judge_direct_model`).
 
-Four properties, each one a single line in the workflow that nothing else
+Five properties, each one a single line in the workflow that nothing else
 would notice breaking:
 
   * preflight's resolution — `judge_direct=true` only for a plain id with the
@@ -15,6 +15,10 @@ would notice breaking:
   * the exfil guard — a final review carrying the key is replaced by the
     `--init` error seed, so `Build consolidated findings file` takes the
     degraded panel-union path. EXECUTED, both steps.
+  * token usage — the judge records the API's token counts as
+    `usage-direct-judge-<model>` with the cells' script, byte for byte but
+    for the result path, whenever the judge step ran, and never fails the
+    job. EXECUTED.
 
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
@@ -56,6 +60,8 @@ BUILD_STEP = "Build consolidated findings file"
 ADOPT_STEP = "Adopt direct judge review"
 DOWNLOAD_STEP = "Download direct judge review"
 UPLOAD_STEP = "Upload direct judge review"
+RECORD_STEP = "Record token usage"
+USAGE_UPLOAD_STEP = "Upload usage artifact"
 ARTIFACT = "cursor-review-judge-direct"
 # Rebuilt in `judge-direct` exactly as in `consolidate`, so both judges read
 # the same prompt over the same panel.
@@ -180,8 +186,9 @@ class JudgeDirectJobIsolationTest(unittest.TestCase):
         self.assertFalse(any("cursor-agent" in l or "install-cursor-cli" in l for l in body))
         # A stdin script puts the cwd — the PR checkout — first on sys.path.
         self.assertFalse([l for l in body if re.search(r"python3 -(\s|$)", l)])
+        # The judge's MCP config, the exfil guard's count and `Record token usage`.
         self.assertEqual([l.strip().split()[0] for l in body if re.search(r"python3 -I -", l)],
-                         ["mcp_config=\"$(python3", "python3"])
+                         ["mcp_config=\"$(python3", "python3", "python3"])
 
     def test_it_runs_only_when_consolidate_would_and_the_judge_is_direct(self):
         direct_if = self.job_scalar(self.direct, "if")
@@ -408,6 +415,88 @@ class ExfilGuardTest(unittest.TestCase):
         done = run_step(step(self.consolidate, ADOPT_STEP), self.context, self.workdir)[0]
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.read()["status"], "error")
+
+
+class JudgeTokenUsageTest(unittest.TestCase):
+    """`Record token usage` and `Upload usage artifact` in `judge-direct`: the
+    direct cells' accounting, for the judge. RecordTokenUsageTest covers the
+    script itself; this pins that the judge runs the same script over its own
+    result, when, and that accounting can never fail or reach the hand-off."""
+
+    CONTEXT = {"inputs.judge_direct_model": JUDGE_MODEL, "github.run_attempt": "1"}
+
+    @classmethod
+    def setUpClass(cls):
+        all_jobs = jobs()
+        cls.cell = all_jobs["review-anthropic-direct"]
+        cls.direct = all_jobs["judge-direct"]
+        cls.record_step = step(cls.direct, RECORD_STEP)
+        cls.upload = step(cls.direct, USAGE_UPLOAD_STEP)
+
+    def record(self, result):
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        if result is not None:
+            with open(os.path.join(workdir, "judge-claude-result.json"), "w", encoding="utf-8") as f:
+                json.dump(result, f)
+        done, _ = run_step(self.record_step, self.CONTEXT, workdir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(os.path.join(workdir, "usage-out", "usage.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_the_script_is_the_cells_but_for_the_result_path(self):
+        cell = run_block(step(self.cell, RECORD_STEP))
+        self.assertIn("/tmp/claude-result.json", cell)
+        self.assertEqual(run_block(self.record_step),
+                         cell.replace("/tmp/claude-result.json", "/tmp/judge-claude-result.json"))
+        # ...which is where `Run judge (direct)` writes it.
+        self.assertIn("> /tmp/judge-claude-result.json", "\n".join(code_lines(step(self.direct, DIRECT_JUDGE_STEP))))
+
+    def test_it_records_the_judges_counts_and_nothing_model_written(self):
+        record = self.record({
+            "result": "MODEL-WRITTEN TEXT",
+            "total_cost_usd": 0.4321,
+            "usage": {"input_tokens": 12, "output_tokens": 2100, "cache_read_input_tokens": 90000,
+                      "cache_creation_input_tokens": 30000,
+                      "cache_creation": {"ephemeral_5m_input_tokens": 30000, "ephemeral_1h_input_tokens": 0}},
+            "modelUsage": {JUDGE_MODEL: {"inputTokens": 12, "outputTokens": 2100,
+                                         "cacheReadInputTokens": 90000, "cacheCreationInputTokens": 30000}},
+            "num_turns": 4,
+            "duration_ms": 41000,
+        })
+        self.assertEqual((record["model"], record["review_type"], record["run_attempt"], record["measured"]),
+                         (JUDGE_MODEL, "judge", 1, True))
+        self.assertEqual((record["usage"]["output_tokens"], record["usage"]["ephemeral_5m_input_tokens"]),
+                         (2100, 30000))
+        for leaked in ("MODEL-WRITTEN TEXT", "0.4321"):
+            self.assertNotIn(leaked, json.dumps(record))
+
+    def test_a_judge_that_left_no_result_is_unmeasured(self):
+        # Its cap killed it, or it never got a word out: tokens may still have
+        # been spent, so the record says unknown, never a measured zero.
+        record = self.record(None)
+        self.assertFalse(record["measured"])
+        self.assertNotIn("usage", record)
+
+    def test_it_runs_whenever_the_judge_step_did(self):
+        self.assertEqual(step_scalar(step(self.direct, DIRECT_JUDGE_STEP), "id"), "judge_direct")
+        for body in (self.record_step, self.upload):
+            condition = step_scalar(body, "if")
+            for outcome, runs in (("success", True), ("failure", True), ("cancelled", True), ("skipped", False)):
+                with self.subTest(outcome=outcome):
+                    self.assertEqual(bool(evaluate(condition, {"steps.judge_direct.outcome": outcome})), runs)
+
+    def test_accounting_never_fails_the_job_or_reaches_the_hand_off(self):
+        for body in (self.record_step, self.upload):
+            self.assertEqual(step_scalar(body, "continue-on-error"), "true")
+            self.assertFalse(any("ANTHROPIC_API_KEY" in l for l in code_lines(body)))
+        name = block_mapping(self.upload, "        with:", 10)["name"]
+        self.assertEqual(name, "usage-direct-judge-${{ inputs.judge_direct_model }}")
+        self.assertFalse(name.startswith("findings-"), "consolidate downloads `findings-*` as panel cells")
+        self.assertNotEqual(name, ARTIFACT)
+        # Last, after the review's own upload, so it can never delay the hand-off.
+        names = [l.strip()[len("- name: "):] for l in self.direct if l.startswith("      - name: ")]
+        self.assertEqual(names[-3:], [UPLOAD_STEP, RECORD_STEP, USAGE_UPLOAD_STEP])
 
 
 if __name__ == "__main__":
