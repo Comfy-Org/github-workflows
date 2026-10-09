@@ -211,9 +211,12 @@ def _measure(path):
 
     `chars` counts decoded characters (newlines included), the unit Claude
     Code's oversized-memory-file warning is expressed in. `line_lengths`
-    excludes the line terminator.
+    excludes the line terminator. `newline=""` turns off universal-newline
+    translation, so each CRLF counts as the two characters it is on disk —
+    otherwise a CRLF file reads one char short per line and slips under the
+    ceiling. `splitlines()` still treats CRLF as one terminator.
     """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
         text = f.read()
     lengths = [len(line) for line in text.splitlines()]
     return len(lengths), len(text), lengths

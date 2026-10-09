@@ -89,6 +89,7 @@ root file **and** every nested one the walk finds:
 `0` turns a limit off. The hard ceiling defaults off so a caller bumping its pin
 never goes red on the bump; `40000` is the suggested value, matching the size
 at which Claude Code starts warning about an oversized memory file. Characters
-are decoded characters, newlines included. Every finding names the file, its
+are decoded characters, newlines included (a CRLF counts as two). Every
+finding names the file, its
 size (with a chars/4 token estimate) and its longest lines, and points at the
 remedy: move rationale into `docs/agents/` and leave a one-line pointer.

@@ -601,6 +601,20 @@ class CharacterLimitsTest(unittest.TestCase):
         failures, warnings = self._run(max_chars=4000, warn_chars=4000)
         self.assertEqual((failures, warnings), ([], []))
 
+    def test_crlf_counts_both_characters_toward_max_chars(self):
+        # 1000 lines of 3 chars + CRLF = 5000 on disk. Read with universal
+        # newlines it would be 4000 and pass a 4999 ceiling it is over.
+        with open(os.path.join(self.root, "AGENTS.md"), "wb") as f:
+            f.write(b"abc\r\n" * 1000)
+        limits = dict(max_lines=2000, warn_lines=2000, warn_chars=0)
+        self.assertEqual(self._run(max_chars=5000, **limits), ([], []))
+        failures, warnings = self._run(max_chars=4999, **limits)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("5000 chars", failures[0])
+        self.assertIn("across 1000 lines", failures[0])
+        self.assertIn("L1 (3 chars)", failures[0])
+
     def test_zero_turns_every_char_limit_off(self):
         self._write_paragraph_file()
         self.assertEqual(
