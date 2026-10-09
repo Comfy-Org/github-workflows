@@ -25,6 +25,10 @@ DEFAULT_CONFIG = {
     "agents_file": "AGENTS.md",
     "max_lines": 200,
     "warn_lines": 150,
+    # Mirrors main()'s env defaults: hard character ceiling off, warns on.
+    "max_chars": 0,
+    "warn_chars": 25000,
+    "max_line_chars": 3000,
     "forbid_cursorrules": True,
     "check_nested": True,
     "require_shim": True,
@@ -524,6 +528,152 @@ class ExcludePathsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("EXCLUDED: plugins (matched plugins/**)", out)
         self.assertIn("EXCLUDED: vendored-skills (matched vendored-skills/**)", out)
+
+
+class CharacterLimitsTest(unittest.TestCase):
+    """`max_chars` / `warn_chars` / `max_line_chars`.
+
+    The motivating shape: a file comfortably under the LINE ceiling that still
+    carries hundreds of KB, because each paragraph is a single line.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
+        _write(self.root, "CODEOWNERS", "* @o\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, **overrides):
+        failures, warnings, _ = cam.run_checks(self.root, _config(**overrides))
+        return failures, warnings
+
+    def _write_paragraph_file(self, rel="AGENTS.md"):
+        # 111 lines (well under 150/200) but ~95k chars, one 89,015-char line.
+        lines = ["short line"] * 110
+        lines.insert(41, "x" * 89015)
+        _write(self.root, rel, "\n".join(lines) + "\n")
+
+    def test_small_file_passes_with_no_char_findings(self):
+        _write(self.root, "AGENTS.md", "\n".join(f"line {i}" for i in range(120)))
+        self.assertEqual(self._run(), ([], []))
+
+    def test_defaults_only_warn_on_an_oversized_file(self):
+        # Non-breaking rollout: with the shipped defaults (max_chars off) a
+        # caller bumping its pin gets warnings, never a red run.
+        self._write_paragraph_file()
+        failures, warnings = self._run()
+        self.assertEqual(failures, [])
+        self.assertEqual(len(warnings), 2)
+        total, per_line = warnings
+        self.assertIn("'AGENTS.md' is 90226 chars", total)
+        self.assertIn("across 111 lines", total)
+        self.assertIn("over the character target of 25000", total)
+        self.assertIn("no hard ceiling set", total)
+        self.assertIn("L42 (89015 chars)", total)
+        self.assertIn("docs/agents/", total)
+        self.assertIn("1 line(s) over the per-line ceiling of 3000", per_line)
+        self.assertIn("L42 (89015 chars)", per_line)
+
+    def test_max_chars_fails_and_supersedes_the_warn(self):
+        self._write_paragraph_file()
+        failures, warnings = self._run(max_chars=40000)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("over the hard character ceiling of 40000", failures[0])
+        self.assertIn("L42 (89015 chars)", failures[0])
+        self.assertIn("docs/agents/", failures[0])
+        # Only the per-line warning remains; the total isn't double-reported.
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("per-line ceiling", warnings[0])
+
+    def test_between_warn_and_max_only_warns(self):
+        _write(self.root, "AGENTS.md", ("y" * 99 + "\n") * 300)  # 30000 chars
+        failures, warnings = self._run(max_chars=40000, max_lines=1000, warn_lines=1000)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("30000 chars", warnings[0])
+        self.assertIn("hard ceiling 40000", warnings[0])
+
+    def test_exactly_at_the_limits_passes(self):
+        _write(self.root, "AGENTS.md", "z" * 3000 + "\n" + "w" * 999)  # 4000 chars
+        failures, warnings = self._run(max_chars=4000, warn_chars=4000)
+        self.assertEqual((failures, warnings), ([], []))
+
+    def test_zero_turns_every_char_limit_off(self):
+        self._write_paragraph_file()
+        self.assertEqual(
+            self._run(max_chars=0, warn_chars=0, max_line_chars=0), ([], [])
+        )
+
+    def test_longest_lines_are_ranked_and_capped(self):
+        lines = ["a" * 4000, "b" * 9000, "c" * 5000, "d" * 7000, "ok"]
+        _write(self.root, "AGENTS.md", "\n".join(lines))
+        _, warnings = self._run(warn_chars=0)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("4 line(s) over", warnings[0])
+        self.assertIn(
+            "L2 (9000 chars), L4 (7000 chars), L3 (5000 chars).", warnings[0]
+        )
+        self.assertNotIn("L1 ", warnings[0])
+
+    def test_nested_agents_md_is_measured_too(self):
+        _write(self.root, "AGENTS.md", "thin\n")
+        self._write_paragraph_file("src/AGENTS.md")
+        _write(self.root, "src/CLAUDE.md", "@AGENTS.md\n")
+        failures, warnings = self._run(max_chars=40000)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("nested 'src/AGENTS.md' is 90226 chars", failures[0])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("nested 'src/AGENTS.md' has 1 line(s)", warnings[0])
+
+    def test_nested_char_limits_respect_exclusions(self):
+        _write(self.root, "AGENTS.md", "thin\n")
+        self._write_paragraph_file("plugins/p/AGENTS.md")
+        failures, warnings = self._run(max_chars=40000, exclude=["plugins/**"])
+        self.assertEqual((failures, warnings), ([], []))
+
+    def test_line_checks_are_unchanged_alongside_char_checks(self):
+        _write(self.root, "AGENTS.md", "\n".join("l" for _ in range(250)))
+        failures, _ = self._run()
+        self.assertEqual(len(failures), 1)
+        self.assertIn("250 lines, over the hard ceiling of 200", failures[0])
+
+    def test_cli_reads_the_char_limits_from_env(self):
+        self._write_paragraph_file()
+        env = {"MAX_CHARS": "40000", "WARN_CHARS": "25000", "MAX_LINE_CHARS": "3000"}
+        buf = io.StringIO()
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = cam.main(["--root", self.root])
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::AGENTS.md integrity: 'AGENTS.md' is 90226 chars", out)
+        self.assertIn("::warning::AGENTS.md integrity: 'AGENTS.md' has 1 line(s)", out)
+
+    def test_cli_defaults_warn_but_pass(self):
+        self._write_paragraph_file()
+        keys = ("MAX_CHARS", "WARN_CHARS", "MAX_LINE_CHARS")
+        old = {k: os.environ.pop(k, None) for k in keys}
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = cam.main(["--root", self.root])
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(code, 0)
+        self.assertIn("Result: passed with 2 warning(s).", buf.getvalue())
 
 
 if __name__ == "__main__":

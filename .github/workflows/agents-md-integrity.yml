@@ -4,7 +4,8 @@ name: AGENTS.md Integrity (reusable)
 # standard (Comfy Engineering Guide, "AGENTS.md, done right", §10): one thin
 # top-level AGENTS.md as the single source of truth, a one-line `@AGENTS.md`
 # CLAUDE.md shim, no divergent `.cursorrules`, a hard under-200-line ceiling
-# (Anthropic guidance) with an aspirational 150-line target, per-subtree shims
+# (Anthropic guidance) with an aspirational 150-line target, character limits
+# (a paragraph is one line, so lines alone do not bound size), per-subtree shims
 # in monorepos, and a CODEOWNERS DRI. It runs in the CALLER's context, so
 # `actions/checkout` checks out the calling repo and the checks operate on that
 # repo's files. Fails with a non-zero exit (and GitHub annotations) so it can
@@ -34,12 +35,27 @@ name: AGENTS.md Integrity (reusable)
 #                        Default 200 (official Anthropic guidance).
 #   warn_lines           Aspirational target; over it emits a non-fatal WARNING
 #                        (but at/under max_lines still passes). Default 150.
+#   max_chars            Hard ceiling on each agents file's total CHARACTERS
+#                        (root and every nested one); over it FAILS. Default 0
+#                        = OFF, so bumping the pin never turns a caller red;
+#                        set 40000 (Claude Code's oversized-memory-file floor)
+#                        to enforce it. The line ceiling alone does not bound
+#                        size: a paragraph is one line.
+#   warn_chars           Total-character target; over it WARNS (never fails).
+#                        Default 25000. 0 = off.
+#   max_line_chars       Per-line character ceiling; any longer line WARNS
+#                        (never fails), catching a paragraph kept on one line.
+#                        Default 3000. 0 = off.
+#                        Every character finding names the file, its size, its
+#                        longest lines, and the remedy: move rationale into
+#                        `docs/agents/` and leave a one-line pointer.
 #   forbid_cursorrules   When true, a legacy root `.cursorrules` file FAILS the
 #                        check (AGENTS.md is the single source of truth).
 #                        Default true.
 #   check_nested         When true, every nested `AGENTS.md` (monorepo subtree)
-#                        must have a sibling `CLAUDE.md` containing `@AGENTS.md`
-#                        and must itself be <= max_lines. Default true.
+#                        must have a sibling `CLAUDE.md` containing `@AGENTS.md`,
+#                        must itself be <= max_lines, and is held to the same
+#                        character limits as the root file. Default true.
 #   exclude_paths        Newline- or comma-separated path globs (repo-root
 #                        relative) carved out of the NESTED scan — for a repo
 #                        that ships agent-instruction files as distributable
@@ -87,6 +103,28 @@ on:
         type: number
         required: false
         default: 150
+      max_chars:
+        description: >-
+          Hard ceiling on each agents file's total characters, root and nested
+          (over it FAILS). Default 0 = off; 40000 matches Claude Code's
+          oversized-memory-file floor.
+        type: number
+        required: false
+        default: 0
+      warn_chars:
+        description: >-
+          Total-character target for each agents file (over it WARNS, never
+          fails). Default 25000; 0 = off.
+        type: number
+        required: false
+        default: 25000
+      max_line_chars:
+        description: >-
+          Per-line character ceiling for each agents file (a longer line WARNS,
+          never fails). Default 3000; 0 = off.
+        type: number
+        required: false
+        default: 3000
       forbid_cursorrules:
         description: >-
           Fail when a legacy root `.cursorrules` file exists. Default true.
@@ -96,7 +134,8 @@ on:
       check_nested:
         description: >-
           Check nested (monorepo) AGENTS.md files for a sibling `@AGENTS.md`
-          CLAUDE.md shim and the line ceiling. Default true.
+          CLAUDE.md shim, the line ceiling and the character limits. Default
+          true.
         type: boolean
         required: false
         default: true
@@ -199,6 +238,9 @@ jobs:
           AGENTS_CHECK_ROOT: ${{ github.workspace }}
           MAX_LINES: ${{ inputs.max_lines }}
           WARN_LINES: ${{ inputs.warn_lines }}
+          MAX_CHARS: ${{ inputs.max_chars }}
+          WARN_CHARS: ${{ inputs.warn_chars }}
+          MAX_LINE_CHARS: ${{ inputs.max_line_chars }}
           FORBID_CURSORRULES: ${{ inputs.forbid_cursorrules }}
           CHECK_NESTED: ${{ inputs.check_nested }}
           REQUIRE_SHIM: ${{ inputs.require_shim }}

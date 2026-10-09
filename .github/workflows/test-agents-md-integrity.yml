@@ -60,6 +60,37 @@ jobs:
           fi
           echo "checker correctly failed the drifted repo"
 
+      - name: Smoke test — a paragraph-as-one-line file warns by default, fails under MAX_CHARS
+        run: |
+          # 111 lines (under every line limit) but one 89,015-char paragraph.
+          root="$(mktemp -d)"
+          python3 -c "open('$root/AGENTS.md','w').write(chr(10).join(['x'*89015]+['l']*110))"
+          printf '@AGENTS.md\n' > "$root/CLAUDE.md"
+          printf '* @comfy-org/backend\n' > "$root/CODEOWNERS"
+
+          # Shipped defaults: warn-first, so an existing caller stays green.
+          out="$(python3 .github/agents-md-integrity/check_agents_md.py --root "$root")"
+          echo "$out"
+          grep -qF "WARN: 'AGENTS.md' has 1 line(s) over the per-line ceiling of 3000" <<<"$out" || {
+            echo "::error::per-line character warning did not fire under the defaults"
+            exit 1
+          }
+
+          set +e
+          out="$(MAX_CHARS=40000 python3 .github/agents-md-integrity/check_agents_md.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::MAX_CHARS=40000 on a 89k-char file: expected exit 1, got $code"
+            exit 1
+          fi
+          grep -qF "over the hard character ceiling of 40000" <<<"$out" || {
+            echo "::error::character ceiling failure missing from the log"
+            exit 1
+          }
+          echo "checker correctly warned by default and failed under MAX_CHARS"
+
       - name: Smoke test — --exclude carves out a payload subtree, and is logged
         run: |
           # A repo that SHIPS agent instructions as plugin payload: the nested
