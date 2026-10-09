@@ -177,8 +177,15 @@ class Tee:
                 except OSError:
                     break
 
-    def drain(self):
-        self.thread.join(DRAIN_TIMEOUT)
+    def drain(self, interrupted=lambda: False):
+        """The kept tail, once the pipe hits EOF, DRAIN_TIMEOUT passes, or
+        `interrupted()` turns true — a forwarded signal must not wait it out."""
+        deadline = time.monotonic() + DRAIN_TIMEOUT
+        while self.thread.is_alive() and not interrupted():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.thread.join(min(WAIT_SLICE, remaining))
         return self.tail
 
 
@@ -285,8 +292,12 @@ def run(command, findings, poll, linger, grace,
     for attempt in range(1, attempts + 1):
         code, stderr_tail = attempt_once(
             command, findings, poll, linger, grace, received, current)
+        # A signal that lands after the agent exited — while its stderr drains
+        # — still ends the wrapper as signalled, whatever the agent returned.
+        if received:
+            return -received[0]
         marker = retriable_marker(stderr_tail)
-        if attempt == attempts or received or code <= 0 or marker is None:
+        if attempt == attempts or code <= 0 or marker is None:
             return code
         # Everything printed below follows the agent's own stderr, whose last
         # write may lack a newline; the `::warning::` must start a line.
@@ -338,7 +349,7 @@ def attempt_once(command, findings, poll, linger, grace, received, current):
         # rewrite the findings after the upload and leg check read them.
         signal_group(child.pid, signal.SIGKILL)
         current[0] = None
-    stderr_tail = tee.drain()
+    stderr_tail = tee.drain(lambda: bool(received))
     child.stderr.close()
     return code, stderr_tail
 

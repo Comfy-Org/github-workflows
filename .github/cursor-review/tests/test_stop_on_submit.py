@@ -312,6 +312,24 @@ class WrapperTest(AgentHarness):
         for pid in self.pids():
             self.assert_gone(pid)
 
+    def test_signal_while_stderr_drains_is_reported_as_signalled(self):
+        # A process that escaped the agent's group keeps its stderr open, so
+        # the wrapper is still draining it after the agent exited 0; the step
+        # cap landing then must end the wrapper at once, reported as a signal.
+        proc = self.wrap("""\
+            kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                                   start_new_session=True)
+            record_pid(kid.pid)
+            sys.exit(0)
+            """)
+        self.wait_for_pids(2)
+        time.sleep(1)  # the agent has exited; the wrapper is draining its stderr
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        code, err, _ = self.finish(proc, cap=10)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertLess(time.monotonic() - started, 2, "signal waited out the drain")
+
     def test_agent_that_exits_on_its_own_leaves_nothing_behind(self):
         # A grandchild still in the agent's group could rewrite findings.json
         # after the upload; the wrapper reaps the group on this path too.
