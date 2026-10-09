@@ -2029,8 +2029,16 @@ jobs:
       # cells (counted in ok_count/total, leg red on failure). Side by side
       # ('false') they stay advisory.
       openai_direct_counts: ${{ steps.models.outputs.openai_direct_counts }}
+      # The caps DERIVED from `cell_timeout_minutes`, computed here because
+      # Actions expressions have no arithmetic: `${{ x + 15 }}` is a parse
+      # error that fails the workflow at load for every caller. Consumers
+      # read them through `fromJSON(needs.preflight.outputs.*)`.
+      cell_job_timeout: ${{ steps.cell_timeout.outputs.cell_job }}
+      judge_step_timeout: ${{ steps.cell_timeout.outputs.judge_step }}
+      judge_job_timeout: ${{ steps.cell_timeout.outputs.judge_job }}
     steps:
       - name: Validate the cell timeout
+        id: cell_timeout
         # FIRST, and before a single cell spends. `type: number` buys only
         # numeric-ness: 0, -5 and 600 all parse. The three derived caps make a
         # bad value worse than it looks — the judge's job cap is 2x + 10, so a
@@ -2059,6 +2067,11 @@ jobs:
             exit 1
           fi
           echo "::notice::Cell agent cap ${CELL_TIMEOUT}m; cell job $((CELL_TIMEOUT + 15))m; judge step $((CELL_TIMEOUT * 2))m; judge job $((CELL_TIMEOUT * 2 + 10))m."
+          {
+            echo "cell_job=$((CELL_TIMEOUT + 15))"
+            echo "judge_step=$((CELL_TIMEOUT * 2))"
+            echo "judge_job=$((CELL_TIMEOUT * 2 + 10))"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Define panel models
         id: models
@@ -2383,10 +2396,10 @@ jobs:
     # cap must sit above its step cap so a hung judge trips the step (degraded
     # fallback still posts) rather than the job (all panel cells discarded). A
     # cell cap that outgrew them recreated exactly the silent skew that fix was
-    # for — so the arithmetic lives in the workflow now, where it cannot be
-    # half-applied. The +15 is this job's non-agent overhead: checkout, CLI
+    # for — so the arithmetic lives in `preflight` now (expressions cannot do
+    # it), where it cannot be half-applied. The +15 is this job's non-agent overhead: checkout, CLI
     # install, artifact download and upload, none of which the step cap covers.
-    timeout-minutes: ${{ inputs.cell_timeout_minutes + 15 }}
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.cell_job_timeout) }}
     permissions:
       contents: read
     strategy:
@@ -2897,7 +2910,7 @@ jobs:
     # `review`) holds for this cell too; the agent step caps lower, at 15.
     # DERIVED from `cell_timeout_minutes`, the same +15 as the Cursor cells
     # above and for the same overhead; see that job's note.
-    timeout-minutes: ${{ inputs.cell_timeout_minutes + 15 }}
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.cell_job_timeout) }}
     permissions:
       contents: read
     strategy:
@@ -3301,7 +3314,7 @@ jobs:
     #
     # DERIVED from `cell_timeout_minutes` (step x 2, + 10 slack), so raising a
     # cell's cap carries the judge with it instead of leaving it behind.
-    timeout-minutes: ${{ inputs.cell_timeout_minutes * 2 + 10 }}
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_job_timeout) }}
     # contents: read ONLY. This job checks out PR-authored code and runs the
     # judge agent over it, so it must carry nothing write-scoped — `post-review`
     # below holds pull-requests: write and the bot credentials instead.
@@ -3575,7 +3588,7 @@ jobs:
         # DERIVED: twice `cell_timeout_minutes`. The judge adjudicates EVERY
         # cell's findings at the same reasoning tier, so a budget equal to one
         # cell's is the floor, not the target.
-        timeout-minutes: ${{ inputs.cell_timeout_minutes * 2 }}
+        timeout-minutes: ${{ fromJSON(needs.preflight.outputs.judge_step_timeout) }}
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |

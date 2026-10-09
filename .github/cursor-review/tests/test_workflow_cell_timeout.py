@@ -18,17 +18,23 @@ to the cell: the job dies before `Fail the leg when the cell did not submit`
 can read the artifact back, so a dead cell reads as a cancelled run rather than
 a red leg.
 
-So the arithmetic now lives in the workflow as expressions, and this file pins
-it from three directions:
+So the arithmetic now lives in the workflow — in `preflight`'s shell, exposed
+as job outputs, because Actions expressions have NO arithmetic operators:
+`${{ inputs.x + 15 }}` is a parse error that fails the reusable at load for
+every caller, default included. This file pins it from four directions:
 
   * the exact expression at each of the six sites (a re-hardcoded literal
     fails, which is the regression),
+  * no `${{ }}` anywhere in the workflow uses `+`, `-`, `*` or `/` outside a
+    string literal (the load-time failure above, which a text-only pin of the
+    expression would happily keep green),
   * the ORDERING invariants, evaluated over the whole admitted range rather
     than at the default — a derivation that holds at 15 and inverts at 45 is
     the bug this is for,
   * the preflight bound check, by RUNNING its shell against real values, since
     `type: number` admits 0, -5 and 600 and the derived judge job cap doubles
-    whatever gets through.
+    whatever gets through — and reading back the caps it writes to
+    $GITHUB_OUTPUT, which the six sites consume.
 
 Deliberately parsed WITHOUT PyYAML, like its sibling suites: this repo is
 stdlib-only and CI installs no requirements for these tests.
@@ -39,6 +45,7 @@ Run: python3 .github/cursor-review/tests/test_workflow_cell_timeout.py
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 
 WORKFLOW = os.path.normpath(
@@ -50,9 +57,16 @@ FLOOR, CEILING, DEFAULT = 5, 45, 15
 # site -> the expression that must be there. `None` for the step sites means
 # "the bare input", spelled out per-site so a copy-paste between jobs fails.
 CELL = "${{ inputs.cell_timeout_minutes }}"
-CELL_JOB = "${{ inputs.cell_timeout_minutes + 15 }}"
-JUDGE_STEP = "${{ inputs.cell_timeout_minutes * 2 }}"
-JUDGE_JOB = "${{ inputs.cell_timeout_minutes * 2 + 10 }}"
+CELL_JOB = "${{ fromJSON(needs.preflight.outputs.cell_job_timeout) }}"
+JUDGE_STEP = "${{ fromJSON(needs.preflight.outputs.judge_step_timeout) }}"
+JUDGE_JOB = "${{ fromJSON(needs.preflight.outputs.judge_job_timeout) }}"
+
+# preflight job output -> the step output it must forward.
+PREFLIGHT_OUTPUTS = {
+    "cell_job_timeout": "${{ steps.cell_timeout.outputs.cell_job }}",
+    "judge_step_timeout": "${{ steps.cell_timeout.outputs.judge_step }}",
+    "judge_job_timeout": "${{ steps.cell_timeout.outputs.judge_job }}",
+}
 
 # The values today's workflow had before the input existed. The default must
 # reproduce them exactly, or this stopped being a no-op refactor.
@@ -133,6 +147,21 @@ class DerivedSites(unittest.TestCase):
         self.assertEqual(job_level_timeout(blk), JUDGE_JOB)
         self.assertEqual(step_level_timeout(step_block(blk, "Run judge")), JUDGE_STEP)
 
+    def test_consumers_need_preflight(self):
+        # A `needs.preflight.outputs.*` read from a job that does not list
+        # preflight in `needs:` evaluates to '' and fromJSON('') fails the job.
+        for name in ("review", "review-openai-direct", "consolidate"):
+            blk = job_block(self.src, name)
+            m = re.search(r"^    needs: \[([^\]]*)\]", blk, re.M)
+            self.assertIsNotNone(m, name)
+            self.assertIn("preflight", [n.strip() for n in m.group(1).split(",")], name)
+
+    def test_preflight_exposes_each_derived_cap(self):
+        blk = job_block(self.src, "preflight")
+        for out, expr in PREFLIGHT_OUTPUTS.items():
+            self.assertRegex(blk, r"\n      %s: %s\n" % (out, re.escape(expr)))
+        self.assertIn("        id: cell_timeout\n", step_block(blk, "Validate the cell timeout"))
+
     def test_no_literal_cap_survives_in_the_three_coupled_jobs(self):
         # The regression is one site re-hardcoded while the others stay
         # expressions — green CI, skewed panel.
@@ -144,6 +173,44 @@ class DerivedSites(unittest.TestCase):
                     blk,
                     "%s re-hardcoded a cap; derive it from cell_timeout_minutes" % name,
                 )
+
+
+ARITH = re.compile(r"[+*/]|(?<![\w.-])-(?![\w])|\s-\s")
+
+
+def has_arithmetic(expr):
+    # Operators inside a quoted string literal are just text, and `.*` is the
+    # object filter (`labels.*.name`), not a multiplication.
+    bare = re.sub(r"'(?:[^']|'')*'", "''", expr).replace(".*", "")
+    return bool(ARITH.search(bare))
+
+
+class NoExpressionArithmetic(unittest.TestCase):
+    """Actions expressions have no `+ - * /`; one in `${{ }}` fails the load."""
+
+    def test_no_arithmetic_operator_inside_any_expression(self):
+        bad = []
+        for lineno, line in enumerate(text().splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue  # YAML comments are never evaluated
+            for expr in re.findall(r"\$\{\{(.*?)\}\}", line):
+                if has_arithmetic(expr):
+                    bad.append("%d: ${{%s}}" % (lineno, expr))
+        self.assertEqual(bad, [], "arithmetic in an expression fails at load")
+
+    def test_the_check_would_catch_the_original_bug(self):
+        # Guards the check above against going vacuous.
+        for expr in (" inputs.x + 15 ", " inputs.x * 2 ", " inputs.x * 2 + 10 ", " a - 1 ", " a / 2 "):
+            with self.subTest(expr=expr):
+                self.assertTrue(has_arithmetic(expr))
+        # ...while hyphenated names, object filters and string text are not.
+        for expr in (
+            " needs.diff-size.outputs.within_cap == 'true' ",
+            " toJSON(github.event.pull_request.labels.*.name) ",
+            " fromJSON(inputs.runs_on || '\"a+b\"') ",
+        ):
+            with self.subTest(expr=expr):
+                self.assertFalse(has_arithmetic(expr))
 
 
 class DerivationInvariants(unittest.TestCase):
@@ -177,12 +244,17 @@ class PreflightBoundCheck(unittest.TestCase):
         )
 
     def run_guard(self, value):
-        return subprocess.run(
-            ["bash", "-c", self.script],
-            env={**os.environ, "CELL_TIMEOUT": str(value)},
-            capture_output=True,
-            text=True,
-        )
+        with tempfile.NamedTemporaryFile("r", suffix=".out") as out:
+            r = subprocess.run(
+                ["bash", "-c", self.script],
+                env={**os.environ, "CELL_TIMEOUT": str(value), "GITHUB_OUTPUT": out.name},
+                capture_output=True,
+                text=True,
+            )
+            r.outputs = dict(
+                line.split("=", 1) for line in out.read().splitlines() if "=" in line
+            )
+        return r
 
     def test_it_runs_before_any_cell_spends(self):
         src = text()
@@ -205,6 +277,26 @@ class PreflightBoundCheck(unittest.TestCase):
         r = self.run_guard(DEFAULT)
         for v in HISTORICAL.values():
             self.assertIn(str(v), r.stdout, r.stdout)
+
+    def test_writes_the_derived_caps_the_jobs_consume(self):
+        # These ARE the timeouts now; the notice above is only for humans.
+        for cell in (FLOOR, DEFAULT, CEILING):
+            d = derive(cell)
+            with self.subTest(cell=cell):
+                r = self.run_guard(cell)
+                self.assertEqual(
+                    r.outputs,
+                    {
+                        "cell_job": str(d["cell_job"]),
+                        "judge_step": str(d["judge_step"]),
+                        "judge_job": str(d["judge_job"]),
+                    },
+                )
+
+    def test_rejected_values_write_no_caps(self):
+        for v in (0, 600, "1.5"):
+            with self.subTest(v=v):
+                self.assertEqual(self.run_guard(v).outputs, {})
 
     def test_rejects_out_of_range(self):
         for v in (0, FLOOR - 1, CEILING + 1, 600):
