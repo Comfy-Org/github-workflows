@@ -443,8 +443,11 @@ on:
           red (the leg itself, and `Panel integrity` with it), so a caller that
           chains jobs off it — the cursor-approve axes above all — must guard
           them with `!cancelled()` or GitHub's default `needs:` rule skips them
-          and the tolerance buys nothing. See docs/callers/cursor-approve.md
-          ("A red panel cell must not skip the axes").
+          and the tolerance buys nothing. `!cancelled()` also drops the implicit
+          success requirement on EVERY other `needs:` entry, so restate those
+          explicitly (the axes keep `needs.approve-start.result == 'success'`).
+          See docs/callers/cursor-approve.md ("A red panel cell must not skip
+          the axes").
         type: number
         required: false
         default: 0

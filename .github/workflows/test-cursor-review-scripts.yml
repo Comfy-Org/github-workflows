@@ -19,16 +19,15 @@ name: Test cursor-review scripts
 # into the table-driven harness at
 # .github/workflow-pins/tests/test_inputs_docs_drift.py, which reads BOTH
 # docs/callers/cursor-review.md and .github/cursor-review/README.md. Both paths
-# are in test-workflow-pins.yml's filters, so docs/callers/cursor-review.md is
-# deliberately NOT listed below — no suite this workflow runs reads it, and a
-# docs-only PR that deletes the `blocking` row (the #31 scenario) still fires
-# the alarm, over there.
+# are in test-workflow-pins.yml's filters, and a docs-only PR that deletes the
+# `blocking` row (the #31 scenario) still fires the alarm, over there.
 #
-# docs/callers/cursor-approve.md IS listed, for the opposite reason: a suite
-# here does read it. test_caller_doc_pattern.py pins the `if:` guards on the
-# caller snippet, because a copied caller is only as good as the snippet and
-# dropping `!cancelled()` from it silently withholds every approval (see that
-# file's docstring).
+# docs/callers/cursor-approve.md and docs/callers/cursor-review.md ARE listed
+# below anyway, because a suite here reads them too: test_caller_doc_pattern.py
+# pins the `if:` guards on the cursor-approve caller snippet and on
+# cursor-review's `next:` approve_gate example. A copied caller is only as good
+# as the snippet, and dropping `!cancelled()` from it silently withholds every
+# approval (see that file's docstring).
 
 on:
   pull_request:
@@ -42,11 +41,11 @@ on:
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
       - '.github/workflows/axis-*.yml'
-      # test_caller_doc_pattern.py reads the caller snippet out of this page and
-      # pins its `if:` guards. Unlike docs/callers/cursor-review.md (see the
-      # note above), a suite HERE parses it, and the regression it guards is a
+      # test_caller_doc_pattern.py reads the caller snippets out of these
+      # pages and pins their `if:` guards; the regression it guards is a
       # docs-only edit — dropping `!cancelled()` from a snippet a caller copies.
       - 'docs/callers/cursor-approve.md'
+      - 'docs/callers/cursor-review.md'
       - '.github/workflows/test-cursor-review-scripts.yml'
   push:
     branches: [main]
@@ -60,11 +59,11 @@ on:
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
       - '.github/workflows/axis-*.yml'
-      # test_caller_doc_pattern.py reads the caller snippet out of this page and
-      # pins its `if:` guards. Unlike docs/callers/cursor-review.md (see the
-      # note above), a suite HERE parses it, and the regression it guards is a
+      # test_caller_doc_pattern.py reads the caller snippets out of these
+      # pages and pins their `if:` guards; the regression it guards is a
       # docs-only edit — dropping `!cancelled()` from a snippet a caller copies.
       - 'docs/callers/cursor-approve.md'
+      - 'docs/callers/cursor-review.md'
       - '.github/workflows/test-cursor-review-scripts.yml'
 
 permissions:

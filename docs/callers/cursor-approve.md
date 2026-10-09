@@ -14,9 +14,12 @@ the context axes (business, design, completeness) are not available yet.
    resolving any thread), and withdraws the approving identity's own earlier
    approvals and requests for changes. Without it, cursor-review's `decide` APPROVES first, and that
    severity-only approval satisfies branch protection or auto-merge until the
-   start phase withdraws it — and stays standing if the cursor-review run fails
-   or is cancelled after approving, because the start phase and the axes are
-   then skipped. With it, this workflow's decide phase is the only approver.
+   start phase withdraws it — and stays standing if the cursor-review run is
+   cancelled after approving, or if its `approve_gate` comes out `untrusted`,
+   because the start phase and the axes are then skipped. (A run that merely
+   went red on an errored panel cell does NOT skip them while the gate reads
+   `pass` or `capped`; see "A red panel cell must not skip the axes".) With it,
+   this workflow's decide phase is the only approver.
 2. `cursor-approve` with `phase: start` first withdraws the approving
    identity's own approvals — a backstop: with `defer_approval: true` there is
    none from this round, but a caller that does not set it has one standing
@@ -326,16 +329,30 @@ reports every axis as ⚠️ no result and withholds. A caller that sets
 gets the tolerance it configured — one errored cell out of six withholds every
 round, and nothing on the card says why.
 
-This does not widen what may be approved. `approve_gate` stays the only
-authority on whether a round may be decided, and reading it off a red
-cursor-review job cannot approve a round the gate itself rejected: it is already
-`untrusted` when the judge was degraded, when more cells errored than the caller
-tolerates, when the review did not land as threads or when the head moved, and
-it falls back to `untrusted` whenever an upstream decision job did not succeed —
-which is every Panel integrity failure that is not simply a short panel. The
-axes keep an explicit `needs.approve-start.result == 'success'` rather than a
-blanket `!cancelled()` so the invariant above is unchanged: a start phase that
-failed to withdraw cursor-review's standing approval still skips them.
+`approve_gate` stays the only authority on whether a round may be decided, and
+reading it off a red cursor-review job cannot approve a round the gate itself
+rejected: it is already `untrusted` when the judge was degraded, when more cells
+errored than the caller tolerates, when the review did not land as threads or
+when the head moved, and it falls back to `untrusted` whenever an upstream
+decision job did not succeed — which is every Panel integrity failure that is
+not simply a short panel. The axes keep an explicit
+`needs.approve-start.result == 'success'` rather than a blanket `!cancelled()`
+so the invariant above is unchanged: a start phase that failed to withdraw
+cursor-review's standing approval still skips them.
+
+What the guard does give up is an *incidental* backstop. The gate counts each
+cell by the `status` that cell's own findings artifact reports, not by its
+leg's conclusion — that is how a tolerated errored cell still passes — and
+cursor-review documents that status as an availability signal, not an
+attestation: a prompt-injected cell can write a clean `ok` record, and because
+artifact names are run-global it can claim another cell's name first, so that
+cell's real upload fails and its leg goes red while consolidate reads the
+forgery. A bare `needs:` used to skip the axes on that red leg. With
+`!cancelled()` the round goes on to the axes, which still review the change
+independently, and decide still withholds on any red axis (or more yellow
+than `max_yellow_axes`). Treat the panel count
+as tamper-evident only in the rollup (the red leg stays visible), not in the
+gate.
 
 ## Inputs
 
