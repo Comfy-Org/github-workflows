@@ -183,12 +183,27 @@ The build is then **verified, not trusted**, and against the reviewed diff's own
 |---|---|
 | OpenAI | `gpt-5.6-sol-xhigh` |
 | Anthropic | `claude-opus-5-5-xhigh` |
-| Moonshot | `kimi-k3-high` |
+| Moonshot | `kimi-k3-max` |
 
 Gemini 3.1 Pro was dropped on 2026-08-27 after a spend review: across 1,450
 judge-kept findings its two cells were the sole raiser of 2.5% of findings and
 3 of 213 critical/high ones, at ~9% of every run's cost. Kimi moved from `-max`
 to `-high` and the judge from `-max` to `-xhigh` in the same review.
+
+**Kimi moved back to `-max` on 2026-10-09.** The `-high` tier turned
+capacity-bound — cells dying in ~25s with `RetriableError:
+[resource_exhausted]`, 32% of them on one consumer, and the in-step retry does
+not rescue a sustained condition. Re-running the attribution above over 1,158
+judge-kept findings (82 PRs), normalised per finding raised: Kimi is the sole
+raiser of 1.05 findings per PR at **both** tiers and uniquely caught 3 of 58
+critical/high at `-max`, against Gemini's 0.33 per PR and 0 of 58 — so the lane
+is worth about three times what the dropped Gemini lane was, and the fix is the
+tier, not removal. This gives back the spend the `-high` notch was for.
+Reliability at `-max` is not re-established under current conditions (0 of 36
+red, but measured 2026-10-07, and the tiers may share a pool); if it goes the
+same way, the attribution says drop to a two-lab Cursor panel rather than
+substitute Gemini or Grok — Grok `4.7-high`, tried 2026-10-09, raised 0 unique
+findings in 17 while timing out on 11 of 20 cells.
 
 The Anthropic cell moved from Opus 5 `-thinking-max` to **Opus 5.5 `-xhigh`** on
 2026-10-07 — a newer model one reasoning notch down, on the same spend
