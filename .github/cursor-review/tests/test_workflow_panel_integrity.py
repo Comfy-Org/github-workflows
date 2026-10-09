@@ -297,8 +297,15 @@ class ConsolidateExposesPanelCountsTest(unittest.TestCase):
             )
 
     def test_the_aggregate_step_still_writes_both_counts(self):
-        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={len(panel)}\\n")'):
-            self.assertIn(written, self.consolidate)
+        # The counting lives in aggregate-panel.py (behaviour tested in
+        # test_aggregate_panel.py); the step must still hand it GITHUB_OUTPUT.
+        self.assertIn('aggregate-panel.py"', self.consolidate)
+        self.assertIn('--github-output "$GITHUB_OUTPUT"', self.consolidate)
+        script = os.path.join(os.path.dirname(WORKFLOW), "..", "cursor-review", "aggregate-panel.py")
+        with open(script, encoding="utf-8") as f:
+            source = f.read()
+        for written in ('g.write(f"ok_count={ok}\\n")', 'g.write(f"total={total}\\n")'):
+            self.assertIn(written, source)
 
 
 class PanelIntegrityJobTest(unittest.TestCase):
