@@ -4492,9 +4492,12 @@ jobs:
         # for the result path (test_workflow_judge_direct.py pins that). It
         # runs whenever the judge step did, so a judge its cap killed is still
         # recorded, as unmeasured. Best effort, and after the review's upload:
-        # accounting must never fail or delay the judge's hand-off.
+        # accounting must never fail or delay the judge's hand-off. Time-boxed
+        # too: `continue-on-error` does not absorb the JOB cap, and a job that
+        # ends cancelled loses its already-uploaded review to `consolidate`.
         if: always() && steps.judge_direct.outcome != 'skipped'
         continue-on-error: true
+        timeout-minutes: 1
         env:
           MODEL: ${{ inputs.judge_direct_model }}
           REVIEW_TYPE: judge
@@ -4573,15 +4576,29 @@ jobs:
       - name: Upload usage artifact
         # The cells' `usage-direct-<review_type>-<model>` family, review type
         # `judge`. Neither `findings-*` nor `cursor-review-judge-direct`, so
-        # neither `consolidate` nor the hand-back ever reads it. Best effort.
+        # neither `consolidate` nor the hand-back ever reads it. Best effort,
+        # and time-boxed for the same reason as `Record token usage`.
+        id: usage_upload
         if: always() && steps.judge_direct.outcome != 'skipped'
         continue-on-error: true
+        timeout-minutes: 2
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: usage-direct-judge-${{ inputs.judge_direct_model }}
           path: /tmp/usage-out/usage.json
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Warn on unrecorded usage
+        # The name is fixed and known before the job runs, so a panel cell (an
+        # agent over PR code that runs first) can upload under it and make this
+        # upload 409. `continue-on-error` would hide that, leaving the squatter's
+        # counts as the judge's record; say so on the run. `usage-direct-*`
+        # records are unauthenticated either way: treat them as indicative.
+        if: always() && steps.usage_upload.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: echo "::warning::The direct judge's usage artifact did not upload; any usage-direct-judge-* record on this run is not the judge's."
 
   consolidate:
     # Adjudicates the panel cell artifacts into one consolidated review.

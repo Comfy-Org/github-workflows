@@ -62,6 +62,7 @@ DOWNLOAD_STEP = "Download direct judge review"
 UPLOAD_STEP = "Upload direct judge review"
 RECORD_STEP = "Record token usage"
 USAGE_UPLOAD_STEP = "Upload usage artifact"
+USAGE_WARN_STEP = "Warn on unrecorded usage"
 ARTIFACT = "cursor-review-judge-direct"
 # Rebuilt in `judge-direct` exactly as in `consolidate`, so both judges read
 # the same prompt over the same panel.
@@ -432,6 +433,7 @@ class JudgeTokenUsageTest(unittest.TestCase):
         cls.direct = all_jobs["judge-direct"]
         cls.record_step = step(cls.direct, RECORD_STEP)
         cls.upload = step(cls.direct, USAGE_UPLOAD_STEP)
+        cls.warn = step(cls.direct, USAGE_WARN_STEP)
 
     def record(self, result):
         workdir = tempfile.mkdtemp()
@@ -487,8 +489,11 @@ class JudgeTokenUsageTest(unittest.TestCase):
                     self.assertEqual(bool(evaluate(condition, {"steps.judge_direct.outcome": outcome})), runs)
 
     def test_accounting_never_fails_the_job_or_reaches_the_hand_off(self):
-        for body in (self.record_step, self.upload):
+        for body in (self.record_step, self.upload, self.warn):
             self.assertEqual(step_scalar(body, "continue-on-error"), "true")
+            # `continue-on-error` does not absorb the job cap: a stalled
+            # accounting step must not cancel a job whose review is uploaded.
+            self.assertIn(step_scalar(body, "timeout-minutes"), ("1", "2"))
             self.assertFalse(any("ANTHROPIC_API_KEY" in l for l in code_lines(body)))
         name = block_mapping(self.upload, "        with:", 10)["name"]
         self.assertEqual(name, "usage-direct-judge-${{ inputs.judge_direct_model }}")
@@ -496,7 +501,16 @@ class JudgeTokenUsageTest(unittest.TestCase):
         self.assertNotEqual(name, ARTIFACT)
         # Last, after the review's own upload, so it can never delay the hand-off.
         names = [l.strip()[len("- name: "):] for l in self.direct if l.startswith("      - name: ")]
-        self.assertEqual(names[-3:], [UPLOAD_STEP, RECORD_STEP, USAGE_UPLOAD_STEP])
+        self.assertEqual(names[-4:], [UPLOAD_STEP, RECORD_STEP, USAGE_UPLOAD_STEP, USAGE_WARN_STEP])
+
+    def test_a_failed_usage_upload_is_flagged(self):
+        # A squatted name 409s under `continue-on-error`; the run must say so.
+        self.assertEqual(step_scalar(self.upload, "id"), "usage_upload")
+        condition = step_scalar(self.warn, "if")
+        for outcome, runs in (("success", False), ("failure", True), ("skipped", False)):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(bool(evaluate(condition, {"steps.usage_upload.outcome": outcome})), runs)
+        self.assertTrue(any("::warning::" in l for l in code_lines(self.warn)))
 
 
 if __name__ == "__main__":
