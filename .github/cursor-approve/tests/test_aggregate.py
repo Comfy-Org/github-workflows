@@ -536,6 +536,16 @@ class ExtractCli(unittest.TestCase):
         with open(self.out, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["commit_sha"], SHA)
 
+    def test_the_headline_reaches_the_artifact(self):
+        """extract has no key allowlist, so the field it validates is the field
+        decide reads out of the uploaded artifact. Nothing else pins that."""
+        code, _, err = self.extract(
+            'Here you go:\n```json\n{"verdict": "green", "confidence": 1, '
+            '"headline": "Both branches handle an empty payload.", "summary": "ok"}\n```\n')
+        self.assertEqual(code, 0, err)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["headline"], "Both branches handle an empty payload.")
+
     def test_rejects_a_bad_commit_sha(self):
         code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok"}', sha="main")
         self.assertEqual(code, 1)
