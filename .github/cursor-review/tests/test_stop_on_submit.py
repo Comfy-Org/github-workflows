@@ -653,7 +653,12 @@ class WorkflowWiringTest(unittest.TestCase):
         for sig in ("INT", "TERM", "HUP"):
             self.assertIn(f"trap 'forward_signal {sig}' {sig}", step)
         self.assertLess(step.index("trap 'forward_signal TERM'"), step.index("stop-on-submit.py\""))
-        self.assertIn("timeout-minutes: 15", step)
+        # The cap is `cell_timeout_minutes`, not a literal: a hardcoded 15 here
+        # would have to be edited by anyone raising the input, and a literal
+        # left in the workflow is exactly the drift the derived caps removed.
+        self.assertIn(
+            "timeout-minutes: ${{ inputs.cell_timeout_minutes }}", step)
+        self.assertNotIn("timeout-minutes: 15", step)
         # Transient Cursor capacity errors are retried, named per cell.
         self.assertIn("--retry-delays 30,90", step)
         self.assertIn('--cell "$REVIEW_TYPE/$MODEL"', step)
