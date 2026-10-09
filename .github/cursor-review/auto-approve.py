@@ -111,11 +111,14 @@ none: the label already hands the PR to a human. A round is untrusted when:
   while every review type (``PANEL_REVIEW_TYPES``) still has an ``ok`` cell. A
   non-dict cell, a missing or unknown status, or an empty panel always
   withholds. Tolerated cells are named in the decision's reason;
-* a reviewer leg did not succeed although every panel cell reports ``ok``
-  (the consolidated file's ``panel_inconsistent``, set by aggregate-panel.py
-  from the matrices' results): a cell can upload a forged ``ok`` under another
-  cell's artifact name, and the honest leg's own upload then fails. Not
-  re-run automatically — the forged artifact persists across re-run attempts;
+* a counted cell's findings artifact may not be its own: a reviewer leg did
+  not succeed although every panel cell reports ``ok``, or a record disagrees
+  with its artifact name (``--panel-inconsistent``, aggregate-panel.py's step
+  output, written before the judge ran; the consolidated file's
+  ``panel_inconsistent`` is OR-ed in). A cell can upload a forged ``ok`` under
+  another cell's artifact name, and the honest leg's own upload then fails.
+  Not re-run automatically — a fresh round runs the same PR content, so a
+  forger forges again; the card asks a human to read the red legs;
 * the review did not land as resolvable threads (`delivered` is not ``true``,
   or any finding reached the review body only — ``ungated_findings`` > 0 — where
   the open-thread check below cannot see it);
@@ -657,15 +660,19 @@ REASON_NOT_DELIVERED = "the review did not land on the PR as resolvable threads"
 REASON_UNGATED_TAIL = "finding(s) reached the review body only, not as resolvable threads"
 REASON_EMPTY_DIFF = ("the reviewed diff is empty — every changed path was excluded from review, "
                      "so nothing a reviewer saw can earn an approval")
-# Structural too: artifacts are immutable once uploaded, so a forged one under
-# another cell's name survives a re-run attempt and the honest leg 409s again.
-REASON_PANEL_INCONSISTENT = ("a reviewer leg did not succeed although every panel cell reports ok, "
-                             "so a cell's artifact may not be its own")
+# Structural too, though not for the reason the others are: a fresh round
+# CAN clear it when a leg merely flaked after its review, but it runs the same
+# PR content, so a forger forges again — auto-retry cannot tell the two apart,
+# and a human reading the red legs can. Hence its own card suffix below.
+REASON_PANEL_INCONSISTENT = ("a counted panel cell's findings artifact may not be its own (a reviewer "
+                             "leg did not succeed although every cell reports ok, or a record "
+                             "disagrees with its artifact name)")
+PANEL_INCONSISTENT_CAUSE = "a panel cell's findings artifact may not be its own (see the red leg checks)"
 STRUCTURAL_CAUSES = (
     (REASON_NOT_DELIVERED, "the findings did not land as resolvable threads"),
     (REASON_UNGATED_TAIL, "some findings reached the review body only, not as resolvable threads"),
     (REASON_EMPTY_DIFF, "the reviewed diff is empty (every changed path was excluded from review)"),
-    (REASON_PANEL_INCONSISTENT, "a reviewer leg failed although every panel cell reports ok (see the red leg checks)"),
+    (REASON_PANEL_INCONSISTENT, PANEL_INCONSISTENT_CAUSE),
 )
 
 # The two causes a fresh round on the LIVE head actually fixes, and the only
@@ -1040,6 +1047,11 @@ def no_decision_next(reasons: list, label: str = ""):
     causes = [cause for needle, cause in STRUCTURAL_CAUSES
               if any(isinstance(r, str) and needle in r for r in reasons or [])]
     if causes:
+        if causes == [PANEL_INCONSISTENT_CAUSE]:
+            return card.NEXT_HUMAN, (
+                f"A human is needed: {PANEL_INCONSISTENT_CAUSE}. A re-run clears a leg that "
+                "failed after its review, not a forged artifact: the same PR content runs again."
+            )
         return card.NEXT_HUMAN, f"A human is needed: {'; '.join(causes)}. A re-run would land the same way."
     if any(isinstance(r, str) and r == REASON_HEAD_MOVED for r in reasons or []):
         # The head moved, so the next round reads a commit with no review on it
@@ -1723,9 +1735,14 @@ def cmd_decide(args) -> int:
         data = json.load(f)
     findings = data.get("findings") or []
     panel = data.get("panel") or []
-    # A JSON bool written by `Build consolidated findings file`; absent (an
-    # older payload) reads as consistent, exactly as before.
-    panel_inconsistent = data.get("panel_inconsistent") is True
+    # The flag is the authority (a job output written before the judge ran);
+    # the file's copy is only OR-ed in, so neither can clear the other.
+    flag = (getattr(args, "panel_inconsistent", "") or "").strip().lower()
+    if flag not in ("", "true", "false"):
+        print(f"::error::--panel-inconsistent must be 'true', 'false' or empty, got {args.panel_inconsistent!r}")
+        withdraw_own_approvals(args)
+        return 2
+    panel_inconsistent = flag == "true" or data.get("panel_inconsistent") is True
     try:
         ungated = int(args.ungated or 0)
     except ValueError:
@@ -3169,6 +3186,8 @@ def main() -> int:
     d.add_argument("--open-anchors", default="", help="post-review's --open-anchors-out snapshot")
     # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
     d.add_argument("--max-failed-reviewers", default="0")
+    # consolidate's panel_inconsistent output (aggregate-panel.py): `true` withholds.
+    d.add_argument("--panel-inconsistent", default="")
     # approve_authors, as resolved by the workflow's `gate` job: `false` = the PR
     # author is not listed, so auto-approve is off for this PR. Anything else
     # (including the default empty) = decide as usual.

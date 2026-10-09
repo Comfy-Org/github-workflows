@@ -3252,9 +3252,11 @@ jobs:
     outputs:
       ok_count: ${{ steps.aggregate.outputs.ok_count }}
       total: ${{ steps.aggregate.outputs.total }}
-      # 'true' when a reviewer matrix did not succeed although every counted
-      # cell artifact of it reads `ok` — an artifact may not be its own cell's.
-      # Written by aggregate-panel.py BEFORE the judge runs in this job.
+      # 'true' when a counted cell artifact may not be its own cell's: a
+      # reviewer matrix did not succeed although every counted cell of it
+      # reads `ok`, or a record is `mismatch`. Written by aggregate-panel.py
+      # BEFORE the judge runs in this job; `Auto-approve decision` and `Panel
+      # integrity` read it from here, never from consolidated.json.
       panel_inconsistent: ${{ steps.aggregate.outputs.panel_inconsistent }}
       degraded: ${{ steps.consolidated.outputs.degraded }}
       # Untrusted: this is whatever string the judge agent's own tool wrote as
@@ -4189,6 +4191,10 @@ jobs:
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
           MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
+          # aggregate-panel.py's step output, written before the judge ran —
+          # not consolidated.json, which `consolidate` builds after the judge
+          # (`--trust`, same job) could have rewritten its inputs.
+          PANEL_INCONSISTENT: ${{ needs.consolidate.outputs.panel_inconsistent }}
           # approve_authors, resolved by `gate`: `false` → decide posts nothing
           # and reports `off` for this author.
           AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}
@@ -4245,6 +4251,7 @@ jobs:
             --ledger /tmp/ledger/ledger.json \
             --open-anchors /tmp/open-anchors.json \
             --max-failed-reviewers "${MAX_FAILED_REVIEWERS:-0}" \
+            --panel-inconsistent "$PANEL_INCONSISTENT" \
             --author-enabled "$AUTHOR_ENABLED" \
             --pr-author "$PR_AUTHOR" \
             --card true \
@@ -4677,10 +4684,10 @@ jobs:
             causes=$((causes + 1))
           fi
 
-          # Separate from the counts: here they MATCH, and that is the problem.
-          # See aggregate-panel.py's leg-result cross-check.
+          # Separate from the counts: here they can MATCH, and that is the
+          # problem. See aggregate-panel.py's two cross-checks.
           if [ "$PANEL_INCONSISTENT" = "true" ]; then
-            echo "::error::A reviewer leg did not succeed although every findings artifact reads ok: an artifact under a cell's name was uploaded by something other than that cell, or its upload failed after the review. The panel count is untrusted; see the red leg checks."
+            echo "::error::A findings artifact may not be its own cell's: a reviewer leg did not succeed although every findings artifact reads ok, or a record disagrees with the artifact name it sits under (see the Aggregate panel findings warnings). Something other than that cell uploaded it, or an upload failed after the review. The panel count is untrusted; see the red leg checks."
             causes=$((causes + 1))
           fi
 

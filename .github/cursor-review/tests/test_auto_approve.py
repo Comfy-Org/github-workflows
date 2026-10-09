@@ -1428,6 +1428,18 @@ class CmdDecideGateOutputTest(unittest.TestCase):
         self.assertEqual([p["event"] for p in self.posted], ["REQUEST_CHANGES"])
         self.assertIn(AA.REASON_PANEL_INCONSISTENT, self.posted[0]["body"])
 
+    def test_the_flag_withholds_even_when_the_file_says_consistent(self):
+        # The flag is the pre-judge job output; the file is built after the
+        # `--trust` judge ran and cannot clear it.
+        rc, gate = self.run_decide(consolidated={"panel_inconsistent": False}, panel_inconsistent="true")
+        self.assertEqual(gate, "untrusted")
+        self.assertIn(AA.REASON_PANEL_INCONSISTENT, self.posted[0]["body"])
+
+    def test_an_unrecognised_flag_fails_closed(self):
+        rc, _ = self.run_decide(panel_inconsistent="yes")
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("--panel-inconsistent must be" in p for p in self.printed))
+
     def test_panel_inconsistent_absent_or_false_still_approves(self):
         for consolidated in (None, {"panel_inconsistent": False}):
             with self.subTest(consolidated=consolidated):
@@ -2799,8 +2811,9 @@ class PanelInconsistentTest(unittest.TestCase):
         self.assertEqual(reasons, [AA.REASON_PANEL_INCONSISTENT])
         self.assertEqual(
             AA.REASON_PANEL_INCONSISTENT,
-            "a reviewer leg did not succeed although every panel cell reports ok, "
-            "so a cell's artifact may not be its own",
+            "a counted panel cell's findings artifact may not be its own (a reviewer "
+            "leg did not succeed although every cell reports ok, or a record "
+            "disagrees with its artifact name)",
         )
 
     def test_tolerated_failures_do_not_excuse_it(self):
@@ -2814,12 +2827,20 @@ class PanelInconsistentTest(unittest.TestCase):
                          AA.NONE)
 
     def test_it_is_not_retryable(self):
-        # A forged artifact persists across re-run attempts (artifacts are
-        # immutable; the honest leg 409s again), so auto-retry must not loop.
+        # A fresh round runs the same PR content, so a forger forges again;
+        # auto-retry cannot tell that from a flake, a human reading the legs can.
         self.assertFalse(AA.auto_retry_eligible([AA.REASON_HEAD_MOVED, AA.REASON_PANEL_INCONSISTENT]))
         self.assertNotIn(AA.REASON_PANEL_INCONSISTENT, AA.RETRYABLE_CAUSES)
         nxt, text = AA.no_decision_next([AA.REASON_HEAD_MOVED, AA.REASON_PANEL_INCONSISTENT])
         self.assertEqual(nxt, CARD.NEXT_HUMAN)
+        self.assertTrue(text.startswith("A human is needed: "))
+        # Not the other structural causes' "a re-run would land the same way":
+        # a leg that flaked after its review IS cleared by a re-run.
+        self.assertNotIn("A re-run would land the same way", text)
+        self.assertIn("A re-run clears a leg that failed after its review, not a forged artifact", text)
+
+    def test_alongside_another_structural_cause_the_card_keeps_its_suffix(self):
+        _, text = AA.no_decision_next([AA.REASON_PANEL_INCONSISTENT, AA.REASON_EMPTY_DIFF])
         self.assertIn("A re-run would land the same way", text)
 
 

@@ -154,7 +154,8 @@ class AggregateTest(unittest.TestCase):
         gh_out = os.path.join(self.dir, "gh-output")
         result = subprocess.run(
             [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(CURSOR_MODELS),
-             "--direct-model", DIRECT, "--direct-counts", "true", "--out", out, "--github-output", gh_out],
+             "--direct-model", DIRECT, "--direct-counts", "true", "--review-result", "success",
+             "--out", out, "--github-output", gh_out],
             capture_output=True, text=True, check=True,
         )
         self.assertIn("Panel: 5/6 cells contributed findings.", result.stdout)
@@ -248,11 +249,17 @@ class ConsistencyTest(AggregateTest):
 
     def test_record_naming_another_cell_is_a_mismatch(self):
         self.write("findings-adversarial-kimi", cell("claude-opus", "adversarial"))
-        cells, ok, total, _ = AGG.aggregate(self.dir, ["kimi"], "", False)
+        cells, ok, total, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
         mismatched = [c for c in cells if c.get("status") == AGG.MISMATCH_STATUS]
         self.assertEqual(len(mismatched), 1)
-        self.assertEqual(mismatched[0]["model"], "claude-opus")
+        # Keyed to the slot its artifact was uploaded for; the claim kept aside.
+        self.assertEqual((mismatched[0]["model"], mismatched[0]["review_type"]), ("kimi", "adversarial"))
+        self.assertEqual(mismatched[0]["claimed_model"], "claude-opus")
         self.assertEqual(ok, 0)
+        # One slot per artifact: no phantom error is synthesised for the slot
+        # the artifact exists for, and the claimed slot is not counted twice.
+        self.assertEqual(total, 2)
+        self.assertTrue(inconsistent)
         # Not the tolerable `error`: auto-approve never excuses it.
         self.assertNotEqual(AGG.MISMATCH_STATUS, AA.TOLERABLE_CELL_STATUS)
         reason, tolerated = AA.panel_gate(
@@ -269,13 +276,62 @@ class ConsistencyTest(AggregateTest):
     def test_direct_record_is_checked_against_its_direct_name(self):
         self.write(f"findings-direct-edge-case-{DIRECT}", cell("kimi", "edge-case"))
         cells, _, _, _ = AGG.aggregate(self.dir, ["kimi"], DIRECT, True)
-        direct = [c for c in cells if c.get("direct_api") and c.get("model") == "kimi"]
+        direct = [c for c in cells if c.get("direct_api") and c.get("claimed_model") == "kimi"]
         self.assertEqual(direct[0]["status"], AGG.MISMATCH_STATUS)
+        self.assertEqual((direct[0]["model"], direct[0]["review_type"]), (DIRECT, "edge-case"))
 
     def test_unparseable_artifact_name_is_a_mismatch(self):
         self.write("findings-other-kimi", cell("kimi", "adversarial"))
-        cells, _, _, _ = AGG.aggregate(self.dir, ["kimi"], "", False)
+        cells, _, total, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
         self.assertIn(AGG.MISMATCH_STATUS, [c["status"] for c in cells])
+        # It cannot occupy kimi/adversarial: that slot is synthesised as error.
+        synthesised = [c for c in cells if (c["model"], c["review_type"]) == ("kimi", "adversarial")]
+        self.assertEqual([c["status"] for c in synthesised], ["error"])
+        self.assertEqual(total, 3)
+        self.assertTrue(inconsistent)
+
+    def test_phantom_error_under_a_made_up_name_does_not_explain_a_red_leg(self):
+        # A forged ok under the victim's name plus a self-consistent `error`
+        # under a cell the matrix never ran: the phantom must not be the
+        # tolerable error that explains the victim's red leg away.
+        self.full_cursor_panel()
+        self.write("findings-adversarial-phantom", cell("phantom", "adversarial", "error"))
+        cells, ok, total, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, False, "failure")
+        phantom = [c for c in cells if c["model"] == "phantom"]
+        self.assertEqual(phantom[0]["status"], AGG.MISMATCH_STATUS)
+        self.assertTrue(inconsistent)
+        reason, tolerated = AA.panel_gate(
+            [{k: c[k] for k in ("model", "review_type", "status")} for c in cells], max_failed=5
+        )
+        self.assertIsNotNone(reason)
+        self.assertEqual(tolerated, [])
+
+    def test_phantom_ok_cannot_complete_a_review_type(self):
+        self.write("findings-edge-case-kimi", cell("kimi", "edge-case"))
+        self.write("findings-adversarial-phantom", cell("phantom", "adversarial"))
+        cells, ok, _, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
+        self.assertEqual(ok, 1)
+        self.assertTrue(inconsistent)
+
+    def test_unexpected_direct_cell_is_a_mismatch_only_when_counted(self):
+        self.full_cursor_panel()
+        self.write("findings-direct-adversarial-other", cell("other", "adversarial"))
+        cells, _, _, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, True)
+        self.assertIn(AGG.MISMATCH_STATUS, [c["status"] for c in cells if c["model"] == "other"])
+        self.assertTrue(inconsistent)
+        cells, _, _, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, False)
+        self.assertEqual([c["status"] for c in cells if c["model"] == "other"], ["ok"])
+        self.assertFalse(inconsistent)
+
+    def test_cli_requires_the_review_result(self):
+        # Fail closed: a dropped flag must not read as a successful matrix.
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(["kimi"]),
+             "--out", os.path.join(self.dir, "panel.json")],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--review-result", result.stderr)
 
     def test_matching_record_with_hyphenated_model_keeps_its_status(self):
         self.write("findings-edge-case-gpt-5.6-sol-xhigh", cell("gpt-5.6-sol-xhigh", "edge-case"))
@@ -298,7 +354,7 @@ class ConsistencyTest(AggregateTest):
              "--out", os.path.join(self.dir, "panel.json"), "--github-output", gh_out],
             capture_output=True, text=True, check=True,
         )
-        self.assertIn("::warning::A reviewer matrix did not succeed (review=failure", result.stdout)
+        self.assertIn("a reviewer matrix did not succeed (review=failure", result.stdout)
         with open(gh_out, encoding="utf-8") as f:
             self.assertIn("panel_inconsistent=true\n", f.read())
 
@@ -306,7 +362,7 @@ class ConsistencyTest(AggregateTest):
         self.write("findings-adversarial-kimi", cell("x\n::error::forged", "adversarial"))
         result = subprocess.run(
             [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(["kimi"]),
-             "--out", os.path.join(self.dir, "panel.json")],
+             "--review-result", "success", "--out", os.path.join(self.dir, "panel.json")],
             capture_output=True, text=True, check=True,
         )
         self.assertNotIn("\n::error::forged", result.stdout)

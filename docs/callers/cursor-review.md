@@ -343,7 +343,7 @@ the job log:
 | Cause | What it means |
 |---|---|
 | Panel incomplete | Fewer cells submitted findings than ran. The consolidated review was adjudicated over a short panel. The individual leg checks (`adversarial (<model>)` / `edge-case (<model>)`) are red for exactly the cells that did not submit — almost always the 15-minute agent cap. |
-| Panel inconsistent | A reviewer leg is red although every counted cell's findings artifact reads `ok`. A leg reds only when its cell is not `ok`, so this means an artifact under a cell's name was uploaded by something other than that cell (a prompt-injected cell claiming another's name; the honest upload then fails) or the upload failed after the review. Auto-approve withholds (`untrusted`) and does not re-run on it. |
+| Panel inconsistent | A reviewer leg is red although every counted cell's findings artifact reads `ok`, or a record disagrees with the artifact name it sits under (or names no cell the panel runs). A leg reds only when its cell is not `ok`, so this means an artifact under a cell's name was uploaded by something other than that cell (a prompt-injected cell claiming another's name; the honest upload then fails) or the upload failed after the review. Auto-approve withholds (`untrusted`) and does not re-run on it. The leg check is per matrix: any other non-`ok` cell in the same matrix explains a red leg away, so it does not catch every forgery. |
 | Unanchored findings | Findings the review could not anchor to a line of the reviewed diff, so they were demoted to the review **body** and have no thread. The Blocking gate cannot see them; read the body. |
 | Nothing delivered | No review carrying resolvable finding threads reached the PR — a read-only token, a rejected inline payload, or a post that could not be confirmed. The findings are in the `Post review` job summary. |
 | Judge degraded | The judge model never adjudicated; the review is the raw union of the cells' findings, so duplicates and false positives were not filtered out. |
@@ -614,8 +614,8 @@ After `Post review` lands, `auto-approve.py decide` submits one of:
   severity;
 - **no decision** when the round can't be trusted: the judge did not adjudicate, a
   panel reviewer did not complete (beyond what `approve_max_failed_reviewers`
-  tolerates — see below), a reviewer leg failed although every panel cell
-  reports `ok` (Panel inconsistent, above), the review did not land as threads (or some
+  tolerates — see below), a panel cell's artifact may not be its own
+  (Panel inconsistent, above), the review did not land as threads (or some
   finding reached the review body only), the head moved or the base was
   retargeted mid-run, the PR state
   could not be read, an earlier round's thread above the threshold is still

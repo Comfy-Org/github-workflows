@@ -327,6 +327,14 @@ class ConsolidateExposesPanelCountsTest(unittest.TestCase):
         self.assertIn("PANEL_INCONSISTENT: ${{ steps.aggregate.outputs.panel_inconsistent }}", step)
         self.assertIn('"panel_inconsistent": panel_inconsistent', step)
 
+    def test_auto_approve_reads_the_job_output_not_only_the_file(self):
+        # consolidated.json is built after the `--trust` judge ran in the same
+        # job, so the decision takes the pre-judge step output directly.
+        post = self.jobs["post-review"]
+        step = "\n".join(code_lines(step_named(post, "Auto-approve decision")))
+        self.assertIn("PANEL_INCONSISTENT: ${{ needs.consolidate.outputs.panel_inconsistent }}", step)
+        self.assertIn('--panel-inconsistent "$PANEL_INCONSISTENT"', step)
+
 
 class PanelIntegrityJobTest(unittest.TestCase):
     def setUp(self):
@@ -396,7 +404,7 @@ class PanelIntegrityJobTest(unittest.TestCase):
         self.assertIn("PANEL_INCONSISTENT: ${{ needs.consolidate.outputs.panel_inconsistent }}", self.body)
         self.assertRegex(
             self.body,
-            r'if \[ "\$PANEL_INCONSISTENT" = "true" \]; then\n\s+echo "::error::A reviewer leg did not succeed'
+            r'if \[ "\$PANEL_INCONSISTENT" = "true" \]; then\n\s+echo "::error::A findings artifact may not be its own'
             r'[^\n]*"\n\s+causes=\$\(\(causes \+ 1\)\)',
         )
 

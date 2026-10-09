@@ -30,24 +30,38 @@ leg's own upload then 409s and goes red):
 - name vs record: a cell's identity is its artifact NAME,
   `findings-<review_type>-<model>` / `findings-direct-<review_type>-<model>`,
   which the workflow chose. A record whose own `model` / `review_type` disagree
-  with it (or sits under a name that does not parse) gets `status: "mismatch"`
-  — not `ok`, and not the `error` auto-approve may tolerate — so it counts as
-  a failed reviewer.
+  with it (or sits under a name that does not parse, or names no cell the
+  matrix runs) gets `status: "mismatch"` — not `ok`, and not the `error`
+  auto-approve may tolerate — so it counts as a failed reviewer. Its
+  `model` / `review_type` are rewritten to the name's (the claimed pair kept
+  as `claimed_model` / `claimed_review_type`), so it cannot occupy, or count
+  twice in, a slot it was not uploaded for.
 - leg result vs records (`--review-result`, `--direct-result`, the
   `needs.<job>.result` of each matrix): `Fail the leg when the cell did not
   submit` reds every leg whose cell is not `ok`, so a matrix that did not
   succeed while EVERY counted cell of it reads `ok` is inconsistent — some leg
   failed after its agent ran, by an upload conflict (the forgery signature) or
   a post-review infrastructure failure. Either way the count cannot be
-  trusted: `panel_inconsistent=true` is written for auto-approve and `Panel
-  integrity` to withhold on. The cell records are left as they are, so the
-  judge still reads every finding. The direct matrix is checked only when its
-  cells count; advisory, its legs absorb their own failures.
+  trusted. The direct matrix is checked only when its cells count; advisory,
+  its legs absorb their own failures.
+
+Either cross-check failing on a counted cell writes `panel_inconsistent=true`
+to GITHUB_OUTPUT for auto-approve and `Panel integrity` to withhold on — a
+step output, not a field in panel.json: the judge runs `--trust` in the same
+job afterwards and can rewrite the file, but not an earlier step's outputs.
+No finding is dropped either way, so the judge still reads every one.
+
+The leg-result check is per matrix, so ANY non-ok cell in it explains every
+red leg away: a forged `ok` slips through whenever another cell of the same
+matrix errored (a step-cap timeout, or the forger's own), and a forger able to
+delete the honest upload and re-upload under its name leaves no red
+leg at all. Telling which leg failed needs per-job conclusions, which this
+job has no `actions: read` to see.
 
 Stdlib only. Usage:
   aggregate-panel.py --panel-dir /tmp/panel --models '<json list>' \
       [--direct-model <id> --direct-counts true|false] \
-      [--review-result <result> --direct-result <result>] \
+      --review-result <result> [--direct-result <result>] \
       --out /tmp/panel.json [--github-output "$GITHUB_OUTPUT"]
 """
 
@@ -64,6 +78,8 @@ MARKERS = ("direct_api", "advisory")
 # The status a record gets when it disagrees with the artifact name it sits
 # under. Deliberately not auto-approve's tolerable `error`.
 MISMATCH_STATUS = "mismatch"
+# The review_type a mismatched record gets when its artifact name does not parse.
+UNKNOWN_TYPE = "unknown"
 
 
 def identity_from_name(artifact):
@@ -101,12 +117,39 @@ def load_cells(panel_dir):
                 f"{_log_safe(cell.get('review_type'))}/{_log_safe(cell.get('model'))}, not the cell "
                 f"it is named for; counted as status={MISMATCH_STATUS}."
             )
-            cell["status"] = MISMATCH_STATUS
+            _mark_mismatch(cell, review_type or UNKNOWN_TYPE, model or artifact)
         if artifact.startswith(DIRECT_PREFIX):
             direct.append(cell)
         else:
             cursor.append(cell)
     return cursor, direct
+
+
+def _mark_mismatch(cell, review_type, model):
+    """Key `cell` to the slot its artifact name gives it, keeping its claim aside."""
+    cell["claimed_review_type"] = cell.get("review_type")
+    cell["claimed_model"] = cell.get("model")
+    cell["review_type"] = review_type
+    cell["model"] = model
+    cell["status"] = MISMATCH_STATUS
+
+
+def flag_unexpected(cells, models):
+    """Mismatch every cell keyed to no (model, type) the matrix runs.
+
+    A cell can upload under a made-up name as well as a victim's: a phantom
+    `error` would otherwise explain a red leg away (and be tolerated), and a
+    phantom `ok` keep a review type "completed".
+    """
+    expected = {(m, t) for m in models for t in REVIEW_TYPES}
+    for c in cells:
+        if (c.get("model"), c.get("review_type")) not in expected and c.get("status") != MISMATCH_STATUS:
+            print(
+                f"::warning::Findings artifact for {_log_safe(c.get('review_type'))}/"
+                f"{_log_safe(c.get('model'))} is not a cell this panel runs; "
+                f"counted as status={MISMATCH_STATUS}."
+            )
+            c["status"] = MISMATCH_STATUS
 
 
 def fill_missing(cells, models, error):
@@ -131,13 +174,15 @@ def aggregate(panel_dir, models, direct_model="", direct_counts=False,
               review_result="success", direct_result="skipped"):
     """Return (cells, ok_count, total, inconsistent).
 
-    `cells` is everything the judge reads; `inconsistent` is the leg-result
-    cross-check in the module docstring.
+    `cells` is everything the judge reads; `inconsistent` is either
+    cross-check in the module docstring failing on a counted cell.
     """
     panel, direct = load_cells(panel_dir)
+    flag_unexpected(panel, models)
     fill_missing(panel, models, "Cell findings artifact was not uploaded.")
     counts = bool(direct_counts and direct_model)
     if counts:
+        flag_unexpected(direct, [direct_model])
         # Same contract as a Cursor cell: absent means failed, never "not run".
         fill_missing(direct, [direct_model], "Direct-API cell findings artifact was not uploaded.")
     for c in direct:
@@ -146,8 +191,10 @@ def aggregate(panel_dir, models, direct_model="", direct_counts=False,
             c["advisory"] = True
     counted = panel + direct if counts else panel
     ok = sum(1 for c in counted if c.get("status") == "ok")
-    inconsistent = (review_result != "success" and _all_ok(panel)) or (
-        counts and direct_result not in ("success", "skipped") and _all_ok(direct)
+    inconsistent = (
+        (review_result != "success" and _all_ok(panel))
+        or (counts and direct_result not in ("success", "skipped") and _all_ok(direct))
+        or any(c.get("status") == MISMATCH_STATUS for c in counted)
     )
     return panel + direct, ok, len(counted), inconsistent
 
@@ -163,7 +210,8 @@ def main(argv=None):
     p.add_argument("--models", required=True, help="JSON list of Cursor panel model ids")
     p.add_argument("--direct-model", default="")
     p.add_argument("--direct-counts", default="false")
-    p.add_argument("--review-result", default="success", help="needs.review.result")
+    # Required, so a dropped flag fails the step rather than reading as success.
+    p.add_argument("--review-result", required=True, help="needs.review.result")
     p.add_argument("--direct-result", default="skipped", help="needs.review-openai-direct.result")
     p.add_argument("--out", required=True)
     p.add_argument("--github-output", default="")
@@ -179,10 +227,10 @@ def main(argv=None):
     print(f"Panel: {ok}/{total} cells contributed findings.")
     if inconsistent:
         print(
-            f"::warning::A reviewer matrix did not succeed (review={_log_safe(review_result)}, "
-            f"direct={_log_safe(direct_result)}) although every counted cell artifact of it reads "
-            "ok: an artifact may not be its own cell's. The panel count is untrusted "
-            "(panel_inconsistent=true)."
+            f"::warning::A counted findings artifact may not be its own cell's: a reviewer matrix "
+            f"did not succeed (review={_log_safe(review_result)}, direct={_log_safe(direct_result)}) "
+            f"although every counted cell artifact of it reads ok, or a record is "
+            f"status={MISMATCH_STATUS}. The panel count is untrusted (panel_inconsistent=true)."
         )
     for c in cells:
         if c.get("direct_api"):
