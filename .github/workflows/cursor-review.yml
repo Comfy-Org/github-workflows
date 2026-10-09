@@ -2110,9 +2110,9 @@ jobs:
         # nearest is a plain tier id. That plain line IS the thinking model:
         # Cursor labels non-thinking explicitly where it applies (every plain
         # Haiku 5.5 entry reads "No Thinking") and no Opus 5.5 or Sonnet 5.5
-        # entry carries that marker. Moonshot: Kimi K3 at the `high` tier —
-        # same model as the former `kimi-k3-max` pin, one reasoning notch
-        # lower; no NO-ZDR marker.
+        # entry carries that marker. Moonshot: Kimi K3 at the `max` tier —
+        # RESTORED 2026-10-09 after the `-high` tier proved capacity-bound; see
+        # the note below. No NO-ZDR marker.
         #
         # Gemini 3.1 Pro was removed 2026-08-27. Over 1,450 judge-kept
         # findings (172 PRs), its two cells were the sole raiser of 2.5% of
@@ -2123,8 +2123,41 @@ jobs:
         # moved from Opus 5 `-thinking-max` to Opus 5.5 `-xhigh` on
         # 2026-10-07 for the same reason: a newer model one reasoning notch
         # down. That is deliberately TWO axes at once (version + tier) — it
-        # is a default change, not an attribution experiment. The
-        # `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
+        # is a default change, not an attribution experiment.
+        #
+        # Kimi went BACK to `-max` on 2026-10-09. The `-high` tier turned
+        # capacity-bound, not slow: cells died in ~25 seconds with
+        # `RetriableError: [resource_exhausted]` after three internal
+        # reconnects, zero findings, leg red, `Panel integrity` red with it.
+        # Measured on one consumer over 56 panels: 24 of 76 `kimi-k3-high`
+        # cells red (32%), 19 of them this error, and 12 of 22 on the last day.
+        # It is not a property of one repo — the same model threw the same error
+        # the same day on two unrelated consumers — and #388's in-step retry
+        # does not rescue it, because the condition is sustained rather than
+        # transient: both cells on github-workflows#392's own panel exhausted
+        # all three attempts.
+        #
+        # `-max` rather than dropping the lane, because the lane EARNS its
+        # place. Re-running the 2026-08-27 attribution over 1,158 judge-kept
+        # findings (82 PRs), normalised per finding raised so panel size does
+        # not flatter anyone: Kimi was the sole raiser of 17% of what it raised
+        # at `-max` and 27% at `-high` — 1.05 unique findings per PR at BOTH
+        # tiers — and uniquely caught 3 of 58 critical/high at `-max`. Compare
+        # Gemini, cut for exactly this reason: 12% and 0.33 per PR, 0 of 58
+        # critical/high. Dropping Kimi would cost roughly three times what
+        # dropping Gemini did.
+        #
+        # What this trades away is the spend the tier drop was for, so it is a
+        # deliberate reversal of part of #243, not an oversight. The reliability
+        # it buys is also NOT established at this tier under present conditions:
+        # `-max` was 0 of 36 cells red, but that was measured on 2026-10-07,
+        # before the capacity trouble, and the two tiers may well share a pool.
+        # If `-max` goes the same way, the evidence above says drop to a
+        # two-lab Cursor panel rather than substitute Gemini or Grok — Grok
+        # `4.7-high` was tried on 2026-10-09 and raised 0 unique findings in 17
+        # while timing out on 11 of 20 cells.
+        #
+        # The `panel_models` input — or the CURSOR_PANEL_MODELS variable, see the
         # env block below — overrides this list for A/B experiments.
         #
         # The OpenAI cell moved from `gpt-5.6-sol-max` to `gpt-5.6-sol-xhigh`:
@@ -2168,7 +2201,7 @@ jobs:
           [
             "gpt-5.6-sol-xhigh",
             "claude-opus-5-5-xhigh",
-            "kimi-k3-high"
+            "kimi-k3-max"
           ]
           JSON
           if [ -n "$(printf '%s' "$PANEL_MODELS_OVERRIDE" | tr -d '[:space:]')" ]; then
@@ -4556,7 +4589,7 @@ jobs:
     # not submit` in the `review` job is the per-cell half. This job is what a
     # gate should read, because a matrix leg's context name carries the model id
     # and therefore CHANGES whenever the panel list does — a required check on
-    # `edge-case (kimi-k3-high)` bricks every PR the day that pin moves.
+    # `edge-case (kimi-k3-max)` bricks every PR the day that pin moves.
     #
     # ADVISORY by default, exactly like `Blocking gate`: red here fails no other
     # job IN THIS WORKFLOW, gates no merge, and does not gate `post-review` — a

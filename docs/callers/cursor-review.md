@@ -144,11 +144,11 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 ```bash
 # one repo
 gh variable set CURSOR_PANEL_MODELS --repo <owner>/<repo> \
-  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-max"]'
 
 # or the whole fleet at once (visibility must include private repos)
 gh variable set CURSOR_PANEL_MODELS --org <org> --visibility all \
-  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-high"]'
+  --body '["gpt-5.6-sol-xhigh","claude-opus-5-5-max","kimi-k3-max"]'
 ```
 
 These examples deliberately differ from the built-in list by exactly one axis:
@@ -383,7 +383,7 @@ The remaining shapes to expect before you require it:
   `cancel-in-progress` caller above that red lands on the head SHA that was
   superseded, not on the new one.
 * **Do not require a leg check instead.** A panel cell's context name carries
-  the model id (`edge-case (kimi-k3-high)`), so it changes whenever the panel
+  the model id (`edge-case (kimi-k3-max)`), so it changes whenever the panel
   list does — and a required check whose name no longer exists blocks every PR
   in the repo. `Panel integrity` is stable by design.
 * **It is red, not skipped, when the decision itself failed.** Panel integrity
