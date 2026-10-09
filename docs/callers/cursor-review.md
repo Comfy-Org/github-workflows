@@ -870,7 +870,10 @@ jobs:
     secrets: { CURSOR_API_KEY: "${{ secrets.CURSOR_API_KEY }}" }
   next:
     needs: cursor-review
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    # `!cancelled()`: an errored panel cell turns the called job red even when
+    # `approve_max_failed_reviewers` tolerates it, and a bare `if:` is then
+    # skipped by GitHub's default `needs:` rule.
+    if: ${{ !cancelled() && needs.cursor-review.outputs.approve_gate == 'pass' }}
 ```
 
 | Value | Meaning |

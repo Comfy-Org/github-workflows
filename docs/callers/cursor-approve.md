@@ -14,9 +14,12 @@ the context axes (business, design, completeness) are not available yet.
    resolving any thread), and withdraws the approving identity's own earlier
    approvals and requests for changes. Without it, cursor-review's `decide` APPROVES first, and that
    severity-only approval satisfies branch protection or auto-merge until the
-   start phase withdraws it — and stays standing if the cursor-review run fails
-   or is cancelled after approving, because the start phase and the axes are
-   then skipped. With it, this workflow's decide phase is the only approver.
+   start phase withdraws it — and stays standing if the cursor-review run is
+   cancelled after approving, or if its `approve_gate` comes out `untrusted`,
+   because the start phase and the axes are then skipped. (A run that merely
+   went red on an errored panel cell does NOT skip them while the gate reads
+   `pass` or `capped`; see "A red panel cell must not skip the axes".) With it,
+   this workflow's decide phase is the only approver.
 2. `cursor-approve` with `phase: start` first withdraws the approving
    identity's own approvals — a backstop: with `defer_approval: true` there is
    none from this round, but a caller that does not set it has one standing
@@ -228,7 +231,13 @@ jobs:
 
   approve-start:
     needs: cursor-review
-    if: needs.cursor-review.outputs.approve_gate == 'pass' || needs.cursor-review.outputs.approve_gate == 'capped'
+    # `!cancelled()`, not a bare condition: cursor-review's called job goes red
+    # on any errored panel cell, which would otherwise skip this job. See
+    # "A red panel cell must not skip the axes" below.
+    if: >-
+      !cancelled()
+      && (needs.cursor-review.outputs.approve_gate == 'pass'
+      || needs.cursor-review.outputs.approve_gate == 'capped')
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-approve.yml@<sha>  # v1
     with:
       workflows_ref: <sha>
@@ -243,7 +252,10 @@ jobs:
 
   axis-correctness:
     needs: [cursor-review, approve-start]
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    if: >-
+      !cancelled()
+      && needs.approve-start.result == 'success'
+      && needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-correctness.yml@<sha>  # v1
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
@@ -252,7 +264,10 @@ jobs:
 
   axis-conformance:
     needs: [cursor-review, approve-start]
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    if: >-
+      !cancelled()
+      && needs.approve-start.result == 'success'
+      && needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-conformance.yml@<sha>  # v1
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
@@ -297,6 +312,47 @@ failed axis read as "no result" (withheld) instead of skipping the decision and
 leaving an earlier approval standing. The axes `needs: approve-start` so they
 never start while cursor-review's approval still stands; a start phase that
 fails to withdraw it skips them, which decide reads as "no result".
+
+### A red panel cell must not skip the axes
+
+`!cancelled()` on the start phase and the axes is load-bearing. cursor-review's
+called job goes **red whenever a panel cell errors** — the leg fails by design
+and `Panel integrity` fails alongside it — and `approve_max_failed_reviewers`
+does not change that. That input governs the `approve_gate` verdict, not the
+job's conclusion, so a tolerated errored cell still leaves the called job in
+`failure`.
+
+Without `!cancelled()`, GitHub's default `needs:` rule skips the start phase on
+that red job; the axes skip with it; and decide, which runs on `always()`,
+reports every axis as ⚠️ no result and withholds. A caller that sets
+`approve_max_failed_reviewers` above 0 and omits `!cancelled()` therefore never
+gets the tolerance it configured — one errored cell out of six withholds every
+round, and nothing on the card says why.
+
+`approve_gate` stays the only authority on whether a round may be decided, and
+reading it off a red cursor-review job cannot approve a round the gate itself
+rejected: it is already `untrusted` when the judge was degraded, when more cells
+errored than the caller tolerates, when the review did not land as threads or
+when the head moved, and it falls back to `untrusted` whenever an upstream
+decision job did not succeed — which is every Panel integrity failure that is
+not simply a short panel. The axes keep an explicit
+`needs.approve-start.result == 'success'` rather than a blanket `!cancelled()`
+so the invariant above is unchanged: a start phase that failed to withdraw
+cursor-review's standing approval still skips them.
+
+What the guard does give up is an *incidental* backstop. The gate counts each
+cell by the `status` that cell's own findings artifact reports, not by its
+leg's conclusion — that is how a tolerated errored cell still passes — and
+cursor-review documents that status as an availability signal, not an
+attestation: a prompt-injected cell can write a clean `ok` record, and because
+artifact names are run-global it can claim another cell's name first, so that
+cell's real upload fails and its leg goes red while consolidate reads the
+forgery. A bare `needs:` used to skip the axes on that red leg. With
+`!cancelled()` the round goes on to the axes, which still review the change
+independently, and decide still withholds on any red axis (or more yellow
+than `max_yellow_axes`). Treat the panel count
+as tamper-evident only in the rollup (the red leg stays visible), not in the
+gate.
 
 ## Inputs
 
@@ -401,7 +457,10 @@ Business and design fetch the change from the GitHub compare API, which
 ```yaml
   axis-business:
     needs: [cursor-review, approve-start]
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    if: >-
+      !cancelled()
+      && needs.approve-start.result == 'success'
+      && needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-business.yml@<sha>  # v1
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
@@ -412,7 +471,10 @@ Business and design fetch the change from the GitHub compare API, which
 
   axis-design:
     needs: [cursor-review, approve-start]
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    if: >-
+      !cancelled()
+      && needs.approve-start.result == 'success'
+      && needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-design.yml@<sha>  # v1
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
@@ -423,7 +485,10 @@ Business and design fetch the change from the GitHub compare API, which
 
   axis-completeness:
     needs: [cursor-review, approve-start]
-    if: needs.cursor-review.outputs.approve_gate == 'pass'
+    if: >-
+      !cancelled()
+      && needs.approve-start.result == 'success'
+      && needs.cursor-review.outputs.approve_gate == 'pass'
     uses: Comfy-Org/github-workflows/.github/workflows/axis-completeness.yml@<sha>  # v1
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
