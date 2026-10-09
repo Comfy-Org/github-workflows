@@ -1298,7 +1298,6 @@ class RecordTokenUsageTest(unittest.TestCase):
             "modelUsage": {
                 "claude-opus-5-5": {"inputTokens": 26, "outputTokens": 5312, "cacheReadInputTokens": 397506,
                                     "cacheCreationInputTokens": 43925, "costUSD": 0.5372},
-                "not a model id; $(x)": {"inputTokens": 1},
             },
             "num_turns": 12,
             "duration_ms": 65000,
@@ -1318,7 +1317,7 @@ class RecordTokenUsageTest(unittest.TestCase):
         }})
         self.assertEqual((record["num_turns"], record["duration_ms"]), (12, 65000))
         text = json.dumps(record)
-        for leaked in ("MODEL-WRITTEN TEXT", "session-1", "1.2345", "0.5372", "$(x)"):
+        for leaked in ("MODEL-WRITTEN TEXT", "session-1", "1.2345", "0.5372"):
             self.assertNotIn(leaked, text)
         self.assertNotIn("5312", stdout, "token counts belong in the artifact, not the public log")
 
@@ -1329,19 +1328,47 @@ class RecordTokenUsageTest(unittest.TestCase):
                 self.assertFalse(record["measured"])
                 self.assertNotIn("usage", record)
 
-    def test_a_count_that_is_not_a_plain_integer_reads_as_zero(self):
-        record, _ = self.record({"usage": {
-            "input_tokens": "9", "output_tokens": -5, "cache_read_input_tokens": True,
-            "cache_creation_input_tokens": 1.5, "cache_creation": ["not", "a", "mapping"],
-        }})
+    def test_a_malformed_count_makes_the_record_unmeasured(self):
+        # A guessed zero would read as a measured, free cell in a cost report.
+        cases = {
+            "a string": {"input_tokens": "900"},
+            "a negative": {"output_tokens": -5},
+            "a boolean": {"cache_read_input_tokens": True},
+            "a float": {"cache_creation_input_tokens": 1.5},
+            "a non-mapping cache split": {"cache_creation": ["not", "a", "mapping"]},
+        }
+        for label, usage in cases.items():
+            with self.subTest(label):
+                record, stdout = self.record({"usage": usage})
+                self.assertFalse(record["measured"])
+                self.assertNotIn("usage", record)
+                self.assertIn("malformed:", stdout)
+                self.assertNotIn("900", stdout, "values never reach the public log")
+
+    def test_a_malformed_model_id_makes_the_record_unmeasured_and_is_not_echoed(self):
+        record, stdout = self.record({
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"not a model id; $(x)": {"inputTokens": 1}},
+        })
+        self.assertFalse(record["measured"])
+        self.assertNotIn("$(x)", json.dumps(record) + stdout)
+
+    def test_an_absent_count_reads_as_zero_and_stays_measured(self):
+        # Older CLIs report no cache-write split; that is a measured zero.
+        record, _ = self.record({"usage": {"input_tokens": 7, "output_tokens": 3}})
         self.assertTrue(record["measured"])
-        self.assertEqual(set(record["usage"].values()), {0})
+        self.assertEqual(record["usage"]["input_tokens"], 7)
+        self.assertEqual(record["usage"]["ephemeral_1h_input_tokens"], 0)
+        self.assertEqual(record["models"], {})
 
     def test_the_upload_cannot_reach_the_judge_or_fail_the_cell(self):
         name = block_mapping(self.upload, "        with:", 10)["name"]
         self.assertTrue(name.startswith("usage-direct-"), name)
         self.assertFalse(name.startswith("findings-"), "consolidate downloads `findings-*` as panel cells")
         self.assertEqual(step_scalar(self.upload, "continue-on-error"), "true")
+        # A failed record step would turn a cell that submitted `ok` red, and
+        # the aggregator would then flag the whole panel as inconsistent.
+        self.assertEqual(step_scalar(self.step, "continue-on-error"), "true")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
