@@ -1,8 +1,9 @@
 {
   "name": "comfy-cursor-review-direct-cli",
   "private": true,
-  "description": "Manifest whose ONLY job is to be the single, Dependabot-visible source of truth for the @openai/codex CLI version that cursor-review.yml's optional direct-API review cell installs. Nothing is ever `npm install`ed from this directory: the job reads the pin out of this file and runs `npm install -g @openai/codex@<pin>`. It is a real npm manifest rather than a workflow `env:` constant purely so Dependabot's npm ecosystem can see the pin and open a bump PR — an inline `npm install -g pkg@1.2.3` inside a `run:` step is invisible to every ecosystem, which is how the groom CLI pin silently rotted (see .github/groom/package.json, the precedent this mirrors). Keep the version EXACT (no ^ or ~): the agent CLI is executable supply chain for a step that reads untrusted repo content, and the job rejects a non-exact pin at run time.",
+  "description": "Manifest whose ONLY job is to be the single, Dependabot-visible source of truth for the CLI versions cursor-review.yml's optional direct-API review cells install: @openai/codex (the direct OpenAI cells) and @anthropic-ai/claude-code (the direct Anthropic cells). Nothing is ever `npm install`ed from this directory: the job reads the pin out of this file and runs `npm install -g <package>@<pin>`. It is a real npm manifest rather than a workflow `env:` constant purely so Dependabot's npm ecosystem can see the pin and open a bump PR — an inline `npm install -g pkg@1.2.3` inside a `run:` step is invisible to every ecosystem, which is how the groom CLI pin silently rotted (see .github/groom/package.json, the precedent this mirrors). Keep the version EXACT (no ^ or ~): the agent CLI is executable supply chain for a step that reads untrusted repo content, and the job rejects a non-exact pin at run time.",
   "dependencies": {
-    "@openai/codex": "0.162.0"
+    "@openai/codex": "0.162.0",
+    "@anthropic-ai/claude-code": "2.1.286"
   }
 }

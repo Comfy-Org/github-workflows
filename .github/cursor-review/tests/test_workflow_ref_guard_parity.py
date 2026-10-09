@@ -42,7 +42,7 @@ WORKFLOW = os.path.normpath(
 # The guard steps. `.strip()`-compared so the assertion is about the step name,
 # not about the indentation of whichever job happens to hold it.
 GUARD_STEP_NAME = "- name: Require a pinned workflows_ref"
-EXPECTED_GUARDS = 12
+EXPECTED_GUARDS = 13
 
 # The ledger's exempt resolver, addressed by its step id rather than its name so
 # a comment rewrite above it cannot move the anchor.

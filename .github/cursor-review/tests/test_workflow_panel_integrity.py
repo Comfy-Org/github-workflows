@@ -681,7 +681,7 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
 
-CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix)(?:\.[A-Za-z0-9_-]+)+")
+CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github)(?:\.[A-Za-z0-9_-]+)+")
 
 
 def evaluate(expression, context):
@@ -1045,6 +1045,13 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
     """
 
     DIRECT_MODEL = "gpt-6.1-sol"
+    # Per lab, so the Anthropic twin below runs the same chain.
+    JOB = DIRECT_JOB
+    MODEL_INPUT = "openai_direct_model"
+    REPLACE_INPUT = "openai_direct_replaces_cursor_openai"
+    KEY_OUTPUT = "openai_key_present"
+    DIRECT_OUTPUT = "openai_direct"
+    VENDOR_PREFIX = "gpt-"
 
     @classmethod
     def setUpClass(cls):
@@ -1054,7 +1061,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         jobs = split_jobs(read_workflow())
         cls.preflight = jobs["preflight"]
         cls.review = jobs[MATRIX_JOB]
-        cls.direct = jobs[DIRECT_JOB]
+        cls.direct = jobs[cls.JOB]
         cls.consolidate = jobs["consolidate"]
 
     def setUp(self):
@@ -1072,9 +1079,9 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         done, step_outputs = run_step(
             self.step(self.preflight, PANEL_MODELS_STEP),
             {
-                "inputs.openai_direct_model": self.DIRECT_MODEL,
-                "inputs.openai_direct_replaces_cursor_openai": replace,
-                "needs.gate.outputs.openai_key_present": key_present,
+                "inputs." + self.MODEL_INPUT: self.DIRECT_MODEL,
+                "inputs." + self.REPLACE_INPUT: replace,
+                "needs.gate.outputs." + self.KEY_OUTPUT: key_present,
             },
             tempfile.mkdtemp(dir=self.tmp),
         )
@@ -1088,7 +1095,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
     def downstream(self, replace):
         """The context the direct legs and `consolidate` evaluate against."""
         context = self.preflight_outputs(replace)
-        context["inputs.openai_direct_model"] = self.DIRECT_MODEL
+        context["inputs." + self.MODEL_INPUT] = self.DIRECT_MODEL
         return context
 
     def upload(self, panel, job_lines, cell_context, model, review_type, status):
@@ -1134,24 +1141,24 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
 
     def test_preflight_marks_replacing_cells_as_counted(self):
         replacing = self.preflight_outputs(replace=True)
-        self.assertEqual(replacing["needs.preflight.outputs.openai_direct"], "true")
+        self.assertEqual(replacing["needs.preflight.outputs." + self.DIRECT_OUTPUT], "true")
         self.assertEqual(
-            replacing["needs.preflight.outputs.openai_direct_counts"],
+            replacing["needs.preflight.outputs." + self.DIRECT_OUTPUT + "_counts"],
             "true",
             "preflight no longer marks REPLACING direct cells as counted, so every "
             "reader downstream treats them as advisory",
         )
         self.assertEqual(
-            [m for m in json.loads(replacing["needs.preflight.outputs.models"]) if m.startswith("gpt-")],
+            [m for m in json.loads(replacing["needs.preflight.outputs.models"]) if m.lower().startswith(self.VENDOR_PREFIX)],
             [],
-            "the Cursor OpenAI cells were not dropped from the panel",
+            f"the Cursor {self.VENDOR_PREFIX}* cells were not dropped from the panel",
         )
         for label, outputs in (
             ("side by side", self.preflight_outputs(replace=False)),
-            ("no OPENAI_API_KEY", self.preflight_outputs(replace=True, key_present="false")),
+            ("no API key", self.preflight_outputs(replace=True, key_present="false")),
         ):
             with self.subTest(label):
-                self.assertEqual(outputs["needs.preflight.outputs.openai_direct_counts"], "false")
+                self.assertEqual(outputs["needs.preflight.outputs." + self.DIRECT_OUTPUT + "_counts"], "false")
 
     def test_a_failed_replacing_cell_counts_against_the_panel(self):
         ok, total, cursor = self.aggregate(
@@ -1179,7 +1186,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         self.assertEqual(
             render(job_scalar(self.direct, "continue-on-error") or "false", context),
             "false",
-            f"`{DIRECT_JOB}` absorbs its own failure while it REPLACES the Cursor OpenAI lane",
+            f"`{self.JOB}` absorbs its own failure while it REPLACES the Cursor OpenAI lane",
         )
         for review_type in REVIEW_TYPES:
             with self.subTest(review_type):
@@ -1214,14 +1221,154 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         )
         self.assertIsNone(
             step_scalar(self.step(self.direct, LEG_STEP), "continue-on-error"),
-            f"`{DIRECT_JOB}`'s `{LEG_STEP}` carries continue-on-error and can no longer turn the leg red",
+            f"`{self.JOB}`'s `{LEG_STEP}` carries continue-on-error and can no longer turn the leg red",
         )
         self.assertIn(
             "      fail-fast: false",
             code_lines(self.direct),
-            f"`{DIRECT_JOB}` lost `fail-fast: false`: one red direct leg would cancel the other",
+            f"`{self.JOB}` lost `fail-fast: false`: one red direct leg would cancel the other",
         )
 
+
+
+class AnthropicDirectCellsGateWhenTheyReplaceTest(DirectCellsGateWhenTheyReplaceTest):
+    """The same executed chain for `review-anthropic-direct`: its own inputs,
+    its own preflight outputs and its own `--anthropic-direct-*` aggregate
+    flags, so a broken Anthropic link fails here even with the OpenAI one
+    intact."""
+
+    DIRECT_MODEL = "claude-opus-5-5"
+    JOB = "review-anthropic-direct"
+    MODEL_INPUT = "anthropic_direct_model"
+    REPLACE_INPUT = "anthropic_direct_replaces_cursor_anthropic"
+    KEY_OUTPUT = "anthropic_key_present"
+    DIRECT_OUTPUT = "anthropic_direct"
+    VENDOR_PREFIX = "claude-"
+
+    def test_the_judge_model_is_untouched(self):
+        step = self.step(self.preflight, PANEL_MODELS_STEP)
+        self.assertFalse(
+            any("judge" in line.lower() for line in code_lines(step) if "anthropic" in line.lower()),
+            "the Anthropic replacement reaches the judge model",
+        )
+
+
+class RecordTokenUsageTest(unittest.TestCase):
+    """`Record token usage` in `review-anthropic-direct`, executed: the record
+    it uploads carries the API's token counts and nothing model-written (the
+    result JSON is model output steered by PR text) and no price, and a cell
+    that left no result is marked unmeasured instead of failing the step."""
+
+    CONTEXT = {
+        "inputs.anthropic_direct_model": "claude-opus-5-5",
+        "matrix.review_type": "edge-case",
+        "github.run_attempt": "2",
+    }
+
+    def setUp(self):
+        job = split_jobs(read_workflow())["review-anthropic-direct"]
+        self.step = step_named(job, "Record token usage")
+        self.upload = step_named(job, "Upload usage artifact")
+        self.assertIsNotNone(self.step, "review-anthropic-direct lost its `Record token usage` step")
+        self.assertIsNotNone(self.upload, "review-anthropic-direct lost its `Upload usage artifact` step")
+
+    def record(self, result):
+        """Run the step over `result` (None: no result file at all) and return
+        (the usage record it wrote, the step's stdout)."""
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        if result is not None:
+            with open(os.path.join(workdir, "claude-result.json"), "w", encoding="utf-8") as f:
+                f.write(result if isinstance(result, str) else json.dumps(result))
+        done, _ = run_step(self.step, self.CONTEXT, workdir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(os.path.join(workdir, "usage-out", "usage.json"), encoding="utf-8") as f:
+            return json.load(f), done.stdout
+
+    def test_copies_the_token_counts_and_nothing_else(self):
+        record, stdout = self.record({
+            "result": "MODEL-WRITTEN TEXT",
+            "session_id": "session-1",
+            "total_cost_usd": 1.2345,
+            "usage": {
+                "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+                "cache_creation_input_tokens": 43925,
+                "cache_creation": {"ephemeral_1h_input_tokens": 43925, "ephemeral_5m_input_tokens": 0},
+            },
+            "modelUsage": {
+                "claude-opus-5-5": {"inputTokens": 26, "outputTokens": 5312, "cacheReadInputTokens": 397506,
+                                    "cacheCreationInputTokens": 43925, "costUSD": 0.5372},
+            },
+            "num_turns": 12,
+            "duration_ms": 65000,
+        })
+        self.assertEqual(
+            (record["model"], record["review_type"], record["run_attempt"], record["measured"]),
+            ("claude-opus-5-5", "edge-case", 2, True),
+        )
+        self.assertEqual(record["usage"], {
+            "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+            "cache_creation_input_tokens": 43925, "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 43925,
+        })
+        self.assertEqual(record["models"], {"claude-opus-5-5": {
+            "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+            "cache_creation_input_tokens": 43925,
+        }})
+        self.assertEqual((record["num_turns"], record["duration_ms"]), (12, 65000))
+        text = json.dumps(record)
+        for leaked in ("MODEL-WRITTEN TEXT", "session-1", "1.2345", "0.5372"):
+            self.assertNotIn(leaked, text)
+        self.assertNotIn("5312", stdout, "token counts belong in the artifact, not the public log")
+
+    def test_a_cell_with_no_usable_result_is_unmeasured(self):
+        for result in (None, "", "{truncated", "[]", {"usage": "n/a"}):
+            with self.subTest(result=result):
+                record, _ = self.record(result)
+                self.assertFalse(record["measured"])
+                self.assertNotIn("usage", record)
+
+    def test_a_malformed_count_makes_the_record_unmeasured(self):
+        # A guessed zero would read as a measured, free cell in a cost report.
+        cases = {
+            "a string": {"input_tokens": "900"},
+            "a negative": {"output_tokens": -5},
+            "a boolean": {"cache_read_input_tokens": True},
+            "a float": {"cache_creation_input_tokens": 1.5},
+            "a non-mapping cache split": {"cache_creation": ["not", "a", "mapping"]},
+        }
+        for label, usage in cases.items():
+            with self.subTest(label):
+                record, stdout = self.record({"usage": usage})
+                self.assertFalse(record["measured"])
+                self.assertNotIn("usage", record)
+                self.assertIn("malformed:", stdout)
+                self.assertNotIn("900", stdout, "values never reach the public log")
+
+    def test_a_malformed_model_id_makes_the_record_unmeasured_and_is_not_echoed(self):
+        record, stdout = self.record({
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"not a model id; $(x)": {"inputTokens": 1}},
+        })
+        self.assertFalse(record["measured"])
+        self.assertNotIn("$(x)", json.dumps(record) + stdout)
+
+    def test_an_absent_count_reads_as_zero_and_stays_measured(self):
+        # Older CLIs report no cache-write split; that is a measured zero.
+        record, _ = self.record({"usage": {"input_tokens": 7, "output_tokens": 3}})
+        self.assertTrue(record["measured"])
+        self.assertEqual(record["usage"]["input_tokens"], 7)
+        self.assertEqual(record["usage"]["ephemeral_1h_input_tokens"], 0)
+        self.assertEqual(record["models"], {})
+
+    def test_the_upload_cannot_reach_the_judge_or_fail_the_cell(self):
+        name = block_mapping(self.upload, "        with:", 10)["name"]
+        self.assertTrue(name.startswith("usage-direct-"), name)
+        self.assertFalse(name.startswith("findings-"), "consolidate downloads `findings-*` as panel cells")
+        self.assertEqual(step_scalar(self.upload, "continue-on-error"), "true")
+        # A failed record step would turn a cell that submitted `ok` red, and
+        # the aggregator would then flag the whole panel as inconsistent.
+        self.assertEqual(step_scalar(self.step, "continue-on-error"), "true")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

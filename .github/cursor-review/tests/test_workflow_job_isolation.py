@@ -303,6 +303,72 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap",
                                    "auto-retry"})
 
+    def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
+        # `gate` only resolves a presence boolean; the cells are the one
+        # consumer, and they hold a model key beside a PR checkout, so they
+        # must stay GitHub-hosted.
+        holders = {
+            name for name, body in self.jobs.items()
+            if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
+        }
+        self.assertEqual(holders, {"gate", "review-anthropic-direct"})
+        runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
+        self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
+
+    def test_the_anthropic_cells_load_no_pr_authored_claude_config(self):
+        # `claude` runs with the PR checkout as cwd, so PR-authored
+        # `.claude/settings*.json` or `.mcp.json` could re-point the API key at
+        # another host. Pin both halves: no setting source is loaded, and the
+        # files are removed from the checkout before the agent runs.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        invocations = [l for l in body if "claude -p" in l]
+        self.assertEqual(len(invocations), 1, invocations)
+        for flag in ("--restricted", '--setting-sources ""'):
+            self.assertIn(flag, invocations[0])
+        self.assertTrue(
+            any("rm -rf" in l and "_pr/.claude" in l and "_pr/.mcp.json" in l for l in body),
+            "review-anthropic-direct no longer removes the PR's .claude/ and .mcp.json",
+        )
+
+    def test_the_anthropic_cells_keep_their_search_tools(self):
+        # On the pinned CLI `--bare` silently drops Grep and Glob from
+        # `--tools "Read,Grep,Glob"`, leaving Read alone: the agent could open
+        # files it already knows of but never search the checkout, which is
+        # the reason it reads the checkout at all. `--setting-sources ""` and
+        # the fresh CLAUDE_CONFIG_DIR already cover what `--bare` would skip.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        start = next(i for i, l in enumerate(body) if "claude -p" in l)
+        argv = []
+        for line in body[start:]:
+            argv.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        argv = " ".join(argv)
+        self.assertNotIn("--bare", argv)
+        self.assertIn('--tools "Read,Grep,Glob"', argv)
+
+    def test_the_anthropic_cells_deny_proc_independently_of_restricted(self):
+        # ANTHROPIC_API_KEY is in the env of the process serving Read/Grep/Glob,
+        # so `/proc/self/environ` is the key. `--restricted` confines the file
+        # tools to the checkout; the deny rules are a second layer that holds
+        # even if a CLI bump loosens that flag, and the verify step fails the
+        # cell by name if the pinned CLI stops advertising any flag relied on.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        invocation = [l for l in body if "claude -p" in l]
+        self.assertEqual(len(invocation), 1, invocation)
+        start = body.index(invocation[0])
+        argv = []
+        for line in body[start:]:
+            argv.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        argv = " ".join(argv)
+        self.assertIn('--disallowedTools "Read(//proc/**),Read(//sys/**)"', argv)
+        self.assertIn("--permission-prompts none", argv)
+        help_check = " ".join(body)
+        for flag in ("--restricted", "--disallowedTools", "--permission-prompts", "--setting-sources"):
+            self.assertRegex(help_check, rf"for flag in [^;]*{flag}\b", flag)
+
     def test_only_credential_free_jobs_follow_the_runs_on_input(self):
         # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected
         # model cell may have run. Anything holding the bot key, a write scope,
