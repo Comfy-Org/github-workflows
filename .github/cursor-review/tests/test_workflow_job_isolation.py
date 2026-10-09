@@ -330,6 +330,28 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             "review-anthropic-direct no longer removes the PR's .claude/ and .mcp.json",
         )
 
+    def test_the_anthropic_cells_deny_proc_independently_of_restricted(self):
+        # ANTHROPIC_API_KEY is in the env of the process serving Read/Grep/Glob,
+        # so `/proc/self/environ` is the key. `--restricted` confines the file
+        # tools to the checkout; the deny rules are a second layer that holds
+        # even if a CLI bump loosens that flag, and the verify step fails the
+        # cell by name if the pinned CLI stops advertising any flag relied on.
+        body = code_lines(self.jobs["review-anthropic-direct"])
+        invocation = [l for l in body if "claude -p" in l]
+        self.assertEqual(len(invocation), 1, invocation)
+        start = body.index(invocation[0])
+        argv = []
+        for line in body[start:]:
+            argv.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        argv = " ".join(argv)
+        self.assertIn('--disallowedTools "Read(//proc/**),Read(//sys/**)"', argv)
+        self.assertIn("--permission-prompts none", argv)
+        help_check = " ".join(body)
+        for flag in ("--restricted", "--disallowedTools", "--permission-prompts", "--setting-sources"):
+            self.assertRegex(help_check, rf"for flag in [^;]*{flag}\b", flag)
+
     def test_only_credential_free_jobs_follow_the_runs_on_input(self):
         # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected
         # model cell may have run. Anything holding the bot key, a write scope,

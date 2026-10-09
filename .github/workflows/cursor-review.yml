@@ -3457,9 +3457,11 @@ jobs:
     #
     # Credential posture: `contents: read` only, no write-scoped token (see
     # SECURITY.md); the PR checkout persists no credential. ANTHROPIC_API_KEY
-    # reaches `claude` in that ONE step's env and is never written to disk,
-    # and the agent has no tool that can read the environment. Belt and
-    # braces, groom's finder guard runs on the record before it uploads.
+    # reaches `claude` in that ONE step's env and is never written to disk.
+    # The agent cannot run code, and its file tools cannot reach
+    # `/proc/self/environ`: `--restricted` confines them to the checkout, and
+    # deny rules on /proc and /sys hold independently of that flag. The
+    # literal-match guard on the record before upload is a last tripwire.
     name: '${{ matrix.review_type }} direct (${{ inputs.anthropic_direct_model }})'
     needs: [gate, diff-size, preflight, ledger]
     if: >-
@@ -3657,6 +3659,17 @@ jobs:
             exit 1
           fi
           echo "claude ${installed}"
+          # The confinement rests on these flags, so a bump whose CLI dropped
+          # or renamed one fails HERE, by name, rather than at argv parsing
+          # mid-review — or, worse, by silently running unconfined.
+          help="$(claude --help 2>&1)"
+          for flag in --bare --restricted --setting-sources --strict-mcp-config \
+                      --disallowedTools --permission-prompts --no-session-persistence; do
+            if ! printf '%s\n' "$help" | grep -qE -- "(^|[[:space:],])${flag}([[:space:],]|$)"; then
+              echo "::error::claude ${installed} does not advertise ${flag}, which the direct-API cell's confinement relies on."
+              exit 1
+            fi
+          done
 
       - name: Build prompt
         if: steps.key.outputs.present == 'true'
@@ -3728,7 +3741,10 @@ jobs:
           # The SAME MCP submission tool the Cursor and Codex cells use, as the
           # only MCP server (`--strict-mcp-config`). The agent's tools are
           # Read, Grep and Glob, confined to this checkout by `--restricted`,
-          # plus the two submission calls.
+          # plus the two submission calls. The `--disallowedTools` deny rules
+          # (a Read rule covers Grep and Glob too) are a second, independent
+          # layer over /proc and /sys — `/proc/self/environ` holds the key — so
+          # a CLI bump that loosened `--restricted` alone still cannot reach it.
           mcp_config="$(python3 -I - <<'PY'
           import json, os
           print(json.dumps({"mcpServers": {"cursor-review-output": {
@@ -3750,6 +3766,7 @@ jobs:
             --tools "Read,Grep,Glob" \
             --strict-mcp-config --mcp-config "$mcp_config" \
             --allowedTools "Read,Grep,Glob,mcp__cursor-review-output__cursor_review_record_finding,mcp__cursor-review-output__cursor_review_finish" \
+            --disallowedTools "Read(//proc/**),Read(//sys/**)" \
             --permission-prompts none \
             --model "$MODEL" --effort "$EFFORT" \
             --output-format json --no-session-persistence \
