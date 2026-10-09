@@ -23,20 +23,29 @@ What it deliberately does NOT do:
     so nothing the agent left running can rewrite the findings afterwards.
 
 Retry on a transient Cursor capacity error (`--retry-delays`): when the agent
-exits non-zero by itself and the tail of its stdout or stderr carries Cursor's
-retriable marker (`[resource_exhausted]` or `RetriableError`), the agent is run
-again after the next delay, up to one retry per delay. A retry happens only when
-the findings file still reads as an untouched, unsubmitted record — a parseable
-object, status not "ok", and NO recorded findings — because the MCP tool appends
-to that file, so re-running a cell that already recorded findings would
-duplicate them. It is also skipped once `--retry-window` seconds (measured from
-the wrapper's start, including the delay) would be exceeded, so a retry starts
-only while a full review still fits inside the step cap. Anything else — exit 0,
-a different error, death by signal, a forwarded signal (the step cap) — is
-reported exactly as without retries. Each retry prints one `::warning::` line
-naming the `--cell`, the attempt and the matched marker. The agent's output
-still reaches this wrapper's stdout/stderr unchanged; it is only teed through
-here so its tail can be matched.
+exits non-zero by itself and the tail of its stderr carries Cursor's retriable
+marker (`[resource_exhausted]` or `RetriableError`), the agent is run again
+after the next delay, up to one retry per delay. Only stderr is matched: stdout
+is the model's own text, which the PR under review can steer. A retry happens
+only when the findings file still reads as an untouched, unsubmitted record — a
+parseable object, status not "ok", and NO recorded findings — because the MCP
+tool appends to that file, so re-running a cell that already recorded findings
+would duplicate them. It is also skipped once `--retry-window` seconds
+(measured from the wrapper's start, including the delay) would be exceeded, so
+a retry starts only while a full review still fits inside the step cap.
+Anything else — exit 0, a different error, death by signal, a forwarded signal
+(the step cap) — is reported exactly as without retries. Each retry prints one
+`::warning::` line, on a line of its own, naming the `--cell`, the attempt and
+the matched marker. The agent's stdout is inherited untouched; its stderr still
+reaches this wrapper's stderr unchanged, only teed through here so its tail can
+be matched.
+
+The prompt is the agent's stdin (`< /tmp/prompt.txt`), one open file whose
+offset every attempt shares, and the first attempt reads it to EOF. So the
+offset stdin has at startup is recorded, and stdin is put back there before
+every retry; without that, the retry would read an empty prompt and fail at
+once. A stdin that cannot seek (a pipe, a tty) cannot be replayed, so it rules
+the retry out, and the wrapper logs why.
 
 A SIGINT/SIGTERM/SIGHUP to this wrapper (the step cap, a run cancel) is passed
 to the agent's group; the agent then gets at most 5 seconds before SIGKILL —
@@ -83,10 +92,10 @@ RETRIABLE = (
     ("resource_exhausted", re.compile(rb"\[resource_exhausted\]")),
     ("RetriableError", re.compile(rb"\bRetriableError\b")),
 )
-# How much of each stream's end is kept for the match. The marker is the last
-# thing a failed run prints.
+# How much of the end of the agent's stderr is kept for the match. The marker
+# is the last thing a failed run prints.
 TAIL_BYTES = 64 * 1024
-# How long to wait for a stream to drain after the agent's group is killed.
+# How long to wait for stderr to drain after the agent's group is killed.
 # Bounded so a stray process that escaped the group cannot hang the wrapper.
 DRAIN_TIMEOUT = 5.0
 
@@ -173,12 +182,57 @@ class Tee:
         return self.tail
 
 
-def retriable_marker(*tails):
-    """The fixed marker name Cursor's retriable error carries, or None."""
+def retriable_marker(stderr_tail):
+    """The fixed marker name Cursor's retriable error carries, or None.
+
+    Only the agent's stderr is searched, never its stdout: that is the model's
+    own output, which text in the PR under review can steer.
+    """
     for name, pattern in RETRIABLE:
-        if any(pattern.search(tail) for tail in tails):
+        if pattern.search(stderr_tail):
             return name
     return None
+
+
+def fresh_line(stderr_tail):
+    """A newline when the agent's stderr ended mid-line, else nothing.
+
+    The agent's stderr is copied into the wrapper's, and its last write may
+    lack a newline; a `::warning::` glued onto it is not a workflow command
+    (the runner only parses one at the start of a line).
+    """
+    return "" if not stderr_tail or stderr_tail.endswith(b"\n") else "\n"
+
+
+class Prompt:
+    """The agent's stdin, put back where it started before each retry.
+
+    Every attempt inherits the same open stdin, offset included, and the first
+    one reads it to EOF, so a retry left alone reads an empty prompt (and
+    cursor-agent fails at once with "No prompt provided for print mode"). The
+    offset is recorded before the first attempt; a stdin that cannot seek — a
+    pipe, a tty, a closed descriptor — cannot be replayed, and `problem` says
+    why.
+    """
+
+    def __init__(self, fd=0):
+        self.fd = fd
+        self.problem = None
+        try:
+            self.offset = os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError as exc:
+            self.offset, self.problem = None, exc.strerror or repr(exc)
+
+    def rewind(self):
+        """True once stdin is back at the offset it had at startup."""
+        if self.offset is None:
+            return False
+        try:
+            os.lseek(self.fd, self.offset, os.SEEK_SET)
+        except OSError as exc:
+            self.problem = exc.strerror or repr(exc)
+            return False
+        return True
 
 
 def safe_label(text):
@@ -210,6 +264,8 @@ def run(command, findings, poll, linger, grace,
     received = []
     current = [None]
     started = time.monotonic()
+    # Recorded before the first attempt can move the shared offset.
+    prompt = Prompt()
 
     # The step cap and a run cancel signal THIS process; pass them on, so a cell
     # that never submits still dies at the cap exactly as it did unwrapped.
@@ -227,10 +283,14 @@ def run(command, findings, poll, linger, grace,
 
     attempts = len(retry_delays) + 1
     for attempt in range(1, attempts + 1):
-        code, marker = attempt_once(
+        code, stderr_tail = attempt_once(
             command, findings, poll, linger, grace, received, current)
+        marker = retriable_marker(stderr_tail)
         if attempt == attempts or received or code <= 0 or marker is None:
             return code
+        # Everything printed below follows the agent's own stderr, whose last
+        # write may lack a newline; the `::warning::` must start a line.
+        print(fresh_line(stderr_tail), end="", file=sys.stderr, flush=True)
         if not retry_safe(findings):
             log(f"agent exited {code} with [{marker}], but findings were already "
                 "recorded or the file is unreadable; not retrying")
@@ -239,6 +299,12 @@ def run(command, findings, poll, linger, grace,
         if time.monotonic() - started + delay > retry_window:
             log(f"agent exited {code} with [{marker}], but a retry after {delay:g}s "
                 f"would start past the {retry_window:g}s retry window; not retrying")
+            return code
+        # Nothing reads stdin between here and the next attempt: the agent's
+        # whole group is dead, and this wrapper never reads it.
+        if not prompt.rewind():
+            log(f"agent exited {code} with [{marker}], but its stdin cannot be "
+                f"rewound to replay the prompt ({prompt.problem}); not retrying")
             return code
         print(f"::warning::Reviewer cell {safe_label(cell)}: attempt {attempt}/"
               f"{attempts} failed with Cursor's retriable error [{marker}] "
@@ -254,16 +320,16 @@ def run(command, findings, poll, linger, grace,
 
 
 def attempt_once(command, findings, poll, linger, grace, received, current):
-    """Run the agent once: (its status, the retriable marker it printed or None)."""
+    """Run the agent once: (its status, the last TAIL_BYTES of its stderr)."""
     # Own process group, so a stop reaches cursor-agent's children too (the
     # MCP server, any shell it spawned) — not just the top-level process.
-    # Both streams are piped through here only so a retriable error can be
-    # recognised; every byte is copied on to this wrapper's own stdout/stderr.
+    # stdin and stdout are inherited as they are. stderr is piped through here
+    # only so a retriable error can be recognised; every byte is copied on to
+    # this wrapper's own stderr.
     child = subprocess.Popen(command, start_new_session=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                             stderr=subprocess.PIPE)
     current[0] = child
-    tees = (Tee(child.stdout, sys.stdout.fileno()),
-            Tee(child.stderr, sys.stderr.fileno()))
+    tee = Tee(child.stderr, sys.stderr.fileno())
     try:
         code = supervise(child, findings, poll, linger, grace, received)
     finally:
@@ -272,10 +338,9 @@ def attempt_once(command, findings, poll, linger, grace, received, current):
         # rewrite the findings after the upload and leg check read them.
         signal_group(child.pid, signal.SIGKILL)
         current[0] = None
-    tails = [tee.drain() for tee in tees]
-    for stream in (child.stdout, child.stderr):
-        stream.close()
-    return code, retriable_marker(*tails)
+    stderr_tail = tee.drain()
+    child.stderr.close()
+    return code, stderr_tail
 
 
 def stop_on_signal(child, signum, grace):

@@ -2600,7 +2600,10 @@ jobs:
         # Only a cell with no recorded findings is re-run, and no retry starts
         # later than 300s in, so the last attempt still has ~10 min of this cap
         # for a full review. Each retry is a `::warning::` naming the cell; a
-        # cell that exhausts them fails its leg exactly as before.
+        # cell that exhausts them fails its leg exactly as before. A retry
+        # re-reads the whole prompt because the wrapper rewinds its stdin, so
+        # keep feeding it as `< /tmp/prompt.txt`: a pipe cannot be rewound,
+        # and turns the retries off.
         continue-on-error: true
         timeout-minutes: 15
         env:
