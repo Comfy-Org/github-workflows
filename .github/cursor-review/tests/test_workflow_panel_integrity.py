@@ -1045,6 +1045,13 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
     """
 
     DIRECT_MODEL = "gpt-6.1-sol"
+    # Per lab, so the Anthropic twin below runs the same chain.
+    JOB = DIRECT_JOB
+    MODEL_INPUT = "openai_direct_model"
+    REPLACE_INPUT = "openai_direct_replaces_cursor_openai"
+    KEY_OUTPUT = "openai_key_present"
+    DIRECT_OUTPUT = "openai_direct"
+    VENDOR_PREFIX = "gpt-"
 
     @classmethod
     def setUpClass(cls):
@@ -1054,7 +1061,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         jobs = split_jobs(read_workflow())
         cls.preflight = jobs["preflight"]
         cls.review = jobs[MATRIX_JOB]
-        cls.direct = jobs[DIRECT_JOB]
+        cls.direct = jobs[cls.JOB]
         cls.consolidate = jobs["consolidate"]
 
     def setUp(self):
@@ -1072,9 +1079,9 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         done, step_outputs = run_step(
             self.step(self.preflight, PANEL_MODELS_STEP),
             {
-                "inputs.openai_direct_model": self.DIRECT_MODEL,
-                "inputs.openai_direct_replaces_cursor_openai": replace,
-                "needs.gate.outputs.openai_key_present": key_present,
+                "inputs." + self.MODEL_INPUT: self.DIRECT_MODEL,
+                "inputs." + self.REPLACE_INPUT: replace,
+                "needs.gate.outputs." + self.KEY_OUTPUT: key_present,
             },
             tempfile.mkdtemp(dir=self.tmp),
         )
@@ -1088,7 +1095,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
     def downstream(self, replace):
         """The context the direct legs and `consolidate` evaluate against."""
         context = self.preflight_outputs(replace)
-        context["inputs.openai_direct_model"] = self.DIRECT_MODEL
+        context["inputs." + self.MODEL_INPUT] = self.DIRECT_MODEL
         return context
 
     def upload(self, panel, job_lines, cell_context, model, review_type, status):
@@ -1134,24 +1141,24 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
 
     def test_preflight_marks_replacing_cells_as_counted(self):
         replacing = self.preflight_outputs(replace=True)
-        self.assertEqual(replacing["needs.preflight.outputs.openai_direct"], "true")
+        self.assertEqual(replacing["needs.preflight.outputs." + self.DIRECT_OUTPUT], "true")
         self.assertEqual(
-            replacing["needs.preflight.outputs.openai_direct_counts"],
+            replacing["needs.preflight.outputs." + self.DIRECT_OUTPUT + "_counts"],
             "true",
             "preflight no longer marks REPLACING direct cells as counted, so every "
             "reader downstream treats them as advisory",
         )
         self.assertEqual(
-            [m for m in json.loads(replacing["needs.preflight.outputs.models"]) if m.startswith("gpt-")],
+            [m for m in json.loads(replacing["needs.preflight.outputs.models"]) if m.lower().startswith(self.VENDOR_PREFIX)],
             [],
-            "the Cursor OpenAI cells were not dropped from the panel",
+            f"the Cursor {self.VENDOR_PREFIX}* cells were not dropped from the panel",
         )
         for label, outputs in (
             ("side by side", self.preflight_outputs(replace=False)),
-            ("no OPENAI_API_KEY", self.preflight_outputs(replace=True, key_present="false")),
+            ("no API key", self.preflight_outputs(replace=True, key_present="false")),
         ):
             with self.subTest(label):
-                self.assertEqual(outputs["needs.preflight.outputs.openai_direct_counts"], "false")
+                self.assertEqual(outputs["needs.preflight.outputs." + self.DIRECT_OUTPUT + "_counts"], "false")
 
     def test_a_failed_replacing_cell_counts_against_the_panel(self):
         ok, total, cursor = self.aggregate(
@@ -1179,7 +1186,7 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         self.assertEqual(
             render(job_scalar(self.direct, "continue-on-error") or "false", context),
             "false",
-            f"`{DIRECT_JOB}` absorbs its own failure while it REPLACES the Cursor OpenAI lane",
+            f"`{self.JOB}` absorbs its own failure while it REPLACES the Cursor OpenAI lane",
         )
         for review_type in REVIEW_TYPES:
             with self.subTest(review_type):
@@ -1214,14 +1221,36 @@ class DirectCellsGateWhenTheyReplaceTest(unittest.TestCase):
         )
         self.assertIsNone(
             step_scalar(self.step(self.direct, LEG_STEP), "continue-on-error"),
-            f"`{DIRECT_JOB}`'s `{LEG_STEP}` carries continue-on-error and can no longer turn the leg red",
+            f"`{self.JOB}`'s `{LEG_STEP}` carries continue-on-error and can no longer turn the leg red",
         )
         self.assertIn(
             "      fail-fast: false",
             code_lines(self.direct),
-            f"`{DIRECT_JOB}` lost `fail-fast: false`: one red direct leg would cancel the other",
+            f"`{self.JOB}` lost `fail-fast: false`: one red direct leg would cancel the other",
         )
 
+
+
+class AnthropicDirectCellsGateWhenTheyReplaceTest(DirectCellsGateWhenTheyReplaceTest):
+    """The same executed chain for `review-anthropic-direct`: its own inputs,
+    its own preflight outputs and its own `--anthropic-direct-*` aggregate
+    flags, so a broken Anthropic link fails here even with the OpenAI one
+    intact."""
+
+    DIRECT_MODEL = "claude-opus-5-5"
+    JOB = "review-anthropic-direct"
+    MODEL_INPUT = "anthropic_direct_model"
+    REPLACE_INPUT = "anthropic_direct_replaces_cursor_anthropic"
+    KEY_OUTPUT = "anthropic_key_present"
+    DIRECT_OUTPUT = "anthropic_direct"
+    VENDOR_PREFIX = "claude-"
+
+    def test_the_judge_model_is_untouched(self):
+        step = self.step(self.preflight, PANEL_MODELS_STEP)
+        self.assertFalse(
+            any("judge" in line.lower() for line in code_lines(step) if "anthropic" in line.lower()),
+            "the Anthropic replacement reaches the judge model",
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

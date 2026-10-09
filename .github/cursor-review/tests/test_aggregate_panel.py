@@ -369,6 +369,128 @@ class ConsistencyTest(AggregateTest):
         self.assertIn("counted as status=mismatch", result.stdout)
 
 
+ANTHROPIC = "claude-opus-5-5"
+
+
+class PerLabTest(unittest.TestCase):
+    """The OpenAI and Anthropic direct cells each count by their OWN lab's
+    flag: one lab's role must never leak into the other's."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+        # The Cursor panel once both labs' Cursor cells are replaced.
+        self.models = ["kimi"]
+        for review_type in AGG.REVIEW_TYPES:
+            self.write(f"findings-{review_type}-kimi", cell("kimi", review_type))
+
+    def write(self, artifact, record):
+        os.makedirs(os.path.join(self.dir, artifact), exist_ok=True)
+        with open(os.path.join(self.dir, artifact, "findings.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+    def direct(self, model, review_type, status="ok", **extra):
+        self.write(f"findings-direct-{review_type}-{model}", cell(model, review_type, status, **extra))
+
+    def both_labs(self, openai_status="ok", anthropic_status="ok"):
+        for review_type in AGG.REVIEW_TYPES:
+            self.direct(DIRECT, review_type, openai_status)
+            self.direct(ANTHROPIC, review_type, anthropic_status)
+
+    def run_agg(self, openai_counts, anthropic_counts, **kw):
+        return AGG.aggregate(self.dir, self.models, DIRECT, openai_counts,
+                             kw.get("review_result", "success"), kw.get("direct_result", "success"),
+                             ANTHROPIC, anthropic_counts, kw.get("anthropic_result", "success"))
+
+    def roles(self, cells):
+        return {(c["model"], c["review_type"]): c.get("advisory", False)
+                for c in cells if c.get("direct_api")}
+
+    def test_both_labs_counting(self):
+        self.both_labs(anthropic_status="error")
+        cells, ok, total, inconsistent = self.run_agg(True, True, anthropic_result="failure")
+        self.assertEqual((ok, total), (4, 6))
+        self.assertFalse(inconsistent)
+        self.assertFalse(any(self.roles(cells).values()))
+
+    def test_both_labs_advisory(self):
+        self.both_labs(openai_status="error", anthropic_status="error")
+        cells, ok, total, inconsistent = self.run_agg(False, False)
+        self.assertEqual((ok, total), (2, 2))
+        self.assertFalse(inconsistent)
+        self.assertTrue(all(self.roles(cells).values()))
+
+    def test_openai_counting_anthropic_advisory(self):
+        self.both_labs(anthropic_status="error")
+        cells, ok, total, _ = self.run_agg(True, False)
+        self.assertEqual((ok, total), (4, 4), "an advisory Anthropic cell was counted")
+        roles = self.roles(cells)
+        self.assertFalse(roles[(DIRECT, "adversarial")])
+        self.assertTrue(roles[(ANTHROPIC, "adversarial")])
+
+    def test_anthropic_counting_openai_advisory(self):
+        self.both_labs(openai_status="error")
+        cells, ok, total, _ = self.run_agg(False, True)
+        self.assertEqual((ok, total), (4, 4), "an advisory OpenAI cell was counted")
+        roles = self.roles(cells)
+        self.assertTrue(roles[(DIRECT, "edge-case")])
+        self.assertFalse(roles[(ANTHROPIC, "edge-case")])
+
+    def test_missing_anthropic_artifact_is_synthesised_as_error(self):
+        self.direct(ANTHROPIC, "adversarial")
+        cells, ok, total, _ = self.run_agg(False, True)
+        self.assertEqual((ok, total), (3, 4))
+        synthesised = [c for c in cells if c["model"] == ANTHROPIC and c["review_type"] == "edge-case"]
+        self.assertEqual([c["status"] for c in synthesised], ["error"])
+        self.assertTrue(synthesised[0]["direct_api"])
+
+    def test_missing_advisory_anthropic_artifact_is_not_synthesised(self):
+        cells, ok, total, _ = self.run_agg(True, False)
+        self.assertFalse([c for c in cells if c["model"] == ANTHROPIC])
+
+    def test_an_anthropic_cell_cannot_set_its_own_markers(self):
+        self.both_labs()
+        self.direct(ANTHROPIC, "edge-case", "error", advisory=True, direct_api=False)
+        cells, ok, total, _ = self.run_agg(False, True)
+        self.assertEqual((ok, total), (3, 4), "a forged `advisory` excused a failed counted cell")
+        forged = [c for c in cells if c["model"] == ANTHROPIC and c["review_type"] == "edge-case"][0]
+        self.assertIs(forged["direct_api"], True)
+        self.assertNotIn("advisory", forged)
+
+    def test_counted_anthropic_lane_failed_with_all_ok_is_inconsistent(self):
+        self.both_labs()
+        _, _, _, inconsistent = self.run_agg(False, True, anthropic_result="failure")
+        self.assertTrue(inconsistent)
+        _, _, _, inconsistent = self.run_agg(True, False, anthropic_result="failure")
+        self.assertFalse(inconsistent, "an advisory lab's red matrix was read as a forgery")
+
+    def test_direct_artifact_matching_neither_lab_is_a_mismatch_when_any_counts(self):
+        self.both_labs()
+        self.direct("other-model", "adversarial")
+        cells, ok, total, inconsistent = self.run_agg(False, True)
+        self.assertEqual((ok, total), (4, 5))
+        self.assertTrue(inconsistent)
+        cells, ok, total, inconsistent = self.run_agg(False, False)
+        self.assertEqual((ok, total), (2, 2))
+        self.assertFalse(inconsistent)
+
+    def test_cli_takes_the_anthropic_flags(self):
+        self.both_labs(anthropic_status="error")
+        out = os.path.join(self.dir, "panel.json")
+        gh = os.path.join(self.dir, "gh-output")
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(self.models),
+             "--direct-model", DIRECT, "--direct-counts", "false", "--review-result", "success",
+             "--anthropic-direct-model", ANTHROPIC, "--anthropic-direct-counts", "true",
+             "--anthropic-direct-result", "failure", "--out", out, "--github-output", gh],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertIn("Panel: 2/4 cells contributed findings.", result.stdout)
+        with open(gh, encoding="utf-8") as f:
+            self.assertIn("panel_inconsistent=false", f.read())
+
+
 class DownstreamTest(unittest.TestCase):
     def test_summary_names_a_failed_direct_cell_with_its_backend(self):
         panel = [

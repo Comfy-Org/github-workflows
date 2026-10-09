@@ -303,6 +303,18 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap",
                                    "auto-retry"})
 
+    def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
+        # `gate` only resolves a presence boolean; the cells are the one
+        # consumer, and they hold a model key beside a PR checkout, so they
+        # must stay GitHub-hosted.
+        holders = {
+            name for name, body in self.jobs.items()
+            if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
+        }
+        self.assertEqual(holders, {"gate", "review-anthropic-direct"})
+        runs_on = [l.strip() for l in self.jobs["review-anthropic-direct"] if l.startswith("    runs-on:")]
+        self.assertEqual(runs_on, ["runs-on: ubuntu-latest"])
+
     def test_only_credential_free_jobs_follow_the_runs_on_input(self):
         # `runs_on` hands jobs to a caller-chosen pool where a prompt-injected
         # model cell may have run. Anything holding the bot key, a write scope,

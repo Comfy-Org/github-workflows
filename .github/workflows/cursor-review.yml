@@ -314,6 +314,48 @@ on:
         type: boolean
         required: false
         default: true
+      anthropic_direct_model:
+        description: >-
+          OPT-IN. An Anthropic model id (e.g. `claude-opus-5-5`) reviewed
+          through the Anthropic API directly, via the Claude Code CLI, as two
+          cells — adversarial and edge-case, the same passes and prompts a
+          Cursor model gets. The Anthropic twin of `openai_direct_model`, with
+          the same rules: empty (default) = the job is skipped and nothing
+          changes; requires the `ANTHROPIC_API_KEY` secret and a plain id
+          (`[A-Za-z0-9._-]`), and set without either, preflight warns, the
+          cells stay off and the panel is unchanged. Unlike the OpenAI cells,
+          which see the diff only, the agent also reads a read-only checkout of
+          the PR with Read, Grep and Glob alone — no Bash or other
+          code-running tool — and `--restricted` confines those file tools to
+          that checkout. This panel reviews private-repo diffs and the workflow
+          cannot check the Anthropic organization's data-retention terms, so a
+          caller on a private repo must use a key from an organization with
+          zero data retention. By default the cells REPLACE the Cursor
+          Anthropic cells; see `anthropic_direct_replaces_cursor_anthropic`.
+        type: string
+        required: false
+        default: ''
+      anthropic_direct_effort:
+        description: >-
+          Reasoning effort for the direct Anthropic cells (`--effort`): one of
+          `low`, `medium`, `high`, `xhigh`, `max`. Any other value warns and
+          falls back to `xhigh`, the default. Ignored unless
+          `anthropic_direct_model` is in effect.
+        type: string
+        required: false
+        default: xhigh
+      anthropic_direct_replaces_cursor_anthropic:
+        description: >-
+          The Anthropic twin of `openai_direct_replaces_cursor_openai`, with
+          the same semantics: when the direct Anthropic cells are in effect,
+          drop the Cursor-hosted Anthropic cells (vendor prefix `claude-`,
+          case-insensitive) so they REPLACE them and gate exactly as they
+          would. Set false for a side-by-side comparison in which the direct
+          cells are ADVISORY. Refuses to leave the Cursor panel empty. Never
+          touches `judge_model`.
+        type: boolean
+        required: false
+        default: true
       skip_bot_branch_prefixes:
         description: >-
           Space-separated head-branch prefixes that skip the review when the PR
@@ -533,6 +575,14 @@ on:
           a user key — the cell bills per call against it directly rather than
           against a pooled seat.
         required: false
+      ANTHROPIC_API_KEY:
+        description: >-
+          Anthropic API key for the optional direct-API Anthropic review cells.
+          Required only when the `anthropic_direct_model` input is set; ignored
+          otherwise. Use a key scoped to its own Anthropic workspace with a
+          spend limit, never a personal key — the cells bill per call against
+          it directly rather than against a pooled seat.
+        required: false
       SLACK_BOT_TOKEN:
         description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
         required: false
@@ -683,6 +733,7 @@ jobs:
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
       approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
       openai_key_present: ${{ steps.openai_key.outputs.present }}
+      anthropic_key_present: ${{ steps.anthropic_key.outputs.present }}
     steps:
       - name: Resolve OPENAI_API_KEY presence
         # A boolean for `preflight`, which cannot read the secret itself: it
@@ -695,6 +746,15 @@ jobs:
         env:
           OPENAI_KEY_PRESENT: ${{ secrets.OPENAI_API_KEY != '' }}
         run: echo "present=${OPENAI_KEY_PRESENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve ANTHROPIC_API_KEY presence
+        # Same as `Resolve OPENAI_API_KEY presence` above, for the direct
+        # Anthropic cells.
+        id: anthropic_key
+        if: inputs.anthropic_direct_model != ''
+        env:
+          ANTHROPIC_KEY_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: echo "present=${ANTHROPIC_KEY_PRESENT}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve the auto-approve author opt-in
         # approve_authors, resolved ONCE here so the workflow-level
@@ -2031,6 +2091,11 @@ jobs:
       # cells (counted in ok_count/total, leg red on failure). Side by side
       # ('false') they stay advisory.
       openai_direct_counts: ${{ steps.models.outputs.openai_direct_counts }}
+      # The same pair for the direct Anthropic cells (`review-anthropic-direct`).
+      anthropic_direct: ${{ steps.models.outputs.anthropic_direct }}
+      anthropic_direct_counts: ${{ steps.models.outputs.anthropic_direct_counts }}
+      # `anthropic_direct_effort`, validated: always one of the allowed levels.
+      anthropic_direct_effort: ${{ steps.models.outputs.anthropic_direct_effort }}
       # The caps DERIVED from `cell_timeout_minutes`, computed here because
       # Actions expressions have no arithmetic: `${{ x + 15 }}` is a parse
       # error that fails the workflow at load for every caller. Consumers
@@ -2196,6 +2261,11 @@ jobs:
           # Resolved in the hosted `gate` job: this one follows `runs_on`, so
           # it must not reference the secret at all.
           OPENAI_KEY_PRESENT: ${{ needs.gate.outputs.openai_key_present }}
+          # The same three for the direct Anthropic cells.
+          ANTHROPIC_DIRECT_MODEL: ${{ inputs.anthropic_direct_model }}
+          ANTHROPIC_DIRECT_REPLACES: ${{ inputs.anthropic_direct_replaces_cursor_anthropic }}
+          ANTHROPIC_DIRECT_EFFORT: ${{ inputs.anthropic_direct_effort }}
+          ANTHROPIC_KEY_PRESENT: ${{ needs.gate.outputs.anthropic_key_present }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -2288,6 +2358,48 @@ jobs:
             fi
           fi
           echo "openai_direct_counts=${openai_direct_counts}" >> "$GITHUB_OUTPUT"
+          # The direct Anthropic cells, by exactly the rules above: one verdict
+          # first, then the replacement, applied to whatever the OpenAI branch
+          # left, so the empty-panel check sees both drops. `judge_model` is
+          # never touched — the judge stays on Cursor.
+          anthropic_direct=false
+          if [ -n "$(printf '%s' "${ANTHROPIC_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
+            if ! printf '%s' "$ANTHROPIC_DIRECT_MODEL" | grep -Eqx '[A-Za-z0-9._-]{1,100}'; then
+              echo "::warning::anthropic_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API Anthropic cells are off for this run and the panel is unchanged."
+            elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
+              echo "::warning::anthropic_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
+            else
+              anthropic_direct=true
+            fi
+          fi
+          echo "anthropic_direct=${anthropic_direct}" >> "$GITHUB_OUTPUT"
+          case "${ANTHROPIC_DIRECT_EFFORT:-}" in
+            low|medium|high|xhigh|max) anthropic_direct_effort="$ANTHROPIC_DIRECT_EFFORT" ;;
+            *)
+              anthropic_direct_effort=xhigh
+              if [ "$anthropic_direct" = "true" ]; then
+                echo "::warning::anthropic_direct_effort is not one of low, medium, high, xhigh, max, so the direct-API Anthropic cells use xhigh."
+              fi ;;
+          esac
+          echo "anthropic_direct_effort=${anthropic_direct_effort}" >> "$GITHUB_OUTPUT"
+          anthropic_direct_counts=false
+          if [ "$anthropic_direct" = "true" ] \
+             && [ "${ANTHROPIC_DIRECT_REPLACES:-true}" = "true" ]; then
+            anthropic_direct_counts=true
+            dropped="$(jq -c '[.[] | select((ascii_downcase | startswith("claude-")))]' /tmp/models.json)"
+            kept="$(jq -c '[.[] | select((ascii_downcase | startswith("claude-")) | not)]' /tmp/models.json)"
+            if [ "$(printf '%s' "$dropped" | jq 'length')" -gt 0 ]; then
+              if [ "$(printf '%s' "$kept" | jq 'length')" -eq 0 ]; then
+                echo "::error::anthropic_direct_model is set and anthropic_direct_replaces_cursor_anthropic is true, but every id left in the panel list is an Anthropic id, so replacing them would leave no Cursor cell at all. Set anthropic_direct_replaces_cursor_anthropic: false, or widen panel_models."
+                exit 1
+              fi
+              printf '%s' "$kept" > /tmp/models.json
+              echo "direct-API Anthropic cells are on, so the Cursor Anthropic cell(s) $dropped were dropped from the panel; remaining: $kept"
+            else
+              echo "direct-API Anthropic cells are on, but the panel list carries no Cursor Anthropic id to replace; panel unchanged."
+            fi
+          fi
+          echo "anthropic_direct_counts=${anthropic_direct_counts}" >> "$GITHUB_OUTPUT"
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
       - name: Require a pinned workflows_ref
@@ -3311,6 +3423,419 @@ jobs:
           fi
           echo "Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
 
+  review-anthropic-direct:
+    # The Anthropic twin of `review-openai-direct`: the same OPT-IN pair of
+    # cells (adversarial + edge-case), reaching their model through the
+    # Anthropic API directly, via the Claude Code CLI, instead of through
+    # Cursor. Everything that job's header says — why it is a separate job, how
+    # the judge picks it up, gating by role (here preflight's
+    # `anthropic_direct_counts`), scope — holds here; only the differences are
+    # noted below.
+    #
+    # The one deliberate difference: this agent ALSO reads a read-only
+    # checkout of the PR (`_pr`, its working directory) with Read, Grep and
+    # Glob — no Bash or other code-running tool — because a diff-only cell
+    # misses every finding that needs a file outside the diff.
+    #
+    # Credential posture: `contents: read` only, no write-scoped token (see
+    # SECURITY.md); the PR checkout persists no credential. ANTHROPIC_API_KEY
+    # reaches `claude` in that ONE step's env and is never written to disk,
+    # and the agent has no tool that can read the environment. Belt and
+    # braces, groom's finder guard runs on the record before it uploads.
+    name: '${{ matrix.review_type }} direct (${{ inputs.anthropic_direct_model }})'
+    needs: [gate, diff-size, preflight, ledger]
+    if: >-
+      needs.preflight.outputs.anthropic_direct == 'true'
+      && needs.gate.outputs.should_run == 'true'
+      && needs.gate.outputs.already_reviewed != 'true'
+      && needs.diff-size.outputs.within_cap == 'true'
+    # GitHub-hosted, never `runs_on`: this job holds ANTHROPIC_API_KEY (see
+    # `review-openai-direct`).
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ needs.preflight.outputs.anthropic_direct_counts != 'true' }}
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.cell_job_timeout) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        review_type: [adversarial, edge-case]
+    steps:
+      - name: Seed default findings artifact
+        # Same contract as `review-openai-direct`'s seed.
+        env:
+          MODEL: ${{ inputs.anthropic_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          mkdir -p /tmp/findings-out
+          python3 - <<'PY'
+          import json, os
+          record = {
+              "model": os.environ["MODEL"],
+              "review_type": os.environ["REVIEW_TYPE"],
+              "status": "error",
+              "error": "Direct-API cell did not reach the submission step.",
+              "findings": [],
+          }
+          with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2)
+          PY
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Checkout PR repo
+        # The read-only tree the agent's file tools read: the default ref, so
+        # the same commit the Cursor cells review. No credential persisted.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _pr
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Remove symlinks from the PR checkout
+        # A symlink planted in the PR could lead the file tools outside the
+        # tree (e.g. to the runner's home), so none survive into the review.
+        run: find _pr -type l -delete
+
+      - name: Download reviewed diff
+        # Built once in the diff-size job (generated files already excluded),
+        # shared here, so this cell needs no PR checkout of its own.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-diff
+          path: /tmp
+
+      - name: Download prior-review ledger
+        # Same artifact, same tolerance as the `review` job: absent on round 1.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
+      - name: Check the API key is present
+        id: key
+        # Belt and braces, as in `review-openai-direct`.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::warning::anthropic_direct_model is set but the ANTHROPIC_API_KEY secret is absent, so the direct-API Anthropic cell is skipped. Pass the secret through from the caller to enable it."
+            python3 -c 'import json; p = "/tmp/findings-out/findings.json"; r = json.load(open(p)); r["error"] = "ANTHROPIC_API_KEY secret was not provided to the reusable workflow."; json.dump(r, open(p, "w"), indent=2)'
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Claude Code CLI
+        if: steps.key.outputs.present == 'true'
+        # Pinned in .github/cursor-review/package.json, read exactly as
+        # `review-openai-direct`'s `Install Codex CLI` reads its pin.
+        run: |
+          manifest="$CURSOR_REVIEW_ASSETS/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the direct-API cell's CLI pin."
+            exit 1
+          fi
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@anthropic-ai/claude-code"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the direct-API cell's CLI pin."
+            exit 1
+          fi
+          version="$(printf '%s' "$version" | tr -d '\r\n')"
+          case "$version" in
+            ""|*[!0-9.]*)
+              echo "::error::dependencies[\"@anthropic-ai/claude-code\"] must be an EXACT version (digits and dots only, no ^ or ~); got a value this job will not install."
+              exit 1 ;;
+          esac
+          echo "CLAUDE_CLI_VERSION=$version" >> "$GITHUB_ENV"
+          npm install -g "@anthropic-ai/claude-code@${version}"
+
+      - name: Verify Claude Code CLI version
+        if: steps.key.outputs.present == 'true'
+        # As `Verify Codex CLI version`: `claude --version` prints
+        # `2.1.286 (Claude Code)`, so the FIRST field is the version.
+        run: |
+          installed="$(claude --version 2>/dev/null | head -n 1 | tr -d '\r' | awk '{print $1}')"
+          if [ "$installed" != "$CLAUDE_CLI_VERSION" ]; then
+            echo "::error::claude reports '${installed}', expected the pinned '${CLAUDE_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "claude ${installed}"
+
+      - name: Build prompt
+        if: steps.key.outputs.present == 'true'
+        # Byte-identical construction to the Cursor cells' `Build prompt`, so a
+        # finding difference is attributable to the model or the backend rather
+        # than to the prompt: the same prompt-<review_type>.md with the same
+        # prior-review ledger spliced in, the same marker stripped and
+        # re-emitted by fence-diff.py, the same new-hunks block from round 2
+        # on, and a fresh per-prompt nonce minted into a shell variable (never
+        # a step `env:`) so a leaked marker from one cell cannot forge a fence
+        # in another. See that step for the full rationale.
+        env:
+          REVIEW_TYPE: ${{ matrix.review_type }}
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md" \
+            --marker '=== BEGIN DIFF ===' \
+            --insert /tmp/ledger/ledger.md \
+            --out /tmp/prompt-head.txt
+          diff_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/prompt-head.txt \
+            --marker '=== BEGIN DIFF ==='
+          {
+            cat /tmp/prompt-head.txt
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/pr-diff.patch --label DIFF --nonce "$diff_nonce"
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "The block below is the subset of the diff above that changed since"
+              echo "the last reviewed commit. Prioritize it — but the full diff above"
+              echo "is still in scope."
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --body /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$diff_nonce"
+            fi
+          } > /tmp/prompt.txt
+
+      - name: Run direct-API review
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        # Step-capped below the job, as in `review-openai-direct`.
+        timeout-minutes: ${{ inputs.cell_timeout_minutes }}
+        working-directory: _pr
+        env:
+          MODEL: ${{ inputs.anthropic_direct_model }}
+          EFFORT: ${{ needs.preflight.outputs.anthropic_direct_effort }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+          # Process env of this ONE step only: never argv, never a file.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # No telemetry or error report may carry private-diff context.
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: |
+          mkdir -p /tmp/findings-out
+          # A fresh, empty config dir under RUNNER_TEMP, as CODEX_HOME is.
+          CLAUDE_CONFIG_DIR="$(mktemp -d -p "$RUNNER_TEMP")"
+          export CLAUDE_CONFIG_DIR
+          python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+            --mode reviewer \
+            --out /tmp/findings-out/findings.json \
+            --model "$MODEL" \
+            --review-type "$REVIEW_TYPE" \
+            --init
+          # The SAME MCP submission tool the Cursor and Codex cells use, as the
+          # only MCP server (`--strict-mcp-config`). The agent's tools are
+          # Read, Grep and Glob, confined to this checkout by `--restricted`,
+          # plus the two submission calls.
+          mcp_config="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({"mcpServers": {"cursor-review-output": {
+              "command": "python3",
+              "args": [
+                  os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
+                  "--mode", "reviewer",
+                  "--out", "/tmp/findings-out/findings.json",
+                  "--model", os.environ["MODEL"],
+                  "--review-type", os.environ["REVIEW_TYPE"],
+              ],
+          }}}))
+          PY
+          )"
+          # The result JSON goes to a file that is never echoed: the run log
+          # is public and the result is model output steered by PR text.
+          claude -p --bare --restricted \
+            --tools "Read,Grep,Glob" \
+            --strict-mcp-config --mcp-config "$mcp_config" \
+            --allowedTools "Read,Grep,Glob,mcp__cursor-review-output__cursor_review_record_finding,mcp__cursor-review-output__cursor_review_finish" \
+            --permission-prompts none \
+            --model "$MODEL" --effort "$EFFORT" \
+            --output-format json --no-session-persistence \
+            < /tmp/prompt.txt > /tmp/claude-result.json
+
+      - name: Refuse a record carrying the API key
+        # groom.yml's finder guard: should a prompt-injected agent get the key
+        # into its findings, error the record rather than publish it (to the
+        # judge, and from there to the PR). Literal match only.
+        if: always()
+        env:
+          MODEL: ${{ inputs.anthropic_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -uo pipefail
+          out=/tmp/findings-out/findings.json
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$out" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$out"; then
+            echo "::error::direct-API Anthropic findings contain ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
+            python3 - <<'PY'
+          import json, os
+          record = {
+              "model": os.environ["MODEL"],
+              "review_type": os.environ["REVIEW_TYPE"],
+              "status": "error",
+              "error": "findings contained the API key; refusing to publish",
+              "findings": [],
+          }
+          with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2)
+          PY
+          fi
+
+      - name: Report cell outcome
+        if: always()
+        env:
+          MODEL: ${{ inputs.anthropic_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+          COUNTS: ${{ needs.preflight.outputs.anthropic_direct_counts }}
+        # Status and a count only — NOT the findings verbatim, unlike the Cursor
+        # cells: the run log is public, and finding bodies are model output
+        # steered by PR-authored text. The full record still reaches the judge
+        # through the artifact below.
+        run: |
+          read -r status count < <(python3 - <<'PY'
+          import json, re
+          try:
+              with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
+                  cell = json.load(f)
+          except (OSError, ValueError):
+              cell = None
+          value = cell.get("status") if isinstance(cell, dict) else None
+          if not isinstance(value, str):
+              value = "error"
+          findings = cell.get("findings") if isinstance(cell, dict) else None
+          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error",
+                len(findings) if isinstance(findings, list) else 0)
+          PY
+          )
+          echo "Direct-API cell: status=${status}, ${count} finding(s)."
+          if [ "$status" = "ok" ]; then
+            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
+          elif [ "$COUNTS" = "true" ]; then
+            # Failed AFTER the upload below, by `Fail the leg when the cell did
+            # not submit`, so the errored record still reaches the judge.
+            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor Anthropic lane, so it counts as a failed reviewer."
+          else
+            echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+          fi
+
+      - name: Upload findings artifact
+        if: always()
+        # `findings-*` so `consolidate` globs it; `direct-` so it can never
+        # collide with a Cursor cell's `findings-<review_type>-<model>` (with
+        # replacement off the two may share an id) and so `consolidate` can
+        # tell it apart. The id is charset-checked in preflight.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: findings-direct-${{ matrix.review_type }}-${{ inputs.anthropic_direct_model }}
+          path: /tmp/findings-out/findings.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Fail the leg when the cell did not submit
+        # Only when these cells REPLACE the Cursor Anthropic lane — the same
+        # rollup-visibility contract as the `review` job's step of this name
+        # (BE-15554), and like it deliberately AFTER the upload, so the errored
+        # record still reaches the judge and the consolidated review still
+        # posts. Side by side the cell is advisory and this step is skipped.
+        # Same availability-not-attestation scope as that step: the status is
+        # read from a file this cell's own agent could write.
+        if: always() && needs.preflight.outputs.anthropic_direct_counts == 'true'
+        env:
+          MODEL: ${{ inputs.anthropic_direct_model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          # Read defensively and sanitized for a ::workflow command:: line, as
+          # in the `review` job (`ValueError` covers invalid UTF-8 too).
+          status=$(python3 - <<'PY'
+          import json, re
+
+          try:
+              with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
+                  cell = json.load(f)
+          except (OSError, ValueError):
+              cell = None
+          value = cell.get("status") if isinstance(cell, dict) else None
+          if not isinstance(value, str):
+              value = "error"
+          print(re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:32] or "error")
+          PY
+          )
+          if [ "$status" != "ok" ]; then
+            echo "::error::Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} did not submit a review (status=$status). It replaces the Cursor Anthropic lane, so it counts as a failed reviewer; its findings artifact was uploaded and the panel still consolidates."
+            exit 1
+          fi
+          echo "Direct-API reviewer cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
+
   consolidate:
     # Adjudicates the panel cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
@@ -3320,13 +3845,13 @@ jobs:
     # "Credential isolation" note for why the judge must not share a job with
     # a write-scoped token.
     name: Consolidate panel
-    # `review-openai-direct` is here for ORDERING — its artifacts must land
-    # before `Download panel findings` runs. It never gates this job: when it
+    # `review-openai-direct` and `review-anthropic-direct` are here for
+    # ORDERING — their artifacts must land before `Download panel findings` runs. It never gates this job: when it
     # is skipped (the default) or fails, `!cancelled()` below still runs, and
     # a failed cell is counted from its artifact (or its absence) instead. Its
     # result is read once, by `Aggregate panel findings`, as a consistency
     # check on those artifacts (see aggregate-panel.py).
-    needs: [gate, diff-size, preflight, review, review-openai-direct, ledger]
+    needs: [gate, diff-size, preflight, review, review-openai-direct, review-anthropic-direct, ledger]
     # `!cancelled()`, not `always()`: the judge is the most expensive call in
     # the workflow, and the only job that does anything with its payload,
     # `post-review`, is itself `!cancelled()`. On a cancelled run — now an
@@ -3553,6 +4078,10 @@ jobs:
           # post-review failure — either way, panel_inconsistent=true.
           REVIEW_RESULT: ${{ needs.review.result }}
           DIRECT_RESULT: ${{ needs.review-openai-direct.result }}
+          # The same three for the direct Anthropic cells, counted per lab.
+          ANTHROPIC_DIRECT_MODEL: ${{ needs.preflight.outputs.anthropic_direct == 'true' && inputs.anthropic_direct_model || '' }}
+          ANTHROPIC_DIRECT_COUNTS: ${{ needs.preflight.outputs.anthropic_direct_counts }}
+          ANTHROPIC_DIRECT_RESULT: ${{ needs.review-anthropic-direct.result }}
         run: |
           # Each artifact directory contains one findings.json. Combine into
           # a single panel.json array preserving cell metadata, and emit the
@@ -3565,6 +4094,9 @@ jobs:
             --direct-counts "${DIRECT_COUNTS:-false}" \
             --review-result "$REVIEW_RESULT" \
             --direct-result "${DIRECT_RESULT:-skipped}" \
+            --anthropic-direct-model "$ANTHROPIC_DIRECT_MODEL" \
+            --anthropic-direct-counts "${ANTHROPIC_DIRECT_COUNTS:-false}" \
+            --anthropic-direct-result "${ANTHROPIC_DIRECT_RESULT:-skipped}" \
             --out /tmp/panel.json \
             --github-output "$GITHUB_OUTPUT"
 

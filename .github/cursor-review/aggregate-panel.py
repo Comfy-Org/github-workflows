@@ -17,6 +17,12 @@ of two roles, chosen by `--direct-counts`:
   reach the judge, but they stay out of `present` (so one cannot mask a missing
   Cursor cell with the same id) and out of ok_count/total.
 
+The role is chosen PER LAB: the OpenAI cells (`--direct-model`,
+`--direct-counts`, `--direct-result`, the original flags) and the Anthropic
+ones (`--anthropic-direct-*`) each count only by their own lab's flag. A direct
+artifact is assigned to a lab by its model id; one matching neither lab is
+unexpected — a mismatch when any lab counts, advisory otherwise.
+
 Two markers are set HERE and only here — a cell's own record is model-adjacent
 output and must never be able to excuse itself from the count: `direct_api`
 (this cell came through the direct backend) and `advisory` (keep it out of the
@@ -61,7 +67,9 @@ job has no `actions: read` to see.
 Stdlib only. Usage:
   aggregate-panel.py --panel-dir /tmp/panel --models '<json list>' \
       [--direct-model <id> --direct-counts true|false] \
+      [--anthropic-direct-model <id> --anthropic-direct-counts true|false] \
       --review-result <result> [--direct-result <result>] \
+      [--anthropic-direct-result <result>] \
       --out /tmp/panel.json [--github-output "$GITHUB_OUTPUT"]
 """
 
@@ -171,7 +179,9 @@ def _all_ok(cells):
 
 
 def aggregate(panel_dir, models, direct_model="", direct_counts=False,
-              review_result="success", direct_result="skipped"):
+              review_result="success", direct_result="skipped",
+              anthropic_direct_model="", anthropic_direct_counts=False,
+              anthropic_direct_result="skipped"):
     """Return (cells, ok_count, total, inconsistent).
 
     `cells` is everything the judge reads; `inconsistent` is either
@@ -180,22 +190,43 @@ def aggregate(panel_dir, models, direct_model="", direct_counts=False,
     panel, direct = load_cells(panel_dir)
     flag_unexpected(panel, models)
     fill_missing(panel, models, "Cell findings artifact was not uploaded.")
-    counts = bool(direct_counts and direct_model)
-    if counts:
-        flag_unexpected(direct, [direct_model])
-        # Same contract as a Cursor cell: absent means failed, never "not run".
-        fill_missing(direct, [direct_model], "Direct-API cell findings artifact was not uploaded.")
+    # (model, counts, matrix result) per lab; OpenAI first, the original flags.
+    labs = [
+        (direct_model, bool(direct_counts and direct_model), direct_result),
+        (anthropic_direct_model, bool(anthropic_direct_counts and anthropic_direct_model),
+         anthropic_direct_result),
+    ]
+    by_lab = [[] for _ in labs]
+    unassigned = []
+    for c in direct:
+        for i, (model, _, _) in enumerate(labs):
+            if model and c.get("model") == model:
+                by_lab[i].append(c)
+                break
+        else:
+            unassigned.append(c)
+    any_counts = any(counts for _, counts, _ in labs)
+    if any_counts:
+        # Same as a Cursor cell: a direct artifact no lab runs is a mismatch.
+        flag_unexpected(unassigned, [])
+    counted = list(panel)
+    inconsistent = review_result != "success" and _all_ok(panel)
+    for (model, counts, result), cells in zip(labs, by_lab):
+        if counts:
+            # Same contract as a Cursor cell: absent means failed, never "not run".
+            fill_missing(cells, [model], "Direct-API cell findings artifact was not uploaded.")
+            counted += cells
+            inconsistent = inconsistent or (result not in ("success", "skipped") and _all_ok(cells))
+    if any_counts:
+        counted += unassigned
+    direct = [c for cells in by_lab for c in cells] + unassigned
+    counted_ids = {id(c) for c in counted}
     for c in direct:
         c["direct_api"] = True
-        if not counts:
+        if id(c) not in counted_ids:
             c["advisory"] = True
-    counted = panel + direct if counts else panel
     ok = sum(1 for c in counted if c.get("status") == "ok")
-    inconsistent = (
-        (review_result != "success" and _all_ok(panel))
-        or (counts and direct_result not in ("success", "skipped") and _all_ok(direct))
-        or any(c.get("status") == MISMATCH_STATUS for c in counted)
-    )
+    inconsistent = inconsistent or any(c.get("status") == MISMATCH_STATUS for c in counted)
     return panel + direct, ok, len(counted), inconsistent
 
 
@@ -213,6 +244,10 @@ def main(argv=None):
     # Required, so a dropped flag fails the step rather than reading as success.
     p.add_argument("--review-result", required=True, help="needs.review.result")
     p.add_argument("--direct-result", default="skipped", help="needs.review-openai-direct.result")
+    p.add_argument("--anthropic-direct-model", default="")
+    p.add_argument("--anthropic-direct-counts", default="false")
+    p.add_argument("--anthropic-direct-result", default="skipped",
+                   help="needs.review-anthropic-direct.result")
     p.add_argument("--out", required=True)
     p.add_argument("--github-output", default="")
     args = p.parse_args(argv)
@@ -220,15 +255,19 @@ def main(argv=None):
     counts = args.direct_counts.strip().lower() == "true"
     review_result = args.review_result.strip()
     direct_result = args.direct_result.strip()
+    anthropic_counts = args.anthropic_direct_counts.strip().lower() == "true"
+    anthropic_result = args.anthropic_direct_result.strip()
     cells, ok, total, inconsistent = aggregate(
         args.panel_dir, json.loads(args.models), args.direct_model.strip(), counts,
         review_result, direct_result,
+        args.anthropic_direct_model.strip(), anthropic_counts, anthropic_result,
     )
     print(f"Panel: {ok}/{total} cells contributed findings.")
     if inconsistent:
         print(
             f"::warning::A counted findings artifact may not be its own cell's: a reviewer matrix "
-            f"did not succeed (review={_log_safe(review_result)}, direct={_log_safe(direct_result)}) "
+            f"did not succeed (review={_log_safe(review_result)}, direct={_log_safe(direct_result)}, "
+            f"anthropic_direct={_log_safe(anthropic_result)}) "
             f"although every counted cell artifact of it reads ok, or a record is "
             f"status={MISMATCH_STATUS}. The panel count is untrusted (panel_inconsistent=true)."
         )
