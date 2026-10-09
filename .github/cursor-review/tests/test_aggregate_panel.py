@@ -57,7 +57,7 @@ class AggregateTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def write(self, artifact, record):
-        os.makedirs(os.path.join(self.dir, artifact))
+        os.makedirs(os.path.join(self.dir, artifact), exist_ok=True)
         with open(os.path.join(self.dir, artifact, "findings.json"), "w", encoding="utf-8") as f:
             json.dump(record, f)
 
@@ -76,7 +76,7 @@ class AggregateTest(unittest.TestCase):
         self.full_cursor_panel()
         self.direct("adversarial")
         self.direct("edge-case")
-        cells, ok, total = self.run_agg(True)
+        cells, ok, total, _ = self.run_agg(True)
         self.assertEqual((ok, total), (6, 6))
         direct = [c for c in cells if c.get("direct_api")]
         self.assertEqual(sorted(c["review_type"] for c in direct), ["adversarial", "edge-case"])
@@ -86,13 +86,13 @@ class AggregateTest(unittest.TestCase):
         self.full_cursor_panel()
         self.direct("adversarial")
         self.direct("edge-case", status="error")
-        _, ok, total = self.run_agg(True)
+        _, ok, total, _ = self.run_agg(True)
         self.assertEqual((ok, total), (5, 6))
 
     def test_replace_true_missing_direct_artifact_is_synthesised_as_error(self):
         self.full_cursor_panel()
         self.direct("adversarial")
-        cells, ok, total = self.run_agg(True)
+        cells, ok, total, _ = self.run_agg(True)
         self.assertEqual((ok, total), (5, 6))
         missing = [c for c in cells if c.get("direct_api") and c["review_type"] == "edge-case"]
         self.assertEqual(len(missing), 1)
@@ -103,7 +103,7 @@ class AggregateTest(unittest.TestCase):
         self.full_cursor_panel()
         self.direct("adversarial", status="error")
         self.direct("edge-case")
-        cells, ok, total = self.run_agg(False)
+        cells, ok, total, _ = self.run_agg(False)
         self.assertEqual((ok, total), (4, 4))
         direct = [c for c in cells if c.get("direct_api")]
         self.assertEqual(len(direct), 2)
@@ -111,7 +111,7 @@ class AggregateTest(unittest.TestCase):
 
     def test_replace_false_missing_direct_cell_is_not_synthesised(self):
         self.full_cursor_panel()
-        cells, ok, total = self.run_agg(False)
+        cells, ok, total, _ = self.run_agg(False)
         self.assertEqual((ok, total), (4, 4))
         self.assertFalse(any(c.get("direct_api") for c in cells))
 
@@ -120,13 +120,13 @@ class AggregateTest(unittest.TestCase):
         # record must not stand in for a Cursor cell that never uploaded.
         self.write("findings-adversarial-claude-opus", cell("claude-opus", "adversarial"))
         self.write(f"findings-direct-edge-case-{DIRECT}", cell("claude-opus", "edge-case"))
-        cells, ok, total = AGG.aggregate(self.dir, ["claude-opus"], DIRECT, False)
+        cells, ok, total, _ = AGG.aggregate(self.dir, ["claude-opus"], DIRECT, False)
         self.assertEqual((ok, total), (1, 2))
 
     def test_a_cell_cannot_set_its_own_markers(self):
         self.write("findings-adversarial-kimi", cell("kimi", "adversarial", "error", advisory=True, direct_api=True))
         self.direct("adversarial", status="error", advisory=True)
-        cells, ok, total = AGG.aggregate(self.dir, ["kimi"], DIRECT, True)
+        cells, ok, total, _ = AGG.aggregate(self.dir, ["kimi"], DIRECT, True)
         cursor = [c for c in cells if c["model"] == "kimi" and c["review_type"] == "adversarial"]
         self.assertNotIn("advisory", cursor[0])
         self.assertNotIn("direct_api", cursor[0])
@@ -136,14 +136,14 @@ class AggregateTest(unittest.TestCase):
     def test_counts_without_a_model_falls_back_to_advisory(self):
         self.full_cursor_panel()
         self.direct("adversarial")
-        _, ok, total = AGG.aggregate(self.dir, CURSOR_MODELS, "", True)
+        _, ok, total, _ = AGG.aggregate(self.dir, CURSOR_MODELS, "", True)
         self.assertEqual((ok, total), (4, 4))
 
     def test_unreadable_artifacts_are_skipped(self):
         os.makedirs(os.path.join(self.dir, "findings-adversarial-kimi"))
         with open(os.path.join(self.dir, "findings-adversarial-kimi", "findings.json"), "wb") as f:
             f.write(b"\xff\xfe not json")
-        cells, ok, total = AGG.aggregate(self.dir, ["kimi"], "", False)
+        cells, ok, total, _ = AGG.aggregate(self.dir, ["kimi"], "", False)
         self.assertEqual((ok, total), (0, 2))
 
     def test_cli_writes_panel_and_outputs(self):
@@ -154,15 +154,219 @@ class AggregateTest(unittest.TestCase):
         gh_out = os.path.join(self.dir, "gh-output")
         result = subprocess.run(
             [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(CURSOR_MODELS),
-             "--direct-model", DIRECT, "--direct-counts", "true", "--out", out, "--github-output", gh_out],
+             "--direct-model", DIRECT, "--direct-counts", "true", "--review-result", "success",
+             "--out", out, "--github-output", gh_out],
             capture_output=True, text=True, check=True,
         )
         self.assertIn("Panel: 5/6 cells contributed findings.", result.stdout)
         self.assertIn("Direct-API cell edge-case (counted): status=error.", result.stdout)
         with open(gh_out, encoding="utf-8") as f:
-            self.assertEqual(f.read(), "ok_count=5\ntotal=6\n")
+            self.assertEqual(f.read(), "ok_count=5\ntotal=6\npanel_inconsistent=false\n")
         with open(out, encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)), 6)
+
+
+class ConsistencyTest(AggregateTest):
+    """Leg results vs artifacts, and artifact name vs record.
+
+    `Fail the leg when the cell did not submit` reds every non-ok cell, so a
+    red matrix whose every counted artifact reads ok means some leg failed
+    after its agent ran — an upload 409 behind a forged artifact, or a
+    post-review infra failure. Neither leaves the count trustworthy.
+    """
+
+    def consistent(self, counts=False, review_result="success", direct_result="skipped"):
+        return AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, counts, review_result, direct_result)[3]
+
+    def test_all_ok_under_a_failed_review_matrix_is_inconsistent(self):
+        self.full_cursor_panel()
+        self.assertTrue(self.consistent(review_result="failure"))
+
+    def test_all_ok_under_a_successful_matrix_is_consistent(self):
+        self.full_cursor_panel()
+        self.assertFalse(self.consistent(review_result="success"))
+
+    def test_defaults_are_consistent(self):
+        self.full_cursor_panel()
+        self.assertFalse(AGG.aggregate(self.dir, CURSOR_MODELS)[3])
+
+    def test_an_error_cell_explains_the_red_matrix(self):
+        self.full_cursor_panel()
+        self.write("findings-edge-case-kimi", cell("kimi", "edge-case", "error"))
+        self.assertFalse(self.consistent(review_result="failure"))
+
+    def test_a_missing_artifact_explains_the_red_matrix(self):
+        self.full_cursor_panel()
+        os.remove(os.path.join(self.dir, "findings-edge-case-kimi", "findings.json"))
+        self.assertFalse(self.consistent(review_result="failure"))
+
+    def test_cancelled_matrix_with_all_ok_is_inconsistent(self):
+        self.full_cursor_panel()
+        self.assertTrue(self.consistent(review_result="cancelled"))
+
+    def test_counted_direct_lane_failed_with_all_ok_is_inconsistent(self):
+        self.full_cursor_panel()
+        self.direct("adversarial")
+        self.direct("edge-case")
+        self.assertTrue(self.consistent(counts=True, direct_result="failure"))
+        self.assertFalse(self.consistent(counts=True, direct_result="success"))
+        self.assertFalse(self.consistent(counts=True, direct_result="skipped"))
+
+    def test_counted_direct_lane_failed_with_an_error_cell_is_consistent(self):
+        self.full_cursor_panel()
+        self.direct("adversarial")
+        self.direct("edge-case", status="error")
+        self.assertFalse(self.consistent(counts=True, direct_result="failure"))
+
+    def test_counted_direct_lane_failed_with_its_artifact_missing_is_consistent(self):
+        self.full_cursor_panel()
+        self.direct("adversarial")
+        self.assertFalse(self.consistent(counts=True, direct_result="failure"))
+
+    def test_advisory_direct_lane_result_is_ignored(self):
+        self.full_cursor_panel()
+        self.direct("adversarial")
+        self.direct("edge-case")
+        self.assertFalse(self.consistent(counts=False, direct_result="failure"))
+
+    def test_a_direct_error_does_not_explain_a_red_review_matrix(self):
+        # The two lanes are checked separately: an errored direct cell is no
+        # reason the Cursor matrix went red.
+        self.full_cursor_panel()
+        self.direct("adversarial")
+        self.direct("edge-case", status="error")
+        self.assertTrue(self.consistent(counts=True, review_result="failure", direct_result="failure"))
+
+    def test_forged_ok_under_another_cells_name_with_its_leg_red(self):
+        # The forger's own cell is honest-looking; the cell it impersonated
+        # lost the upload race (409) and went red, so only the result shows it.
+        self.full_cursor_panel()
+        self.write("findings-adversarial-kimi", cell("kimi", "adversarial", "ok", findings=[]))
+        cells, ok, total, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, False, "failure")
+        self.assertTrue(inconsistent)
+        # The records are left alone: the judge still reads every finding.
+        self.assertEqual((ok, total), (4, 4))
+
+    def test_record_naming_another_cell_is_a_mismatch(self):
+        self.write("findings-adversarial-kimi", cell("claude-opus", "adversarial"))
+        cells, ok, total, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
+        mismatched = [c for c in cells if c.get("status") == AGG.MISMATCH_STATUS]
+        self.assertEqual(len(mismatched), 1)
+        # Keyed to the slot its artifact was uploaded for; the claim kept aside.
+        self.assertEqual((mismatched[0]["model"], mismatched[0]["review_type"]), ("kimi", "adversarial"))
+        self.assertEqual(mismatched[0]["claimed_model"], "claude-opus")
+        self.assertEqual(ok, 0)
+        # One slot per artifact: no phantom error is synthesised for the slot
+        # the artifact exists for, and the claimed slot is not counted twice.
+        self.assertEqual(total, 2)
+        self.assertTrue(inconsistent)
+        # Not the tolerable `error`: auto-approve never excuses it.
+        self.assertNotEqual(AGG.MISMATCH_STATUS, AA.TOLERABLE_CELL_STATUS)
+        reason, tolerated = AA.panel_gate(
+            [{k: c[k] for k in ("model", "review_type", "status")} for c in cells], max_failed=5
+        )
+        self.assertIsNotNone(reason)
+        self.assertEqual(tolerated, [])
+
+    def test_record_naming_another_review_type_is_a_mismatch(self):
+        self.write("findings-edge-case-kimi", cell("kimi", "adversarial"))
+        cells, _, _, _ = AGG.aggregate(self.dir, ["kimi"], "", False)
+        self.assertIn(AGG.MISMATCH_STATUS, [c["status"] for c in cells])
+
+    def test_direct_record_is_checked_against_its_direct_name(self):
+        self.write(f"findings-direct-edge-case-{DIRECT}", cell("kimi", "edge-case"))
+        cells, _, _, _ = AGG.aggregate(self.dir, ["kimi"], DIRECT, True)
+        direct = [c for c in cells if c.get("direct_api") and c.get("claimed_model") == "kimi"]
+        self.assertEqual(direct[0]["status"], AGG.MISMATCH_STATUS)
+        self.assertEqual((direct[0]["model"], direct[0]["review_type"]), (DIRECT, "edge-case"))
+
+    def test_unparseable_artifact_name_is_a_mismatch(self):
+        self.write("findings-other-kimi", cell("kimi", "adversarial"))
+        cells, _, total, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
+        self.assertIn(AGG.MISMATCH_STATUS, [c["status"] for c in cells])
+        # It cannot occupy kimi/adversarial: that slot is synthesised as error.
+        synthesised = [c for c in cells if (c["model"], c["review_type"]) == ("kimi", "adversarial")]
+        self.assertEqual([c["status"] for c in synthesised], ["error"])
+        self.assertEqual(total, 3)
+        self.assertTrue(inconsistent)
+
+    def test_phantom_error_under_a_made_up_name_does_not_explain_a_red_leg(self):
+        # A forged ok under the victim's name plus a self-consistent `error`
+        # under a cell the matrix never ran: the phantom must not be the
+        # tolerable error that explains the victim's red leg away.
+        self.full_cursor_panel()
+        self.write("findings-adversarial-phantom", cell("phantom", "adversarial", "error"))
+        cells, ok, total, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, False, "failure")
+        phantom = [c for c in cells if c["model"] == "phantom"]
+        self.assertEqual(phantom[0]["status"], AGG.MISMATCH_STATUS)
+        self.assertTrue(inconsistent)
+        reason, tolerated = AA.panel_gate(
+            [{k: c[k] for k in ("model", "review_type", "status")} for c in cells], max_failed=5
+        )
+        self.assertIsNotNone(reason)
+        self.assertEqual(tolerated, [])
+
+    def test_phantom_ok_cannot_complete_a_review_type(self):
+        self.write("findings-edge-case-kimi", cell("kimi", "edge-case"))
+        self.write("findings-adversarial-phantom", cell("phantom", "adversarial"))
+        cells, ok, _, inconsistent = AGG.aggregate(self.dir, ["kimi"], "", False)
+        self.assertEqual(ok, 1)
+        self.assertTrue(inconsistent)
+
+    def test_unexpected_direct_cell_is_a_mismatch_only_when_counted(self):
+        self.full_cursor_panel()
+        self.write("findings-direct-adversarial-other", cell("other", "adversarial"))
+        cells, _, _, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, True)
+        self.assertIn(AGG.MISMATCH_STATUS, [c["status"] for c in cells if c["model"] == "other"])
+        self.assertTrue(inconsistent)
+        cells, _, _, inconsistent = AGG.aggregate(self.dir, CURSOR_MODELS, DIRECT, False)
+        self.assertEqual([c["status"] for c in cells if c["model"] == "other"], ["ok"])
+        self.assertFalse(inconsistent)
+
+    def test_cli_requires_the_review_result(self):
+        # Fail closed: a dropped flag must not read as a successful matrix.
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(["kimi"]),
+             "--out", os.path.join(self.dir, "panel.json")],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--review-result", result.stderr)
+
+    def test_matching_record_with_hyphenated_model_keeps_its_status(self):
+        self.write("findings-edge-case-gpt-5.6-sol-xhigh", cell("gpt-5.6-sol-xhigh", "edge-case"))
+        self.write("findings-adversarial-gpt-5.6-sol-xhigh", cell("gpt-5.6-sol-xhigh", "adversarial"))
+        _, ok, total, _ = AGG.aggregate(self.dir, ["gpt-5.6-sol-xhigh"], "", False)
+        self.assertEqual((ok, total), (2, 2))
+
+    def test_identity_from_name(self):
+        self.assertEqual(AGG.identity_from_name("findings-edge-case-kimi"), ("edge-case", "kimi"))
+        self.assertEqual(AGG.identity_from_name(f"findings-direct-adversarial-{DIRECT}"), ("adversarial", DIRECT))
+        self.assertEqual(AGG.identity_from_name("findings-adversarial-"), (None, None))
+        self.assertEqual(AGG.identity_from_name("pr-diff"), (None, None))
+
+    def test_cli_writes_panel_inconsistent(self):
+        self.full_cursor_panel()
+        gh_out = os.path.join(self.dir, "gh-output")
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(CURSOR_MODELS),
+             "--review-result", "failure", "--direct-result", "skipped",
+             "--out", os.path.join(self.dir, "panel.json"), "--github-output", gh_out],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertIn("a reviewer matrix did not succeed (review=failure", result.stdout)
+        with open(gh_out, encoding="utf-8") as f:
+            self.assertIn("panel_inconsistent=true\n", f.read())
+
+    def test_cli_log_line_cannot_forge_a_command(self):
+        self.write("findings-adversarial-kimi", cell("x\n::error::forged", "adversarial"))
+        result = subprocess.run(
+            [sys.executable, SCRIPT, "--panel-dir", self.dir, "--models", json.dumps(["kimi"]),
+             "--review-result", "success", "--out", os.path.join(self.dir, "panel.json")],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertNotIn("\n::error::forged", result.stdout)
+        self.assertIn("counted as status=mismatch", result.stdout)
 
 
 class DownstreamTest(unittest.TestCase):

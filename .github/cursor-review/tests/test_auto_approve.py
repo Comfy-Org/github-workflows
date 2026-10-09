@@ -1368,7 +1368,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
 
     def run_decide(self, findings=(), labels=(), heads=(SHA, SHA), threshold="medium", post_error=None,
                    labels_after=None, reviews=(), put_error=None, panel=PANEL_OK, max_failed=None,
-                   approve_scope=None, **extra):
+                   approve_scope=None, consolidated=None, **extra):
         heads = iter(heads)
         reads = []
         writes = []
@@ -1398,7 +1398,7 @@ class CmdDecideGateOutputTest(unittest.TestCase):
             out = os.path.join(d, "out")
             open(out, "w").close()
             with open(fpath, "w") as f:
-                json.dump({"findings": list(findings), "panel": list(panel)}, f)
+                json.dump({"findings": list(findings), "panel": list(panel), **(consolidated or {})}, f)
             with open(dpath, "w") as f:
                 f.write(DIFF)
             args = argparse.Namespace(threshold=threshold, findings=fpath, repo="o/r", pr_number="1",
@@ -1421,6 +1421,29 @@ class CmdDecideGateOutputTest(unittest.TestCase):
             self.writes = writes
             self.outputs = read_outputs(out)
             return rc, self.outputs.get("approve_gate")
+
+    def test_an_inconsistent_panel_is_untrusted(self):
+        rc, gate = self.run_decide(consolidated={"panel_inconsistent": True})
+        self.assertEqual(gate, "untrusted")
+        self.assertEqual([p["event"] for p in self.posted], ["REQUEST_CHANGES"])
+        self.assertIn(AA.REASON_PANEL_INCONSISTENT, self.posted[0]["body"])
+
+    def test_the_flag_withholds_even_when_the_file_says_consistent(self):
+        # The flag is the pre-judge job output; the file is built after the
+        # `--trust` judge ran and cannot clear it.
+        rc, gate = self.run_decide(consolidated={"panel_inconsistent": False}, panel_inconsistent="true")
+        self.assertEqual(gate, "untrusted")
+        self.assertIn(AA.REASON_PANEL_INCONSISTENT, self.posted[0]["body"])
+
+    def test_an_unrecognised_flag_fails_closed(self):
+        rc, _ = self.run_decide(panel_inconsistent="yes")
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("--panel-inconsistent must be" in p for p in self.printed))
+
+    def test_panel_inconsistent_absent_or_false_still_approves(self):
+        for consolidated in (None, {"panel_inconsistent": False}):
+            with self.subTest(consolidated=consolidated):
+                self.assertEqual(self.run_decide(consolidated=consolidated), (0, "pass"))
 
     def test_label_applied_during_the_post_withdraws_the_approval(self):
         self.assertEqual(self.run_decide(labels_after=["needs-human-review"]), (0, "capped"))
@@ -2774,6 +2797,51 @@ class CardContractMirrorTest(unittest.TestCase):
         self.assertEqual((AA.CARD_PASS, AA.CARD_CHANGES, AA.CARD_NO_DECISION, AA.CARD_CAPPED), CARD.STATES)
         self.assertEqual((AA.CARD_NEXT_NONE, AA.CARD_NEXT_RESOLVE, AA.CARD_NEXT_RELABEL, AA.CARD_NEXT_PUSH,
                           AA.CARD_NEXT_HUMAN), CARD.NEXTS)
+
+
+class PanelInconsistentTest(unittest.TestCase):
+    """A reviewer leg failed although every panel cell reports ok: a forged
+    artifact under another cell's name, or an upload that failed after the
+    review. The count cannot be trusted, and a re-run cannot clear it."""
+
+    def test_it_is_untrusted_however_clean_the_round(self):
+        event, gate, reasons, blocking = AA.decide_gate(
+            "low", [], PANEL_OK, "ok", True, SHA, SHA, [], panel_inconsistent=True)
+        self.assertEqual((event, gate, blocking), (AA.NONE, AA.GATE_UNTRUSTED, []))
+        self.assertEqual(reasons, [AA.REASON_PANEL_INCONSISTENT])
+        self.assertEqual(
+            AA.REASON_PANEL_INCONSISTENT,
+            "a counted panel cell's findings artifact may not be its own (a reviewer "
+            "leg did not succeed although every cell reports ok, or a record "
+            "disagrees with its artifact name)",
+        )
+
+    def test_tolerated_failures_do_not_excuse_it(self):
+        _, gate, _, _ = AA.decide_gate(
+            "low", [], PANEL_OK, "ok", True, SHA, SHA, [], max_failed_reviewers=5, panel_inconsistent=True)
+        self.assertEqual(gate, AA.GATE_UNTRUSTED)
+
+    def test_default_is_unchanged(self):
+        self.assertEqual(AA.decide_gate("low", [], PANEL_OK, "ok", True, SHA, SHA, [])[1], AA.GATE_PASS)
+        self.assertEqual(AA.decide("low", [], PANEL_OK, "ok", True, SHA, SHA, [], panel_inconsistent=True)[0],
+                         AA.NONE)
+
+    def test_it_is_not_retryable(self):
+        # A fresh round runs the same PR content, so a forger forges again;
+        # auto-retry cannot tell that from a flake, a human reading the legs can.
+        self.assertFalse(AA.auto_retry_eligible([AA.REASON_HEAD_MOVED, AA.REASON_PANEL_INCONSISTENT]))
+        self.assertNotIn(AA.REASON_PANEL_INCONSISTENT, AA.RETRYABLE_CAUSES)
+        nxt, text = AA.no_decision_next([AA.REASON_HEAD_MOVED, AA.REASON_PANEL_INCONSISTENT])
+        self.assertEqual(nxt, CARD.NEXT_HUMAN)
+        self.assertTrue(text.startswith("A human is needed: "))
+        # Not the other structural causes' "a re-run would land the same way":
+        # a leg that flaked after its review IS cleared by a re-run.
+        self.assertNotIn("A re-run would land the same way", text)
+        self.assertIn("A re-run clears a leg that failed after its review, not a forged artifact", text)
+
+    def test_alongside_another_structural_cause_the_card_keeps_its_suffix(self):
+        _, text = AA.no_decision_next([AA.REASON_PANEL_INCONSISTENT, AA.REASON_EMPTY_DIFF])
+        self.assertIn("A re-run would land the same way", text)
 
 
 class NoDecisionNextTest(unittest.TestCase):

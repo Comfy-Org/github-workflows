@@ -127,7 +127,17 @@ leg's "did it submit" verdict is the `status` its own `--trust` agent wrote into
 `findings.json`, so a prompt-injected cell can green itself; this is an
 availability signal against stalls, crashes and step caps — which is what every
 observed failure has been — and a forgery-resistant count would need the
-submission recorded outside the cell's own writable job. Otherwise it prints one
+submission recorded outside the cell's own writable job. One forgery it does
+catch: a cell that uploads an `ok` record under ANOTHER cell's artifact name
+makes that cell's own upload fail, so its leg goes red while every artifact
+reads `ok`. `aggregate-panel.py` flags that combination (`panel_inconsistent`),
+and a record whose `model`/`review_type` disagree with its artifact name, or
+that names no cell the panel runs, counts as `status: mismatch` (which also
+sets `panel_inconsistent`). The leg check is per matrix, so any other non-`ok`
+cell in it — a step-cap timeout, or the forger's own — explains the red leg
+away (tolerated under `approve_max_failed_reviewers` > 0), and a forger able to
+delete the honest upload and re-upload leaves no red leg; see the
+aggregate-panel.py docstring. Otherwise it prints one
 `::notice::Panel integrity: <ok>/<total> cells, <n> anchored finding(s), 0
 unanchored.` It gates no other job — a short panel must not also cost the PR the
 findings it did produce — so blocking on it is the caller's call, exactly like
@@ -217,7 +227,7 @@ the consolidated review's panel table. See [Panel integrity](#panel-integrity).
 
 | File | Role |
 |---|---|
-| [`aggregate-panel.py`](aggregate-panel.py) | Run by `consolidate`'s **Aggregate panel findings** step. Combines the cells' `findings-*` artifacts into the `panel.json` the judge reads, adds a `status=error` record for every expected cell whose artifact never arrived, and writes the `ok_count` / `total` that `Panel integrity` reads. The direct-OpenAI cells (`findings-direct-*`) count like Cursor cells when they replace the Cursor OpenAI lane (`openai_direct_replaces_cursor_openai: true`, so a failed one also counts against `approve_max_failed_reviewers`) and stay advisory side by side. Only this script sets the `direct_api` / `advisory` markers, so a cell's own record cannot excuse itself from the count. |
+| [`aggregate-panel.py`](aggregate-panel.py) | Run by `consolidate`'s **Aggregate panel findings** step. Combines the cells' `findings-*` artifacts into the `panel.json` the judge reads, adds a `status=error` record for every expected cell whose artifact never arrived, and writes the `ok_count` / `total` / `panel_inconsistent` that `Panel integrity` and auto-approve read (`panel_inconsistent`: a reviewer matrix did not succeed although every counted cell artifact reads `ok`, or a counted record is `status: mismatch` — it disagrees with its artifact name or names no cell the panel runs). The direct-OpenAI cells (`findings-direct-*`) count like Cursor cells when they replace the Cursor OpenAI lane (`openai_direct_replaces_cursor_openai: true`, so a failed one also counts against `approve_max_failed_reviewers`) and stay advisory side by side. Only this script sets the `direct_api` / `advisory` markers, so a cell's own record cannot excuse itself from the count. |
 | [`prompt-adversarial.md`](prompt-adversarial.md) | Prompt for the security/reliability review pass. |
 | [`prompt-edge-case.md`](prompt-edge-case.md) | Prompt for the correctness/logic review pass. |
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |

@@ -111,6 +111,14 @@ none: the label already hands the PR to a human. A round is untrusted when:
   while every review type (``PANEL_REVIEW_TYPES``) still has an ``ok`` cell. A
   non-dict cell, a missing or unknown status, or an empty panel always
   withholds. Tolerated cells are named in the decision's reason;
+* a counted cell's findings artifact may not be its own: a reviewer leg did
+  not succeed although every panel cell reports ``ok``, or a record disagrees
+  with its artifact name (``--panel-inconsistent``, aggregate-panel.py's step
+  output, written before the judge ran; the consolidated file's
+  ``panel_inconsistent`` is OR-ed in). A cell can upload a forged ``ok`` under
+  another cell's artifact name, and the honest leg's own upload then fails.
+  Not re-run automatically — a fresh round runs the same PR content, so a
+  forger forges again; the card asks a human to read the red legs;
 * the review did not land as resolvable threads (`delivered` is not ``true``,
   or any finding reached the review body only — ``ungated_findings`` > 0 — where
   the open-thread check below cannot see it);
@@ -627,6 +635,7 @@ def decide(
     human_review: bool = False,
     scope=None,
     max_failed_reviewers: int = 0,
+    panel_inconsistent: bool = False,
 ):
     """Return (event, reasons, blocking_findings). Pure; no I/O.
 
@@ -639,6 +648,7 @@ def decide(
         threshold, findings, panel, judge_status, delivered, reviewed_sha,
         live_head_sha, open_thread_severities, ungated, human_review,
         reviewed_diff_empty, reviewed_base, live_base, scope, max_failed_reviewers,
+        panel_inconsistent,
     )
     return event, reasons, blocking
 
@@ -650,10 +660,19 @@ REASON_NOT_DELIVERED = "the review did not land on the PR as resolvable threads"
 REASON_UNGATED_TAIL = "finding(s) reached the review body only, not as resolvable threads"
 REASON_EMPTY_DIFF = ("the reviewed diff is empty — every changed path was excluded from review, "
                      "so nothing a reviewer saw can earn an approval")
+# Structural too, though not for the reason the others are: a fresh round
+# CAN clear it when a leg merely flaked after its review, but it runs the same
+# PR content, so a forger forges again — auto-retry cannot tell the two apart,
+# and a human reading the red legs can. Hence its own card suffix below.
+REASON_PANEL_INCONSISTENT = ("a counted panel cell's findings artifact may not be its own (a reviewer "
+                             "leg did not succeed although every cell reports ok, or a record "
+                             "disagrees with its artifact name)")
+PANEL_INCONSISTENT_CAUSE = "a panel cell's findings artifact may not be its own (see the red leg checks)"
 STRUCTURAL_CAUSES = (
     (REASON_NOT_DELIVERED, "the findings did not land as resolvable threads"),
     (REASON_UNGATED_TAIL, "some findings reached the review body only, not as resolvable threads"),
     (REASON_EMPTY_DIFF, "the reviewed diff is empty (every changed path was excluded from review)"),
+    (REASON_PANEL_INCONSISTENT, PANEL_INCONSISTENT_CAUSE),
 )
 
 # The two causes a fresh round on the LIVE head actually fixes, and the only
@@ -684,6 +703,7 @@ def decide_gate(
     live_base: str = "",
     scope=None,
     max_failed_reviewers: int = 0,
+    panel_inconsistent: bool = False,
 ):
     """decide(), plus the approve_gate value: (event, gate, reasons, blocking).
 
@@ -704,6 +724,8 @@ def decide_gate(
     panel_reason, tolerated = panel_gate(panel, max_failed_reviewers)
     if panel_reason:
         reasons.append(panel_reason)
+    if panel_inconsistent:
+        reasons.append(REASON_PANEL_INCONSISTENT)
     if not delivered:
         reasons.append(REASON_NOT_DELIVERED)
     elif ungated:
@@ -1025,6 +1047,11 @@ def no_decision_next(reasons: list, label: str = ""):
     causes = [cause for needle, cause in STRUCTURAL_CAUSES
               if any(isinstance(r, str) and needle in r for r in reasons or [])]
     if causes:
+        if causes == [PANEL_INCONSISTENT_CAUSE]:
+            return card.NEXT_HUMAN, (
+                f"A human is needed: {PANEL_INCONSISTENT_CAUSE}. A re-run clears a leg that "
+                "failed after its review, not a forged artifact: the same PR content runs again."
+            )
         return card.NEXT_HUMAN, f"A human is needed: {'; '.join(causes)}. A re-run would land the same way."
     if any(isinstance(r, str) and r == REASON_HEAD_MOVED for r in reasons or []):
         # The head moved, so the next round reads a commit with no review on it
@@ -1708,6 +1735,14 @@ def cmd_decide(args) -> int:
         data = json.load(f)
     findings = data.get("findings") or []
     panel = data.get("panel") or []
+    # The flag is the authority (a job output written before the judge ran);
+    # the file's copy is only OR-ed in, so neither can clear the other.
+    flag = (getattr(args, "panel_inconsistent", "") or "").strip().lower()
+    if flag not in ("", "true", "false"):
+        print(f"::error::--panel-inconsistent must be 'true', 'false' or empty, got {args.panel_inconsistent!r}")
+        withdraw_own_approvals(args)
+        return 2
+    panel_inconsistent = flag == "true" or data.get("panel_inconsistent") is True
     try:
         ungated = int(args.ungated or 0)
     except ValueError:
@@ -1744,6 +1779,7 @@ def cmd_decide(args) -> int:
             live_base,
             scope,
             max_failed,
+            panel_inconsistent,
         )
     set_output("approve_gate", gate)
     if event != NONE:
@@ -3150,6 +3186,8 @@ def main() -> int:
     d.add_argument("--open-anchors", default="", help="post-review's --open-anchors-out snapshot")
     # approve_max_failed_reviewers: errored panel cells to tolerate (see panel_gate).
     d.add_argument("--max-failed-reviewers", default="0")
+    # consolidate's panel_inconsistent output (aggregate-panel.py): `true` withholds.
+    d.add_argument("--panel-inconsistent", default="")
     # approve_authors, as resolved by the workflow's `gate` job: `false` = the PR
     # author is not listed, so auto-approve is off for this PR. Anything else
     # (including the default empty) = decide as usual.
