@@ -681,7 +681,7 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
 
-CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix)(?:\.[A-Za-z0-9_-]+)+")
+CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github)(?:\.[A-Za-z0-9_-]+)+")
 
 
 def evaluate(expression, context):
@@ -1251,6 +1251,97 @@ class AnthropicDirectCellsGateWhenTheyReplaceTest(DirectCellsGateWhenTheyReplace
             any("judge" in line.lower() for line in code_lines(step) if "anthropic" in line.lower()),
             "the Anthropic replacement reaches the judge model",
         )
+
+
+class RecordTokenUsageTest(unittest.TestCase):
+    """`Record token usage` in `review-anthropic-direct`, executed: the record
+    it uploads carries the API's token counts and nothing model-written (the
+    result JSON is model output steered by PR text) and no price, and a cell
+    that left no result is marked unmeasured instead of failing the step."""
+
+    CONTEXT = {
+        "inputs.anthropic_direct_model": "claude-opus-5-5",
+        "matrix.review_type": "edge-case",
+        "github.run_attempt": "2",
+    }
+
+    def setUp(self):
+        job = split_jobs(read_workflow())["review-anthropic-direct"]
+        self.step = step_named(job, "Record token usage")
+        self.upload = step_named(job, "Upload usage artifact")
+        self.assertIsNotNone(self.step, "review-anthropic-direct lost its `Record token usage` step")
+        self.assertIsNotNone(self.upload, "review-anthropic-direct lost its `Upload usage artifact` step")
+
+    def record(self, result):
+        """Run the step over `result` (None: no result file at all) and return
+        (the usage record it wrote, the step's stdout)."""
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        if result is not None:
+            with open(os.path.join(workdir, "claude-result.json"), "w", encoding="utf-8") as f:
+                f.write(result if isinstance(result, str) else json.dumps(result))
+        done, _ = run_step(self.step, self.CONTEXT, workdir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(os.path.join(workdir, "usage-out", "usage.json"), encoding="utf-8") as f:
+            return json.load(f), done.stdout
+
+    def test_copies_the_token_counts_and_nothing_else(self):
+        record, stdout = self.record({
+            "result": "MODEL-WRITTEN TEXT",
+            "session_id": "session-1",
+            "total_cost_usd": 1.2345,
+            "usage": {
+                "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+                "cache_creation_input_tokens": 43925,
+                "cache_creation": {"ephemeral_1h_input_tokens": 43925, "ephemeral_5m_input_tokens": 0},
+            },
+            "modelUsage": {
+                "claude-opus-5-5": {"inputTokens": 26, "outputTokens": 5312, "cacheReadInputTokens": 397506,
+                                    "cacheCreationInputTokens": 43925, "costUSD": 0.5372},
+                "not a model id; $(x)": {"inputTokens": 1},
+            },
+            "num_turns": 12,
+            "duration_ms": 65000,
+        })
+        self.assertEqual(
+            (record["model"], record["review_type"], record["run_attempt"], record["measured"]),
+            ("claude-opus-5-5", "edge-case", 2, True),
+        )
+        self.assertEqual(record["usage"], {
+            "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+            "cache_creation_input_tokens": 43925, "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 43925,
+        })
+        self.assertEqual(record["models"], {"claude-opus-5-5": {
+            "input_tokens": 26, "output_tokens": 5312, "cache_read_input_tokens": 397506,
+            "cache_creation_input_tokens": 43925,
+        }})
+        self.assertEqual((record["num_turns"], record["duration_ms"]), (12, 65000))
+        text = json.dumps(record)
+        for leaked in ("MODEL-WRITTEN TEXT", "session-1", "1.2345", "0.5372", "$(x)"):
+            self.assertNotIn(leaked, text)
+        self.assertNotIn("5312", stdout, "token counts belong in the artifact, not the public log")
+
+    def test_a_cell_with_no_usable_result_is_unmeasured(self):
+        for result in (None, "", "{truncated", "[]", {"usage": "n/a"}):
+            with self.subTest(result=result):
+                record, _ = self.record(result)
+                self.assertFalse(record["measured"])
+                self.assertNotIn("usage", record)
+
+    def test_a_count_that_is_not_a_plain_integer_reads_as_zero(self):
+        record, _ = self.record({"usage": {
+            "input_tokens": "9", "output_tokens": -5, "cache_read_input_tokens": True,
+            "cache_creation_input_tokens": 1.5, "cache_creation": ["not", "a", "mapping"],
+        }})
+        self.assertTrue(record["measured"])
+        self.assertEqual(set(record["usage"].values()), {0})
+
+    def test_the_upload_cannot_reach_the_judge_or_fail_the_cell(self):
+        name = block_mapping(self.upload, "        with:", 10)["name"]
+        self.assertTrue(name.startswith("usage-direct-"), name)
+        self.assertFalse(name.startswith("findings-"), "consolidate downloads `findings-*` as panel cells")
+        self.assertEqual(step_scalar(self.upload, "continue-on-error"), "true")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
