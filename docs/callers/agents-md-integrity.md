@@ -96,7 +96,9 @@ blocking the queue.
 **Character limits are warn-first.** Read the warnings after a pin bump; once
 every agents file is under `warn_chars`, set `max_chars: 40000` to make the
 ceiling stick. The fix for an oversized file is the same whether it is long or
-wide: move rationale into `docs/agents/` and leave a one-line pointer.
+wide: move rationale into `docs/agents/` and leave a one-line pointer (a
+plain link — an `@` import is still expanded at session start). A limit that
+is not a whole number fails the run with exit 2 rather than switching off.
 
 **`check_nested: true` on a large monorepo** can surface a lot at once. Land the
 top-level fix first, then switch it on.

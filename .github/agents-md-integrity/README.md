@@ -86,10 +86,14 @@ root file **and** every nested one the walk finds:
 | `WARN_CHARS` / `warn_chars` | `25000` | warns |
 | `MAX_LINE_CHARS` / `max_line_chars` | `3000` | warns |
 
-`0` turns a limit off. The hard ceiling defaults off so a caller bumping its pin
-never goes red on the bump; `40000` is the suggested value, matching the size
-at which Claude Code starts warning about an oversized memory file. Characters
-are decoded characters, newlines included (a CRLF counts as two). Every
-finding names the file, its
-size (with a chars/4 token estimate) and its longest lines, and points at the
-remedy: move rationale into `docs/agents/` and leave a one-line pointer.
+`0` turns a limit off. A value that is not a whole number (`40k`, `40000.5`)
+is a config error (exit 2), never a silent fallback — falling back would turn
+the default-off hard ceiling off. The hard ceiling defaults off so a caller
+bumping its pin never goes red on the bump; `40000` is the suggested value,
+matching the size at which Claude Code starts warning about an oversized memory
+file. Characters are decoded characters, newlines included (a CRLF counts as
+two); lines split on CRLF / LF / CR only, so `L<n>` matches an editor. Every
+finding names the file, its size (with a chars/4 token estimate) and its
+longest lines, and points at the remedy: move rationale into `docs/agents/` and
+leave a one-line pointer — a plain link, not an `@` import, which Claude Code
+would still expand at session start.

@@ -689,6 +689,49 @@ class CharacterLimitsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Result: passed with 2 warning(s).", buf.getvalue())
 
+    def _main_with_env(self, env):
+        keys = ("MAX_CHARS", "WARN_CHARS", "MAX_LINE_CHARS")
+        old = {k: os.environ.pop(k, None) for k in keys}
+        os.environ.update(env)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = cam.main(["--root", self.root])
+        finally:
+            for k in keys:
+                os.environ.pop(k, None)
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+        return code, buf.getvalue()
+
+    def test_cli_rejects_an_unparseable_char_limit(self):
+        # Falling back to the default would turn the hard ceiling (default 0
+        # = OFF) off and leave the run green; it must be a loud config error.
+        self._write_paragraph_file()
+        for bad in ("40k", "40000.5", "forty"):
+            with self.subTest(bad=bad):
+                code, out = self._main_with_env({"MAX_CHARS": bad})
+                self.assertEqual(code, 2)
+                self.assertIn(f"::error::AGENTS.md integrity: MAX_CHARS='{bad}'", out)
+                self.assertIn("invalid character-limit configuration", out)
+
+    def test_cli_accepts_a_whole_number_in_float_form(self):
+        self._write_paragraph_file()
+        code, out = self._main_with_env({"MAX_CHARS": "40000.0"})
+        self.assertEqual(code, 1)
+        self.assertIn("over the hard character ceiling of 40000.", out)
+
+    def test_unicode_line_separators_do_not_split_a_line(self):
+        # str.splitlines() would cut this at U+2028/NEL/\f into pieces that
+        # each stay under max_line_chars, and shift the L<n> numbers.
+        para = ("p" * 1500 + "\u2028" + "q" * 1500 + "\x85" + "r" * 100 + "\f")
+        _write(self.root, "AGENTS.md", "first\n" + para + "\nlast\n")
+        _, warnings = self._run(warn_chars=0)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1 line(s) over the per-line ceiling of 3000", warnings[0])
+        self.assertIn(f"L2 ({len(para)} chars)", warnings[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
