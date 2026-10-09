@@ -284,7 +284,7 @@ on:
           and edge-case, the same passes and prompts a Cursor model gets.
           Empty (default) = the job is skipped and nothing changes. Requires the
           `OPENAI_API_KEY` secret and a plain id (`[A-Za-z0-9._-]`); set
-          without either, preflight warns, the cell stays off and the panel is
+          without either, preflight warns, the cells stay off and the panel is
           unchanged.
           Deliberately NOT part of `panel_models`: that list is validated
           against the live CURSOR catalog, which a direct-API id is not in.
@@ -296,10 +296,10 @@ on:
         default: ''
       openai_direct_replaces_cursor_openai:
         description: >-
-          When the direct cell is in effect (`openai_direct_model` set, a plain
-          id, and its key present), drop the Cursor-hosted OpenAI cell
+          When the direct cells are in effect (`openai_direct_model` set, a
+          plain id, and its key present), drop the Cursor-hosted OpenAI cells
           from the panel so the lane is reviewed once rather than twice. Default
-          true: the direct cells REPLACE it, and so gate exactly as the Cursor
+          true: the direct cells REPLACE them, and so gate exactly as the Cursor
           cells would — counted in `Panel integrity` and the auto-approve gate
           (`approve_max_failed_reviewers`), a failed one red in the rollup and
           named in the review's "did not contribute" line. Matching is by vendor prefix
@@ -310,7 +310,7 @@ on:
           their findings reach the judge, but the legs never fail the run and
           are not counted. Refuses to leave the Cursor panel empty: if
           every remaining id would be dropped, preflight fails rather than
-          silently shrinking the panel to a single direct cell.
+          silently shrinking the panel to the direct cells alone.
         type: boolean
         required: false
         default: true
@@ -2789,8 +2789,11 @@ jobs:
     # - REPLACING the Cursor OpenAI lane: these cells ARE that lane, so they
     #   gate exactly like a Cursor cell — counted in ok_count/total, which
     #   `Panel integrity` and the auto-approve gate read, and the leg goes red
-    #   when the cell did not submit. Leaving them advisory here shrank the
-    #   gating panel to two labs, so one lab outage withheld approval.
+    #   when the cell did not submit. While they were advisory, a failed
+    #   direct cell cost nothing against `approve_max_failed_reviewers`, so a
+    #   run could approve with the OpenAI lane silent; counted, it spends that
+    #   allowance like a failed Cursor cell, so the gate covers the full panel
+    #   again.
     # - SIDE BY SIDE (replace false): ADVISORY, as when the backend was first
     #   characterised — job-level `continue-on-error`, never counted — since
     #   the Cursor OpenAI cells already gate that lane.

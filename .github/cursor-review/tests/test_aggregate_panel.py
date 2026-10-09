@@ -5,7 +5,9 @@ The direct-API OpenAI cells (`findings-direct-<review_type>-<model>`) gate only
 when they REPLACE the Cursor OpenAI lane; side by side they stay advisory. A
 regression in either direction is invisible in a diff: counting advisory cells
 lets a comparison run withhold approval, and NOT counting replacing cells
-shrinks the gating panel to two labs, so one lab outage withholds it.
+takes the OpenAI lane out of the gate, so a failed one costs nothing against
+`approve_max_failed_reviewers`. The workflow wiring that feeds this script its
+flags is executed in test_workflow_panel_integrity.py.
 
 Also pins the two downstream readers of the markers this script sets: the
 `direct` tag in post-review.py's "did not contribute" line, and auto-approve's
