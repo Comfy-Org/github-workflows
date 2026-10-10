@@ -255,6 +255,23 @@ on:
         type: boolean
         required: false
         default: true
+      rereview_command:
+        description: >-
+          Opt-in: the comment command that asks for ANOTHER round on the SAME
+          commit, e.g. `/review`. Empty (the default) leaves the same-commit
+          dedupe absolute, exactly as before. When set, this workflow does not
+          skip a round if an authorized commenter posted that command AFTER the
+          newest consolidated review for the current HEAD SHA — so a round that
+          reached no decision because reviewers errored can be re-run without
+          pushing an empty commit. It does NOT by itself give anyone a way to
+          TRIGGER a run: the command has to reach the review label, which is
+          `cursor-review-auto-label.yml`'s `issue_comment` moment. Authorized
+          means an OWNER / MEMBER / COLLABORATOR association on the comment,
+          the same bar `pr-derisk.yml` applies to `/derisk`. `max_rounds` still
+          caps how many rounds a PR can have.
+        type: string
+        required: false
+        default: ''
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -762,6 +779,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Also covers `rereview_command`'s read of the PR's conversation
+      # comments: `issues/{n}/comments` on a PULL REQUEST is authorized by
+      # Pull requests, not Issues. Do NOT add `issues: read` — a nested job
+      # cannot exceed its caller's grant, and the documented caller grants
+      # only `contents` + `pull-requests`, so every caller would fail at
+      # startup on the pin bump, whether or not it set the command.
       pull-requests: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
@@ -941,6 +964,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REREVIEW_COMMAND: ${{ inputs.rereview_command }}
         run: |
           # Idempotency: skip the matrix if a Cursor Review consolidated
           # review already exists for this exact HEAD SHA. Protects against
@@ -949,8 +973,10 @@ jobs:
           #
           # Escape hatches:
           # - Push commits → new HEAD SHA, check finds nothing, runs.
-          # - Dismiss the existing review → DISMISSED state filtered out
-          #   below, so re-applying the label fires a fresh run.
+          # - `rereview_command` (below) → an authorized command comment newer
+          #   than the review lets ONE re-labeled run through. Dismissing the
+          #   review is not a hatch: it is posted COMMENTED, which GitHub will
+          #   not dismiss (DISMISSED is still filtered out, for older reviews).
           #
           # API failure falls through to running, not skipping — better to
           # double-review than silently no-op.
@@ -976,13 +1002,63 @@ jobs:
           # matters. Residual, accepted: another installed App could post a
           # marked review. Closing THAT needs the identity check to move into
           # the posting job, where the token exists.
-          EXISTING=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
+          #
+          # Every page, slurped: the endpoint returns 30 per page oldest-first,
+          # so on a long-lived PR the newest round is exactly what page 1 drops.
+          # A failed fetch degrades to "no prior review", as it always has.
+          REVIEWS=$( { gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null || true; } \
+            | jq -c -s 'add // []' 2>/dev/null) || REVIEWS='[]'
+          EXISTING=$(printf '%s' "$REVIEWS" \
             | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
             2>/dev/null || echo 0)
 
-          if [ "$EXISTING" -gt 0 ]; then
+          # An explicit re-review request overrides the dedupe above, which is
+          # otherwise ABSOLUTE for a given commit: the only documented escape
+          # hatches were a new commit or dismissing the existing review, and
+          # the review this step matches is posted COMMENTED — a state GitHub
+          # does not let anyone dismiss. So "look again at this same commit"
+          # had no working path at all, which matters most in exactly the case
+          # it is wanted: a round that reached no decision because reviewers
+          # errored, where the code is fine and nothing needs pushing.
+          #
+          # The signal is a command comment NEWER than the review it overrides,
+          # so one request buys exactly one round: the round it triggers posts
+          # a newer review, and the next run dedupes again. A stale command
+          # from three rounds ago can never re-fire.
+          #
+          # Authorization is the comment's association, the bar `/derisk`
+          # uses. It is checked HERE rather than trusted from whoever applied
+          # the label, because the label is how the request arrives and a
+          # label says nothing about who asked.
+          #
+          # Nothing from the comment is echoed: these logs are public and a
+          # comment body is attacker-authored text.
+          FORCED=0
+          case "${REREVIEW_COMMAND:-}" in
+            *[[:space:]]*)
+              echo "::warning::rereview_command contains whitespace, so it can never match a comment's first token — use a single token such as /review." ;;
+          esac
+          if [ "$EXISTING" -gt 0 ] && [ -n "${REREVIEW_COMMAND:-}" ]; then
+            LAST_REVIEW=$(printf '%s' "$REVIEWS" \
+              | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel"))) | .submitted_at] | max // ""' \
+              2>/dev/null || echo "")
+            if [ -n "$LAST_REVIEW" ]; then
+              FORCED=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
+                | jq -s --arg cmd "$REREVIEW_COMMAND" --arg since "$LAST_REVIEW" \
+                    '[.[][] | select(.created_at > $since)
+                            | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+                            | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^[ \t]+"; "") | sub("[ \t].*$"; "")) == $cmd)] | length' \
+                2>/dev/null || echo 0)
+              case "$FORCED" in ''|*[!0-9]*) FORCED=0 ;; esac
+            fi
+          fi
+
+          if [ "$EXISTING" -gt 0 ] && [ "$FORCED" -eq 0 ]; then
             echo "Already reviewed at $HEAD_SHA ($EXISTING existing review(s)) — skipping matrix."
             echo "already_reviewed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EXISTING" -gt 0 ]; then
+            echo "Already reviewed at $HEAD_SHA, but an authorized re-review was requested after that review — proceeding."
+            echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           else
             echo "No prior review for $HEAD_SHA — proceeding."
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"

@@ -416,6 +416,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `approve_scope` | `delta` | Rounds 2+ of auto-approve gate only on findings inside the verified incremental block, live re-raises of unresolved threads (by `repeat_of`, or by landing on the path and line of an earlier round's still-open thread), and High/Critical anywhere; the rest post as threads marked non-blocking and are never auto-resolved. Fails closed to `full` (every finding counts) on round 1, an unavailable/discarded/empty block, a block naming an unparseable path, an unknown ledger, an unreadable list of earlier open threads, or an explicitly empty value. |
 | `defer_approval` | `false` | For a caller that runs cursor-approve after this workflow: an APPROVE outcome still reports `approve_gate` = `pass` but posts no approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes, so cursor-approve's decide is the only approver. Pass the workflow's `approve_scope_effective` output (the scope `decide` actually gated under, `full` on any fallback) to cursor-approve's `approve_scope`, so its resolution honours non-gating marks only after a `delta` round. |
 | `approve_max_failed_reviewers` | `0` | Errored panel reviewers (status `error`) auto-approve tolerates before withholding its decision. `0` → any reviewer that did not complete means no decision. Never tolerates another status, more than N, or a review type with no completed reviewer; tolerated cells are named in the decision. |
+| `rereview_command` | `''` (off) | A comment command, e.g. `/review`, asking for another round on the **same commit**. Empty leaves the same-commit dedupe absolute. Needs the SAME value on [`cursor-review-auto-label.yml`](../../docs/callers/cursor-review-auto-label.md) plus `issue_comment` in that caller's triggers: that half re-applies the label (removing it first, since adding a label already present raises no event), this half stops the dedupe from skipping the round it starts. Setting one alone is a silent no-op. The command must be the first token of the first line, and the commenter's association must be `OWNER`, `MEMBER` or `COLLABORATOR` — not the opted-in roster. The request must postdate the review it overrides, so one request buys one round; `max_rounds` still applies. Exists because the documented alternative cannot work: the consolidated review is `COMMENTED`, which GitHub will not dismiss. See [the setup guide](../../docs/callers/cursor-review.md#asking-for-another-round-on-the-same-commit). |
 | `max_rounds` | `5` | Per-PR review-round cap; `0` → none. Counts the posting identity's consolidated reviews since `needs-human-review` was last removed; at or over the cap the panel is skipped, the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Fails open on a read error. See [the setup guide](../../docs/callers/cursor-review.md#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` (same shape as `cursor-review-auto-label.yml`'s) for the four credential-free heavy jobs only: `diff-size`, `preflight`, the `review` panel and `consolidate`. The gate, ledger, Slack notices and every job holding the App token or `pull-requests: write` stay on GitHub-hosted `ubuntu-latest`. Those four run models with unsandboxed shell over PR code, so use a self-hosted pool only if each job gets a fresh pod (fresh filesystem and `$HOME`), holds no cloud identity or token, and can't reach private networks or the metadata server. The image must be linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. |
 
@@ -464,8 +465,13 @@ and upsert are both `continue-on-error`: the size verdict lives in the
   trigger label is on) starts a run.
 - **Re-review after changes**: push commits. The new HEAD SHA bypasses the
   idempotency check and a re-applied label runs a fresh panel.
-- **Re-review unchanged content**: dismiss the existing review, then re-apply
-  the label.
+- **Re-review unchanged content**: set `rereview_command` (e.g. `/review`) on
+  BOTH `cursor-review.yml` and `cursor-review-auto-label.yml`, then comment it
+  as an OWNER / MEMBER / COLLABORATOR. Dismissing the existing review — what
+  this said before — cannot be done: the consolidated review is posted
+  `COMMENTED`, and GitHub dismisses only `APPROVED` and `CHANGES_REQUESTED`
+  ones, so without the command the only re-review is a new commit. See
+  [the caller page](../../docs/callers/cursor-review.md#asking-for-another-round-on-the-same-commit).
 
 ## Customizing the review
 

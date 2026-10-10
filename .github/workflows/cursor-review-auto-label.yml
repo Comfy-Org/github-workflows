@@ -10,6 +10,9 @@ name: Cursor Review Auto-Label (reusable)
 #   - assigned            -> the newly-assigned reviewer
 #   - opened              -> the PR author (skipped while the PR is a draft)
 #   - ready_for_review    -> the PR author
+#   - issue_comment       -> an authorized commenter typing `rereview_command`
+#                            (e.g. `/review`), which asks for ANOTHER round on
+#                            the SAME commit. Off unless that input is set.
 # A caller that lists only `[assigned]` keeps the original assignment-only
 # behavior; add `opened` / `ready_for_review` to also label on PR creation.
 #
@@ -63,6 +66,23 @@ name: Cursor Review Auto-Label (reusable)
 on:
   workflow_call:
     inputs:
+      rereview_command:
+        description: >-
+          Opt-in: a comment command (e.g. `/review`) that re-applies the review
+          label so cursor-review.yml runs ANOTHER round on the SAME commit.
+          Empty (the default) ignores every comment, so a caller that does not
+          list `issue_comment` in its `on:` is unaffected either way. Set the
+          SAME value on cursor-review.yml's `rereview_command`: this half makes
+          the round start, and that half stops its same-commit dedupe from
+          skipping it. Setting only this one re-applies a label that the dedupe
+          then no-ops, which looks exactly like the command being ignored.
+          Authorization is the comment's own association — OWNER, MEMBER or
+          COLLABORATOR, the bar `pr-derisk.yml` applies to `/derisk` — never
+          the opted-in roster, which governs who gets labelled automatically
+          rather than who may ask for a re-read.
+        type: string
+        required: false
+        default: ''
       review_label:
         description: >-
           Label to apply. MUST match the label cursor-review.yml triggers on
@@ -125,6 +145,20 @@ permissions:
 jobs:
   auto-label:
     name: Auto-apply review label
+    # Every comment on every issue and PR fires `issue_comment`. Settle the
+    # cheap, payload-only questions here so the rest never allocates a runner
+    # (possibly the caller's self-hosted `runs_on` pool) or mints the App
+    # token: the feature is on, this is a NEW comment (an edited or deleted
+    # old `/review` must not toggle the label and cancel a running panel),
+    # on an open PR, from an authorized association. The step re-checks the
+    # association and the live PR state; this is only the prefilter.
+    if: >-
+      github.event_name != 'issue_comment'
+      || (inputs.rereview_command != ''
+          && github.event.action == 'created'
+          && github.event.issue.pull_request
+          && github.event.issue.state == 'open'
+          && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
@@ -262,3 +296,109 @@ jobs:
 
           echo "Applying $REVIEW_LABEL label for $candidate (action=$ACTION)."
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"
+
+      - name: Re-apply the label when an authorized commenter asks for another round
+        # The one moment that is NOT about who became responsible for a PR: a
+        # human saying "look at this again". It exists because the same-commit
+        # dedupe in cursor-review.yml had no working escape hatch — its own
+        # documented one is to dismiss the existing review, and that review is
+        # posted COMMENTED, a state GitHub does not let anyone dismiss. So a
+        # round that reached no decision because reviewers ERRORED could only
+        # be retried by pushing a commit that changed nothing.
+        #
+        # Unlike the step above this must REMOVE and re-add: after a round the
+        # label is already present, and adding a label that is already there
+        # raises no event at all.
+        if: github.event_name == 'issue_comment' && github.event.action == 'created' && inputs.rereview_command != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token-narrow.outputs.token || steps.app-token-default.outputs.token }}
+          # `null` unless the comment is on a PR; issue_comment fires for plain
+          # issues too, which have no label worth touching.
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          # Through the ENVIRONMENT, never interpolated into the script: a
+          # comment body is attacker-authored text and `${{ }}` in a `run:`
+          # would be a shell-injection hole.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+          REVIEW_LABEL: ${{ inputs.review_label }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
+          REREVIEW_COMMAND: ${{ inputs.rereview_command }}
+        run: |
+          if [ "$IS_PR" != "true" ]; then
+            echo "Comment is not on a pull request — no-op."
+            exit 0
+          fi
+
+          # The match below is against ONE whitespace-free token, so a value
+          # like `/cursor review` can never match and the feature would
+          # silently do nothing.
+          case "$REREVIEW_COMMAND" in
+            *[[:space:]]*)
+              echo "::warning::rereview_command contains whitespace, so it can never match a comment's first token — use a single token such as /review."
+              exit 0 ;;
+          esac
+
+          # The FIRST token of the first line, so `/review please have another
+          # look` counts and `/reviewer` does not. Nothing from the body is
+          # echoed: these logs are public.
+          first_token=$(printf '%s' "$COMMENT_BODY" | head -n 1 | tr -d '\r' | awk '{print $1}')
+          if [ "$first_token" != "$REREVIEW_COMMAND" ]; then
+            echo "Comment does not open with the re-review command — no-op."
+            exit 0
+          fi
+
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *)
+              echo "::warning::Ignoring a re-review command from a $ASSOCIATION association."
+              exit 0 ;;
+          esac
+
+          # A comment on a closed or merged PR still fires issue_comment, and
+          # the label event it would raise starts a round on code that can no
+          # longer land.
+          pr=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels,state)
+          if [ "$(echo "$pr" | jq -r .state)" != "OPEN" ]; then
+            echo "PR is not open — no-op."
+            exit 0
+          fi
+          labels=$(echo "$pr" | jq -c '[.labels[].name]')
+          if echo "$labels" | jq -e --arg l "$SKIP_LABEL" 'index($l)' > /dev/null; then
+            echo "$SKIP_LABEL present — not re-reviewing."
+            exit 0
+          fi
+
+          if echo "$labels" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+            echo "Re-review requested — removing and re-adding $REVIEW_LABEL to raise a fresh event."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$REVIEW_LABEL"
+            # The remove raises an `unlabeled` run and the add a `labeled` one,
+            # and both land in cursor-review's `trigger` slot with
+            # cancel-in-progress. Fired back to back, GitHub does not promise
+            # which run is created first — and if `unlabeled` is second it
+            # cancels the round this command asked for. So wait until the
+            # remove is visible, then give its run a head start.
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              if ! gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name]' \
+                  | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            sleep 10
+          else
+            echo "Re-review requested — applying $REVIEW_LABEL."
+          fi
+          # Retried: once the remove above has landed, a single failed add
+          # would leave the PR WITHOUT the label it had before the command —
+          # strictly worse than ignoring the request.
+          for attempt in 1 2 3; do
+            if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"; then
+              exit 0
+            fi
+            echo "::warning::Adding $REVIEW_LABEL failed (attempt $attempt of 3)."
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+          done
+          echo "::error::Could not re-add $REVIEW_LABEL — the PR is now missing it; re-apply it by hand."
+          exit 1

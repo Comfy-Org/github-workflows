@@ -99,6 +99,7 @@ Only that. The label write goes through the App token, not `GITHUB_TOKEN`.
 
 | Input | Default | Notes |
 |---|---|---|
+| `rereview_command` | `''` (off) | A comment command, e.g. `/review`, that re-applies the review label so another round runs on the **same commit**. Needs `issue_comment` in your `on:` triggers, and the SAME value on `cursor-review.yml`'s `rereview_command` — this half starts the round, that half stops its same-commit dedupe from skipping it. Set only here, the label is re-applied and then the dedupe no-ops it, which looks exactly like the command being ignored. Authorized = an `OWNER` / `MEMBER` / `COLLABORATOR` association; the opted-in roster is not consulted. **Also widen the job's `if:` above** to `github.event_name == 'issue_comment' \|\| (<the existing guard>)` — `github.event.pull_request` is null on a comment event, so the same-repo check alone skips every command. See [the full caller](cursor-review.md#asking-for-another-round-on-the-same-commit). |
 | `review_label` | `cursor-review` | Must match `cursor-review.yml`'s `review_label`. |
 | `skip_label` | `skip-cursor-review` | Present on a PR ⇒ never auto-label it. |
 | `runs_on` | `'"ubuntu-latest"'` | JSON. Set for self-hosted runners. |

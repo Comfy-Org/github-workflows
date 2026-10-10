@@ -139,6 +139,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `approve_scope` | `delta` | What an auto-approve round after the first gates on. `delta`: a finding above `approve_max_severity` blocks only when it sits inside a hunk of the verified incremental block (the changes since the last reviewed commit), re-raises an earlier finding whose thread is still unresolved (the judge names that thread in `repeat_of`, or the finding sits on the path and line of an earlier round's thread that is still open — so a re-raise of an unanswered thread gates without a `repeat_of`), or is High/Critical anywhere in the reviewed diff. Every other finding is still posted, as a thread marked *Outside this round's changes: not blocking auto-approve*, and is never auto-resolved — it stays open for a human (and still counts for the `blocking` gate). Round 1, an incremental block that was unavailable or discarded, an empty one (a pure rebase, or no new-side hunk), one naming a path that cannot be parsed, an unknown prior-review ledger, and a list of earlier open threads that could not be read all fail closed to `full`; so does an explicitly empty value (only the input's own default picks `delta`). The decision note states the scope used, the gating vs non-gating counts, and why each gating finding gated. `full`: every finding counts wherever it sits (the behaviour before this input). The panel reviews the full diff either way. No effect without `approve_max_severity`. |
 | `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
 | `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
+| `rereview_command` | `''` (off) | A comment command, e.g. `/review`, that asks for ANOTHER round on the **same commit**. Empty leaves the same-commit dedupe absolute. Set the same value on [`cursor-review-auto-label.yml`](cursor-review-auto-label.md) — that half turns the comment into the label event, this half stops the dedupe from skipping the round it starts; setting only one is a silent no-op. Authorized = an `OWNER` / `MEMBER` / `COLLABORATOR` association on the comment. One request buys one round, and `max_rounds` still applies. See [below](#asking-for-another-round-on-the-same-commit). |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 
@@ -221,6 +222,80 @@ default and then drift from it. (`catalog-drift.py` also parses that default out
 of the workflow.) Overriding the judge is better done with a literal, or by
 changing the default in the reusable.
 
+## Asking for another round on the same commit
+
+A round can end with no decision for a reason that has nothing to do with the
+code — most often reviewer cells erroring, which `approve_max_failed_reviewers`
+counts. The fix is to run it again, and until `rereview_command` there was no
+way to: the dedupe keys on the consolidated review for the current HEAD SHA,
+dismissing that review is impossible (it is `COMMENTED`), and the code is fine,
+so there is nothing to push.
+
+Set the **same** command on both workflows:
+
+```yaml
+# CI - Cursor Review
+jobs:
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with:
+      workflows_ref: <the same sha>
+      rereview_command: '/review'
+
+# CI - Cursor Review Auto-Label  — add issue_comment to its triggers
+on:
+  pull_request:
+    types: [assigned, opened, ready_for_review]
+  issue_comment:
+    types: [created]
+jobs:
+  auto-label:
+    # Widen the canonical guard: `github.event.pull_request` is null on
+    # `issue_comment`, so the same-repo check alone skips every `/review`.
+    # (A comment event runs in the base repo with its secrets, fork PR or not;
+    # the reusable checks the commenter's association itself.)
+    if: >-
+      github.event_name == 'issue_comment'
+      || (github.event.pull_request.head.repo.full_name == github.repository
+          && github.actor != 'dependabot[bot]')
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<sha>  # v1
+    with:
+      rereview_command: '/review'
+```
+
+Then a maintainer comments `/review` and the next round runs. What that does,
+precisely:
+
+- **auto-label** removes and re-adds the review label, which raises the
+  `labeled` event cursor-review triggers on. It removes first because adding a
+  label that is already present raises no event at all, and after a round the
+  label is always already present.
+- **the gate** sees the prior review for this SHA, then looks for an authorized
+  command comment **newer than that review**. One request therefore buys exactly
+  one round: the round it starts posts a newer review, so the next run dedupes
+  again and a `/review` from three rounds ago can never re-fire.
+
+Details worth knowing:
+
+- The command must be the **first token of the first line**, so `/review please
+  look again` counts and `/reviewer` does not, and quoting someone else's
+  `/review` further down a comment does nothing.
+- Authorization is the comment's own association, the bar `pr-derisk.yml`
+  applies to `/derisk`. The opted-in roster is not consulted — it governs who
+  gets labelled automatically, not who may ask for a re-read.
+- Comments on plain issues are ignored, and `skip-cursor-review` still wins.
+- `max_rounds` still caps completed rounds, but it bounds rather than prevents
+  repeat spending: each command cancels an in-flight panel through the
+  `trigger` slot, and a cancelled panel posts no review, so it is never counted.
+  `MEMBER` / `COLLABORATOR` also do not imply write access (a read-only
+  collaborator qualifies) — the same bar, and the same trade, as `/derisk`.
+- Only a newly **created** comment counts; editing or deleting an old
+  `/review` does nothing.
+- The value must be a single token with no whitespace (`/cursor review` can
+  never match); both workflows warn if it is not.
+- Nothing from the comment reaches a log: a comment body is attacker-authored
+  text, and these logs may be public.
+
 ## Gotchas
 
 **The label must be applied by a GitHub App token, not `GITHUB_TOKEN`.** Events
@@ -272,9 +347,14 @@ remove the label, confirm it is gone, then re-add it.
 
 **One review per commit — re-labeling alone will not re-review.** The gate skips
 the panel if a non-dismissed consolidated review already exists for the PR's HEAD
-SHA, so a remove-and-re-add on unchanged content no-ops by design. To get a fresh
-review of the same commit, **dismiss the existing review first**, then apply the
-label.
+SHA, so a remove-and-re-add on unchanged content no-ops by design.
+
+**Dismissing that review is not actually an option, despite what this page used
+to say here.** The consolidated review is posted `COMMENTED`, and GitHub only
+dismisses `APPROVED` and `CHANGES_REQUESTED` reviews — so the one remedy this
+page prescribed could never be carried out. Set
+[`rereview_command`](#asking-for-another-round-on-the-same-commit) to get a
+working one; without it, the only way to re-review is to push a commit.
 
 Pushing a commit clears the dedupe (new head SHA), but with the label-gated caller
 above it does **not** by itself start a run — `types: [labeled, unlabeled]` omits
@@ -341,8 +421,9 @@ both pass it and you get two panels and two reviews. Keying on the PR number
 alone keeps every trigger in one group.
 
 Keep `labeled`/`unlabeled` in the list even in label-free mode: the label path
-stays live alongside it, which is how you force a re-review on an unchanged commit
-(dismiss the existing review, then apply the label — see the dedupe gotcha below).
+stays live alongside it, and it is how a re-review on an unchanged commit arrives
+(see [`rereview_command`](#asking-for-another-round-on-the-same-commit); the
+dedupe gotcha below explains why dismissing the review is not the answer).
 
 **The reusable owns a group of its own — it ADDS to your caller group, it does not replace it.** `cursor-review.yml` declares a workflow-level `concurrency: cursor-review-reusable-<pr>-<slot>` with `cancel-in-progress: true`, which reaches you at your next pin bump with no caller edit and no permission change. Its slot rule: the trigger label and `skip-cursor-review` share one `trigger` slot, so **applying `skip-cursor-review` mid-panel cancels the running panel**; every other label gets its own `label-<name>` slot, so an unrelated label add never kills a running review; `pull_request_review_thread` events stay out of `trigger`, so resolving a finding thread on a blocking caller cannot cancel a panel; and under `run_without_label: true` the four plain PR actions the gate accepts (`opened` / `reopened` / `ready_for_review` / `synchronize`) join `trigger` as well, so a push supersedes a running panel and the veto label can still reach it.
 
