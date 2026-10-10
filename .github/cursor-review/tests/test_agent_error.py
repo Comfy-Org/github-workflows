@@ -393,5 +393,141 @@ class WorkflowWiringTest(unittest.TestCase):
             self.assertNotIn("cat /tmp/findings-out/findings.json", block)
 
 
+class StepBehaviourTest(unittest.TestCase):
+    """Runs the workflow's REAL `Report cell outcome` body, not just the script.
+
+    `WorkflowWiringTest` reads the step statically, which cannot tell whether
+    the branch it sits in is reached or whether the step as a whole keeps the
+    agent's prose out. So the body is extracted and EXECUTED against fixtures,
+    with its hardcoded `/tmp` paths rewritten into a sandbox. The leak
+    assertion is the point: it covers the whole step, so a future `cat` of the
+    events file added beside the diagnosis would fail here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with io.open(WORKFLOW, encoding="utf-8") as f:
+            text = f.read()
+        cls.bodies = cls._bodies(text)
+        # Both lanes, or the extraction below has drifted from the workflow.
+        assert len(cls.bodies) == 2, f"extracted {len(cls.bodies)} wired bodies"
+
+    @staticmethod
+    def _bodies(text):
+        """The `run:` script of every `Report cell outcome` step that calls us."""
+        out, cur, lines = [], None, text.splitlines()
+        for line in lines:
+            if re.match(r"^      - name: ", line):
+                if cur:
+                    out.append("\n".join(cur))
+                cur = [] if "Report cell outcome" in line else None
+            elif cur is not None:
+                cur.append(line)
+        if cur:
+            out.append("\n".join(cur))
+        bodies = []
+        for step in out:
+            m = re.search(r"^        run: \|\n(.*)", step, re.S | re.M)
+            if not m:
+                continue
+            body = []
+            for ln in m.group(1).splitlines():
+                if ln.strip() and not ln.startswith("          "):
+                    break
+                body.append(ln[10:])
+            body = "\n".join(body)
+            if "agent-error.py" in body:
+                bodies.append(body)
+        return bodies
+
+    EVENTS = (
+        '{"type":"item.completed","item":{"type":"reasoning","text":"%s"}}\n'
+        '{"type":"error","error":{"type":"insufficient_quota",'
+        '"code":"credit_balance_exhausted"}}\n'
+    ) % PROSE
+
+    def run_step(self, body, record, counts="true", events=EVENTS):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        findings = os.path.join(d, "findings.json")
+        with open(findings, "w", encoding="utf-8") as f:
+            f.write(record if isinstance(record, str) else json.dumps(record))
+        evfile = os.path.join(d, "events")
+        if events is not None:
+            with open(evfile, "w", encoding="utf-8") as f:
+                f.write(events)
+        script = body
+        for placeholder in ("/tmp/findings-out/findings.json",):
+            script = script.replace(placeholder, findings)
+        for placeholder in ("/tmp/codex-events.jsonl", "/tmp/claude-result.json"):
+            script = script.replace(placeholder, evfile)
+        proc = subprocess.run(
+            ["bash", "-e", "-c", script], capture_output=True, text=True,
+            env={
+                **os.environ,
+                "CURSOR_REVIEW_ASSETS": os.path.dirname(SCRIPT),
+                "MODEL": "gpt-5.6-sol",
+                "REVIEW_TYPE": "adversarial",
+                "COUNTS": counts,
+            },
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return proc.stdout
+
+    def test_a_failed_cell_names_the_provider_error(self):
+        for i, body in enumerate(self.bodies):
+            with self.subTest(lane=i):
+                out = self.run_step(body, {"status": "error", "findings": []})
+                self.assertIn("why the cell failed", out)
+                self.assertIn("credit_balance_exhausted", out)
+
+    def test_the_step_never_prints_the_agents_prose(self):
+        # The whole step, not just the script: a `cat` of the events file added
+        # next to the diagnosis would fail here.
+        for i, body in enumerate(self.bodies):
+            for counts in ("true", "false"):
+                with self.subTest(lane=i, counts=counts):
+                    out = self.run_step(
+                        body, {"status": "error", "findings": []}, counts=counts
+                    )
+                    self.assertNotIn(PROSE, out)
+
+    def test_a_submitted_cell_gets_no_failure_diagnosis(self):
+        for i, body in enumerate(self.bodies):
+            with self.subTest(lane=i):
+                out = self.run_step(body, {"status": "ok", "findings": [{"a": 1}]})
+                self.assertNotIn("why the cell failed", out)
+                self.assertIn("submitted its findings", out)
+
+    def test_a_missing_output_file_does_not_fail_the_step(self):
+        # The step is `always()`; a cell killed before its agent wrote anything
+        # must still report, not error.
+        for i, body in enumerate(self.bodies):
+            with self.subTest(lane=i):
+                out = self.run_step(
+                    body, {"status": "error", "findings": []}, events=None
+                )
+                self.assertIn("could not read", out)
+
+    def test_an_unparseable_record_still_reports_a_failure(self):
+        for i, body in enumerate(self.bodies):
+            with self.subTest(lane=i):
+                out = self.run_step(body, "not json at all")
+                self.assertIn("status=error", out)
+
+    def test_the_gating_and_advisory_wording_both_survive(self):
+        for i, body in enumerate(self.bodies):
+            with self.subTest(lane=i):
+                gating = self.run_step(
+                    body, {"status": "error", "findings": []}, counts="true"
+                )
+                self.assertIn("counts as a failed reviewer", gating)
+                advisory = self.run_step(
+                    body, {"status": "error", "findings": []}, counts="false"
+                )
+                self.assertIn("::warning::", advisory)
+                self.assertIn("advisory", advisory)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
