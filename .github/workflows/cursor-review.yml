@@ -3467,9 +3467,13 @@ jobs:
             # metadata and never the prose, and exits 0 on anything — a
             # truncated or non-JSON file must not turn the diagnosis into a
             # second failure.
+            # `|| true` because this step runs under `bash -e`: the script's
+            # own exit-0 contract cannot cover a script that never STARTED
+            # (a skipped assets checkout, so `python3` exits 2), and aborting
+            # here would lose the status and `::warning::` lines below.
             python3 "$CURSOR_REVIEW_ASSETS/agent-error.py" \
               --events /tmp/codex-events.jsonl \
-              --label "${REVIEW_TYPE}/${MODEL}"
+              --label "${REVIEW_TYPE}/${MODEL}" || true
             if [ "$COUNTS" = "true" ]; then
               # Failed AFTER the upload below, by `Fail the leg when the cell did
               # not submit`, so the errored record still reaches the judge.
@@ -3939,9 +3943,13 @@ jobs:
             # metadata and never the prose, and exits 0 on anything — a
             # truncated or non-JSON file must not turn the diagnosis into a
             # second failure.
+            # `|| true` because this step runs under `bash -e`: the script's
+            # own exit-0 contract cannot cover a script that never STARTED
+            # (a skipped assets checkout, so `python3` exits 2), and aborting
+            # here would lose the status and `::warning::` lines below.
             python3 "$CURSOR_REVIEW_ASSETS/agent-error.py" \
               --events /tmp/claude-result.json \
-              --label "${REVIEW_TYPE}/${MODEL}"
+              --label "${REVIEW_TYPE}/${MODEL}" || true
             if [ "$COUNTS" = "true" ]; then
               # Failed AFTER the upload below, by `Fail the leg when the cell did
               # not submit`, so the errored record still reaches the judge.

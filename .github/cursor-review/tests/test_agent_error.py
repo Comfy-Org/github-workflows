@@ -29,6 +29,7 @@ limit (`BoundsTest`).
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 """
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -211,6 +212,29 @@ class SanitizationTest(unittest.TestCase):
         # Deleting would let a crafted value collapse into different text.
         self.assertEqual("a?b", agent_error.sanitize("a\u0000b"))
 
+    def test_an_odd_run_of_colons_leaves_no_pair(self):
+        # `str.replace` does not rescan its own output: `":::"` came back as
+        # `": ::"`, so the no-`::` guarantee failed for odd-length runs.
+        for value in (":::", "::::", "a:::b", ":" * 9):
+            with self.subTest(value=value):
+                self.assertNotIn("::", agent_error.sanitize(value))
+
+    def test_the_legacy_command_form_is_broken_too(self):
+        # The runner also recognises `##[command]` anywhere in a line, and
+        # `_SAFE` allows `#`, `[` and `]`.
+        for value in ("##[error]forged", "##[add-mask]x", "###[error]x"):
+            with self.subTest(value=value):
+                out = agent_error.sanitize(value)
+                self.assertNotIn("##[", out)
+                self.assertIn("forged" if "forged" in value else "x", out)
+
+    def test_no_emitted_line_can_carry_either_command_form(self):
+        payload = {"error": {"type": ":::", "code": "##[add-mask]",
+                             "message": "x:::y ##[error]z"}}
+        for line in summary(payload):
+            self.assertNotIn("::", line)
+            self.assertNotIn("##[", line)
+
     def test_a_long_value_is_truncated(self):
         out = agent_error.sanitize("x" * 5000)
         self.assertLessEqual(len(out), agent_error.MAX_VALUE)
@@ -227,14 +251,18 @@ class SanitizationTest(unittest.TestCase):
 
 class BoundsTest(unittest.TestCase):
     def test_deep_nesting_does_not_recurse_without_limit(self):
+        # Nested through an ENVELOPE key, since that is the only path the walk
+        # descends at all: an earlier version of this test wrapped the payload
+        # in an arbitrary `wrap` key and so stopped proving anything once
+        # descent became an allowlist.
         node = {"type": "error", "code": "deep"}
         for _ in range(5000):
-            node = {"wrap": node}
+            node = {"error": node}
         out = joined(node)   # must not raise RecursionError
         self.assertIn("walk bounded", out)
 
     def test_wide_breadth_is_bounded(self):
-        payload = {"items": [{"type": f"t{i}"} for i in range(50000)]}
+        payload = {"error": [{"type": "error", "code": f"c{i}"} for i in range(50000)]}
         out = joined(payload)
         self.assertIn("walk bounded", out)
 
@@ -259,6 +287,173 @@ class BoundsTest(unittest.TestCase):
         census = [line for line in summary(text) if line.startswith("events: ")]
         self.assertEqual(1, len(census))
         self.assertLessEqual(census[0].count("×"), 10)
+
+
+class ModelAuthoredSubtreeTest(unittest.TestCase):
+    """The agent writes part of this file. Those parts must never be read.
+
+    A reviewer agent chooses the `arguments` of its own MCP tool calls, so a
+    prompt-injected one can plant an error-shaped object there and — if the
+    walk descended into every value — get attacker-chosen text into the run
+    log. That is not hypothetical nesting: it is the one subtree in these files
+    whose contents the model dictates.
+    """
+
+    SHAPES = (
+        # codex: an MCP tool call whose arguments the model wrote.
+        {"type": "item.completed",
+         "item": {"type": "mcp_tool_call", "name": "cursor_review_record_finding",
+                  "arguments": {"severity": "high", "error": {"message": PROSE}}}},
+        # The shape that needed no `error` key at all.
+        {"item": {"arguments": {"type": "error", "message": PROSE}}},
+        # A tool result's content.
+        {"type": "item.completed",
+         "item": {"type": "tool_result", "content": [{"is_error": True, "message": PROSE}]}},
+        # Prose hidden under an allowlisted field name one level down.
+        {"type": "result", "is_error": True, "result": {"error": {"message": PROSE}}},
+        # A model-chosen `type`, which would otherwise reach the census.
+        {"item": {"arguments": {"type": PROSE}}},
+    )
+
+    def test_no_model_authored_subtree_reaches_the_log(self):
+        for i, shape in enumerate(self.SHAPES):
+            with self.subTest(shape=i):
+                self.assertNotIn(PROSE, joined(shape))
+
+    def test_the_descent_allowlist_holds_no_model_written_key(self):
+        # The guard that matters when someone widens ENVELOPE_KEYS later.
+        for key in ("arguments", "input", "tool_input", "result", "content",
+                    "text", "output", "reasoning", "thinking", "delta",
+                    "parameters", "params", "messages", "findings"):
+            self.assertNotIn(key, agent_error.ENVELOPE_KEYS)
+
+    def test_a_provider_error_beside_the_arguments_is_still_read(self):
+        # Blocking the model's subtree must not cost the CLI's own error.
+        payload = {"type": "item.completed",
+                   "item": {"type": "mcp_tool_call",
+                            "arguments": {"error": {"message": PROSE}},
+                            "error": {"code": "tool_rejected"}}}
+        out = joined(payload)
+        self.assertIn("tool_rejected", out)
+        self.assertNotIn(PROSE, out)
+
+
+class ClaudeResultShapeTest(unittest.TestCase):
+    """Claude Code reports an API failure as a result object.
+
+    The cause sits in `result` — the same field its review prose uses — so it
+    is NOT printed. `is_error` is, so the line cannot read as a success. This
+    pins the documented gap: see the per-lane note in
+    `docs/callers/cursor-review.md`.
+    """
+
+    FAILURE = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "result": "API Error: 400 credit balance is too low",
+    }
+
+    def test_the_failure_is_not_reported_as_a_success(self):
+        out = joined(self.FAILURE)
+        self.assertIn("is_error=True", out)
+
+    def test_the_cause_in_result_is_withheld(self):
+        self.assertNotIn("credit balance", joined(self.FAILURE))
+
+    def test_is_error_is_allowlisted(self):
+        self.assertIn("is_error", agent_error.ERROR_FIELDS)
+
+
+class TailReadTest(unittest.TestCase):
+    """The explaining event is the LAST thing an agent writes."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_a_late_error_in_an_oversized_file_is_still_found(self):
+        # Reading forward from byte 0 would spend the whole budget on filler
+        # and lose the terminal event — the one the script exists to print.
+        path = os.path.join(self.dir.name, "events.jsonl")
+        filler = json.dumps({"type": "item.completed", "item": {"type": "reasoning"}})
+        with open(path, "w", encoding="utf-8") as f:
+            while f.tell() < agent_error.MAX_READ + 500_000:
+                f.write(filler + "\n")
+            f.write(json.dumps(
+                {"type": "error", "error": {"code": "terminal_failure"}}) + "\n")
+        out = run_script(path)
+        self.assertIn("terminal_failure", out)
+
+    def test_the_truncated_read_is_declared(self):
+        path = os.path.join(self.dir.name, "big.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x" * (agent_error.MAX_READ + 10))
+        self.assertIn("larger file", run_script(path))
+
+    def test_the_newest_error_is_reported_first(self):
+        text = (
+            json.dumps({"type": "error", "error": {"code": "first_failure"}}) + "\n"
+            + json.dumps({"type": "error", "error": {"code": "last_failure"}}) + "\n"
+        )
+        out = "\n".join(summary(text))
+        self.assertLess(out.index("last_failure"), out.index("first_failure"))
+
+
+class DecoderHostileInputTest(unittest.TestCase):
+    """`json.loads` raises RecursionError — a RuntimeError, not a ValueError.
+
+    400 KB of `[` is enough, well inside the 4 MB read. An uncaught one would
+    traceback, exit 1, and under the step's `bash -e` abort `Report cell
+    outcome` before its status line — turning an advisory leg red.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def write(self, text):
+        path = os.path.join(self.dir.name, "events.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_deeply_nested_json_exits_zero(self):
+        depth = 200_000
+        run_script(self.write("[" * depth + "]" * depth))   # asserts exit 0
+
+    def test_deeply_nested_json_on_one_ndjson_line_exits_zero(self):
+        depth = 200_000
+        run_script(self.write(
+            '{"type":"session.created"}\n' + "[" * depth + "]" * depth + "\n"))
+
+    def test_an_unexpected_failure_in_the_walk_still_exits_zero(self):
+        # `main`'s broad `except` is unreachable through any input the rest of
+        # this suite can construct — `_loads` already absorbs the decoder — so
+        # the guard is exercised directly instead of left as untested
+        # defensive code. Whatever future change makes `summarize` raise, the
+        # step must still reach its status line.
+        path = self.write('{"type":"error","code":"x"}\n')
+        original = agent_error.walk
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        agent_error.walk = explode
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = agent_error.main(["--events", path])
+        finally:
+            agent_error.walk = original
+        self.assertEqual(0, code)
+        self.assertIn("could not summarize", buf.getvalue())
+        self.assertNotIn("boom", buf.getvalue())   # the message is not echoed
+
+    def test_the_loads_helper_never_raises(self):
+        for payload in ("[" * 200_000, "{" * 200_000, "nonsense", ""):
+            ok, _ = agent_error._loads(payload)
+            self.assertFalse(ok)
 
 
 def run_script(path, label="adversarial/gpt-5.6-sol"):
@@ -387,6 +582,15 @@ class WorkflowWiringTest(unittest.TestCase):
         for block in self.blocks:
             if "agent-error.py" in block:
                 self.assertIn('"$CURSOR_REVIEW_ASSETS/agent-error.py"', block)
+
+    def test_the_diagnosis_cannot_abort_the_step(self):
+        # The step runs under `bash -e`, and the script's own exit-0 contract
+        # cannot cover a script that never STARTED — a skipped assets checkout
+        # makes `python3` exit 2, which would lose the status and `::warning::`
+        # lines this step exists to print.
+        for block in self.blocks:
+            if "agent-error.py" in block:
+                self.assertIn('--label "${REVIEW_TYPE}/${MODEL}" || true', block)
 
     def test_the_cell_outcome_step_still_withholds_the_findings(self):
         for block in self.blocks:

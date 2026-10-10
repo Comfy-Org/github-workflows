@@ -232,12 +232,28 @@ exists to handle.
 **A direct-API cell that fails says why in its own job log.** The direct
 lanes never echo their agent's output — it carries model prose steered by the
 PR — so when a cell does not submit, its **Report cell outcome** step prints an
-allowlisted summary of the provider's error instead (`type`, `code`, `status`,
-`message`) plus a census of the events it got that far. A quota or rate-limit
-failure names itself there; a cell that ran but submitted nothing shows up as a
-census with no error object. Nothing else is printed and the raw output is not
-uploaded, so that step is the whole diagnosis — if it is not enough, the fix is
-to widen the allowlist in `agent-error.py`, not to publish the transcript.
+allowlisted summary of the provider's error instead (`type`, `subtype`,
+`is_error`, `code`, `param`, `status`, `message`) plus a census of the events it
+got that far.
+
+How much that names depends on the lane, because the two CLIs report failures
+differently. **OpenAI/codex** puts the cause in a structured error event, so a
+quota or rate-limit failure names itself — `type=insufficient_quota
+code=credit_balance_exhausted` and the provider's own message.
+**Anthropic/claude** reports an API-level failure as a result object whose
+cause sits in `result`, which is the same field its review prose uses: that
+field is not allowlisted and is not printed, so the Anthropic lane tells you
+`is_error=true` and the event census but **not** the cause. Reading it means
+re-running the cell, or checking the provider's status/billing directly.
+
+That is a deliberate trade, not an oversight: `result` is attacker-steerable
+(the agent reads PR-authored text), so printing it would hand a prompt-injected
+agent a channel into the run log, which is the exact thing withholding these
+files prevents. A cell that ran but submitted nothing shows up as a census with
+no error object. Nothing else is printed and the raw output is not uploaded, so
+that step is the whole diagnosis — if it is not enough, the fix is to widen the
+allowlist in `agent-error.py` to a field the CLI owns, not to publish the
+transcript.
 
 **Applying the label does not guarantee a run.** If the event was swallowed,
 remove the label, confirm it is gone, then re-add it.
