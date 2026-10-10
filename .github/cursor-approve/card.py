@@ -37,6 +37,17 @@ Every card carries two machine-readable markers on the lines right after
 ``CARD_MARKER`` — ``STATE_MARKER`` and ``NEXT_MARKER`` — a stable contract
 for agents, documented in docs/callers/cursor-approve.md.
 
+With ``prior_rounds`` above 0 (BE-5109's continuity, for the axes), ``decide``
+also writes ONE line at column 0 of the card, ``AXES_SENTINEL_OPENER`` +
+base64(JSON) + `` -->``: the last ``prior_rounds`` rounds of per-axis verdict,
+headline and summary, oldest first. ``upsert`` carries that line through every
+later rewrite that does not write its own (``start``, ``ensure``, cursor-review's
+``render_round``), and ``prior`` reads it back in the next round's start phase,
+for ``aggregate.py render --prior-file``. Base64, so model text can never close
+the comment or start a line; read back only from the card ``find_card`` trusts,
+only at a line start, only at version ``v1``, and only after a byte cap and a
+per-entry shape check — anything else is an empty history and a warning.
+
 Every model-supplied string (an axis summary, a reason that echoes one) goes
 through ``sanitize`` — post-review.py's ``neutralize_mentions`` plus escaping of
 every character that could open markdown or HTML — so a summary cannot add a
@@ -44,6 +55,8 @@ heading, fire a mention or forge the card marker.
 """
 
 import argparse
+import base64
+import binascii
 import importlib.util
 import json
 import os
@@ -110,6 +123,24 @@ STATE_MARKER = "<!-- cursor-approve-state: {} -->"
 NEXT_MARKER = "<!-- cursor-approve-next: {} -->"
 
 DEFAULT_REVIEW_LABEL = "cursor-review"
+
+# The prior-axes sentinel. `v1` is part of the literal, so a future `v2`
+# payload is recognised as a sentinel and refused rather than misread.
+AXES_SENTINEL_OPENER = "<!-- cursor-approve:axes v1 "
+AXES_SENTINEL_CLOSER = " -->"
+_AXES_SENTINEL_RE = re.compile(r"^<!-- cursor-approve:axes (v[0-9]+) (\S*) -->[ \t\r]*$", re.MULTILINE)
+# Any mention of the sentinel's prefix at all, to report one that sits where
+# the line-start match above (rightly) does not take it.
+_AXES_SENTINEL_ANY_RE = re.compile(r"cursor-approve:axes v")
+VERDICTS = ("red", "yellow", "green", "n/a")
+PRIOR_ROUNDS_LIMIT = 3
+# The ledger's MAX_BODY_CHARS (build-ledger.py).
+PRIOR_SUMMARY_CHARS = 600
+# The JSON payload, in UTF-8 bytes; the oldest round is dropped until it fits.
+MAX_AXES_PAYLOAD_BYTES = 16 * 1024
+# The base64 text `prior` will decode: exactly what MAX_AXES_PAYLOAD_BYTES
+# encodes to, checked BEFORE decoding.
+MAX_AXES_SENTINEL_CHARS = 4 * -(-MAX_AXES_PAYLOAD_BYTES // 3)
 
 
 def safe_label(label) -> str:
@@ -461,6 +492,153 @@ def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, hea
     return "\n".join(lines) + "\n"
 
 
+_AGGREGATE = None
+
+
+def _clamp_headline(text: str) -> str:
+    """aggregate.py's headline rules, re-applied to a headline read off the card."""
+    global _AGGREGATE
+    if _AGGREGATE is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aggregate.py")
+        spec = importlib.util.spec_from_file_location("cursor_approve_aggregate", path)
+        _AGGREGATE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_AGGREGATE)
+    return _AGGREGATE.clamp_headline(" ".join(text.split()))
+
+
+def parse_prior_rounds(value) -> int:
+    """`prior_rounds`, 0..PRIOR_ROUNDS_LIMIT; a `type: number` may render `1.0`."""
+    text = _int_or_q(value) if str(value or "").strip() else "0"
+    n = int(text) if text.isdigit() else -1
+    if not 0 <= n <= PRIOR_ROUNDS_LIMIT:
+        raise ValueError(f"--prior-rounds must be an integer from 0 to {PRIOR_ROUNDS_LIMIT}, got {value!r}")
+    return n
+
+
+def _valid_round(r) -> dict:
+    """One sentinel round, normalised, or raise ValueError."""
+    if not isinstance(r, dict):
+        raise ValueError("a round is not an object")
+    number, sha, axes = r.get("round"), r.get("commit_sha"), r.get("axes")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+        raise ValueError(f"round {number!r} is not a non-negative integer")
+    if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+        raise ValueError("commit_sha is not a full 40-hex SHA")
+    if not isinstance(axes, dict):
+        raise ValueError("axes is not an object")
+    out = {}
+    for axis, entry in axes.items():
+        if axis not in AXES or not isinstance(entry, dict):
+            raise ValueError(f"unknown axis entry {str(axis)[:20]!r}")
+        if entry.get("verdict") not in VERDICTS:
+            raise ValueError(f"{axis}: verdict is not one of {', '.join(VERDICTS)}")
+        headline, summary = entry.get("headline"), entry.get("summary")
+        if not isinstance(headline, str) or not headline.strip():
+            raise ValueError(f"{axis}: headline is missing")
+        if summary is not None and not isinstance(summary, str):
+            raise ValueError(f"{axis}: summary is not a string")
+        out[axis] = {"verdict": entry["verdict"], "headline": _clamp_headline(headline),
+                     "summary": (summary or "")[:PRIOR_SUMMARY_CHARS]}
+    return {"round": number, "commit_sha": sha, "axes": out}
+
+
+def read_axes_sentinel(body):
+    """(rounds, problem) from a card body. ([], None) when there is no sentinel;
+    ([], reason) when there is one this module will not trust."""
+    matches = _AXES_SENTINEL_RE.findall(body or "")
+    if not matches:
+        if _AXES_SENTINEL_ANY_RE.search(body or ""):
+            return [], "an axes sentinel that is not at a line start was ignored"
+        return [], None
+    if len(matches) > 1:
+        return [], "the card carries more than one axes sentinel"
+    version, payload = matches[0]
+    if version != "v1":
+        return [], f"unknown axes sentinel version {version[:8]!r}"
+    if len(payload) > MAX_AXES_SENTINEL_CHARS:
+        return [], f"the axes sentinel is larger than {MAX_AXES_SENTINEL_CHARS} characters"
+    try:
+        data = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
+    except (binascii.Error, ValueError, RecursionError):
+        return [], "the axes sentinel is not valid base64 JSON"
+    if not isinstance(data, list):
+        return [], "the axes sentinel is not a list of rounds"
+    try:
+        return [_valid_round(r) for r in data], None
+    except (ValueError, RecursionError) as e:
+        return [], f"the axes sentinel holds an invalid round ({e})"
+
+
+def round_entry(round_no, sha: str, decision):
+    """This round's sentinel entry from `aggregate.py decide`'s result, or None
+    when there is nothing to record (unknown round or commit, no axis verdict)."""
+    number = _int_or_q(round_no)
+    if not number.isdigit() or not SHA_RE.fullmatch(sha or ""):
+        return None
+    detail = decision.get("axes") if isinstance(decision, dict) else None
+    axes = {}
+    for axis, entry in (detail.items() if isinstance(detail, dict) else ()):
+        if axis not in AXES or not isinstance(entry, dict) or entry.get("verdict") not in VERDICTS:
+            continue
+        headline = entry.get("headline")
+        try:
+            headline = _clamp_headline(headline) if isinstance(headline, str) and headline.strip() else ""
+        except ValueError:
+            headline = ""
+        if not headline:
+            continue
+        summary = entry.get("summary")
+        axes[axis] = {"verdict": entry["verdict"], "headline": headline,
+                      "summary": summary[:PRIOR_SUMMARY_CHARS] if isinstance(summary, str) else ""}
+    return {"round": int(number), "commit_sha": sha, "axes": axes} if axes else None
+
+
+def axes_sentinel(rounds: list) -> str:
+    """The sentinel line for `rounds` (oldest first), or "" when none fit.
+
+    The oldest round is dropped until the JSON is within MAX_AXES_PAYLOAD_BYTES.
+    """
+    rounds = list(rounds)
+    while rounds:
+        payload = json.dumps(rounds, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) <= MAX_AXES_PAYLOAD_BYTES:
+            return AXES_SENTINEL_OPENER + base64.b64encode(payload).decode("ascii") + AXES_SENTINEL_CLOSER
+        rounds.pop(0)
+    return ""
+
+
+def merge_rounds(rounds: list, entry, keep: int) -> list:
+    """`rounds` plus `entry`, at most the last `keep`. A re-run of the same
+    (round, commit_sha) replaces its entry rather than appending a second."""
+    if entry is not None:
+        key = (entry["round"], entry["commit_sha"])
+        rounds = [r for r in rounds if (r["round"], r["commit_sha"]) != key] + [entry]
+    return rounds[-keep:] if keep > 0 else []
+
+
+def _append_line(body: str, line: str) -> str:
+    return body if not line else body.rstrip("\n") + "\n\n" + line + "\n"
+
+
+def with_axes_history(body: str, existing_body, entry=None, keep: int = 0) -> str:
+    """`body` with the axes sentinel it should carry.
+
+    With `keep` above 0 (decide, `prior_rounds` set), the existing card's rounds
+    plus `entry`, trimmed and re-encoded. Otherwise the existing card's valid
+    sentinel is carried through unchanged — unless `body` writes its own — so
+    the start card, ensure and cursor-review's round card never erase history.
+    With no sentinel on the card this returns `body` unchanged.
+    """
+    if _AXES_SENTINEL_RE.search(body):
+        return body
+    rounds, problem = read_axes_sentinel(existing_body)
+    if problem:
+        print(f"::warning::Dropping the cursor-approve card's prior-axes history: {problem}")
+    if keep > 0:
+        return _append_line(body, axes_sentinel(merge_rounds(rounds, entry, keep)))
+    return _append_line(body, axes_sentinel(rounds)) if rounds else body
+
+
 def gh(args: list, payload=None) -> str:
     try:
         result = subprocess.run(
@@ -493,9 +671,14 @@ def list_comments(repo: str, pr_number) -> list:
     return [c for page in pages for c in page] if pages and isinstance(pages[0], list) else pages
 
 
-def upsert(repo: str, pr_number, login: str, body: str) -> dict:
-    """Edit the existing card in place, or create it when there is none."""
+def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep: int = 0) -> dict:
+    """Edit the existing card in place, or create it when there is none.
+
+    The card's axes sentinel is carried into `body` (see `with_axes_history`);
+    `entry` and `keep` are decide's, when `prior_rounds` is set.
+    """
     card = find_card(list_comments(repo, pr_number), login)
+    body = with_axes_history(body, card.get("body") if card is not None else "", entry, keep)
     if card is not None:
         return json.loads(gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{card['id']}", "--input", "-"],
                              {"body": body}))
@@ -524,6 +707,11 @@ def _write_output(key: str, value: str) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prior")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--pr-number", required=True)
+    p.add_argument("--login", required=True)
+    p.add_argument("--out", required=True)
     for name in ("start", "ensure", "decide"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
@@ -540,12 +728,16 @@ def main(argv=None) -> int:
             p.add_argument("--decision", required=True)
             p.add_argument("--outcome", required=True)
             p.add_argument("--max-yellow-axes", default="0")
+            p.add_argument("--prior-rounds", default="0")
     args = parser.parse_args(argv)
     # An empty login matches no comment, so every phase would post a fresh card.
     if not (args.login or "").strip():
         print("::error::--login is empty; refusing to post a card that can never be found again")
         return 2
+    if args.cmd == "prior":
+        return cmd_prior(args)
     axes = parse_axes(args.axes)
+    entry, keep = None, 0
     if args.cmd == "start":
         body = render_start(args.round, args.max_rounds, args.commit_sha, axes, args.approve_gate, args.run_url)
     elif args.cmd == "ensure":
@@ -567,15 +759,49 @@ def main(argv=None) -> int:
             decision = {}
         body = render_decide(args.round, args.max_rounds, args.commit_sha, axes, decision, args.outcome,
                              args.max_yellow_axes, args.run_url)
+        try:
+            keep = parse_prior_rounds(args.prior_rounds)
+        except ValueError as e:
+            print(f"::warning::{e}; writing no prior-axes history")
+        if keep:
+            entry = round_entry(args.round, args.commit_sha, decision)
         # The other half of the card's "workflow run" link. Written before the
         # card so a GitHub API failure below cannot cost us the detail too, and
         # a failure HERE is never fatal: the card is what the author reads.
         _write_job_summary(render_job_summary(args.round, args.max_rounds, args.commit_sha, axes,
                                               decision, args.outcome, args.max_yellow_axes))
     try:
-        upsert(args.repo, args.pr_number, args.login, body)
+        upsert(args.repo, args.pr_number, args.login, body, entry, keep)
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not update the cursor-approve card: {e}")
+    return 0
+
+
+def cmd_prior(args) -> int:
+    """Write `{"rounds": [...]}`, the card's prior-axes history, to --out.
+
+    Never an error past the arguments: no card, no sentinel, an untrusted one
+    or a failed read is an empty history (with a warning when something was
+    wrong), so the axes run exactly as they do without `prior_rounds`.
+    """
+    rounds = []
+    try:
+        comments = list_comments(args.repo, args.pr_number)
+        card = find_card(comments, args.login)
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not read the cursor-approve card for prior verdicts: {e}")
+        card = None
+        comments = []
+    if card is not None:
+        rounds, problem = read_axes_sentinel(card.get("body"))
+        if problem:
+            print(f"::warning::Ignoring the card's prior-axes history: {problem}")
+    elif any(isinstance(c, dict) and _AXES_SENTINEL_ANY_RE.search(c.get("body") or "") for c in comments):
+        print(f"::warning::Ignoring an axes sentinel in a comment not written as the card by {args.login}")
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump({"rounds": rounds}, f, ensure_ascii=False)
+        f.write("\n")
+    print(f"prior rounds read from the card: {len(rounds)}")
     return 0
 
 

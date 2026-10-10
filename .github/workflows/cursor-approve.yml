@@ -56,6 +56,12 @@ name: Cursor approve
 #                    marked non-gating stop blocking auto-resolution, as
 #                    cursor-review's own decide does. Default `full`: a marked
 #                    thread blocks like any other (fail-closed)
+#   prior_rounds     0..3 (default 0 = off): how many earlier rounds of each
+#                    axis's own verdicts it sees. decide writes them to the
+#                    card as one base64 sentinel line; start reads them back
+#                    (`card.py prior`) into the `prior-axes` artifact the axis
+#                    workflows take with the same input. Pass it to BOTH phases
+#                    and to every axis. 0 leaves every prompt and card unchanged.
 # Secrets:
 #   APPROVER_TOKEN   token of the approving identity. Empty → warn and exit 0;
 #                    there is deliberately no fallback to an App or GITHUB_TOKEN.
@@ -101,6 +107,9 @@ on:
       approve_scope:
         type: string
         default: full
+      prior_rounds:
+        type: number
+        default: 0
     secrets:
       APPROVER_TOKEN:
         required: false
@@ -127,10 +136,16 @@ jobs:
           APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           PHASE: ${{ inputs.phase }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
         run: |
           case "$PHASE" in
             start|decide) ;;
             *) echo "::error::phase must be start or decide, got '$PHASE'"; exit 1 ;;
+          esac
+          # A `type: number` can render as `1.0`.
+          case "$PRIOR_ROUNDS" in
+            0|1|2|3|0.0|1.0|2.0|3.0) ;;
+            *) echo "::error::prior_rounds must be an integer from 0 to 3, got '$PRIOR_ROUNDS'"; exit 1 ;;
           esac
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::cursor-approve runs on a pull_request(_target) event only"; exit 1
@@ -257,6 +272,33 @@ jobs:
             --login "$LOGIN" --commit-sha "$COMMIT_SHA" --axes "$AXES" --round "$ROUND" \
             --max-rounds "$MAX_ROUNDS" --approve-gate "$APPROVE_GATE" --run-url "$RUN_URL"
 
+      - name: Read the prior axis verdicts
+        # The workflow, not the agent, reads the card: the axis jobs hold
+        # `contents: read` and no token that can read PR comments. Read after
+        # the start card is written; upsert carried the sentinel through it.
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' && steps.login.outputs.login != '' && inputs.phase == 'start' && inputs.prior_rounds > 0 }}
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          LOGIN: ${{ steps.login.outputs.login }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/prior"
+          python3 "$CURSOR_APPROVE_ASSETS/card.py" prior --repo "$REPO" --pr-number "$PR_NUMBER" \
+            --login "$LOGIN" --out "$RUNNER_TEMP/prior/prior-axes.json"
+
+      - name: Upload the prior axis verdicts
+        # NOT axis-*: decide downloads `axis-*`, and this must never be read
+        # as a verdict (a test pins the name).
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.prior_rounds > 0 }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prior-axes
+          path: ${{ runner.temp }}/prior/prior-axes.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
       - name: Download the axis verdicts
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
@@ -341,10 +383,12 @@ jobs:
           ROUND: ${{ inputs.round }}
           MAX_ROUNDS: ${{ inputs.max_rounds }}
           MAX_YELLOW: ${{ inputs.max_yellow_axes }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
           OUTCOME: ${{ steps.approve.outputs.outcome || 'error' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 "$CURSOR_APPROVE_ASSETS/card.py" decide --repo "$REPO" --pr-number "$PR_NUMBER" \
             --login "$LOGIN" --commit-sha "$COMMIT_SHA" --axes "$AXES" --round "$ROUND" \
             --max-rounds "$MAX_ROUNDS" --decision "$RUNNER_TEMP/decision.json" \
-            --outcome "$OUTCOME" --max-yellow-axes "$MAX_YELLOW" --run-url "$RUN_URL"
+            --outcome "$OUTCOME" --max-yellow-axes "$MAX_YELLOW" --prior-rounds "$PRIOR_ROUNDS" \
+            --run-url "$RUN_URL"
