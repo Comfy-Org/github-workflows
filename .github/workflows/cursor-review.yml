@@ -3454,12 +3454,33 @@ jobs:
           echo "Direct-API cell: status=${status}, ${count} finding(s)."
           if [ "$status" = "ok" ]; then
             echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
-          elif [ "$COUNTS" = "true" ]; then
-            # Failed AFTER the upload below, by `Fail the leg when the cell did
-            # not submit`, so the errored record still reaches the judge.
-            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor OpenAI lane, so it counts as a failed reviewer."
           else
-            echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+            # WHY it failed, not just THAT it did. The agent reports an
+            # API-level failure in its STRUCTURED OUTPUT, which is redirected
+            # to a file and — unlike the Cursor cells, which echo 500 chars of
+            # raw output and all of stderr — never echoed, because that file
+            # also holds the agent's prose. So a real outage
+            # (`insufficient_quota` / `credit_balance_exhausted`, naming its
+            # own cause) was discarded and this log showed only a non-zero
+            # exit, leaving the lane's failures to be inferred from job
+            # DURATION. agent-error.py prints an ALLOWLIST of provider error
+            # metadata and never the prose, and exits 0 on anything — a
+            # truncated or non-JSON file must not turn the diagnosis into a
+            # second failure.
+            # `|| true` because this step runs under `bash -e`: the script's
+            # own exit-0 contract cannot cover a script that never STARTED
+            # (a skipped assets checkout, so `python3` exits 2), and aborting
+            # here would lose the status and `::warning::` lines below.
+            python3 "$CURSOR_REVIEW_ASSETS/agent-error.py" \
+              --events /tmp/codex-events.jsonl \
+              --label "${REVIEW_TYPE}/${MODEL}" || true
+            if [ "$COUNTS" = "true" ]; then
+              # Failed AFTER the upload below, by `Fail the leg when the cell did
+              # not submit`, so the errored record still reaches the judge.
+              echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor OpenAI lane, so it counts as a failed reviewer."
+            else
+              echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+            fi
           fi
 
       - name: Upload findings artifact
@@ -3909,12 +3930,33 @@ jobs:
           echo "Direct-API cell: status=${status}, ${count} finding(s)."
           if [ "$status" = "ok" ]; then
             echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} submitted its findings."
-          elif [ "$COUNTS" = "true" ]; then
-            # Failed AFTER the upload below, by `Fail the leg when the cell did
-            # not submit`, so the errored record still reaches the judge.
-            echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor Anthropic lane, so it counts as a failed reviewer."
           else
-            echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+            # WHY it failed, not just THAT it did. The agent reports an
+            # API-level failure in its STRUCTURED OUTPUT, which is redirected
+            # to a file and — unlike the Cursor cells, which echo 500 chars of
+            # raw output and all of stderr — never echoed, because that file
+            # also holds the agent's prose. So a real outage
+            # (`insufficient_quota` / `credit_balance_exhausted`, naming its
+            # own cause) was discarded and this log showed only a non-zero
+            # exit, leaving the lane's failures to be inferred from job
+            # DURATION. agent-error.py prints an ALLOWLIST of provider error
+            # metadata and never the prose, and exits 0 on anything — a
+            # truncated or non-JSON file must not turn the diagnosis into a
+            # second failure.
+            # `|| true` because this step runs under `bash -e`: the script's
+            # own exit-0 contract cannot cover a script that never STARTED
+            # (a skipped assets checkout, so `python3` exits 2), and aborting
+            # here would lose the status and `::warning::` lines below.
+            python3 "$CURSOR_REVIEW_ASSETS/agent-error.py" \
+              --events /tmp/claude-result.json \
+              --label "${REVIEW_TYPE}/${MODEL}" || true
+            if [ "$COUNTS" = "true" ]; then
+              # Failed AFTER the upload below, by `Fail the leg when the cell did
+              # not submit`, so the errored record still reaches the judge.
+              echo "Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status); it replaces the Cursor Anthropic lane, so it counts as a failed reviewer."
+            else
+              echo "::warning::Direct-API cell ${REVIEW_TYPE}/${MODEL} did not submit (status=$status). Its record still reaches the judge; this leg stays green because the cell is advisory."
+            fi
           fi
 
       - name: Upload findings artifact
