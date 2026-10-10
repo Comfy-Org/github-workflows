@@ -19,7 +19,7 @@ does not dump them. It prints an ALLOWLIST of short metadata fields
 types.
 
 ONE field is read out of model-written territory — Claude Code's API-failure
-cause, which sits in `result` and nowhere else — under the three gates in
+cause, which sits in `result` and nowhere else — under the gates in
 ``_api_error_cause``. Everything below describes the rule that field is the
 stated exception to.
 
@@ -70,6 +70,9 @@ import sys
 ERROR_FIELDS = (
     "type", "subtype", "is_error", "code", "param",
     "status", "status_code", "http_status", "message",
+    # Claude Code's own scalars on a failed result object, beside the
+    # model-written `result`: the HTTP status and `api_error` respectively.
+    "api_error_status", "terminal_reason",
 )
 
 # The ONLY keys this descends through — the envelope a CLI writes around the
@@ -94,10 +97,17 @@ MAX_NODES = 20000
 
 # Claude Code's API-failure cause sits in `result`, a field the model also
 # writes. Printing it is THE one exception to "no model-written field reaches
-# the log" — see `_api_error_cause`, which gates it three ways.
+# the log" — see `_api_error_cause`, which gates it.
 CAUSE_FIELD = "result"
 CAUSE_LIMIT = 120
-_API_ERROR = re.compile(r"^API Error: \d{3} ")
+# `[0-9]`, not `\d`: in a str pattern `\d` matches any Unicode digit.
+_API_ERROR = re.compile(r"^API Error: [0-9]{3} ")
+# An Anthropic key's prefix, and the window of the REAL key (from the step's
+# env) that a cause may not contain. A window rather than the whole key: the
+# cut to CAUSE_LIMIT leaves a truncated key, which Actions' exact-value mask
+# no longer matches.
+_KEY_PREFIX = "sk-ant-"
+KEY_WINDOW = 16
 
 _SAFE = re.compile(r"[^A-Za-z0-9 .,:;_/@+()\[\]{}='\"!?#$%^&*|~`<>-]")
 # A colon followed by a colon, and a `#` that begins a `##[`. Lookahead, so one
@@ -158,7 +168,7 @@ def _fields(obj: dict) -> str:
     return " ".join(parts)
 
 
-def _api_error_cause(obj: dict) -> str:
+def _api_error_cause(obj: dict, top: bool = False) -> str:
     """Claude Code's API-failure cause, read out of a model-written field.
 
     THE one exception to the rule that no model-written field reaches the log,
@@ -169,25 +179,57 @@ def _api_error_cause(obj: dict) -> str:
     uploaded either, an Anthropic-lane outage was otherwise undiagnosable
     without re-running the cell.
 
-    So it is gated three ways: the object must declare `is_error` true, the
-    value must be a string opening with the CLI's own `API Error: <status> `
-    preamble, and it is cut to ``CAUSE_LIMIT`` and sanitized like every other
-    value. A prompt-injected agent CAN forge that preamble, so this is a
-    BOUNDED and documented channel, not a safe one — roughly 120 sanitized
-    characters that cannot carry a workflow command. That trade was taken
-    knowingly (#402); the alternative was a lane that reports `subtype=success`
-    and names nothing.
+    So it is gated:
 
-    A failure whose message does not carry a status code yields nothing rather
-    than a guess, which is the safe direction: widen the pattern only against
-    a real message, never speculatively.
+    1. the object is the CLI's own top-level `{"type":"result"}` object with
+       `is_error` true — never a nested or codex-lane object (``walk`` passes
+       ``top``), where the shape is not the one this exception covers;
+    2. the CLI marked it an API failure: a numeric `api_error_status` (a CLI
+       scalar the model cannot write — `Invalid API key · Fix external API
+       key` with status 401 is a real 2.1.286 failure, and carries no
+       preamble), or a string opening with `API Error: <status> `;
+    3. it holds no Anthropic key: not the `sk-ant-` prefix and no
+       ``KEY_WINDOW``-char slice of the step's own ``ANTHROPIC_API_KEY`` —
+       the screen `findings.json` gets before publishing, which this path
+       would otherwise skip;
+    4. it is cut to ``CAUSE_LIMIT`` and sanitized like every other value.
+
+    A prompt-injected agent CAN forge the preamble, so this is a BOUNDED and
+    documented channel, not a safe one — roughly 120 sanitized characters
+    that cannot carry a workflow command or the key, but can carry other
+    text. That trade was taken knowingly (#402); the alternative was a lane
+    that reports `subtype=success` and names nothing.
+
+    A failure with neither marker yields nothing rather than a guess, which is
+    the safe direction: widen the gate only against a real message, never
+    speculatively.
     """
-    if obj.get("is_error") is not True:
+    if not top or obj.get("type") != "result" or obj.get("is_error") is not True:
         return ""
     value = obj.get(CAUSE_FIELD)
-    if not isinstance(value, str) or not _API_ERROR.match(value):
+    if not isinstance(value, str):
         return ""
+    status = obj.get("api_error_status")
+    cli_marked = isinstance(status, int) and not isinstance(status, bool)
+    if not cli_marked and not _API_ERROR.match(value):
+        return ""
+    if _holds_key(value):
+        return f"{CAUSE_FIELD}=(withheld: it contains an Anthropic API key or part of one)"
     return f"{CAUSE_FIELD}={sanitize(value, CAUSE_LIMIT)}"
+
+
+def _holds_key(value: str) -> bool:
+    """True when ``value`` carries the key prefix or a slice of the real key."""
+    if _KEY_PREFIX in value:
+        return True
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return False
+    if len(key) <= KEY_WINDOW:
+        return key in value
+    return any(
+        key[i : i + KEY_WINDOW] in value for i in range(len(key) - KEY_WINDOW + 1)
+    )
 
 
 def walk(node, out: list, types: dict, state: dict, depth: int = 0) -> None:
@@ -215,7 +257,7 @@ def walk(node, out: list, types: dict, state: dict, depth: int = 0) -> None:
         rendered = _fields(node)
         if rendered and rendered not in out:
             out.append(rendered)
-        cause = _api_error_cause(node)
+        cause = _api_error_cause(node, top=depth == 0)
         if cause and cause not in out:
             out.append(cause)
     # An `error` KEY is the canonical envelope and must be read on its own

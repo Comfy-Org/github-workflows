@@ -242,19 +242,24 @@ quota or rate-limit failure names itself — `type=insufficient_quota
 code=credit_balance_exhausted` and the provider's own message.
 **Anthropic/claude** reports an API-level failure as a result object whose
 `subtype` reads `success` — so `is_error=true` is what tells you it failed —
-and whose cause sits in `result`, the same field its review prose uses. That
-cause **is** printed, under three gates: `is_error` must be true, the value
-must open with the CLI's own `API Error: <status> ` preamble, and it is cut to
-120 sanitized characters.
+and whose cause sits in `result`, the same field its review prose uses. The
+CLI's own `api_error_status` and `terminal_reason` are printed beside it, and
+the cause itself **is** printed, under gates: only from the top-level result
+object with `is_error` true; only when the CLI marked it an API failure (a
+numeric `api_error_status`, or an `API Error: <status> ` preamble); never when
+it contains an Anthropic key or any slice of the step's own; and cut to 120
+sanitized characters. A bad key, for example, prints
+`api_error_status=401 terminal_reason=api_error` and
+`result=Invalid API key ? Fix external API key`.
 
 This is the one place a model-written field reaches the log, and it is a
 knowing trade rather than an oversight. A prompt-injected agent *can* forge
-that preamble, so treat it as a bounded, documented channel — ~120 sanitized
-characters that cannot carry a workflow command — not a safe one. The
-alternative was the lane reporting `subtype=success` and naming nothing, since
-the cause appears nowhere else in the file and the file is not uploaded. A
-failure whose message carries no status code prints no cause rather than a
-guess, so widen that pattern only against a real message.
+the preamble, so treat it as a bounded, documented channel — ~120 sanitized
+characters that cannot carry a workflow command or the API key, but can carry
+other text — not a safe one. The alternative was the lane reporting
+`subtype=success` and naming nothing, since the cause appears nowhere else in
+the file and the file is not uploaded. A failure with neither marker prints no
+cause rather than a guess, so widen the gate only against a real message.
 
 A cell that ran but submitted nothing prints whatever error objects (and,
 on the Anthropic lane, the gated cause) it recognized, plus the census; when

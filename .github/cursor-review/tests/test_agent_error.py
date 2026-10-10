@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "agent-error.py")
@@ -121,8 +122,8 @@ class AllowlistTest(unittest.TestCase):
     )
 
     def test_no_prose_key_is_printed_from_an_error_object(self):
-        # `result` is covered too: bare prose does not pass
-        # `_api_error_cause`'s preamble gate. The one value that DOES pass is
+        # `result` is covered too: bare prose on a non-`result` object does
+        # not pass `_api_error_cause`'s gates. The one value that DOES pass is
         # pinned in ClaudeResultShapeTest, deliberately in one place.
         for key in self.PROSE_KEYS:
             with self.subTest(key=key):
@@ -316,6 +317,15 @@ class ModelAuthoredSubtreeTest(unittest.TestCase):
         {"type": "result", "is_error": True, "result": {"error": {"message": PROSE}}},
         # A model-chosen `type`, which would otherwise reach the census.
         {"item": {"arguments": {"type": PROSE}}},
+        # The Claude result shape, but NOT at the top level: the cause
+        # exception covers only the CLI's own top-level object.
+        {"type": "item.completed",
+         "item": {"type": "result", "is_error": True, "api_error_status": 400,
+                  "result": f"API Error: 400 {PROSE}"}},
+        {"error": {"type": "result", "is_error": True, "api_error_status": 400,
+                   "result": f"API Error: 400 {PROSE}"}},
+        [{"type": "result", "is_error": True, "api_error_status": 400,
+          "result": f"API Error: 400 {PROSE}"}],
     )
 
     def test_no_model_authored_subtree_reaches_the_log(self):
@@ -385,8 +395,9 @@ class ClaudeResultShapeTest(unittest.TestCase):
     def test_the_cause_needs_is_error(self):
         # The object must still look like an error by ANOTHER signal, or the
         # extractor is never reached and the test proves nothing about the
-        # gate. `type` carrying "error" and a 4xx status are those signals.
-        for other_signal in ({"type": "error"}, {"type": "x", "status": 500}):
+        # gate. `subtype` carrying "error" and a 5xx status are those signals;
+        # `type` stays `result` so only `is_error` is under test.
+        for other_signal in ({"subtype": "error_max_turns"}, {"status": 500}):
             payload = dict(self.FAILURE, **other_signal)
             payload["is_error"] = False
             payload["result"] = f"API Error: 400 {PROSE}"
@@ -414,9 +425,80 @@ class ClaudeResultShapeTest(unittest.TestCase):
             self.assertNotIn("::", line)
             self.assertNotIn("##[", line)
 
+    def test_the_cause_needs_the_top_level_result_type(self):
+        payload = dict(self.FAILURE, type="error",
+                       result=f"API Error: 400 {PROSE}")
+        out = joined(payload)
+        self.assertNotIn(PROSE, out)
+        self.assertIn("error: ", out)
+
+    def test_only_an_ascii_status_passes_the_preamble(self):
+        # `\d` would accept Arabic-Indic digits.
+        payload = dict(self.FAILURE, result=f"API Error: \u0664\u0660\u0660 {PROSE}")
+        self.assertNotIn(PROSE, joined(payload))
+
+    def test_a_boolean_api_error_status_is_not_the_cli_marker(self):
+        payload = dict(self.FAILURE, api_error_status=True, result=PROSE)
+        self.assertNotIn(PROSE, joined(payload))
+
+    # --- the key screen ---
+
+    def test_a_key_prefixed_cause_is_withheld(self):
+        payload = dict(self.FAILURE, result="API Error: 401 sk-ant-api03-" + "A" * 90)
+        out = joined(payload)
+        self.assertNotIn("sk-ant", out)
+        self.assertIn("result=(withheld", out)
+
+    def test_a_slice_of_the_real_key_is_withheld(self):
+        # Truncated by the cap, and offset past its prefix: Actions' mask
+        # matches neither, so the screen must.
+        key = "sk-ant-api03-" + "Kq7xZ2pLm9Vw" * 8
+        cases = (key, key[20:], key[30:60])
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": key}):
+            for leaked in cases:
+                with self.subTest(leaked=leaked[:12]):
+                    payload = dict(self.FAILURE, result=f"API Error: 401 {leaked}")
+                    out = joined(payload)
+                    self.assertNotIn(key[30:46], out)
+                    self.assertIn("result=(withheld", out)
+
+    def test_the_screen_passes_an_ordinary_cause_with_a_key_set(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api03-" + "Z" * 90}):
+            self.assertIn("credit balance is too low", joined(self.FAILURE))
+
     def test_the_exception_is_one_field_only(self):
         # Guards against the gate being reused for another prose field later.
         self.assertEqual("result", agent_error.CAUSE_FIELD)
+
+
+class ClaudeRealFailureTest(unittest.TestCase):
+    """A real failure, not a hand-written one.
+
+    Captured from `@anthropic-ai/claude-code@2.1.286` (the pinned CLI) run with
+    an invalid ANTHROPIC_API_KEY and `--output-format json`, trimmed to the
+    fields this reads. Its `result` carries NO `API Error: <status> ` preamble
+    — a gate on the preamble alone missed exactly the outage it was for — and
+    the status sits in the CLI-written `api_error_status`.
+    """
+
+    CAPTURED = {
+        "type": "result", "subtype": "success", "is_error": True,
+        "api_error_status": 401, "terminal_reason": "api_error",
+        "num_turns": 1, "duration_api_ms": 0, "total_cost_usd": 0,
+        "result": "Invalid API key \u00b7 Fix external API key",
+    }
+
+    def test_status_and_reason_are_printed(self):
+        out = joined(self.CAPTURED)
+        self.assertIn("api_error_status=401", out)
+        self.assertIn("terminal_reason=api_error", out)
+
+    def test_the_cause_is_named(self):
+        self.assertIn("result=Invalid API key ? Fix external API key", joined(self.CAPTURED))
+
+    def test_the_cli_scalars_are_allowlisted(self):
+        for key in ("api_error_status", "terminal_reason"):
+            self.assertIn(key, agent_error.ERROR_FIELDS)
 
 
 class TailReadTest(unittest.TestCase):
