@@ -229,6 +229,16 @@ another workflow using the default token silently fails to start a review. That
 is exactly what [`cursor-review-auto-label.yml`](cursor-review-auto-label.md)
 exists to handle.
 
+**A direct-API cell that fails says why in its own job log.** The direct
+lanes never echo their agent's output — it carries model prose steered by the
+PR — so when a cell does not submit, its **Report cell outcome** step prints an
+allowlisted summary of the provider's error instead (`type`, `code`, `status`,
+`message`) plus a census of the events it got that far. A quota or rate-limit
+failure names itself there; a cell that ran but submitted nothing shows up as a
+census with no error object. Nothing else is printed and the raw output is not
+uploaded, so that step is the whole diagnosis — if it is not enough, the fix is
+to widen the allowlist in `agent-error.py`, not to publish the transcript.
+
 **Applying the label does not guarantee a run.** If the event was swallowed,
 remove the label, confirm it is gone, then re-add it.
 
