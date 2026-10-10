@@ -250,6 +250,14 @@ on:
     types: [created]
 jobs:
   auto-label:
+    # Widen the canonical guard: `github.event.pull_request` is null on
+    # `issue_comment`, so the same-repo check alone skips every `/review`.
+    # (A comment event runs in the base repo with its secrets, fork PR or not;
+    # the reusable checks the commenter's association itself.)
+    if: >-
+      github.event_name == 'issue_comment'
+      || (github.event.pull_request.head.repo.full_name == github.repository
+          && github.actor != 'dependabot[bot]')
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<sha>  # v1
     with:
       rereview_command: '/review'
@@ -276,7 +284,15 @@ Details worth knowing:
   applies to `/derisk`. The opted-in roster is not consulted — it governs who
   gets labelled automatically, not who may ask for a re-read.
 - Comments on plain issues are ignored, and `skip-cursor-review` still wins.
-- `max_rounds` is unchanged, so this cannot be used to run unlimited panels.
+- `max_rounds` still caps completed rounds, but it bounds rather than prevents
+  repeat spending: each command cancels an in-flight panel through the
+  `trigger` slot, and a cancelled panel posts no review, so it is never counted.
+  `MEMBER` / `COLLABORATOR` also do not imply write access (a read-only
+  collaborator qualifies) — the same bar, and the same trade, as `/derisk`.
+- Only a newly **created** comment counts; editing or deleting an old
+  `/review` does nothing.
+- The value must be a single token with no whitespace (`/cursor review` can
+  never match); both workflows warn if it is not.
 - Nothing from the comment reaches a log: a comment body is attacker-authored
   text, and these logs may be public.
 

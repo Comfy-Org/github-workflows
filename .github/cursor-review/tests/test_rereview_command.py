@@ -106,13 +106,17 @@ class BothHalvesTest(unittest.TestCase):
                       read(AUTO_LABEL), re.S | re.M)
         self.assertIn("SAME value on cursor-review.yml", m.group(1))
 
-    def test_the_gate_can_read_issue_comments(self):
-        # A PR's conversation comments are the issues collection.
+    def test_the_gate_asks_for_nothing_the_documented_caller_does_not_grant(self):
+        # A nested job cannot exceed its caller's grant, and the documented
+        # caller grants only `contents` + `pull-requests`. An `issues: read`
+        # here (once added for the comment read, which Pull requests already
+        # authorizes on a PR) failed EVERY caller at startup on the pin bump.
         text = read(REVIEW)
         gate = text[text.index("\n  gate:"):text.index("\n  ledger:")]
-        # Line-anchored: the step's own comment mentions `issues: read` in
-        # prose, so a substring check passed even with the grant deleted.
-        self.assertRegex(gate, r"(?m)^      issues: read$")
+        perms = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", gate)
+        self.assertIsNotNone(perms)
+        granted = set(re.findall(r"(?m)^      ([a-z-]+):", perms.group(1)))
+        self.assertEqual({"contents", "pull-requests"}, granted)
 
 
 class GateBypassTest(unittest.TestCase):
@@ -142,6 +146,9 @@ class GateBypassTest(unittest.TestCase):
         self.assertIn('gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews"',
                       self.script)
         self.assertNotRegex(self.script, r'gh api "repos/\$REPO/pulls/\$PR_NUMBER/reviews"')
+
+    def test_a_command_with_whitespace_is_warned_about(self):
+        self.assertIn("::warning::rereview_command contains whitespace", self.script)
 
     def test_the_skip_branch_still_exists(self):
         self.assertIn("already_reviewed=true", self.script)
@@ -216,6 +223,13 @@ class GateFilterTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(0, self.count([[self.comment(body)]]))
 
+    def test_only_ascii_blanks_delimit_the_token(self):
+        # Matches awk's default field split in the auto-label half: a body the
+        # label step would not act on must not count here either.
+        for body in ("/review\u00a0x", "\u00a0/review"):
+            with self.subTest(body=body):
+                self.assertEqual(0, self.count([[self.comment(body)]]))
+
     def test_a_comment_older_than_the_review_does_not_count(self):
         self.assertEqual(
             0, self.count([[self.comment("/review", at="2026-10-10T02:00:00Z")]])
@@ -262,6 +276,39 @@ class AutoLabelCommandTest(unittest.TestCase):
     def test_it_only_runs_on_a_comment_and_only_when_enabled(self):
         self.assertIn("github.event_name == 'issue_comment'", self.block)
         self.assertIn("inputs.rereview_command != ''", self.block)
+
+    def test_only_a_new_comment_counts(self):
+        # An edited or deleted old `/review` must not toggle the label.
+        self.assertIn("github.event.action == 'created'", self.block)
+
+    def test_the_job_prefilters_comments_before_a_runner_or_token(self):
+        text = read(AUTO_LABEL)
+        job = text[text.index("\n  auto-label:"):text.index("\n    steps:")]
+        m = re.search(r"(?m)^    if: >-\n((?:      .*\n)+)", job)
+        self.assertIsNotNone(m, "auto-label job has no if:")
+        cond = m.group(1)
+        self.assertIn("github.event_name != 'issue_comment'", cond)
+        for term in ("inputs.rereview_command != ''",
+                     "github.event.action == 'created'",
+                     "github.event.issue.pull_request",
+                     "github.event.issue.state == 'open'",
+                     "github.event.comment.author_association"):
+            self.assertIn(term, cond)
+        for assoc in AUTHORIZED:
+            self.assertIn(assoc, cond)
+        for assoc in OUTSIDERS:
+            self.assertNotIn(assoc, cond)
+
+    def test_the_add_waits_for_the_remove_to_land(self):
+        # Fired back to back, the `unlabeled` run can be created second and
+        # cancel the `labeled` run through cursor-review's trigger slot.
+        between = self.script[self.script.index("--remove-label"):
+                              self.script.rindex("--add-label")]
+        self.assertIn("--json labels", between)
+        self.assertRegex(between, r"(?m)^\s+sleep \d+$")
+
+    def test_a_command_with_whitespace_is_warned_about(self):
+        self.assertIn("::warning::rereview_command contains whitespace", self.script)
 
     def test_the_comment_body_is_not_interpolated_into_the_script(self):
         # The injection guard: `${{ github.event.comment.body }}` inside a

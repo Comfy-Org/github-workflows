@@ -779,11 +779,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Also covers `rereview_command`'s read of the PR's conversation
+      # comments: `issues/{n}/comments` on a PULL REQUEST is authorized by
+      # Pull requests, not Issues. Do NOT add `issues: read` — a nested job
+      # cannot exceed its caller's grant, and the documented caller grants
+      # only `contents` + `pull-requests`, so every caller would fail at
+      # startup on the pin bump, whether or not it set the command.
       pull-requests: read
-      # `issues: read` only for `rereview_command`: a PR's conversation
-      # comments are the ISSUES collection, not the review-comment one, so
-      # `pull-requests: read` alone does not reliably list them.
-      issues: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
@@ -971,8 +973,10 @@ jobs:
           #
           # Escape hatches:
           # - Push commits → new HEAD SHA, check finds nothing, runs.
-          # - Dismiss the existing review → DISMISSED state filtered out
-          #   below, so re-applying the label fires a fresh run.
+          # - `rereview_command` (below) → an authorized command comment newer
+          #   than the review lets ONE re-labeled run through. Dismissing the
+          #   review is not a hatch: it is posted COMMENTED, which GitHub will
+          #   not dismiss (DISMISSED is still filtered out, for older reviews).
           #
           # API failure falls through to running, not skipping — better to
           # double-review than silently no-op.
@@ -1030,6 +1034,10 @@ jobs:
           # Nothing from the comment is echoed: these logs are public and a
           # comment body is attacker-authored text.
           FORCED=0
+          case "${REREVIEW_COMMAND:-}" in
+            *[[:space:]]*)
+              echo "::warning::rereview_command contains whitespace, so it can never match a comment's first token — use a single token such as /review." ;;
+          esac
           if [ "$EXISTING" -gt 0 ] && [ -n "${REREVIEW_COMMAND:-}" ]; then
             LAST_REVIEW=$(printf '%s' "$REVIEWS" \
               | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel"))) | .submitted_at] | max // ""' \
@@ -1039,7 +1047,7 @@ jobs:
                 | jq -s --arg cmd "$REREVIEW_COMMAND" --arg since "$LAST_REVIEW" \
                     '[.[][] | select(.created_at > $since)
                             | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
-                            | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^\\s+"; "") | sub("\\s.*$"; "")) == $cmd)] | length' \
+                            | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^[ \t]+"; "") | sub("[ \t].*$"; "")) == $cmd)] | length' \
                 2>/dev/null || echo 0)
               case "$FORCED" in ''|*[!0-9]*) FORCED=0 ;; esac
             fi

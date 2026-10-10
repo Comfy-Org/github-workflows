@@ -145,6 +145,20 @@ permissions:
 jobs:
   auto-label:
     name: Auto-apply review label
+    # Every comment on every issue and PR fires `issue_comment`. Settle the
+    # cheap, payload-only questions here so the rest never allocates a runner
+    # (possibly the caller's self-hosted `runs_on` pool) or mints the App
+    # token: the feature is on, this is a NEW comment (an edited or deleted
+    # old `/review` must not toggle the label and cancel a running panel),
+    # on an open PR, from an authorized association. The step re-checks the
+    # association and the live PR state; this is only the prefilter.
+    if: >-
+      github.event_name != 'issue_comment'
+      || (inputs.rereview_command != ''
+          && github.event.action == 'created'
+          && github.event.issue.pull_request
+          && github.event.issue.state == 'open'
+          && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
@@ -295,7 +309,7 @@ jobs:
         # Unlike the step above this must REMOVE and re-add: after a round the
         # label is already present, and adding a label that is already there
         # raises no event at all.
-        if: github.event_name == 'issue_comment' && inputs.rereview_command != ''
+        if: github.event_name == 'issue_comment' && github.event.action == 'created' && inputs.rereview_command != ''
         env:
           GH_TOKEN: ${{ steps.app-token-narrow.outputs.token || steps.app-token-default.outputs.token }}
           # `null` unless the comment is on a PR; issue_comment fires for plain
@@ -316,6 +330,15 @@ jobs:
             echo "Comment is not on a pull request — no-op."
             exit 0
           fi
+
+          # The match below is against ONE whitespace-free token, so a value
+          # like `/cursor review` can never match and the feature would
+          # silently do nothing.
+          case "$REREVIEW_COMMAND" in
+            *[[:space:]]*)
+              echo "::warning::rereview_command contains whitespace, so it can never match a comment's first token — use a single token such as /review."
+              exit 0 ;;
+          esac
 
           # The FIRST token of the first line, so `/review please have another
           # look` counts and `/reviewer` does not. Nothing from the body is
@@ -350,6 +373,20 @@ jobs:
           if echo "$labels" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
             echo "Re-review requested — removing and re-adding $REVIEW_LABEL to raise a fresh event."
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$REVIEW_LABEL"
+            # The remove raises an `unlabeled` run and the add a `labeled` one,
+            # and both land in cursor-review's `trigger` slot with
+            # cancel-in-progress. Fired back to back, GitHub does not promise
+            # which run is created first — and if `unlabeled` is second it
+            # cancels the round this command asked for. So wait until the
+            # remove is visible, then give its run a head start.
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              if ! gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name]' \
+                  | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            sleep 10
           else
             echo "Re-review requested — applying $REVIEW_LABEL."
           fi
