@@ -276,21 +276,28 @@ jobs:
         # The workflow, not the agent, reads the card: the axis jobs hold
         # `contents: read` and no token that can read PR comments. Read after
         # the start card is written; upsert carried the sentinel through it.
+        # continue-on-error: history is an aid, so a failed read is no history,
+        # never a failed start phase (which would skip the axes).
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' && steps.login.outputs.login != '' && inputs.phase == 'start' && inputs.prior_rounds > 0 }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           LOGIN: ${{ steps.login.outputs.login }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          ROUND: ${{ inputs.round }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
         run: |
           mkdir -p "$RUNNER_TEMP/prior"
           python3 "$CURSOR_APPROVE_ASSETS/card.py" prior --repo "$REPO" --pr-number "$PR_NUMBER" \
-            --login "$LOGIN" --out "$RUNNER_TEMP/prior/prior-axes.json"
+            --login "$LOGIN" --round "$ROUND" --prior-rounds "$PRIOR_ROUNDS" \
+            --out "$RUNNER_TEMP/prior/prior-axes.json"
 
       - name: Upload the prior axis verdicts
         # NOT axis-*: decide downloads `axis-*`, and this must never be read
         # as a verdict (a test pins the name).
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.prior_rounds > 0 }}
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: prior-axes

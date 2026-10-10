@@ -506,6 +506,13 @@ def _clamp_headline(text: str) -> str:
     return _AGGREGATE.clamp_headline(" ".join(text.split()))
 
 
+def _utf8(text: str) -> str:
+    """`text` with any lone UTF-16 surrogate (an escaped `\\ud800` that
+    `json.loads` decoded) replaced by `?`, so it can always be UTF-8 encoded:
+    the sentinel, the `prior` file and the axis prompt all write UTF-8."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def parse_prior_rounds(value) -> int:
     """`prior_rounds`, 0..PRIOR_ROUNDS_LIMIT; a `type: number` may render `1.0`."""
     text = _int_or_q(value) if str(value or "").strip() else "0"
@@ -537,8 +544,8 @@ def _valid_round(r) -> dict:
             raise ValueError(f"{axis}: headline is missing")
         if summary is not None and not isinstance(summary, str):
             raise ValueError(f"{axis}: summary is not a string")
-        out[axis] = {"verdict": entry["verdict"], "headline": _clamp_headline(headline),
-                     "summary": (summary or "")[:PRIOR_SUMMARY_CHARS]}
+        out[axis] = {"verdict": entry["verdict"], "headline": _clamp_headline(_utf8(headline)),
+                     "summary": _utf8(summary or "")[:PRIOR_SUMMARY_CHARS]}
     return {"round": number, "commit_sha": sha, "axes": out}
 
 
@@ -582,14 +589,14 @@ def round_entry(round_no, sha: str, decision):
             continue
         headline = entry.get("headline")
         try:
-            headline = _clamp_headline(headline) if isinstance(headline, str) and headline.strip() else ""
+            headline = _clamp_headline(_utf8(headline)) if isinstance(headline, str) and headline.strip() else ""
         except ValueError:
             headline = ""
         if not headline:
             continue
         summary = entry.get("summary")
         axes[axis] = {"verdict": entry["verdict"], "headline": headline,
-                      "summary": summary[:PRIOR_SUMMARY_CHARS] if isinstance(summary, str) else ""}
+                      "summary": _utf8(summary)[:PRIOR_SUMMARY_CHARS] if isinstance(summary, str) else ""}
     return {"round": int(number), "commit_sha": sha, "axes": axes} if axes else None
 
 
@@ -597,8 +604,15 @@ def axes_sentinel(rounds: list) -> str:
     """The sentinel line for `rounds` (oldest first), or "" when none fit.
 
     The oldest round is dropped until the JSON is within MAX_AXES_PAYLOAD_BYTES.
+    A newest round too large on its own (`json.dumps` escapes a control
+    character as six bytes) loses its summaries first, so it never costs the
+    earlier rounds their place.
     """
     rounds = list(rounds)
+    if rounds and len(json.dumps(rounds[-1], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) \
+            > MAX_AXES_PAYLOAD_BYTES:
+        newest = rounds[-1]
+        rounds[-1] = dict(newest, axes={a: dict(e, summary="") for a, e in newest["axes"].items()})
     while rounds:
         payload = json.dumps(rounds, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(payload) <= MAX_AXES_PAYLOAD_BYTES:
@@ -608,11 +622,14 @@ def axes_sentinel(rounds: list) -> str:
 
 
 def merge_rounds(rounds: list, entry, keep: int) -> list:
-    """`rounds` plus `entry`, at most the last `keep`. A re-run of the same
-    (round, commit_sha) replaces its entry rather than appending a second."""
+    """`rounds` plus `entry`, ordered by round, at most the last `keep`. A
+    re-run of the same (round, commit_sha) replaces its entry rather than
+    appending a second; a late decide for an older round sorts into place, so
+    trimming always drops the oldest round, not the newest."""
     if entry is not None:
         key = (entry["round"], entry["commit_sha"])
         rounds = [r for r in rounds if (r["round"], r["commit_sha"]) != key] + [entry]
+    rounds = sorted(rounds, key=lambda r: r["round"])
     return rounds[-keep:] if keep > 0 else []
 
 
@@ -620,21 +637,24 @@ def _append_line(body: str, line: str) -> str:
     return body if not line else body.rstrip("\n") + "\n\n" + line + "\n"
 
 
-def with_axes_history(body: str, existing_body, entry=None, keep: int = 0) -> str:
+def with_axes_history(body: str, existing_body, entry=None, keep=None) -> str:
     """`body` with the axes sentinel it should carry.
 
     With `keep` above 0 (decide, `prior_rounds` set), the existing card's rounds
-    plus `entry`, trimmed and re-encoded. Otherwise the existing card's valid
-    sentinel is carried through unchanged — unless `body` writes its own — so
-    the start card, ensure and cursor-review's round card never erase history.
-    With no sentinel on the card this returns `body` unchanged.
+    plus `entry`, trimmed and re-encoded. With `keep` 0 (decide, `prior_rounds`
+    off or invalid) no sentinel at all: turning the feature off drops the
+    stored history rather than keeping stale rounds on the card. With `keep`
+    None (every other writer) the existing card's valid sentinel is carried
+    through unchanged — unless `body` writes its own — so the start card,
+    ensure and cursor-review's round card never erase history. With no
+    sentinel on the card this returns `body` unchanged.
     """
-    if _AXES_SENTINEL_RE.search(body):
+    if _AXES_SENTINEL_RE.search(body) or keep == 0:
         return body
     rounds, problem = read_axes_sentinel(existing_body)
     if problem:
         print(f"::warning::Dropping the cursor-approve card's prior-axes history: {problem}")
-    if keep > 0:
+    if keep is not None:
         return _append_line(body, axes_sentinel(merge_rounds(rounds, entry, keep)))
     return _append_line(body, axes_sentinel(rounds)) if rounds else body
 
@@ -671,11 +691,11 @@ def list_comments(repo: str, pr_number) -> list:
     return [c for page in pages for c in page] if pages and isinstance(pages[0], list) else pages
 
 
-def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep: int = 0) -> dict:
+def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None) -> dict:
     """Edit the existing card in place, or create it when there is none.
 
     The card's axes sentinel is carried into `body` (see `with_axes_history`);
-    `entry` and `keep` are decide's, when `prior_rounds` is set.
+    `entry` and `keep` are decide's; `keep` stays None for every other writer.
     """
     card = find_card(list_comments(repo, pr_number), login)
     body = with_axes_history(body, card.get("body") if card is not None else "", entry, keep)
@@ -712,6 +732,8 @@ def main(argv=None) -> int:
     p.add_argument("--pr-number", required=True)
     p.add_argument("--login", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--round", default="")
+    p.add_argument("--prior-rounds", default="")
     for name in ("start", "ensure", "decide"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
@@ -737,7 +759,7 @@ def main(argv=None) -> int:
     if args.cmd == "prior":
         return cmd_prior(args)
     axes = parse_axes(args.axes)
-    entry, keep = None, 0
+    entry, keep = None, None
     if args.cmd == "start":
         body = render_start(args.round, args.max_rounds, args.commit_sha, axes, args.approve_gate, args.run_url)
     elif args.cmd == "ensure":
@@ -763,6 +785,7 @@ def main(argv=None) -> int:
             keep = parse_prior_rounds(args.prior_rounds)
         except ValueError as e:
             print(f"::warning::{e}; writing no prior-axes history")
+            keep = 0
         if keep:
             entry = round_entry(args.round, args.commit_sha, decision)
         # The other half of the card's "workflow run" link. Written before the
@@ -777,30 +800,57 @@ def main(argv=None) -> int:
     return 0
 
 
-def cmd_prior(args) -> int:
-    """Write `{"rounds": [...]}`, the card's prior-axes history, to --out.
+def _prior_history(args) -> list:
+    """The card's rounds that came before this one, at most `--prior-rounds`.
 
-    Never an error past the arguments: no card, no sentinel, an untrusted one
-    or a failed read is an empty history (with a warning when something was
-    wrong), so the axes run exactly as they do without `prior_rounds`.
+    A re-run of this round (or a later one recorded by a re-run of an older
+    round) is not a PRIOR verdict: showing the axis its own output for this
+    round would anchor it on itself. So only rounds below `--round` are kept,
+    and only the last `--prior-rounds` of those, so lowering the input takes
+    effect in the very next round rather than after decide re-trims the card.
     """
-    rounds = []
     try:
         comments = list_comments(args.repo, args.pr_number)
         card = find_card(comments, args.login)
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not read the cursor-approve card for prior verdicts: {e}")
-        card = None
-        comments = []
-    if card is not None:
-        rounds, problem = read_axes_sentinel(card.get("body"))
-        if problem:
-            print(f"::warning::Ignoring the card's prior-axes history: {problem}")
-    elif any(isinstance(c, dict) and _AXES_SENTINEL_ANY_RE.search(c.get("body") or "") for c in comments):
-        print(f"::warning::Ignoring an axes sentinel in a comment not written as the card by {args.login}")
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"rounds": rounds}, f, ensure_ascii=False)
-        f.write("\n")
+        return []
+    if card is None:
+        if any(isinstance(c, dict) and _AXES_SENTINEL_ANY_RE.search(c.get("body") or "") for c in comments):
+            print(f"::warning::Ignoring an axes sentinel in a comment not written as the card by {args.login}")
+        return []
+    rounds, problem = read_axes_sentinel(card.get("body"))
+    if problem:
+        print(f"::warning::Ignoring the card's prior-axes history: {problem}")
+    current = _int_or_q(args.round)
+    if current.isdigit():
+        rounds = [r for r in rounds if r["round"] < int(current)]
+    if str(args.prior_rounds or "").strip():
+        keep = parse_prior_rounds(args.prior_rounds)
+        rounds = sorted(rounds, key=lambda r: r["round"])[-keep:] if keep else []
+    return rounds
+
+
+def cmd_prior(args) -> int:
+    """Write `{"rounds": [...]}`, the card's prior-axes history, to --out.
+
+    Never an error past the arguments: no card, no sentinel, an untrusted one,
+    a failed read or even a failed write is an empty (or absent) history with a
+    warning when something was wrong, so the axes run exactly as they do
+    without `prior_rounds`.
+    """
+    try:
+        rounds = _prior_history(args)
+    except Exception as e:  # noqa: BLE001 — history is an aid; never fail the start phase for it
+        print(f"::warning::Could not read the prior-axes history ({e.__class__.__name__}: {e}); using none")
+        rounds = []
+    try:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump({"rounds": rounds}, f, ensure_ascii=False)
+            f.write("\n")
+    except (OSError, ValueError) as e:
+        print(f"::warning::Could not write the prior-axes history to {args.out}: {e.__class__.__name__}")
+        return 0
     print(f"prior rounds read from the card: {len(rounds)}")
     return 0
 

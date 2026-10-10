@@ -316,6 +316,105 @@ class UntrustedIsIgnored(unittest.TestCase):
         self.assertNotIn("::warning::", stdout)
 
 
+class ReviewRoundFixes(unittest.TestCase):
+    """The first review round's findings on the sentinel, pinned."""
+
+    def decide(self, fake, tmp, dec, round_no, sha, prior_rounds=3):
+        with mock.patch.object(card, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+            self.assertEqual(run_main(card, decide_argv(tmp, dec, round_no, sha, prior_rounds))[0], 0)
+
+    def prior(self, fake, tmp, *extra):
+        out = os.path.join(tmp, "prior.json")
+        with mock.patch.object(card, "gh", fake):
+            code, stdout, _ = run_main(card, ["prior", "--repo", "o/r", "--pr-number", "5", "--login", LOGIN,
+                                              "--out", out, *extra])
+        with open(out, encoding="utf-8") as f:
+            return code, json.load(f), stdout
+
+    def test_lone_surrogates_never_break_a_write(self):
+        dec = decision(conformance="yellow")
+        dec["axes"]["conformance"]["headline"] = "bad \ud800 headline"
+        dec["axes"]["conformance"]["summary"] = "bad \udfff summary"
+        fake = FakeGitHub()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.decide(fake, tmp, dec, "1", SHA1)
+            self.assertIn(card.AXES_SENTINEL_OPENER, fake.card_body())
+            code, data, _ = self.prior(fake, tmp)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["rounds"][0]["axes"]["conformance"]["summary"], "bad ? summary")
+        # A sentinel that itself carries an escaped surrogate is read back clean.
+        r = good_round()
+        r["axes"]["conformance"]["summary"] = "x\ud800"
+        rounds, problem = card.read_axes_sentinel(sentinel_for([r]))
+        self.assertIsNone(problem)
+        rounds[0]["axes"]["conformance"]["summary"].encode("utf-8")
+        AG.render_prior([r], "conformance", VALUES["head_sha"]).encode("utf-8")
+
+    def test_prior_drops_this_round_and_later_and_trims(self):
+        rounds = [good_round(n, sha) for n, sha in ((1, SHA1), (2, SHA2), (3, SHA3))]
+        fake = FakeGitHub([{"id": 3, "user": {"login": LOGIN},
+                            "body": card.CARD_MARKER + "\n" + sentinel_for(rounds) + "\n"}])
+        with tempfile.TemporaryDirectory() as tmp:
+            _, data, _ = self.prior(fake, tmp, "--round", "3", "--prior-rounds", "1")
+            self.assertEqual([r["round"] for r in data["rounds"]], [2])
+            _, data, _ = self.prior(fake, tmp, "--round", "4", "--prior-rounds", "3")
+            self.assertEqual([r["round"] for r in data["rounds"]], [1, 2, 3])
+            _, data, _ = self.prior(fake, tmp, "--round", "2.0", "--prior-rounds", "2")
+            self.assertEqual([r["round"] for r in data["rounds"]], [1])
+
+    def test_prior_never_fails_even_on_an_unexpected_error_or_bad_out(self):
+        fake = FakeGitHub()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(card, "find_card", side_effect=KeyError("x")):
+            code, data, stdout = self.prior(fake, tmp)
+        self.assertEqual((code, data), (0, {"rounds": []}))
+        self.assertIn("::warning::", stdout)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(card, "gh", fake):
+            code, stdout, _ = run_main(card, ["prior", "--repo", "o/r", "--pr-number", "5", "--login", LOGIN,
+                                              "--out", os.path.join(tmp, "missing", "prior.json")])
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::Could not write", stdout)
+
+    def test_decide_with_prior_rounds_off_drops_the_sentinel(self):
+        for prior_rounds in (0, "7"):
+            with self.subTest(prior_rounds=prior_rounds), tempfile.TemporaryDirectory() as tmp:
+                fake = FakeGitHub()
+                self.decide(fake, tmp, decision(conformance="yellow"), "1", SHA1)
+                self.assertIn(card.AXES_SENTINEL_OPENER, fake.card_body())
+                self.decide(fake, tmp, decision(conformance="green"), "2", SHA2, prior_rounds=prior_rounds)
+                self.assertNotIn(card.AXES_SENTINEL_OPENER, fake.card_body())
+        # Every other writer still carries it through.
+        body = card.render_start("2", "5", SHA2, ["conformance"], "", RUN)
+        line = sentinel_for([good_round()])
+        carried = card.with_axes_history(body, "x\n" + line + "\n")
+        self.assertEqual(card.read_axes_sentinel(carried), ([good_round()], None))
+
+    def test_late_rerun_of_an_older_round_sorts_into_place(self):
+        rounds = [good_round(1, SHA1), good_round(2, SHA2), good_round(3, SHA3)]
+        merged = card.merge_rounds(rounds, good_round(2, SHA2, conformance="green"), 2)
+        self.assertEqual([r["round"] for r in merged], [2, 3])
+        self.assertEqual(merged[0]["axes"]["conformance"]["verdict"], "green")
+        merged = card.merge_rounds(rounds[1:], good_round(1, SHA1), 3)
+        self.assertEqual([r["round"] for r in merged], [1, 2, 3])
+
+    def test_an_oversized_newest_round_loses_summaries_not_the_history(self):
+        older = good_round(1, SHA1)
+        newest = good_round(2, SHA2, **{a: "yellow" for a in card.AXES})
+        for a in card.AXES:
+            newest["axes"][a]["summary"] = "\x01" * card.PRIOR_SUMMARY_CHARS
+        line = card.axes_sentinel([older, newest])
+        payload = json.loads(base64.b64decode(line[len(card.AXES_SENTINEL_OPENER):-len(card.AXES_SENTINEL_CLOSER)]))
+        self.assertEqual([r["round"] for r in payload], [1, 2])
+        self.assertEqual({e["summary"] for e in payload[1]["axes"].values()}, {""})
+        self.assertEqual(payload[0], older)
+
+    def test_a_failing_defang_appends_no_block(self):
+        err = io.StringIO()
+        with mock.patch.object(AG, "defang", side_effect=AttributeError("_defang_fences")), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(AG.render_prior([good_round()], "conformance", VALUES["head_sha"]), "")
+        self.assertIn("::warning::", err.getvalue())
+
+
 class RenderedBlock(unittest.TestCase):
     def render(self, rounds, axis="conformance"):
         return AG.render_prior(rounds, axis, VALUES["head_sha"])
