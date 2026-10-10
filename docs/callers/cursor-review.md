@@ -256,9 +256,10 @@ the cause appears nowhere else in the file and the file is not uploaded. A
 failure whose message carries no status code prints no cause rather than a
 guess, so widen that pattern only against a real message.
 
-A cell that ran but submitted nothing shows up as a census with no error
-object. Nothing else is printed and the raw output is not uploaded, so that
-step is the whole diagnosis — if it is not enough, prefer widening the
+A cell that ran but submitted nothing prints whatever error objects (and,
+on the Anthropic lane, the gated cause) it recognized, plus the census; when
+no error object is found, the census is all you get. Nothing else is printed
+and the raw output is not uploaded, so that step is the whole diagnosis — if it is not enough, prefer widening the
 allowlist to a field the CLI owns over publishing the transcript.
 
 **Applying the label does not guarantee a run.** If the event was swallowed,
