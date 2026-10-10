@@ -19,6 +19,11 @@ name: Cursor axis (base)
 #               (with checkout false) for business and design. false → the
 #               shell is ALLOWED (an explicit Shell(*) rule), and the job fails
 #               if every shell call in the transcript was rejected.
+#   prior_rounds  0..3 (default 0 = off): above 0, download this run's
+#               `prior-axes` artifact (cursor-approve.yml's start phase) and
+#               append this axis's own earlier verdicts to the prompt as one
+#               fenced DATA block. A missing artifact, or no entry for this
+#               axis, appends nothing.
 # Secrets:
 #   CURSOR_API_KEY
 #   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
@@ -71,6 +76,10 @@ on:
         description: Deny cursor-agent's shell and file-write tools.
         type: boolean
         default: false
+      prior_rounds:
+        description: 0..3 earlier rounds of this axis's own verdicts to show it; 0 = off.
+        type: number
+        default: 0
     secrets:
       CURSOR_API_KEY:
         required: true
@@ -108,6 +117,7 @@ jobs:
           CONTEXT_SOURCES: ${{ inputs.context_sources }}
           CHECKOUT: ${{ inputs.checkout }}
           NO_SHELL: ${{ inputs.no_shell }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -117,6 +127,11 @@ jobs:
           case "$AXIS" in
             business|design|correctness|completeness|conformance) ;;
             *) echo "::error::unknown axis '$AXIS'"; exit 1 ;;
+          esac
+          # A `type: number` can render as `1.0`.
+          case "$PRIOR_ROUNDS" in
+            0|1|2|3|0.0|1.0|2.0|3.0) ;;
+            *) echo "::error::prior_rounds must be an integer from 0 to 3, got '$PRIOR_ROUNDS'"; exit 1 ;;
           esac
           if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::commit_sha must be a full 40-hex SHA"; exit 1
@@ -230,6 +245,16 @@ jobs:
             echo "diff bytes: $size"
           fi
 
+      - name: Download the prior verdicts
+        # Written by cursor-approve.yml's start phase in this run. Missing is
+        # normal (first round, or the read failed): no block, never an error.
+        if: inputs.prior_rounds > 0
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: prior-axes
+          path: ${{ runner.temp }}/prior
+
       - name: Render prompt
         env:
           AXIS: ${{ inputs.axis }}
@@ -242,8 +267,12 @@ jobs:
           REPO: ${{ github.repository }}
           CHECKOUT: ${{ inputs.checkout }}
           CONTEXT_SOURCES: ${{ inputs.context_sources }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
         run: |
           mkdir -p pr
+          prior=()
+          prior_file="$RUNNER_TEMP/prior/prior-axes.json"
+          if [ "$PRIOR_ROUNDS" != "0" ] && [ -f "$prior_file" ]; then prior=(--prior-file "$prior_file"); fi
           # The PR's own text, as data the prompt points at. Kept outside the
           # checkout's tracked tree (under .git) so it never shows in a diff.
           ctx_dir="pr/.git"
@@ -258,7 +287,7 @@ jobs:
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
               --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
               --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
-              --base-ref "$BASE_REF" --context-file "${ctx#pr/}"
+              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}"
             case "$CHECKOUT/$AXIS" in
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
             esac

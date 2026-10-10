@@ -6,7 +6,7 @@ name: Cursor axis (conformance)
 # Run it only after a cursor-review round passed; see
 # docs/callers/cursor-approve.md for the caller.
 #
-# Inputs (passed through): commit_sha, model, runs_on.
+# Inputs (passed through): commit_sha, model, runs_on, prior_rounds.
 # Secrets: CURSOR_API_KEY.
 
 on:
@@ -21,6 +21,9 @@ on:
       runs_on:
         type: string
         default: '"ubuntu-latest"'
+      prior_rounds:
+        type: number
+        default: 0
     secrets:
       CURSOR_API_KEY:
         required: true
@@ -39,5 +42,6 @@ jobs:
       commit_sha: ${{ inputs.commit_sha }}
       model: ${{ inputs.model }}
       runs_on: ${{ inputs.runs_on }}
+      prior_rounds: ${{ inputs.prior_rounds }}
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}

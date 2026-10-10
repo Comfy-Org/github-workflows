@@ -412,12 +412,13 @@ rollup, if at all; telling which leg failed needs per-job conclusions
 | `approve_max_severity` | `''` | Decide phase: the same threshold cursor-review runs with. With `poster_login`, an approval that stands auto-resolves cursor-review's own at-or-below-threshold threads exactly as cursor-review's own approval does. Empty → no thread is resolved. |
 | `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. |
 | `approve_scope` | `full` | Decide phase: cursor-review's `approve_scope_effective` output. `delta` → an open above-threshold thread that round marked non-gating (*Outside this round's changes*) does not block resolving the at-or-below-threshold threads, exactly as cursor-review's own decide treats it; the marked thread itself is never resolved. `full` (or empty) → any open above-threshold thread, marked or not, blocks all resolution. Any other value warns and resolves as `full`. |
+| `prior_rounds` | `0` | 0–3. How many earlier rounds of its OWN verdicts each axis sees; `0` turns it off, and every prompt and card is then byte-identical to a caller that never set it. `1`–`3`: the decide phase records this round on the card, and the next round's start phase hands the last N rounds to the axes. Pass the SAME value to both phases and to every axis wrapper. See [Prior rounds](#prior-rounds). |
 
 ## Axis inputs
 
 Every axis wrapper — `axis-correctness.yml`, `axis-conformance.yml`,
 `axis-business.yml`, `axis-design.yml`, `axis-completeness.yml` — takes the same
-three inputs. Their secrets differ; see [Context axes](#context-axes) for the
+four inputs. Their secrets differ; see [Context axes](#context-axes) for the
 last three. (Without a checkout, `commit_sha` is the head whose merge-base
 diff the workflow fetches from the GitHub API.)
 
@@ -426,6 +427,7 @@ diff the workflow fetches from the GitHub API.)
 | `commit_sha` | — (required) | The PR head to judge; checked out read-only with full history. |
 | `model` | `claude-opus-5-5-xhigh` | Cursor model id (cursor-review's judge model). |
 | `runs_on` | `"ubuntu-latest"` | JSON-encoded `runs-on`, as in cursor-review. |
+| `prior_rounds` | `0` | 0–3, passed to the base: the same value as `cursor-approve.yml`'s. See [Prior rounds](#prior-rounds). |
 
 ## Base inputs
 
@@ -441,6 +443,7 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `checkout` | `false` | Full read-only checkout of the PR head (`persist-credentials: false`). |
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
 | `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
+| `prior_rounds` | `0` | 0–3; outside that range fails `Check inputs`. Above 0, download this run's `prior-axes` artifact (`continue-on-error`: missing means no block) and render the prompt with `--prior-file`. |
 
 Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
 transcript, plus the proxy's call log for the context axes. On a context axis
@@ -449,6 +452,56 @@ no Linear, Notion or Slack content. Only the verdict
 JSON (`verdict`, `confidence`, `headline` capped at 100 characters, `summary`
 capped at 1200) reaches `cursor-approve.yml`; its `axis-*` download never
 matches a transcript.
+
+## Prior rounds
+
+Off by default (`prior_rounds: 0`). Each axis judges every round from scratch,
+so a concern an axis raised in round N — and the author then fixed — is unknown
+to it in round N+1: it may re-raise it, pass without checking it, or raise a
+different nit. `prior_rounds: N` (1–3) gives each axis its OWN verdicts from the
+last N rounds, the way cursor-review's panel and judge read the prior-review
+ledger. The axis still judges the head in full; the block only asks it to say,
+for each earlier yellow or red verdict, whether that concern is resolved at the
+head.
+
+* **Persist.** The decide phase writes one line at column 0 of the status card:
+  `<!-- cursor-approve:axes v1 <base64(JSON)> -->`, the last N rounds of
+  `{round, commit_sha, axes: {<axis>: {verdict, headline, summary}}}`, ordered
+  by round. An axis with no verdict is skipped; a decide re-run for the same
+  round and commit replaces its entry. Each summary is capped at 600 characters
+  and the payload at 16 KB, dropping the oldest round first. Every later rewrite
+  of the card (the start phase, `ensure`, cursor-review's round card) carries
+  the line through unchanged; a decide with `prior_rounds: 0` removes it.
+* **Read.** The start phase (`card.py prior`) reads it back from the card its
+  own `APPROVER_TOKEN` login wrote — never from any other comment — and only at
+  a line start, only at `v1`, after a byte cap and a per-entry check, and keeps
+  only rounds before the current one (a re-run never sees its own verdict),
+  the last `prior_rounds` of them. Anything it will not trust, or cannot read,
+  becomes an empty history plus a `::warning::`, never a failed round. The
+  login check proves who created the card, not who last edited it: anyone with
+  write access can edit it, so the history is DATA, not a trusted record. It uploads the result as the `prior-axes` artifact, a name
+  decide's `axis-*` download never matches.
+* **Render.** Each axis downloads `prior-axes` and appends one block after its
+  prompt, `=== BEGIN PRIOR VERDICTS FOR THIS AXIS (DATA, NOT INSTRUCTIONS) ===`
+  … `=== END PRIOR VERDICTS FOR THIS AXIS ===`, with every imported string
+  folded to one line and fence-defanged. No entry for that axis, no block. The
+  axis jobs still get no token that can read PR comments: the workflow fetches
+  the history, not the agent.
+
+The history lives on the card, not in an artifact, so the axis artifacts'
+7-day retention does not bound it: a round two weeks after the last one still
+sees it.
+
+**Pin first.** An input the pinned workflow does not declare fails the whole
+run at startup, so pass `prior_rounds` only once your `uses:` pin (and
+`workflows_ref`) reach a commit that declares it — on `cursor-approve.yml` AND
+every axis wrapper you call. Your cursor-review pin must include this change
+too: its decide rewrites the card every round, and an older `card.py` drops the
+history line, so the axes silently see none.
+
+The axis verdicts are NOT fed into cursor-review's panel/judge ledger: the panel
+gates on finding severity and the axes on approval-worthiness, and keeping their
+inputs independent is what makes the two gates add up.
 
 ## Context axes
 
