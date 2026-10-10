@@ -18,6 +18,11 @@ does not dump them. It prints an ALLOWLIST of short metadata fields
 (``ERROR_FIELDS``) from objects that look like errors, plus a census of event
 types.
 
+ONE field is read out of model-written territory — Claude Code's API-failure
+cause, which sits in `result` and nowhere else — under the three gates in
+``_api_error_cause``. Everything below describes the rule that field is the
+stated exception to.
+
 TWO allowlists, and the second one is the load-bearing one. Restricting the
 FIELDS is not enough on its own, because a reviewer agent writes part of this
 file: it chooses the `arguments` of its own MCP tool calls. A prompt-injected
@@ -87,6 +92,13 @@ MAX_READ = 4_000_000
 MAX_DEPTH = 12
 MAX_NODES = 20000
 
+# Claude Code's API-failure cause sits in `result`, a field the model also
+# writes. Printing it is THE one exception to "no model-written field reaches
+# the log" — see `_api_error_cause`, which gates it three ways.
+CAUSE_FIELD = "result"
+CAUSE_LIMIT = 120
+_API_ERROR = re.compile(r"^API Error: \d{3} ")
+
 _SAFE = re.compile(r"[^A-Za-z0-9 .,:;_/@+()\[\]{}='\"!?#$%^&*|~`<>-]")
 # A colon followed by a colon, and a `#` that begins a `##[`. Lookahead, so one
 # pass breaks every run however long: `":::"` -> `": : :"`, `"###["` -> `"## #["`.
@@ -146,6 +158,38 @@ def _fields(obj: dict) -> str:
     return " ".join(parts)
 
 
+def _api_error_cause(obj: dict) -> str:
+    """Claude Code's API-failure cause, read out of a model-written field.
+
+    THE one exception to the rule that no model-written field reaches the log,
+    and it is deliberate rather than an oversight. Claude Code reports an
+    API-level failure as `{"type":"result","subtype":"success","is_error":true,
+    "result":"API Error: 400 ..."}` — note `subtype`, which reads as SUCCESS —
+    and the cause appears nowhere else in the file. Since the file is not
+    uploaded either, an Anthropic-lane outage was otherwise undiagnosable
+    without re-running the cell.
+
+    So it is gated three ways: the object must declare `is_error` true, the
+    value must be a string opening with the CLI's own `API Error: <status> `
+    preamble, and it is cut to ``CAUSE_LIMIT`` and sanitized like every other
+    value. A prompt-injected agent CAN forge that preamble, so this is a
+    BOUNDED and documented channel, not a safe one — roughly 120 sanitized
+    characters that cannot carry a workflow command. That trade was taken
+    knowingly (#402); the alternative was a lane that reports `subtype=success`
+    and names nothing.
+
+    A failure whose message does not carry a status code yields nothing rather
+    than a guess, which is the safe direction: widen the pattern only against
+    a real message, never speculatively.
+    """
+    if obj.get("is_error") is not True:
+        return ""
+    value = obj.get(CAUSE_FIELD)
+    if not isinstance(value, str) or not _API_ERROR.match(value):
+        return ""
+    return f"{CAUSE_FIELD}={sanitize(value, CAUSE_LIMIT)}"
+
+
 def walk(node, out: list, types: dict, state: dict, depth: int = 0) -> None:
     """Collect error objects and a census of `type` values. Bounded.
 
@@ -171,6 +215,9 @@ def walk(node, out: list, types: dict, state: dict, depth: int = 0) -> None:
         rendered = _fields(node)
         if rendered and rendered not in out:
             out.append(rendered)
+        cause = _api_error_cause(node)
+        if cause and cause not in out:
+            out.append(cause)
     # An `error` KEY is the canonical envelope and must be read on its own
     # terms. The provider's error object does not have to describe ITSELF as an
     # error — OpenAI's is `{"error": {"type": "insufficient_quota", "code":

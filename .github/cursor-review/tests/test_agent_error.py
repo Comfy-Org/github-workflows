@@ -121,6 +121,9 @@ class AllowlistTest(unittest.TestCase):
     )
 
     def test_no_prose_key_is_printed_from_an_error_object(self):
+        # `result` is covered too: bare prose does not pass
+        # `_api_error_cause`'s preamble gate. The one value that DOES pass is
+        # pinned in ClaudeResultShapeTest, deliberately in one place.
         for key in self.PROSE_KEYS:
             with self.subTest(key=key):
                 payload = {"type": "error", "is_error": True, key: PROSE}
@@ -341,10 +344,13 @@ class ModelAuthoredSubtreeTest(unittest.TestCase):
 class ClaudeResultShapeTest(unittest.TestCase):
     """Claude Code reports an API failure as a result object.
 
-    The cause sits in `result` — the same field its review prose uses — so it
-    is NOT printed. `is_error` is, so the line cannot read as a success. This
-    pins the documented gap: see the per-lane note in
-    `docs/callers/cursor-review.md`.
+    `subtype` reads `success` on a failed call, so without `is_error` the line
+    would read as a success that names nothing. The cause sits in `result` —
+    a field the model also writes — and is printed under the three gates in
+    `_api_error_cause`. That is the ONE exception to withholding model-written
+    fields, approved deliberately on #402, so each gate is pinned separately:
+    a gate that quietly stopped holding would widen the channel without
+    changing any other test.
     """
 
     FAILURE = {
@@ -355,14 +361,62 @@ class ClaudeResultShapeTest(unittest.TestCase):
     }
 
     def test_the_failure_is_not_reported_as_a_success(self):
-        out = joined(self.FAILURE)
-        self.assertIn("is_error=True", out)
+        self.assertIn("is_error=True", joined(self.FAILURE))
 
-    def test_the_cause_in_result_is_withheld(self):
-        self.assertNotIn("credit balance", joined(self.FAILURE))
+    def test_the_cause_is_named(self):
+        out = joined(self.FAILURE)
+        self.assertIn("credit balance is too low", out)
 
     def test_is_error_is_allowlisted(self):
         self.assertIn("is_error", agent_error.ERROR_FIELDS)
+
+    # --- the gates ---
+
+    def test_review_prose_without_the_preamble_is_withheld(self):
+        # The normal case by far: `result` holds the agent's review.
+        payload = dict(self.FAILURE, result=f"I reviewed the diff. {PROSE}")
+        self.assertNotIn(PROSE, joined(payload))
+
+    def test_a_message_without_a_status_code_yields_nothing(self):
+        # Fails safe rather than guessing; widen only against a real message.
+        payload = dict(self.FAILURE, result=f"API Error: {PROSE}")
+        self.assertNotIn(PROSE, joined(payload))
+
+    def test_the_cause_needs_is_error(self):
+        # The object must still look like an error by ANOTHER signal, or the
+        # extractor is never reached and the test proves nothing about the
+        # gate. `type` carrying "error" and a 4xx status are those signals.
+        for other_signal in ({"type": "error"}, {"type": "x", "status": 500}):
+            payload = dict(self.FAILURE, **other_signal)
+            payload["is_error"] = False
+            payload["result"] = f"API Error: 400 {PROSE}"
+            with self.subTest(signal=other_signal):
+                out = joined(payload)
+                self.assertNotIn(PROSE, out)
+                # ...and the object WAS recognised as an error, so the only
+                # thing stopping the cause is the gate under test.
+                self.assertIn("error: ", out)
+
+    def test_a_structured_result_is_never_flattened(self):
+        payload = dict(self.FAILURE, result={"blocks": [{"text": PROSE}]})
+        self.assertNotIn(PROSE, joined(payload))
+
+    def test_the_cause_is_capped(self):
+        payload = dict(self.FAILURE, result="API Error: 500 " + "z" * 4000)
+        line = [l for l in summary(payload) if l.startswith("error: result=")]
+        self.assertEqual(1, len(line))
+        self.assertLessEqual(len(line[0]), len("error: result=") + agent_error.CAUSE_LIMIT)
+
+    def test_the_cause_cannot_carry_a_workflow_command(self):
+        payload = dict(self.FAILURE,
+                       result="API Error: 429 x::error::forged ##[add-mask]y")
+        for line in summary(payload):
+            self.assertNotIn("::", line)
+            self.assertNotIn("##[", line)
+
+    def test_the_exception_is_one_field_only(self):
+        # Guards against the gate being reused for another prose field later.
+        self.assertEqual("result", agent_error.CAUSE_FIELD)
 
 
 class TailReadTest(unittest.TestCase):
