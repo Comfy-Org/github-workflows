@@ -137,6 +137,12 @@ class GateBypassTest(unittest.TestCase):
         self.assertIn(".created_at > $since", self.script)
         self.assertIn("submitted_at", self.script)
 
+    def test_reviews_are_read_from_every_page(self):
+        # 30 per page, oldest first: page 1 alone drops the NEWEST round.
+        self.assertIn('gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews"',
+                      self.script)
+        self.assertNotRegex(self.script, r'gh api "repos/\$REPO/pulls/\$PR_NUMBER/reviews"')
+
     def test_the_skip_branch_still_exists(self):
         self.assertIn("already_reviewed=true", self.script)
         self.assertIn("already_reviewed=false", self.script)
@@ -202,6 +208,13 @@ class GateFilterTest(unittest.TestCase):
         # Otherwise quoting someone else's `/review` would re-fire a round.
         self.assertEqual(0, self.count([[self.comment("hello\n/review")]]))
         self.assertEqual(0, self.count([[self.comment("> /review")]]))
+
+    def test_a_blank_first_line_is_not_skipped(self):
+        # Trimming the WHOLE body first would strip the newline and promote
+        # line two; the auto-label half (`head -n 1`) never sees it either.
+        for body in ("\n/review", "  \n/review", "\r\n/review"):
+            with self.subTest(body=body):
+                self.assertEqual(0, self.count([[self.comment(body)]]))
 
     def test_a_comment_older_than_the_review_does_not_count(self):
         self.assertEqual(
@@ -281,6 +294,16 @@ class AutoLabelCommandTest(unittest.TestCase):
         self.assertLess(self.script.index("--remove-label"),
                         self.script.rindex("--add-label"))
 
+    def test_a_closed_pr_is_left_alone(self):
+        self.assertIn("--json labels,state", self.script)
+        self.assertLess(self.script.index('!= "OPEN"'),
+                        self.script.index("--remove-label"))
+
+    def test_a_failed_re_add_is_retried_and_then_fails_loudly(self):
+        # After the remove lands, one failed add would leave the PR unlabeled.
+        self.assertRegex(self.script, r"for attempt in 1 2 3; do\n\s+if gh pr edit .*--add-label")
+        self.assertIn("exit 1", self.script[self.script.rindex("--add-label"):])
+
     def test_the_skip_label_still_wins(self):
         self.assertIn("SKIP_LABEL", self.script)
 
@@ -325,6 +348,7 @@ class FirstTokenTest(unittest.TestCase):
 
     def test_a_later_line_is_not_reached(self):
         self.assertNotEqual("/review", self.token("hello\n/review"))
+        self.assertNotEqual("/review", self.token("\n/review"))
 
     def test_degenerate_bodies_yield_nothing(self):
         for body in ("", "   ", "\n", "\r\n"):

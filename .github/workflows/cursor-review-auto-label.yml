@@ -333,7 +333,15 @@ jobs:
               exit 0 ;;
           esac
 
-          labels=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name]')
+          # A comment on a closed or merged PR still fires issue_comment, and
+          # the label event it would raise starts a round on code that can no
+          # longer land.
+          pr=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels,state)
+          if [ "$(echo "$pr" | jq -r .state)" != "OPEN" ]; then
+            echo "PR is not open — no-op."
+            exit 0
+          fi
+          labels=$(echo "$pr" | jq -c '[.labels[].name]')
           if echo "$labels" | jq -e --arg l "$SKIP_LABEL" 'index($l)' > /dev/null; then
             echo "$SKIP_LABEL present — not re-reviewing."
             exit 0
@@ -345,4 +353,15 @@ jobs:
           else
             echo "Re-review requested — applying $REVIEW_LABEL."
           fi
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"
+          # Retried: once the remove above has landed, a single failed add
+          # would leave the PR WITHOUT the label it had before the command —
+          # strictly worse than ignoring the request.
+          for attempt in 1 2 3; do
+            if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"; then
+              exit 0
+            fi
+            echo "::warning::Adding $REVIEW_LABEL failed (attempt $attempt of 3)."
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+          done
+          echo "::error::Could not re-add $REVIEW_LABEL — the PR is now missing it; re-apply it by hand."
+          exit 1

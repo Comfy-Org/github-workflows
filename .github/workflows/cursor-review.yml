@@ -998,7 +998,13 @@ jobs:
           # matters. Residual, accepted: another installed App could post a
           # marked review. Closing THAT needs the identity check to move into
           # the posting job, where the token exists.
-          EXISTING=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
+          #
+          # Every page, slurped: the endpoint returns 30 per page oldest-first,
+          # so on a long-lived PR the newest round is exactly what page 1 drops.
+          # A failed fetch degrades to "no prior review", as it always has.
+          REVIEWS=$( { gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null || true; } \
+            | jq -c -s 'add // []' 2>/dev/null) || REVIEWS='[]'
+          EXISTING=$(printf '%s' "$REVIEWS" \
             | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
             2>/dev/null || echo 0)
 
@@ -1025,7 +1031,7 @@ jobs:
           # comment body is attacker-authored text.
           FORCED=0
           if [ "$EXISTING" -gt 0 ] && [ -n "${REREVIEW_COMMAND:-}" ]; then
-            LAST_REVIEW=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
+            LAST_REVIEW=$(printf '%s' "$REVIEWS" \
               | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel"))) | .submitted_at] | max // ""' \
               2>/dev/null || echo "")
             if [ -n "$LAST_REVIEW" ]; then
@@ -1033,7 +1039,7 @@ jobs:
                 | jq -s --arg cmd "$REREVIEW_COMMAND" --arg since "$LAST_REVIEW" \
                     '[.[][] | select(.created_at > $since)
                             | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
-                            | select(((.body // "") | sub("^\\s+"; "") | split("\n")[0] // "" | sub("\\s.*$"; "") | sub("\r$"; "")) == $cmd)] | length' \
+                            | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^\\s+"; "") | sub("\\s.*$"; "")) == $cmd)] | length' \
                 2>/dev/null || echo 0)
               case "$FORCED" in ''|*[!0-9]*) FORCED=0 ;; esac
             fi
