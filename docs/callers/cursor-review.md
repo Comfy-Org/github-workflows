@@ -706,7 +706,9 @@ without a PR:
 
 ```yaml
 on:
-  pull_request:
+  # `pull_request_target`, not `pull_request`: under `pull_request` the
+  # reusable refuses to act as APPROVER_TOKEN — see the trust model below.
+  pull_request_target:
     # `synchronize`, `reopened` and `edited` are REQUIRED with auto-approve:
     # they dismiss the bot's earlier approval when new commits land (`reopened`
     # carries a push made while the PR was closed) or the base is retargeted.
@@ -717,10 +719,14 @@ jobs:
     with:
       workflows_ref: <same-sha-as-uses>
       approve_max_severity: ${{ vars.CURSOR_APPROVE_MAX_SEVERITY }}
+      # Optional: approve as a user account (see below). Store the token as an
+      # ENVIRONMENT secret named exactly `APPROVER_TOKEN` in this environment
+      # (deployment branches = the base branch only; see the trust model). The
+      # jobs that declare the environment read that secret, not the caller's.
+      approver_environment: cursor-approver
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-      # Optional: approve as a user account (see below).
-      APPROVER_TOKEN: ${{ secrets.CURSOR_APPROVER_TOKEN }}
+      APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 ```
 
 **Trying it on a few authors first.** `approve_authors` limits auto-approve to
@@ -931,7 +937,12 @@ cursor-approve) from **`pull_request_target`** and pass
    secret. Only the jobs that read it (`post-review`, `dismiss-stale-approval`,
    `auto-retry`, cursor-approve's `approve`) declare that environment; no job
    that checks out PR code does.
-2. Switch the caller's `pull_request:` trigger to `pull_request_target:` (same
+2. **Public repositories:** check the repo's Actions policy insights first.
+   GitHub's default event policy blocks `pull_request_target` in public
+   repositories; it runs in evaluate mode today and is enforced for affected
+   repositories from November 2, 2026, so configure an Actions event policy
+   that allows it before switching.
+3. Switch the caller's `pull_request:` trigger to `pull_request_target:` (same
    `types:`) and set `approver_environment: cursor-approver`. The panel still
    reviews the same tree: every PR checkout pins `refs/pull/<n>/merge`, which
    is what `pull_request` checks out by default.

@@ -255,10 +255,13 @@ and to BOTH cursor-approve phases — see cursor-review's
 ```yaml
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+    # `edited` is REQUIRED: a base retarget fires only `edited`, and without
+    # it no run reaches `dismiss-stale-approval` to withdraw the approval.
+    types: [opened, reopened, ready_for_review, synchronize, edited, labeled, unlabeled]
 
 concurrency:
-  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  # `edited` gets its own group so a title edit cannot cancel a running panel.
+  group: cursor-review-pr-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && '-edited' || '' }}
   cancel-in-progress: true
 
 jobs:
