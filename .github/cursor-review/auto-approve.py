@@ -790,6 +790,22 @@ def _trusted_decision(threshold: str, findings: list, open_thread_severities: li
     return APPROVE, GATE_PASS, [f"every finding is at or below `{threshold}`", *note], []
 
 
+def blocking_without_trust(threshold: str, findings: list, open_thread_severities: list, scope) -> bool:
+    """Would this round block even if it WERE trusted?
+
+    For an untrusted round — decide_gate never got past its trust checks —
+    so a retry is not spent on a PR whose completed cells already found
+    something above the threshold, or that has such a thread open. Fails
+    closed: anything unreadable answers True, which only withholds a retry.
+    """
+    try:
+        _event, gate, _reasons, _blocking = _trusted_decision(
+            threshold, findings or [], open_thread_severities or [], scope or {"scope": SCOPE_FULL}, True)
+    except Exception:  # noqa: BLE001 — unknown is "do not retry", never a traceback
+        return True
+    return gate == GATE_FAIL
+
+
 SCOPE_NOTE_PREFIX = "approve_scope `"
 
 
@@ -1099,7 +1115,7 @@ MAX_AUTO_RETRIES = 1
 DEFAULT_REVIEW_LABEL = "cursor-review"
 
 
-def auto_retry_eligible(reasons: list, retry_errored: bool = False) -> bool:
+def auto_retry_eligible(reasons: list, retry_errored: bool = False, blocked_anyway: bool = False) -> bool:
     """Would a fresh round decide what this one could not?
 
     TWO shapes, and the second one only exists because the wall moved.
@@ -1122,6 +1138,12 @@ def auto_retry_eligible(reasons: list, retry_errored: bool = False) -> bool:
     A reason this cannot fix anywhere in the list still rules out a retry: a
     structural cause, or findings above the threshold, means the next round
     hits the same wall whatever the panel does.
+
+    `blocked_anyway` is that last case for a short panel. decide_gate stops at
+    the trust checks, so an untrusted round's reasons never name its findings:
+    the caller has to ask `blocking_without_trust` whether the cells that DID
+    complete (or an open thread) already block. If they do, a full panel on the
+    same head would only confirm a block, and spend the PR's one retry doing it.
     """
     reasons = [r for r in (reasons or []) if isinstance(r, str) and r.strip()]
     if not reasons:
@@ -1129,6 +1151,10 @@ def auto_retry_eligible(reasons: list, retry_errored: bool = False) -> bool:
     if REASON_HEAD_MOVED in reasons and all(r in RETRYABLE_CAUSES for r in reasons):
         return True
     if not retry_errored:
+        return False
+    if blocked_anyway and REASON_HEAD_MOVED not in reasons:
+        # Same content, same block. A moved head re-reviews different content,
+        # so what the old head's cells found decides nothing about it.
         return False
     # At least one reason must BE the errored panel: without this, a lone base
     # retarget (unfixable by a same-SHA re-run) would pass the `all` below.
@@ -1171,7 +1197,7 @@ def round_cap_leaves_room(args) -> bool:
     return max_rounds <= 0 or this_round < max_rounds
 
 
-def auto_retry_budget_left(args, reasons: list) -> bool:
+def auto_retry_budget_left(args, reasons: list, blocked_anyway: bool = False) -> bool:
     """auto_retry_eligible() plus the per-PR ceiling, read from live reviews.
 
     An unreadable review list spends the budget rather than retrying blind: a
@@ -1189,7 +1215,7 @@ def auto_retry_budget_left(args, reasons: list) -> bool:
     if (getattr(args, "can_relabel", "") or "").strip().lower() != "true":
         return False
     retry_errored = (getattr(args, "retry_errored_rounds", "") or "").strip().lower() == "true"
-    if not auto_retry_eligible(reasons, retry_errored=retry_errored):
+    if not auto_retry_eligible(reasons, retry_errored=retry_errored, blocked_anyway=blocked_anyway):
         return False
     if not (getattr(args, "approver_login", "") or "").strip():
         return False
@@ -1223,8 +1249,26 @@ def cmd_auto_retry(args) -> int:
     The POST is tried twice, since a failed one after a successful DELETE leaves
     the trigger label stripped. Any failure exits 1, so the job goes red; the
     card's next step already says to re-run by hand if no round starts.
+
+    The PR is read again first, because decide's view of it can be up to
+    `auto_retry_delay_minutes` old by now: a PR closed or merged during the
+    wait, or handed to a human (`needs-human-review`), gets no new round. A
+    failed read does not cancel the retry the card already announced — the
+    relabel is what was promised, and the round's own gate re-reads the PR.
     """
     label = (args.review_label or "").strip() or DEFAULT_REVIEW_LABEL
+    try:
+        pr = read_pr(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not re-read the PR before re-running the round; re-running anyway "
+              f"({annotation_cause(e, 'unknown error')}).")
+    else:
+        if (pr.get("state") or "") != "open":
+            emit("⏭️ **Auto-approve: not re-running the round** — the PR is no longer open.")
+            return 0
+        if has_label(pr, HUMAN_REVIEW_LABEL):
+            emit(f"⏭️ **Auto-approve: not re-running the round** — the PR now carries `{HUMAN_REVIEW_LABEL}`.")
+            return 0
     url = f"repos/{args.repo}/issues/{args.pr_number}/labels"
     try:
         gh(["api", "-X", "DELETE", f"{url}/{urllib.parse.quote(label, safe='')}"])
@@ -1245,7 +1289,7 @@ def cmd_auto_retry(args) -> int:
               f"({annotation_cause(err, 'unknown error')}), so the PR may now be WITHOUT the label. "
               f"Add `{label}` back by hand to start the round.")
         return 1
-    emit(f"🔁 **Auto-approve: re-running the round** — the head moved, so `{label}` was removed and re-added.")
+    emit(f"🔁 **Auto-approve: re-running the round** — `{label}` was removed and re-added.")
     return 0
 
 
@@ -1670,7 +1714,8 @@ def _review_label(args) -> str:
     return getattr(args, "review_label", "") or ""
 
 
-def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list, scope: dict) -> int:
+def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list, scope: dict,
+                  blocked_anyway: bool = False) -> int:
     """A NONE decision: the card, plus the standing request for changes.
 
     `capped` posts none: the label hands the PR to a human, and no round will
@@ -1699,9 +1744,13 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
         # BE-19526: the head outran the round, and this PR has a retry left —
         # say so on the block and the card, then fire it below. Decided BEFORE
         # the block is posted so the marker it is counted by is on it.
-        retry = auto_retry_budget_left(args, reasons)
-    hand_text = next_text
+        retry = auto_retry_budget_left(args, reasons, blocked_anyway=blocked_anyway)
+    hand_nxt, hand_text = nxt, next_text
     if retry:
+        # The marker as well as the prose: on an unchanged head (the errored
+        # cause) no_decision_next said `push_then_relabel`, and an agent that
+        # obeyed it would push — cancelling the retry this card announces.
+        nxt = CARD_NEXT_RELABEL
         next_text = _card_text("next_auto_retry_text", args,
                                delay_minutes=getattr(args, "retry_delay_minutes", 0)) or next_text
     posted = {}
@@ -1711,7 +1760,7 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
         # body would not render), so no marker counts this retry: firing it
         # anyway would re-fire on every later moved head, unbounded. The card
         # goes back to the hand-recovery too, since nothing is re-running.
-        retry, next_text = False, hand_text
+        retry, nxt, next_text = False, hand_nxt, hand_text
     write_round_card(args, state, nxt, headline, reasons, next_text, threshold, gating)
     if retry:
         # cursor-review.yml's `auto-retry` job relabels; see cmd_auto_retry.
@@ -1797,7 +1846,7 @@ def cmd_decide(args) -> int:
     scope = with_snapshot_anchors(scope, getattr(args, "open_anchors", "") or "", args.commit_sha)
 
     # The open threads behind `prior`, from the same read: the card links them.
-    threads = []
+    threads, prior = [], []
     try:
         pr = read_pr(args.repo, args.pr_number)
         live_head, live_base = pr_head_base(pr)
@@ -1838,7 +1887,8 @@ def cmd_decide(args) -> int:
         # The standing request for changes and the card (BE-19489): a NONE
         # round used to leave nothing on the PR at all.
         try:
-            if card_for_none(args, gate, reasons, threshold, threads, scope):
+            blocked = gate == GATE_UNTRUSTED and blocking_without_trust(threshold, findings, prior, scope)
+            if card_for_none(args, gate, reasons, threshold, threads, scope, blocked_anyway=blocked):
                 rc = 1
         except Exception as e:  # noqa: BLE001 — the withdrawal above already ran; report, don't traceback
             print(f"::error::Could not leave the no-decision block or card: {annotation_cause(e, 'unknown error')}")

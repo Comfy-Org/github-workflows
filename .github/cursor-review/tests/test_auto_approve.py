@@ -3349,7 +3349,7 @@ class AutoRetryTest(unittest.TestCase):
     def run_decide(self, head=OTHER_SHA, reviews=(), judge="ok", delivered="true",
                    base_ref="main", live_base="main", reviews_fail=False, review_post_error="",
                    can_relabel="true", round_="2", max_rounds="5", approver=APPROVER, omit_can_relabel=False,
-                   panel=PANEL_OK, retry_errored=None, retry_delay=None):
+                   panel=PANEL_OK, retry_errored=None, retry_delay=None, findings=(), open_threads=()):
         self.reviews_posted, self.labels, self.card_writes = [], [], []
 
         def fake_gh(args, payload=None):
@@ -3378,7 +3378,7 @@ class AutoRetryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
             with open(fpath, "w") as f:
-                json.dump({"findings": [], "panel": list(panel)}, f)
+                json.dump({"findings": list(findings), "panel": list(panel)}, f)
             with open(dpath, "w") as f:
                 f.write(DIFF)
             open(out, "w").close()
@@ -3400,7 +3400,7 @@ class AutoRetryTest(unittest.TestCase):
                 args.retry_delay_minutes = retry_delay
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
-                    mock.patch.object(AA, "open_thread_severities", lambda *a, **k: []), \
+                    mock.patch.object(AA, "open_thread_severities", lambda *a, **k: list(open_threads)), \
                     mock.patch.object(AA, "resolve_eligible_threads", lambda *a: None), \
                     mock.patch.object(AA, "emit", lambda *a: None), \
                     mock.patch("builtins.print", lambda *a, **k: None):
@@ -3580,6 +3580,47 @@ class AutoRetryTest(unittest.TestCase):
         self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true")
         self.assertNotIn("in about", self.reviews_posted[0]["body"])
 
+    def test_the_card_marker_says_relabel_not_push(self):
+        # On an unchanged head the hand recovery is `push_then_relabel`; an
+        # agent obeying that marker would push and cancel the announced retry.
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true")
+        self.assertTrue(self.retried())
+        self.assertIn("<!-- cursor-approve-next: relabel -->", self.card_writes[0])
+        self.assertNotIn("push_then_relabel", self.card_writes[0])
+
+    def test_a_failed_block_puts_the_push_marker_back(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true",
+                        review_post_error="gh api failed: HTTP 422")
+        self.assertFalse(self.retried())
+        self.assertIn("<!-- cursor-approve-next: push_then_relabel -->", self.card_writes[0])
+
+    def test_completed_cells_above_the_threshold_rule_out_the_retry(self):
+        # decide_gate stops at the trust checks, so this never appears as a
+        # reason; the retry has to ask whether the completed cells already block.
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true",
+                        findings=[{"severity": "high", "title": "t"}])
+        self.assertFalse(self.retried())
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, self.reviews_posted[0]["body"])
+
+    def test_findings_at_or_below_the_threshold_still_retry(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true",
+                        findings=[{"severity": "low", "title": "t"}])
+        self.assertTrue(self.retried())
+
+    def test_an_open_thread_above_the_threshold_rules_out_the_retry(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true",
+                        open_threads=["high"])
+        self.assertFalse(self.retried())
+
+    def test_findings_do_not_gate_the_moved_head_retry(self):
+        # The pre-existing cause re-reviews DIFFERENT content, so what the old
+        # head's cells found says nothing about the next round.
+        self.run_decide(findings=[{"severity": "high", "title": "t"}])
+        self.assertTrue(self.retried())
+        self.run_decide(panel=self.PANEL_ERR, retry_errored="true",
+                        findings=[{"severity": "high", "title": "t"}])
+        self.assertTrue(self.retried())
+
     def test_the_opt_in_still_obeys_the_one_per_pr_budget(self):
         self.run_decide(head=SHA, panel=self.PANEL_ERR,
                         retry_errored="true", reviews=[retried_block(5)])
@@ -3587,9 +3628,15 @@ class AutoRetryTest(unittest.TestCase):
 
     # -- the relabel itself (the workflow's auto-retry job) ----------------
 
-    def run_auto_retry(self, label="cursor-review", fail=None):
+    def run_auto_retry(self, label="cursor-review", fail=None, pr=None, pr_error=None):
         """`fail` maps a method to the errors its successive calls raise."""
         self.calls, fails = [], {k: list(v) for k, v in (fail or {}).items()}
+        pr = {"state": "open", "labels": []} if pr is None else pr
+
+        def fake_read_pr(repo, number):
+            if pr_error:
+                raise RuntimeError(pr_error)
+            return pr
 
         def fake_gh(args, payload=None):
             self.calls.append((args[2], args[3], payload))
@@ -3599,9 +3646,24 @@ class AutoRetryTest(unittest.TestCase):
             return "{}"
 
         args = argparse.Namespace(repo="o/r", pr_number="1", review_label=label)
-        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "emit", lambda *a: None), \
+        with mock.patch.object(AA, "gh", fake_gh), mock.patch.object(AA, "read_pr", fake_read_pr), \
+                mock.patch.object(AA, "emit", lambda *a: None), \
                 mock.patch("builtins.print", lambda *a, **k: None):
             return AA.cmd_auto_retry(args)
+
+    def test_auto_retry_skips_a_pr_closed_during_the_wait(self):
+        self.assertEqual(self.run_auto_retry(pr={"state": "closed", "labels": []}), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_auto_retry_skips_a_pr_handed_to_a_human_during_the_wait(self):
+        pr = {"state": "open", "labels": [{"name": AA.HUMAN_REVIEW_LABEL}]}
+        self.assertEqual(self.run_auto_retry(pr=pr), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_auto_retry_still_relabels_when_the_pr_cannot_be_read(self):
+        # The card already announced it; the round's own gate re-reads the PR.
+        self.assertEqual(self.run_auto_retry(pr_error="gh api failed: HTTP 502"), 0)
+        self.assertEqual([c[0] for c in self.calls], ["DELETE", "POST"])
 
     def test_auto_retry_removes_and_re_adds_the_label(self):
         self.assertEqual(self.run_auto_retry(), 0)

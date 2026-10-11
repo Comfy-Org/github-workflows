@@ -18,8 +18,9 @@ rather than the happy path.
 The retry must not reach the HUMAN force path. `rereview_command` authorizes by
 the comment's association; the retry posts no comment, and if it could satisfy
 that path then any App's comment could force rounds. The retry's own signal is
-the marked block `decide` already writes, checked for `user.type == "Bot"`, the
-commit id, and recency — and capped, so a forged marker cannot loop.
+the marked block `decide` already writes, checked for its author (a Bot, or the
+identity that fired the relabel — the APPROVER_TOKEN case), its shape, the
+commit id, and recency by review id.
 
 Parsed WITHOUT PyYAML, like its sibling suites: this repo is stdlib-only and CI
 installs no requirements for these tests.
@@ -164,6 +165,23 @@ class EligibilityTest(unittest.TestCase):
             self.eligible([self.ERRORED, auto_approve.REASON_PANEL_INCONSISTENT], True)
         )
 
+    def test_a_round_that_blocks_anyway_is_not_retried(self):
+        # The completed cells (or an open thread) already block: a full panel
+        # on the same head would only confirm it.
+        self.assertFalse(auto_approve.auto_retry_eligible(
+            [self.ERRORED], retry_errored=True, blocked_anyway=True))
+        # ...but a moved head re-reviews different content.
+        self.assertTrue(auto_approve.auto_retry_eligible(
+            [HEAD_MOVED], retry_errored=True, blocked_anyway=True))
+
+    def test_blocking_without_trust_reads_the_real_findings(self):
+        # Fed real findings, not a hand-written reason the producer never emits.
+        block = auto_approve.blocking_without_trust
+        self.assertTrue(block("low", [{"severity": "high"}], [], None))
+        self.assertTrue(block("low", [], ["high"], None))
+        self.assertFalse(block("low", [{"severity": "low"}], [], None))
+        self.assertFalse(block("low", [], [], None))
+
     def test_no_reasons_is_not_eligible(self):
         for reasons in ([], None, [""], ["   "]):
             with self.subTest(reasons=reasons):
@@ -242,7 +260,8 @@ class ConstantParityTest(unittest.TestCase):
 
     def test_the_workflow_uses_the_same_marker(self):
         _block, run = step_run("Check for prior review on this commit")
-        self.assertIn(auto_approve.AUTO_RETRY_MARKER, run)
+        self.assertIn(f"--arg marker '{auto_approve.AUTO_RETRY_MARKER}'", run)
+        self.assertIn(f"--arg approve '{auto_approve.APPROVE_MARKER}'", run)
 
     def test_the_marker_is_an_html_comment(self):
         # It rides in a review body a human reads; it must not be visible.
@@ -284,11 +303,17 @@ class GateWiringTest(unittest.TestCase):
     def test_the_marker_check_is_permission_bounded(self):
         marker = self.body[self.body.index("RETRIED="):]
         self.assertIn('.user.type == "Bot"', marker)
+        self.assertIn('(.user.login // "") == $sender', marker)
         self.assertIn(".commit_id == $sha", marker)
-        self.assertIn(".submitted_at > $since", marker)
+        self.assertIn('.state != "DISMISSED"', marker)
 
-    def test_the_forced_round_is_capped(self):
-        self.assertIn('[ "$RETRIED" -le 1 ]', self.body)
+    def test_the_sender_is_the_event_sender(self):
+        self.assertIn("EVENT_SENDER: ${{ github.event.sender.login }}", self.block)
+
+    def test_a_second_marked_block_does_not_suppress_the_retry(self):
+        # An upper bound here only ever turned a real retry into a dedupe.
+        self.assertIn('[ "$RETRIED" -gt 0 ]', self.body)
+        self.assertNotIn('-le 1', self.body)
 
     def test_a_non_numeric_count_cannot_force(self):
         self.assertIn("case \"$RETRIED\" in ''|*[!0-9]*) RETRIED=0 ;; esac", self.body)
@@ -322,7 +347,8 @@ class DelayTest(unittest.TestCase):
     @unittest.skipIf(shutil.which("bash") is None, "bash not installed")
     def test_the_clamp(self):
         for given, want_sleep in (("0", 0), ("5", 300), ("30", 1800),
-                                  ("31", 1800), ("999", 1800),
+                                  ("31", 1800), ("999", 1800), ("1000", 1800),
+                                  ("99999999999999999999999", 1800),
                                   ("abc", 0), ("", 0), ("-5", 0), ("1.5", 0)):
             with self.subTest(given=given):
                 # Run the real body with `sleep` stubbed, so the test is fast
@@ -430,7 +456,8 @@ class MarkerFilterTest(unittest.TestCase):
     """The real jq program for the retry signal, extracted and executed."""
 
     SHA = "abc123"
-    SINCE = "2026-10-10T03:00:00Z"
+    SINCE = 100  # the newest consolidated review's id
+    SENDER = "approver-pat-user"
 
     @classmethod
     def setUpClass(cls):
@@ -439,46 +466,83 @@ class MarkerFilterTest(unittest.TestCase):
         start = seg.index("'[.[]") + 1
         cls.filter = seg[start:seg.index("' \\", start)]
 
-    def review(self, body, user_type="Bot", sha=None, at="2026-10-10T04:00:00Z"):
-        return {"commit_id": sha or self.SHA, "user": {"type": user_type},
-                "submitted_at": at, "body": body}
+    def block(self, extra=""):
+        """decide's own shape: the auto-approve marker first, the retry marker
+        on a line of its own (render_standing_body)."""
+        return (auto_approve.APPROVE_MARKER + "\n" + auto_approve.AUTO_RETRY_MARKER
+                + "\n### 🤖 Cursor Review — auto-approve" + extra)
 
-    def count(self, reviews):
+    def review(self, body, user_type="Bot", login="app[bot]", sha=None, rid=101,
+               state="CHANGES_REQUESTED"):
+        return {"id": rid, "commit_id": sha or self.SHA, "state": state,
+                "user": {"type": user_type, "login": login}, "body": body}
+
+    def count(self, reviews, sender=SENDER):
         proc = subprocess.run(
-            ["jq", "--arg", "sha", self.SHA, "--arg", "since", self.SINCE,
+            ["jq", "--arg", "sha", self.SHA, "--argjson", "since", str(self.SINCE),
+             "--arg", "sender", sender,
+             "--arg", "approve", auto_approve.APPROVE_MARKER,
              "--arg", "marker", auto_approve.AUTO_RETRY_MARKER, self.filter],
             input=json.dumps(reviews), capture_output=True, text=True,
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         return int(proc.stdout.strip())
 
-    def test_a_marked_block_newer_than_the_review_counts(self):
-        self.assertEqual(
-            1, self.count([self.review("blocked\n" + auto_approve.AUTO_RETRY_MARKER)])
-        )
+    def test_the_real_standing_block_counts(self):
+        # Rendered by the producer, so the gate and decide cannot drift.
+        body = auto_approve.render_standing_body(
+            "No decision.", ["1/6 " + auto_approve.PANEL_INCOMPLETE_SUFFIX], "Nothing.",
+            "low", "a" * 40, "main", retry=True)
+        self.assertEqual(1, self.count([self.review(body)]))
+        unmarked = auto_approve.render_standing_body(
+            "No decision.", ["x"], "Nothing.", "low", "a" * 40, "main", retry=False)
+        self.assertEqual(0, self.count([self.review(unmarked)]))
 
     def test_an_older_marked_block_does_not(self):
         # This is what stops one request re-firing forever.
-        self.assertEqual(0, self.count([
-            self.review("x\n" + auto_approve.AUTO_RETRY_MARKER,
-                        at="2026-10-10T02:00:00Z")
-        ]))
+        self.assertEqual(0, self.count([self.review(self.block(), rid=99)]))
+
+    def test_the_same_second_does_not_lose_the_request(self):
+        # Ordered by id, so a block posted in the consolidated review's own
+        # second still counts.
+        self.assertEqual(1, self.count([self.review(self.block(), rid=self.SINCE + 1)]))
 
     def test_another_commit_does_not_count(self):
-        self.assertEqual(0, self.count([
-            self.review("x\n" + auto_approve.AUTO_RETRY_MARKER, sha="other")
-        ]))
+        self.assertEqual(0, self.count([self.review(self.block(), sha="other")]))
 
-    def test_a_human_cannot_post_it(self):
+    def test_the_approver_token_identity_counts_when_it_relabelled(self):
+        # APPROVER_TOKEN is a PAT: decide's block is User-typed, and the
+        # auto-retry job relabels as that same user.
+        self.assertEqual(1, self.count([
+            self.review(self.block(), user_type="User", login=self.SENDER)]))
+
+    def test_another_human_cannot_post_it(self):
         self.assertEqual(0, self.count([
-            self.review("x\n" + auto_approve.AUTO_RETRY_MARKER, user_type="User")
-        ]))
+            self.review(self.block(), user_type="User", login="someone-else")]))
+        self.assertEqual(0, self.count([
+            self.review(self.block(), user_type="User", login="")], sender=""))
+
+    def test_a_dismissed_block_does_not_count(self):
+        self.assertEqual(0, self.count([self.review(self.block(), state="DISMISSED")]))
+
+    def test_a_quoted_marker_does_not_count(self):
+        # A review that merely mentions the marker — quoting this very diff —
+        # is not decide's block.
+        self.assertEqual(0, self.count([self.review(
+            "## 🔍 Cursor Review — Consolidated panel\nsee `" + auto_approve.AUTO_RETRY_MARKER + "`")]))
+        self.assertEqual(0, self.count([self.review(
+            auto_approve.APPROVE_MARKER + "\nquote: " + auto_approve.AUTO_RETRY_MARKER)]))
+
+    def test_two_marked_blocks_still_count(self):
+        self.assertEqual(2, self.count([self.review(self.block(), rid=101),
+                                        self.review(self.block(), rid=102)]))
 
     def test_an_unmarked_bot_review_does_not_count(self):
         self.assertEqual(0, self.count([self.review("an ordinary block")]))
 
-    def test_a_null_body_is_not_an_error(self):
+    def test_a_null_body_or_id_is_not_an_error(self):
         self.assertEqual(0, self.count([self.review(None)]))
+        self.assertEqual(0, self.count([self.review(self.block(), rid=None)]))
 
     def test_an_empty_list_is_not_an_error(self):
         self.assertEqual(0, self.count([]))
