@@ -158,6 +158,12 @@ def safe_label(label) -> str:
     return label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:/+-]{0,49}", label) else ""
 
 
+# Mirrors cursor-review.yml's clamp on `auto_retry_delay_minutes`; a test pins
+# the two equal, since the sentence must not promise a wait longer than the
+# one the workflow will actually take.
+RETRY_DELAY_CAP = 30
+
+
 def relabel(label=DEFAULT_REVIEW_LABEL) -> str:
     name = safe_label(label)
     return f"remove and re-add the `{name}` label" if name else "remove and re-add the review label"
@@ -181,7 +187,25 @@ def next_push_text(label=DEFAULT_REVIEW_LABEL) -> str:
             f"skips a head that already carries a review — then re-run the round: {relabel(label)}.")
 
 
-def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
+def retry_delay_phrase(delay_minutes=0) -> str:
+    """" in about N minutes", or "" — the advance notice for a delayed retry.
+
+    Sanitised here as well as in the workflow that clamps the input, because
+    this text is posted as the approver: the value arrives as a caller input,
+    and only a small integer may reach the sentence. Out of range or
+    unparsable reads as no delay, matching what the workflow would then wait.
+    """
+    try:
+        mins = int(str(delay_minutes).strip())
+    except (TypeError, ValueError):
+        return ""
+    if mins < 1:
+        return ""
+    mins = min(mins, RETRY_DELAY_CAP)
+    return f" in about {mins} minute{'s' if mins != 1 else ''}"
+
+
+def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0) -> str:
     """The relabel the workflow is doing itself (BE-19526).
 
     Still ``NEXT_RELABEL``: the next step IS a relabel, and an agent reading the
@@ -189,8 +213,15 @@ def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL) -> str:
     differs, so nobody re-does by hand what already fired. Written before the
     relabel runs (a later job; it can fail or be cancelled by a push), hence the
     "if no new round starts" fallback rather than a promise.
+
+    ``delay_minutes`` is the caller's ``auto_retry_delay_minutes``: the wait is
+    announced BEFORE it starts, which is the point of saying it at all — an
+    author who reads "being re-run automatically" and sees nothing happen for
+    five minutes otherwise re-runs it by hand. Zero (every caller that has not
+    set it) leaves the sentence exactly as it was.
     """
-    return (f"Nothing — the round is being re-run automatically ({relabel(label)}). Once only; "
+    return (f"Nothing — the round is being re-run automatically{retry_delay_phrase(delay_minutes)} "
+            f"({relabel(label)}). Once only; "
             "if no new round starts, or it is wrong again, re-run it by hand.")
 
 

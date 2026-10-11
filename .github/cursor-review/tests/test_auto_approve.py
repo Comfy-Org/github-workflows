@@ -3348,7 +3348,8 @@ class AutoRetryTest(unittest.TestCase):
 
     def run_decide(self, head=OTHER_SHA, reviews=(), judge="ok", delivered="true",
                    base_ref="main", live_base="main", reviews_fail=False, review_post_error="",
-                   can_relabel="true", round_="2", max_rounds="5", approver=APPROVER, omit_can_relabel=False):
+                   can_relabel="true", round_="2", max_rounds="5", approver=APPROVER, omit_can_relabel=False,
+                   panel=PANEL_OK, retry_errored=None, retry_delay=None):
         self.reviews_posted, self.labels, self.card_writes = [], [], []
 
         def fake_gh(args, payload=None):
@@ -3377,7 +3378,7 @@ class AutoRetryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fpath, dpath, out = (os.path.join(d, n) for n in ("c.json", "pr.patch", "out"))
             with open(fpath, "w") as f:
-                json.dump({"findings": [], "panel": list(PANEL_OK)}, f)
+                json.dump({"findings": [], "panel": list(panel)}, f)
             with open(dpath, "w") as f:
                 f.write(DIFF)
             open(out, "w").close()
@@ -3390,6 +3391,13 @@ class AutoRetryTest(unittest.TestCase):
                                       run_url="https://github.com/o/r/actions/runs/1")
             if not omit_can_relabel:
                 args.can_relabel = can_relabel
+            # Left OFF the namespace unless a test sets them, so every existing
+            # case here still exercises the defaults a caller that has not
+            # opted in gets.
+            if retry_errored is not None:
+                args.retry_errored_rounds = retry_errored
+            if retry_delay is not None:
+                args.retry_delay_minutes = retry_delay
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_severities", lambda *a, **k: []), \
@@ -3529,6 +3537,52 @@ class AutoRetryTest(unittest.TestCase):
                 self.run_decide(can_relabel=value)
                 self.assertFalse(self.retried())
         self.run_decide(omit_can_relabel=True)
+        self.assertFalse(self.retried())
+
+    # -- the errored-panel opt-in ------------------------------------------
+    # The sequel to the above: a round the panel broke, on a head that never
+    # moved. Retrying it was impossible until the gate learned to re-run a
+    # commit it had already reviewed, so this whole section is off by default.
+
+    PANEL_ERR = [{"model": "m", "review_type": "adversarial", "status": "error"}]
+
+    def test_an_errored_panel_is_not_retried_by_default(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR)
+        self.assertFalse(self.retried())
+        body = self.reviews_posted[0]["body"]
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
+        # The hand recovery for a head that never moved: a relabel alone would
+        # be deduped away, which is the wall the opt-in lifts.
+        self.assertIn("Push a commit so the head moves", body)
+
+    def test_an_errored_panel_is_retried_when_the_caller_opts_in(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true")
+        self.assertTrue(self.retried())
+        body = self.reviews_posted[0]["body"]
+        self.assertIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("re-run automatically", body)
+
+    def test_the_opt_in_does_not_widen_the_other_causes(self):
+        # Still structural, still a judge failure the panel cannot fix.
+        self.run_decide(head=SHA, delivered="false", retry_errored="true")
+        self.assertFalse(self.retried())
+        self.run_decide(head=SHA, judge="error", retry_errored="true")
+        self.assertFalse(self.retried())
+
+    def test_the_configured_wait_is_announced_before_it_starts(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR,
+                        retry_errored="true", retry_delay="5")
+        self.assertTrue(self.retried())
+        for body in (self.reviews_posted[0]["body"], self.card_writes[0]):
+            self.assertIn("in about 5 minutes", body)
+
+    def test_no_wait_is_announced_when_none_is_configured(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true")
+        self.assertNotIn("in about", self.reviews_posted[0]["body"])
+
+    def test_the_opt_in_still_obeys_the_one_per_pr_budget(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ERR,
+                        retry_errored="true", reviews=[retried_block(5)])
         self.assertFalse(self.retried())
 
     # -- the relabel itself (the workflow's auto-retry job) ----------------

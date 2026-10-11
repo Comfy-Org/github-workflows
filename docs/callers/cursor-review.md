@@ -140,6 +140,8 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
 | `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `rereview_command` | `''` (off) | A comment command, e.g. `/review`, that asks for ANOTHER round on the **same commit**. Empty leaves the same-commit dedupe absolute. Set the same value on [`cursor-review-auto-label.yml`](cursor-review-auto-label.md) — that half turns the comment into the label event, this half stops the dedupe from skipping the round it starts; setting only one is a silent no-op. Authorized = an `OWNER` / `MEMBER` / `COLLABORATOR` association on the comment. One request buys one round, and `max_rounds` still applies. See [below](#asking-for-another-round-on-the-same-commit). |
+| `auto_retry_errored_rounds` | `false` | Re-run a round AUTOMATICALLY when it could not decide because **reviewers errored** — provider capacity, a cell timeout — rather than because of anything in the diff. The status card and the standing block say so before it happens, naming the wait. Once per PR (the existing auto-retry ceiling), and `max_rounds` still applies. A round that failed for a structural reason, or that found something above the threshold, is never re-run: the next round would hit the same wall. Needs a token that can relabel — the `bot_app_id` App token, not `GITHUB_TOKEN`, whose label edits fire no run. Independent of `rereview_command`: the retry posts no comment and is not authorized by one. See [below](#retrying-a-round-the-panel-broke). |
+| `auto_retry_delay_minutes` | `0` | How long an automatic retry waits before relabelling, in minutes — provider capacity is the usual cause, and a few minutes is what makes the second attempt different from the first. `0` relabels immediately, which is what every caller had before this input. The wait happens on a runner, so it costs runner-minutes on a private repo; that is the whole cost. Clamped to `30`; anything unparsable waits not at all. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 
@@ -295,6 +297,69 @@ Details worth knowing:
   never match); both workflows warn if it is not.
 - Nothing from the comment reaches a log: a comment body is attacker-authored
   text, and these logs may be public.
+
+## Retrying a round the panel broke
+
+`rereview_command` above is the hand version of this: a maintainer notices the
+round failed for a reason that is not about the code, and asks for another. With
+`auto_retry_errored_rounds` the workflow asks for itself.
+
+```yaml
+jobs:
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with:
+      workflows_ref: <the same sha>
+      auto_retry_errored_rounds: true
+      auto_retry_delay_minutes: 5
+    secrets: inherit
+```
+
+What happens, in order:
+
+1. The round ends with no decision because reviewer cells **errored** — a
+   capacity error from a provider, a cell that timed out, an artifact that never
+   arrived. Nothing in the diff caused it.
+2. `decide` posts its standing block and status card saying the round is being
+   re-run automatically, **naming the wait** (`in about 5 minutes`). Said in
+   advance on purpose: an author who reads "re-run automatically" and then sees
+   nothing happen for five minutes re-runs it by hand, which is the work this
+   input exists to remove.
+3. The `auto-retry` job waits, then removes and re-adds the review label — the
+   same relabel the maintainer would have done.
+4. The gate lets that round through its same-commit dedupe, because `decide`'s
+   block carries the auto-retry marker and is newer than the newest consolidated
+   review for this commit.
+
+### What bounds it
+
+- **Once per PR.** The retry is counted by the marker on `decide`'s own block,
+  the budget the moved-head retry (`BE-19526`) already used — so a PR gets one
+  automatic retry across both causes, not one each. If the second round fails
+  too, the card goes back to the hand recovery.
+- **`max_rounds` still applies**, and a round on the last allowed number is not
+  retried at all rather than retried into the cap.
+- **Only a cause a retry can fix.** A structural failure (the findings did not
+  land as threads, the reviewed diff was empty) or findings above the threshold
+  are never retried: the next round would hit the same wall. Mixed causes follow
+  the strictest one.
+- **A token that can actually relabel.** With the `GITHUB_TOKEN` fallback the
+  retry is skipped, because a label applied by `GITHUB_TOKEN` fires no workflow
+  run — it would stop the round rather than restart it. Set `bot_app_id` /
+  `bot_app_private_key`.
+- **No block, no retry.** If the standing block does not land, nothing carries
+  the marker, so nothing counts the retry — and it is skipped rather than fired
+  uncounted.
+
+### Notes
+
+- It is **independent of `rereview_command`**: the retry posts no comment, and
+  the comment path stays authorized by comment association alone. Enabling the
+  retry cannot widen who may ask for a round.
+- The delay burns runner-minutes while it sleeps — the whole cost of the
+  feature, and the reason the input is off by default. Clamped to 30 minutes.
+- A push during the wait cancels the retry along with the rest of the run, which
+  is correct: the new head starts its own round.
 
 ## Gotchas
 

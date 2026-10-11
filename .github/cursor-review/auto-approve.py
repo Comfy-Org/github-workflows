@@ -577,6 +577,20 @@ def _cell_label(cell: dict) -> str:
     return f"{_label_part(cell.get('model'))}:{_label_part(cell.get('review_type'))}"
 
 
+# The withhold reason a short panel produces is COMPUTED (it carries the
+# counts, and may name the review type left with no completed cell), so
+# `auto_retry_eligible` cannot match it against a fixed string the way it
+# matches the head/base races. This suffix is the stable part, built into the
+# reason by `panel_gate` and matched by `is_panel_incomplete_reason` — one
+# constant, so the producer and the matcher cannot drift apart.
+PANEL_INCOMPLETE_SUFFIX = "panel reviewers did not complete"
+
+
+def is_panel_incomplete_reason(reason) -> bool:
+    """True when this withhold reason is "reviewers did not complete"."""
+    return isinstance(reason, str) and PANEL_INCOMPLETE_SUFFIX in reason
+
+
 def panel_gate(panel: list, max_failed: int = 0):
     """(withhold_reason or None, tolerated_cells). Pure.
 
@@ -589,7 +603,7 @@ def panel_gate(panel: list, max_failed: int = 0):
     bad = [c for c in panel if not isinstance(c, dict) or c.get("status") != "ok"]
     if not bad and max_failed <= 0:
         return None, []
-    incomplete = f"{len(bad)}/{len(panel)} panel reviewers did not complete"
+    incomplete = f"{len(bad)}/{len(panel)} {PANEL_INCOMPLETE_SUFFIX}"
     tolerable = [c for c in bad if isinstance(c, dict) and c.get("status") == TOLERABLE_CELL_STATUS]
     if len(tolerable) != len(bad) or len(bad) > max_failed:
         return incomplete, []
@@ -1085,19 +1099,42 @@ MAX_AUTO_RETRIES = 1
 DEFAULT_REVIEW_LABEL = "cursor-review"
 
 
-def auto_retry_eligible(reasons: list) -> bool:
-    """Would a fresh round on the live head decide what this one could not?
+def auto_retry_eligible(reasons: list, retry_errored: bool = False) -> bool:
+    """Would a fresh round decide what this one could not?
 
-    Only when the head moved — that is what makes the next round read different
-    content, so the gate's same-SHA dedupe cannot skip it. A base retarget
-    alongside it rides along (the relabel fixes both); a retarget ALONE does
-    not, because the head is unchanged and the re-run would be deduped away.
-    Any other reason in the list means a re-run would hit the same wall.
+    TWO shapes, and the second one only exists because the wall moved.
+
+    The head moved. That is what makes the next round read different content,
+    so the gate's same-SHA dedupe cannot skip it. A base retarget alongside it
+    rides along (the relabel fixes both); a retarget ALONE does not, because
+    the head is unchanged and the re-run would be deduped away.
+
+    Reviewers ERRORED, with `retry_errored` on. This is the case the docstring
+    above used to rule out — "any other reason means a re-run would hit the
+    same wall" — and the wall was the gate's same-SHA dedupe, which it now
+    lifts for a marked retry (the bypass #407 built for the human command,
+    keyed here on the marker this decision writes rather than on a comment).
+    The content being identical is exactly the point: the round failed on
+    infrastructure — a capacity error, a cell timeout — so running the SAME
+    content again is what decides it. Opt-in because it spends a whole panel
+    on the guess that the failure was transient.
+
+    A reason this cannot fix anywhere in the list still rules out a retry: a
+    structural cause, or findings above the threshold, means the next round
+    hits the same wall whatever the panel does.
     """
     reasons = [r for r in (reasons or []) if isinstance(r, str) and r.strip()]
-    if not reasons or REASON_HEAD_MOVED not in reasons:
+    if not reasons:
         return False
-    return all(r in RETRYABLE_CAUSES for r in reasons)
+    if REASON_HEAD_MOVED in reasons and all(r in RETRYABLE_CAUSES for r in reasons):
+        return True
+    if not retry_errored:
+        return False
+    # At least one reason must BE the errored panel: without this, a lone base
+    # retarget (unfixable by a same-SHA re-run) would pass the `all` below.
+    if not any(is_panel_incomplete_reason(r) for r in reasons):
+        return False
+    return all(r in RETRYABLE_CAUSES or is_panel_incomplete_reason(r) for r in reasons)
 
 
 def auto_retries_spent(reviews: list, approver_login: str) -> int:
@@ -1151,7 +1188,8 @@ def auto_retry_budget_left(args, reasons: list) -> bool:
     """
     if (getattr(args, "can_relabel", "") or "").strip().lower() != "true":
         return False
-    if not auto_retry_eligible(reasons):
+    retry_errored = (getattr(args, "retry_errored_rounds", "") or "").strip().lower() == "true"
+    if not auto_retry_eligible(reasons, retry_errored=retry_errored):
         return False
     if not (getattr(args, "approver_login", "") or "").strip():
         return False
@@ -1522,12 +1560,17 @@ CARD_NEXT_NONE, CARD_NEXT_RESOLVE, CARD_NEXT_RELABEL, CARD_NEXT_HUMAN = "none", 
 CARD_NEXT_PUSH = "push_then_relabel"
 
 
-def _card_text(name: str, args=None) -> str:
+def _card_text(name: str, args=None, **extra) -> str:
     """A card.py next-step text — a function of the review label, or a constant
-    — or "" when card.py cannot be loaded (the card is then skipped anyway)."""
+    — or "" when card.py cannot be loaded (the card is then skipped anyway).
+
+    ``extra`` reaches a text that takes more than the label (the retry's delay).
+    A card.py without that keyword raises, which is the same "" as an unloadable
+    one: the call site keeps its own fallback text.
+    """
     try:
         value = getattr(_load_card(), name)
-        return value(_review_label(args)) if callable(value) else value
+        return value(_review_label(args), **extra) if callable(value) else value
     except Exception:  # noqa: BLE001 — reporting only, see write_round_card
         return ""
 STANDING_REPLACED_MESSAGE = "Superseded by the latest cursor-review round's request for changes."
@@ -1659,7 +1702,8 @@ def card_for_none(args, gate: str, reasons: list, threshold: str, threads: list,
         retry = auto_retry_budget_left(args, reasons)
     hand_text = next_text
     if retry:
-        next_text = _card_text("next_auto_retry_text", args) or next_text
+        next_text = _card_text("next_auto_retry_text", args,
+                               delay_minutes=getattr(args, "retry_delay_minutes", 0)) or next_text
     posted = {}
     rc = post_standing_change_request(args, headline, reasons, next_text, threshold, retry=retry, result=posted)
     if retry and posted.get("id") is None:
@@ -3207,6 +3251,12 @@ def main() -> int:
     # `false` on the GITHUB_TOKEN fallback, which applies labels that fire
     # nothing. Fails closed: only an explicit `true` retries.
     d.add_argument("--can-relabel", default="false")
+    # Whether a round that could not decide because reviewers ERRORED may be
+    # re-run on the same commit (the caller's `auto_retry_errored_rounds`).
+    # Fails closed, like --can-relabel: only an explicit `true`.
+    d.add_argument("--retry-errored-rounds", default="false")
+    # Announced on the card, not waited for here — the `auto-retry` job waits.
+    d.add_argument("--retry-delay-minutes", default="0")
     s = sub.add_parser("dismiss-stale")
     s.add_argument("--repo", required=True)
     s.add_argument("--pr-number", required=True)
