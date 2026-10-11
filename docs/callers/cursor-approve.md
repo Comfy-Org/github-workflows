@@ -253,9 +253,25 @@ per-PR `concurrency:` group cursor-review's caller already carries: it cancels a
 older run when a newer one starts, so two runs never write the card or decide
 on the same PR at once.
 
+Trigger it from `pull_request_target` and keep `APPROVER_TOKEN` in a
+base-branch-only environment passed as `approver_environment` to cursor-review
+and to BOTH cursor-approve phases — see cursor-review's
+[trust model](cursor-review.md#trust-model). On any other event with
+`APPROVER_TOKEN` set, both phases print an error, post no card and no approval,
+and only withdraw that identity's own earlier approvals. That is also why there
+is no `pull_request_review_thread` trigger here: its caller comes from the PR,
+so it may not approve, and the next `pull_request_target` round decides.
+
 ```yaml
+on:
+  pull_request_target:
+    # `edited` is REQUIRED: a base retarget fires only `edited`, and without
+    # it no run reaches `dismiss-stale-approval` to withdraw the approval.
+    types: [opened, reopened, ready_for_review, synchronize, edited, labeled, unlabeled]
+
 concurrency:
-  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  # `edited` gets its own group so a title edit cannot cancel a running panel.
+  group: cursor-review-pr-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && '-edited' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -265,6 +281,7 @@ jobs:
       workflows_ref: <sha>
       approve_max_severity: low
       defer_approval: true  # only cursor-approve's decide approves
+      approver_environment: cursor-approver
     secrets: inherit
 
   approve-start:
@@ -280,6 +297,7 @@ jobs:
     with:
       workflows_ref: <sha>
       phase: start
+      approver_environment: cursor-approver
       commit_sha: ${{ github.event.pull_request.head.sha }}
       axes: correctness,conformance
       round: ${{ needs.cursor-review.outputs.round }}
@@ -319,6 +337,7 @@ jobs:
     with:
       workflows_ref: <sha>
       phase: decide
+      approver_environment: cursor-approver
       commit_sha: ${{ github.event.pull_request.head.sha }}
       axes: correctness,conformance
       max_yellow_axes: 0
@@ -420,6 +439,7 @@ rollup, if at all; telling which leg failed needs per-job conclusions
 | `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. |
 | `approve_scope` | `full` | Decide phase: cursor-review's `approve_scope_effective` output. `delta` → an open above-threshold thread that round marked non-gating (*Outside this round's changes*) does not block resolving the at-or-below-threshold threads, exactly as cursor-review's own decide treats it; the marked thread itself is never resolved. `full` (or empty) → any open above-threshold thread, marked or not, blocks all resolution. Any other value warns and resolves as `full`. |
 | `prior_rounds` | `0` | 0–3. How many earlier rounds of its OWN verdicts each axis sees; `0` turns it off, and every prompt and card is then byte-identical to a caller that never set it. `1`–`3`: the decide phase records this round on the card, and the next round's start phase hands the last N rounds to the axes. Pass the SAME value to both phases and to every axis wrapper. See [Prior rounds](#prior-rounds). |
+| `approver_environment` | `''` | The caller-repo environment holding `APPROVER_TOKEN` as an environment secret, declared on the `approve` job under `pull_request_target` only. With a base-branch-only deployment policy the token is unreachable from `pull_request` runs. Pass the same value to both phases. See cursor-review's [trust model](cursor-review.md#trust-model). |
 
 ## Axis inputs
 

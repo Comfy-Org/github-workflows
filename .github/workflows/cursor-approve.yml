@@ -56,6 +56,10 @@ name: Cursor approve
 #                    marked non-gating stop blocking auto-resolution, as
 #                    cursor-review's own decide does. Default `full`: a marked
 #                    thread blocks like any other (fail-closed)
+#   approver_environment  the caller-repo environment holding APPROVER_TOKEN
+#                    (an environment secret, deployment branches = the base
+#                    branch only), declared on the `approve` job. Default '' =
+#                    none. See docs/callers/cursor-review.md#trust-model.
 #   prior_rounds     0..3 (default 0 = off): how many earlier rounds of each
 #                    axis's own verdicts it sees. decide writes them to the
 #                    card as one base64 sentinel line; start reads them back
@@ -110,6 +114,13 @@ on:
       prior_rounds:
         type: number
         default: 0
+      approver_environment:
+        description: >-
+          The caller-repo environment that holds APPROVER_TOKEN. With a
+          deployment-branch policy of the base branch only, the token is
+          unreachable from `pull_request` runs. Empty (default) = no environment.
+        type: string
+        default: ''
     secrets:
       APPROVER_TOKEN:
         required: false
@@ -126,6 +137,11 @@ jobs:
     name: 'cursor-approve (${{ inputs.phase }})'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The caller environment holding APPROVER_TOKEN; '' = none (the trust
+    # model in docs/callers/cursor-review.md#trust-model). Only under
+    # `pull_request_target`: any other event runs on `refs/pull/<n>/merge`,
+    # which a base-branch-only deployment policy rejects before a step runs.
+    environment: ${{ github.event_name == 'pull_request_target' && inputs.approver_environment || '' }}
     permissions:
       contents: read
       actions: read
@@ -137,6 +153,8 @@ jobs:
           PHASE: ${{ inputs.phase }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          EVENT_NAME: ${{ github.event_name }}
+          APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
         run: |
           case "$PHASE" in
             start|decide) ;;
@@ -149,6 +167,20 @@ jobs:
           esac
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::cursor-approve runs on a pull_request(_target) event only"; exit 1
+          fi
+          # Only `pull_request_target` loads the caller from the base branch; on
+          # any other event a PR can read APPROVER_TOKEN. Post no card and no
+          # approval as it — but still withdraw that identity's own marked
+          # approvals (`withdraw_only`), so one it posted earlier at this head
+          # does not keep satisfying branch protection.
+          if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "::error::APPROVER_TOKEN on a '$EVENT_NAME' run is readable by any PR-head workflow, so this run posts no approval (it still withdraws earlier ones); call this reusable from pull_request_target with approver_environment (docs/callers/cursor-review.md#trust-model)"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "withdraw_only=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$APPROVER_TOKEN" ] && [ -z "$APPROVER_ENVIRONMENT" ]; then
+            echo "::warning::APPROVER_TOKEN without approver_environment is a repo secret that any PR-head pull_request workflow can read; move it into a base-branch-only environment and pass approver_environment (docs/callers/cursor-review.md#trust-model)"
           fi
           if [ -z "$APPROVER_TOKEN" ]; then
             echo "::warning::APPROVER_TOKEN is empty — cursor-approve posts no card and no approval (there is no fallback identity)."
@@ -215,7 +247,7 @@ jobs:
           fi
 
       - name: Load cursor-approve scripts
-        if: steps.token.outputs.present == 'true'
+        if: steps.token.outputs.present == 'true' || steps.token.outputs.withdraw_only == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
@@ -225,7 +257,7 @@ jobs:
 
       - name: Resolve the approver login
         id: login
-        if: steps.token.outputs.present == 'true'
+        if: steps.token.outputs.present == 'true' || steps.token.outputs.withdraw_only == 'true'
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         # Captured, not inlined into the echo: `echo "login=$(...)"` discards the
@@ -239,7 +271,9 @@ jobs:
           echo "login=$login" >> "$GITHUB_OUTPUT"
 
       - name: Withdraw approvals while the axes run
-        if: steps.token.outputs.present == 'true' && inputs.phase == 'start'
+        # Also, in either phase, on a trigger that may not approve (see the
+        # token step).
+        if: (steps.token.outputs.present == 'true' && inputs.phase == 'start') || steps.token.outputs.withdraw_only == 'true'
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           LOGIN: ${{ steps.login.outputs.login }}
