@@ -142,6 +142,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `rereview_command` | `''` (off) | A comment command, e.g. `/review`, that asks for ANOTHER round on the **same commit**. Empty leaves the same-commit dedupe absolute. Set the same value on [`cursor-review-auto-label.yml`](cursor-review-auto-label.md) — that half turns the comment into the label event, this half stops the dedupe from skipping the round it starts; setting only one is a silent no-op. Authorized = an `OWNER` / `MEMBER` / `COLLABORATOR` association on the comment. One request buys one round, and `max_rounds` still applies. See [below](#asking-for-another-round-on-the-same-commit). |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
+| `approver_environment` | `''` | The caller-repo environment that holds `APPROVER_TOKEN` (as an environment secret). Declared as `environment:` on the three jobs that read the token, and on none that checks out PR code. With a deployment-branch policy of the base branch only, the token is unreachable from `pull_request` runs. Use with a `pull_request_target` caller — see the [trust model](#trust-model). Empty = no environment. |
 
 ## Running a model experiment
 
@@ -907,37 +908,63 @@ concurrency:
   cancel-in-progress: true
 ```
 
-**Known residual: the caller can drop the trigger.** For `pull_request` events
+**Known residual: the caller can drop the trigger.** Under `pull_request`
 GitHub runs the caller workflow from the PR's head, so a commit can remove
-`synchronize` (or the whole caller) and no dismissal runs for it. Closing that
-needs dismissal from base-controlled code — e.g. a separate
-`pull_request_target` dismiss-only job that checks out nothing. Until then,
-treat this the same way as the trust model below.
+`synchronize` (or the whole caller) and no dismissal runs for it. Under
+`pull_request_target` the caller comes from the BASE branch, so a PR cannot
+drop its own dismissal — another reason to use the shape in the trust model below.
 
 **Pair it with `detect-unreviewed-merge`'s `ignore-approvers`.** Pass the
 approver identity there, or the bot's approval satisfies that SOC 2 audit and a
 PR merged with no human review files nothing. See
 [`detect-unreviewed-merge.md`](detect-unreviewed-merge.md#automated-approvers-ignore-approvers).
 
-**Trust model — read before letting the approval count.** The approval is
-only as strong as two things a PR author controls:
+### Trust model
 
-- **Prompt injection.** Every signal `decide` gates on — the findings, the
-  panel's status, the judge's status — is model output over the PR's own diff.
-  The panel and judge run with the PR checked out, so a diff written to steer
-  them can produce a clean round, and that round approves. No check computed
-  outside those jobs can tell a genuinely clean diff from a convincing one.
-- **The switch lives in the PR.** For `pull_request` events GitHub runs the
-  caller workflow from the PR's head, so a same-repo PR can add
-  `approve_max_severity` (and drop `synchronize`) in the very commit it wants
-  approved. A repo variable keeps an *admin's* kill switch out of PRs; it does
-  not stop a PR from editing the caller to ignore it.
+Read this before letting the approval count. Call cursor-review (and
+cursor-approve) from **`pull_request_target`** and pass
+**`approver_environment`**:
 
-So enabling auto-approve makes this approval no stronger than **push access**
-to the repo. Do not let it be the only review that satisfies a ruleset for code
-that needs a human's eyes — in particular, think twice before giving it an
-`APPROVER_TOKEN` that is a code owner. Fork PRs never reach it (the `gate` job
-skips them).
+1. Create a caller-repo environment (e.g. `cursor-approver`) whose
+   deployment-branch policy is the base branch only, and store
+   `APPROVER_TOKEN` there as an **environment** secret — delete the repo-level
+   secret. Only the jobs that read it (`post-review`, `dismiss-stale-approval`,
+   `auto-retry`, cursor-approve's `approve`) declare that environment; no job
+   that checks out PR code does.
+2. Switch the caller's `pull_request:` trigger to `pull_request_target:` (same
+   `types:`) and set `approver_environment: cursor-approver`. The panel still
+   reviews the same tree: every PR checkout pins `refs/pull/<n>/merge`, which
+   is what `pull_request` checks out by default.
+
+Why: under `pull_request` GitHub runs the caller workflow from the PR's head,
+so any same-repo PR can rewrite it — or add a new workflow — to read
+`APPROVER_TOKEN`, or add `approve_max_severity` in the very commit it wants
+approved. Under `pull_request_target` the caller comes from the base branch, and
+the base-branch-only environment keeps the token out of every `pull_request`
+run. With `APPROVER_TOKEN` set, the token steps enforce this: under
+`pull_request` they print an `::error::` and do not act as it (the decision
+falls back to the `bot_app_id` App or `github-actions[bot]`; cursor-approve
+posts nothing; `dismiss-stale-approval` still withdraws that identity's own
+stale approvals, so none is stranded), and under `pull_request_target` with no
+`approver_environment` they warn. Neither turns the posting job red.
+
+- **Forks.** The `gate` job still skips cross-repo heads. Under
+  `pull_request_target` a fork run DOES get secrets, so that skip is
+  load-bearing: never remove it or widen it.
+- **Dependabot.** `pull_request_target` runs triggered by Dependabot get the
+  repo's real secrets (not Dependabot's). Skip them in the caller with
+  `if: github.actor != 'dependabot[bot]'` on the job, or let
+  `skip_bot_branch_prefixes` cover Dependabot's branch prefix.
+- **Prompt injection still applies.** Every signal `decide` gates on — the
+  findings, the panel's status, the judge's status — is model output over the
+  PR's own diff. A diff written to steer the panel can produce a clean round,
+  and that round approves. No check computed outside those jobs can tell a
+  genuinely clean diff from a convincing one.
+
+So even in this shape the approval is no stronger than **push access** to the
+repo. Do not let it be the only review that satisfies a ruleset for code that
+needs a human's eyes — think twice before giving it an `APPROVER_TOKEN` that is
+a code owner.
 
 **Who approves.** `APPROVER_TOKEN` if set, else the `bot_app_id` App, else
 `github-actions[bot]`. A GitHub App cannot be a CODE OWNER, so on a ruleset with

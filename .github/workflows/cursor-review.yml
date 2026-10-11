@@ -42,7 +42,11 @@ name: Cursor Review (reusable)
 #     # moment the last finding thread is resolved. Advisory callers
 #     # (`blocking` unset) can keep the narrower label-only pair; see
 #     # docs/callers/cursor-review.md for both shapes.
-#     pull_request:
+#     # `pull_request_target`, not `pull_request`, once APPROVER_TOKEN is in
+#     # play: the caller file then comes from the BASE branch, so a PR cannot
+#     # rewrite it to read the token (docs/callers/cursor-review.md#trust-model).
+#     # Plain `pull_request` still works and is fine without APPROVER_TOKEN.
+#     pull_request_target:
 #       types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
 #     pull_request_review_thread:
 #       types: [resolved, unresolved]
@@ -103,6 +107,9 @@ name: Cursor Review (reusable)
 #         # see docs/callers/cursor-review.md for the full flow, including the
 #         # pull_request_review_thread trigger that re-checks on thread resolution.
 #         blocking: true
+#         # Optional, with APPROVER_TOKEN: the environment holding it as an
+#         # ENVIRONMENT secret, deployment branches = the base branch only.
+#         approver_environment: cursor-approver
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -612,6 +619,20 @@ on:
         type: string
         required: false
         default: '"ubuntu-latest"'
+      approver_environment:
+        description: >-
+          The caller-repo environment that holds APPROVER_TOKEN, declared as
+          `environment:` on exactly the jobs that read it (`post-review`,
+          `dismiss-stale-approval`, `auto-retry`). Give the environment a
+          deployment-branch policy of the base branch only and store
+          APPROVER_TOKEN as an ENVIRONMENT secret there (not a repo secret):
+          the token is then unreachable from `pull_request` runs, which a PR
+          head controls. Pair with a `pull_request_target` caller — see
+          docs/callers/cursor-review.md#trust-model. Empty (default) = no
+          environment, exactly as before.
+        type: string
+        required: false
+        default: ''
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -747,7 +768,7 @@ concurrency:
   #
   # `inputs` is an allowed context in a called workflow's workflow-level
   # `concurrency:`, same as the `env:` block below.
-  group: cursor-review-reusable-${{ github.event.pull_request.number || github.ref }}-${{ ((inputs.review_label != '' && github.event.label.name == inputs.review_label) || github.event.label.name == 'skip-cursor-review' || (inputs.run_without_label && github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize'))) && 'trigger' || format('label-{0}', github.event.label.name) }}
+  group: cursor-review-reusable-${{ github.event.pull_request.number || github.ref }}-${{ ((inputs.review_label != '' && github.event.label.name == inputs.review_label) || github.event.label.name == 'skip-cursor-review' || (inputs.run_without_label && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize'))) && 'trigger' || format('label-{0}', github.event.label.name) }}
   cancel-in-progress: true
 
 # DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
@@ -873,6 +894,9 @@ jobs:
           # neither analyze nor post, so skip cleanly instead of burning the
           # 8-cell matrix + judge and failing red on every external contribution.
           # (head.repo.full_name != github.repository is the cross-repo signal.)
+          # Under a `pull_request_target` caller this skip is LOAD-BEARING, not
+          # just a saving: there a fork run DOES get secrets, and the panel runs
+          # unsandboxed models over the fork's code.
           if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$BASE_REPO" ]; then
             echo "PR is from a fork ($HEAD_REPO != $BASE_REPO) — review needs secrets and write access a fork PR can't have. Skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
@@ -2758,8 +2782,12 @@ jobs:
           PY
 
       - name: Checkout PR repo
+        # Pinned to the PR's merge ref — what `pull_request` checks out by
+        # default — because under `pull_request_target` the default is the BASE
+        # branch, and the panel would review the wrong tree.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
           persist-credentials: false
 
@@ -4215,8 +4243,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR repo
+        # Pinned to the PR's merge ref — what `pull_request` checks out by
+        # default — because under `pull_request_target` the default is the BASE
+        # branch, and the panel would review the wrong tree.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
           persist-credentials: false
 
@@ -4809,8 +4841,12 @@ jobs:
       judge_status: ${{ steps.consolidated.outputs.judge_status }}
     steps:
       - name: Checkout PR repo
+        # Pinned to the PR's merge ref — what `pull_request` checks out by
+        # default — because under `pull_request_target` the default is the BASE
+        # branch, and the panel would review the wrong tree.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
           persist-credentials: false
 
@@ -5326,6 +5362,10 @@ jobs:
     # already `needs:` it), for the round number on the status card decide
     # writes (BE-19489).
     needs: [gate, consolidate, ledger, diff-size, round-cap]
+    # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
+    # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
+    # checks out PR code.
+    environment: ${{ inputs.approver_environment }}
     # `!cancelled()` rather than `always()`, for the same reason
     # `over-cap-comment` documents at its own `if:`: the documented caller sets
     # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
@@ -5809,7 +5849,18 @@ jobs:
           ROUND: ${{ needs.round-cap.outputs.next_round }}
           MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
         run: |
+          # Trust model (docs/callers/cursor-review.md#trust-model): under
+          # `pull_request` the caller workflow comes from the PR head, so any
+          # PR can read APPROVER_TOKEN — refuse to act as it.
+          if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "::error::APPROVER_TOKEN under a pull_request trigger is readable by any PR-head workflow; call this reusable from pull_request_target with approver_environment (docs/callers/cursor-review.md#trust-model)"
+            APPROVER_TOKEN=""
+          elif [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request_target" ] && [ -z "$APPROVER_ENVIRONMENT" ]; then
+            echo "::warning::APPROVER_TOKEN without approver_environment is a repo secret that any PR-head pull_request workflow can read; move it into a base-branch-only environment and pass approver_environment (docs/callers/cursor-review.md#trust-model)"
+          fi
           # Same identity precedence as `Dismiss stale auto-approval`: the login
           # passed here is the one whose earlier approvals an untrusted round
           # withdraws.
@@ -5902,9 +5953,13 @@ jobs:
     # Open PRs only: a title edit on a merged PR must not try a dismissal.
     name: Dismiss stale auto-approval
     if: >-
-      ${{ github.event_name == 'pull_request' &&
+      ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.head.repo.full_name == github.repository }}
+    # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
+    # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
+    # checks out PR code.
+    environment: ${{ inputs.approver_environment }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -6007,7 +6062,18 @@ jobs:
           # Empty = auto-approve is off: its standing requests for changes are
           # withdrawn, since no round will ever approve over them.
           THRESHOLD: ${{ inputs.approve_max_severity }}
+          EVENT_NAME: ${{ github.event_name }}
+          APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
         run: |
+          # Trust model (docs/callers/cursor-review.md#trust-model). Unlike
+          # `Auto-approve decision` this step still ACTS as APPROVER_TOKEN under
+          # `pull_request`: it only withdraws that identity's own approvals, and
+          # dropping to another login would strand a stale approval it posted.
+          if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "::error::APPROVER_TOKEN under a pull_request trigger is readable by any PR-head workflow; call this reusable from pull_request_target with approver_environment (docs/callers/cursor-review.md#trust-model)"
+          elif [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request_target" ] && [ -z "$APPROVER_ENVIRONMENT" ]; then
+            echo "::warning::APPROVER_TOKEN without approver_environment is a repo secret that any PR-head pull_request workflow can read; move it into a base-branch-only environment and pass approver_environment (docs/callers/cursor-review.md#trust-model)"
+          fi
           # Same identity precedence as `Auto-approve decision`, so the login
           # whose reviews are dismissed is the login that posted them.
           if [ -n "$APPROVER_TOKEN" ]; then
@@ -6492,7 +6558,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ -z "$PR_NUMBER" ]; then
-            echo "::error::The blocking gate was triggered by '$EVENT_NAME', which carries no pull_request payload, so it cannot read this PR's review threads. Trigger cursor-review from pull_request / pull_request_review_thread events (see the blocking caller shape in docs/callers/cursor-review.md)."
+            echo "::error::The blocking gate was triggered by '$EVENT_NAME', which carries no pull_request payload, so it cannot read this PR's review threads. Trigger cursor-review from pull_request (or pull_request_target) / pull_request_review_thread events (see the blocking caller shape in docs/callers/cursor-review.md)."
             exit 1
           fi
 
@@ -6902,6 +6968,10 @@ jobs:
     name: Re-run the round (head moved)
     needs: [post-review, panel-integrity, blocking-gate, notify-complete]
     if: ${{ !cancelled() && needs.post-review.outputs.auto_retry == 'true' }}
+    # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
+    # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
+    # checks out PR code.
+    environment: ${{ inputs.approver_environment }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -6990,7 +7060,18 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           REVIEW_LABEL: ${{ inputs.review_label }}
+          EVENT_NAME: ${{ github.event_name }}
+          APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
         run: |
+          # Trust model (docs/callers/cursor-review.md#trust-model): under
+          # `pull_request` the caller workflow comes from the PR head, so any
+          # PR can read APPROVER_TOKEN — refuse to act as it.
+          if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "::error::APPROVER_TOKEN under a pull_request trigger is readable by any PR-head workflow; call this reusable from pull_request_target with approver_environment (docs/callers/cursor-review.md#trust-model)"
+            APPROVER_TOKEN=""
+          elif [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" = "pull_request_target" ] && [ -z "$APPROVER_ENVIRONMENT" ]; then
+            echo "::warning::APPROVER_TOKEN without approver_environment is a repo secret that any PR-head pull_request workflow can read; move it into a base-branch-only environment and pass approver_environment (docs/callers/cursor-review.md#trust-model)"
+          fi
           if [ -n "$APPROVER_TOKEN" ]; then
             export GH_TOKEN="$APPROVER_TOKEN"
           elif [ -n "$BOT_TOKEN" ]; then

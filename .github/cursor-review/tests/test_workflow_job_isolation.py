@@ -441,6 +441,66 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         self.assertIn("name: cursor-review-consolidated", post)
         self.assertIn("actions/download-artifact@", post)
 
+    def test_environment_is_declared_only_on_the_approver_token_jobs(self):
+        # approver_environment confines APPROVER_TOKEN to a base-branch-only
+        # environment. Declaring it on a PR-checkout job would hand that
+        # environment's secrets to a job running models over PR code.
+        token_jobs = sorted(
+            name
+            for name, body in self.jobs.items()
+            if any("secrets.APPROVER_TOKEN" in line for line in code_lines(body))
+        )
+        self.assertEqual(
+            token_jobs, ["auto-retry", "dismiss-stale-approval", "post-review"]
+        )
+        env_jobs = sorted(
+            name
+            for name, body in self.jobs.items()
+            if any(re.match(r"^    environment:", line) for line in code_lines(body))
+        )
+        self.assertEqual(env_jobs, token_jobs)
+        for name in env_jobs:
+            body = code_lines(self.jobs[name])
+            self.assertIn(
+                "    environment: ${{ inputs.approver_environment }}", body, name
+            )
+            self.assertFalse(
+                checks_out_pr_repo(self.jobs[name]),
+                f"`{name}` declares the approver environment and checks out PR code",
+            )
+        approve = read_lines(APPROVE_WORKFLOW)
+        self.assertEqual(
+            [line for line in approve if re.match(r"^\s+environment:", line)],
+            ["    environment: ${{ inputs.approver_environment }}"],
+        )
+
+    def test_every_pr_checkout_pins_a_ref(self):
+        # Under pull_request_target actions/checkout defaults to the BASE
+        # branch, so a PR checkout with no `ref:` would review the wrong tree.
+        pinned = 0
+        for name, body in self.jobs.items():
+            for step in split_steps(body):
+                lines = outside_run_blocks(code_lines(step))
+                if not any(CHECKOUT.match(line) for line in lines):
+                    continue
+                if any(
+                    (m := REPOSITORY.match(line)) and scalar(m.group(1)) == ASSETS_REPO
+                    for line in lines
+                ):
+                    continue
+                refs = [line for line in lines if re.match(r"^\s+ref:\s*\S", line)]
+                self.assertTrue(refs, f"`{name}` checks out PR code with no `ref:`")
+                pinned += 1
+        self.assertGreaterEqual(pinned, 5)
+
+
+def read_lines(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read().split("\n")
+
+
+APPROVE_WORKFLOW = os.path.join(os.path.dirname(WORKFLOW), "cursor-approve.yml")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
