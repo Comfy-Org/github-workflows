@@ -163,14 +163,21 @@ The workflow now does it itself: it removes and re-adds the review label, **once
 per PR**, and the card says so instead of asking you to. The next step stays
 `relabel` on the contract marker, so an agent reading it waits for the new round
 either way. decide only decides; the relabel is the run's LAST job
-(`Re-run the round (head moved)`), after the Blocking gate, Panel integrity and
+(`Re-run the round`), after the Blocking gate, Panel integrity and
 completion jobs, because the label events it fires cancel whatever of the run is
 still going in the caller's `cancel-in-progress` group.
 
-It fires only when a fresh round would actually decide differently — the head
-moved (a base retarget alongside it rides along). Every other transient cause
-leaves the head where it was, and the gate's same-SHA `dup` check would skip the
-re-run, so those still ask for a human. The budget is counted off the PR's own
+It fires only when a fresh round would actually decide differently. By default
+that means the head moved (a base retarget alongside it rides along): every
+other transient cause leaves the head where it was, and the gate's same-SHA
+`dup` check would skip the re-run, so those ask for a human. A cursor-review
+caller can add one more cause with
+[`auto_retry_errored_rounds`](cursor-review.md#retrying-a-round-the-panel-broke)
+— a round that could not decide because reviewer cells **errored**, which is
+retryable on the same commit because the gate lifts its dedupe for the marked
+block (and which can wait first, `auto_retry_delay_minutes`, the card naming
+the wait). Both causes share the ONE budget below, so a PR gets one automatic
+retry, not one each. The budget is counted off the PR's own
 reviews — each retry's standing block carries `<!-- cursor-review-auto-retry -->`
 and still counts once dismissed — so it holds across rounds and across runs; a
 retry whose block did not post is never fired, since nothing would count it. An

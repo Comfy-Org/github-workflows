@@ -272,6 +272,40 @@ on:
         type: string
         required: false
         default: ''
+      auto_retry_errored_rounds:
+        description: >-
+          Opt-in: re-run a round AUTOMATICALLY when it could not decide because
+          reviewers errored — a capacity error, a cell timeout — rather than
+          because of anything in the diff. Default false. The round is re-run
+          once per PR (the existing auto-retry ceiling), the status card says so
+          before it happens, and `max_rounds` still applies; a round that failed
+          for a structural reason, or that found something above the threshold,
+          is never re-run because the next round would hit the same wall.
+          Independent of `rereview_command`, which is the HUMAN path: that one
+          keys on an authorized comment, and the retry posts no comment. The
+          retry's own force signal is the marked block decide already writes
+          (`AUTO_RETRY_MARKER`), which the gate accepts when it is newer than
+          the newest consolidated review for this commit and was posted by a
+          Bot or by the identity that applied the label — so one marked block
+          buys exactly one round. No effect without `approve_max_severity`,
+          and needs `bot_app_id` or APPROVER_TOKEN to relabel.
+        type: boolean
+        required: false
+        default: false
+      auto_retry_delay_minutes:
+        description: >-
+          How long to wait before an automatic retry relabels, in minutes.
+          Default 0 (immediately), which is the behaviour every existing caller
+          has. Worth setting for `auto_retry_errored_rounds`, because the
+          failures it retries are usually provider capacity and a few minutes
+          is what makes the second attempt different from the first. The wait
+          happens on a runner, so it costs runner-minutes on a private repo —
+          that is the whole cost of this feature. Clamped to 30 rather than
+          holding a runner all day; anything unparsable waits not at all. The
+          status card names the wait before it starts.
+        type: number
+        required: false
+        default: 0
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -965,6 +999,11 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REREVIEW_COMMAND: ${{ inputs.rereview_command }}
+          AUTO_RETRY_ERRORED: ${{ inputs.auto_retry_errored_rounds }}
+          # Who fired this event: on a relabel, the identity that applied the
+          # label. The auto-retry relabels as the same identity decide posted
+          # its marked block under, so the two logins match (see below).
+          EVENT_SENDER: ${{ github.event.sender.login }}
         run: |
           # Idempotency: skip the matrix if a Cursor Review consolidated
           # review already exists for this exact HEAD SHA. Protects against
@@ -1038,18 +1077,79 @@ jobs:
             *[[:space:]]*)
               echo "::warning::rereview_command contains whitespace, so it can never match a comment's first token — use a single token such as /review." ;;
           esac
-          if [ "$EXISTING" -gt 0 ] && [ -n "${REREVIEW_COMMAND:-}" ]; then
+          # Two force signals, deliberately separate. A HUMAN asks with
+          # `rereview_command` and is authorized by the comment's association.
+          # The workflow's own auto-retry posts no comment at all — it writes
+          # the marked block below — and must not be able to reach the human
+          # path, or any App comment could force rounds.
+          LAST_REVIEW=""
+          if [ "$EXISTING" -gt 0 ] \
+             && { [ -n "${REREVIEW_COMMAND:-}" ] || [ "${AUTO_RETRY_ERRORED:-}" = "true" ]; }; then
             LAST_REVIEW=$(printf '%s' "$REVIEWS" \
               | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel"))) | .submitted_at] | max // ""' \
               2>/dev/null || echo "")
-            if [ -n "$LAST_REVIEW" ]; then
-              FORCED=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
-                | jq -s --arg cmd "$REREVIEW_COMMAND" --arg since "$LAST_REVIEW" \
-                    '[.[][] | select(.created_at > $since)
-                            | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
-                            | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^[ \t]+"; "") | sub("[ \t].*$"; "")) == $cmd)] | length' \
-                2>/dev/null || echo 0)
-              case "$FORCED" in ''|*[!0-9]*) FORCED=0 ;; esac
+          fi
+
+          if [ -n "$LAST_REVIEW" ] && [ -n "${REREVIEW_COMMAND:-}" ]; then
+            FORCED=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
+              | jq -s --arg cmd "$REREVIEW_COMMAND" --arg since "$LAST_REVIEW" \
+                  '[.[][] | select(.created_at > $since)
+                          | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+                          | select(((.body // "") | split("\n")[0] // "" | sub("\r$"; "") | sub("^[ \t]+"; "") | sub("[ \t].*$"; "")) == $cmd)] | length' \
+              2>/dev/null || echo 0)
+            case "$FORCED" in ''|*[!0-9]*) FORCED=0 ;; esac
+          fi
+
+          # The workflow's own retry. `decide` writes a block carrying
+          # AUTO_RETRY_MARKER once it has decided to re-run the round, and the
+          # `auto-retry` job relabels afterwards — so a marked block NEWER than
+          # the newest consolidated review for this commit IS the request, and
+          # it buys exactly one round: the round it starts posts a newer
+          # review, after which the marker is older than that review and counts
+          # for nothing.
+          #
+          # Newer by review `id`, not `submitted_at`: ids increase
+          # monotonically, while timestamps have one-second precision and decide
+          # posts its block right after the consolidated review, so the two can
+          # share a second.
+          #
+          # Who may have written it. decide posts under APPROVER_TOKEN when one
+          # is set — a PAT, so `user.type` is "User" — else under the bot App.
+          # This job holds neither token, so it cannot learn the approver login
+          # (the credential split's point). It accepts the block when its author
+          # is a Bot (the App case, and the residual the dedupe above already
+          # accepts: another installed App), or when its author is the identity
+          # that fired THIS event — the PAT case, since `auto-retry` relabels as
+          # the same identity decide posted under. A human can satisfy the
+          # second only by relabelling themselves, which already needs label
+          # write on the repo. The block must also be decide's own shape (it
+          # starts with the auto-approve marker, and carries the retry marker as
+          # a line of its own, not quoted inside other text) and not DISMISSED.
+          #
+          # What bounds a forged marker is `max_rounds` and who can post one —
+          # not this check, which counts a request rather than capping retries;
+          # decide's own one-per-PR budget caps the retries it starts.
+          #
+          # The markers are duplicated from auto-approve.py's APPROVE_MARKER
+          # and AUTO_RETRY_MARKER on purpose — the gate runs before any asset is
+          # loaded — and a test pins them equal, as the relabel's label constant
+          # already is.
+          if [ "$FORCED" -eq 0 ] && [ -n "$LAST_REVIEW" ] && [ "${AUTO_RETRY_ERRORED:-}" = "true" ]; then
+            LAST_REVIEW_ID=$(printf '%s' "$REVIEWS" \
+              | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel"))) | .id | numbers] | max // 0' \
+              2>/dev/null || echo 0)
+            case "$LAST_REVIEW_ID" in ''|*[!0-9]*) LAST_REVIEW_ID=0 ;; esac
+            RETRIED=$(printf '%s' "$REVIEWS" \
+              | jq --arg sha "$HEAD_SHA" --argjson since "$LAST_REVIEW_ID" \
+                  --arg sender "${EVENT_SENDER:-}" \
+                  --arg approve '<!-- cursor-review-auto-approve -->' \
+                  --arg marker '<!-- cursor-review-auto-retry -->' \
+                  '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and ((.id // 0) | numbers) > $since and ((.user.type == "Bot") or ($sender != "" and (.user.login // "") == $sender)) and ((.body // "") | startswith($approve)) and ((.body // "") | split("\n") | any(. == $marker)))] | length' \
+              2>/dev/null || echo 0)
+            case "$RETRIED" in ''|*[!0-9]*) RETRIED=0 ;; esac
+            if [ "$LAST_REVIEW_ID" -gt 0 ] && [ "$RETRIED" -gt 0 ]; then
+              FORCED=1
+              echo "An automatic retry was requested after the last round — proceeding."
             fi
           fi
 
@@ -5796,6 +5896,8 @@ jobs:
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
           MAX_FAILED_REVIEWERS: ${{ inputs.approve_max_failed_reviewers }}
+          RETRY_ERRORED_ROUNDS: ${{ inputs.auto_retry_errored_rounds }}
+          RETRY_DELAY_MINUTES: ${{ inputs.auto_retry_delay_minutes }}
           # aggregate-panel.py's step output, written before the judge ran —
           # not consolidated.json, which `consolidate` builds after the judge
           # (`--trust`, same job) could have rewritten its inputs.
@@ -5864,7 +5966,9 @@ jobs:
             --max-rounds "$MAX_ROUNDS" \
             --run-url "$RUN_URL" \
             --review-label "$REVIEW_LABEL" \
-            --can-relabel "$CAN_RELABEL"
+            --can-relabel "$CAN_RELABEL" \
+            --retry-errored-rounds "$RETRY_ERRORED_ROUNDS" \
+            --retry-delay-minutes "$RETRY_DELAY_MINUTES"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
@@ -6899,11 +7003,15 @@ jobs:
     # `!cancelled()` so a skipped or red one does not skip the retry; a push that
     # cancels this run before it gets here leaves the card's "if no new round
     # starts, re-run it by hand" as the recovery.
-    name: Re-run the round (head moved)
+    name: Re-run the round
     needs: [post-review, panel-integrity, blocking-gate, notify-complete]
     if: ${{ !cancelled() && needs.post-review.outputs.auto_retry == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 5 for the relabel itself, plus the 30 `auto_retry_delay_minutes` is
+    # clamped to: a job killed mid-wait would leave the card promising a round
+    # that never starts. A ceiling, not a reservation — a caller that set no
+    # delay still finishes in seconds.
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -6979,6 +7087,38 @@ jobs:
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: Wait before re-running
+        # The failures this retries are overwhelmingly provider capacity, so a
+        # few minutes is what makes the second attempt different from the
+        # first. Default 0 keeps every existing caller's behaviour.
+        #
+        # The wait is a sleeping runner, which is this feature's whole cost on
+        # a private repo. Clamped to 30 minutes, and anything unparsable is
+        # treated as 0 rather than holding a runner on a typo.
+        #
+        # The wait widens the window in which this job can be cancelled: a
+        # caller whose concurrency group is keyed on the PR alone, with
+        # `cancel-in-progress: true`, loses the pending retry to ANY event on
+        # the PR during the sleep — a label, an edit — not only a push. The
+        # card's "if no new round starts, re-run it by hand" is the recovery;
+        # docs/callers/cursor-review.md says so.
+        if: ${{ inputs.auto_retry_delay_minutes != 0 }}
+        env:
+          DELAY_MINUTES: ${{ inputs.auto_retry_delay_minutes }}
+        run: |
+          mins="${DELAY_MINUTES:-0}"
+          case "$mins" in ''|*[!0-9]*) mins=0 ;; esac
+          # More than three digits is over the cap whatever it says, and a long
+          # enough one overflows bash's integers before the test below can clamp it.
+          if [ "${#mins}" -gt 3 ]; then mins=30; fi
+          if [ "$mins" -gt 30 ]; then mins=30; fi
+          if [ "$mins" -eq 0 ]; then
+            echo "No usable retry delay — re-running immediately."
+            exit 0
+          fi
+          echo "Waiting ${mins} minute(s) before re-running the round, so a transient provider failure has time to clear."
+          sleep "$(( mins * 60 ))"
 
       - name: Remove and re-add the review label
         env:
