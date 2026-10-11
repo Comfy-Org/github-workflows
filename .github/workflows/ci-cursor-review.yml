@@ -33,10 +33,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@0c58c65b5fbdfc295293b5cfc8ee3518f2665a55 # github-workflows main (0c58c65)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1569c2670cf567ad56b726dbbc7157fd316c34fa # github-workflows main (1569c26)
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
-      workflows_ref: 0c58c65b5fbdfc295293b5cfc8ee3518f2665a55
+      workflows_ref: 1569c2670cf567ad56b726dbbc7157fd316c34fa
       # No `panel_models:` here on purpose. The reusable now reads the
       # CURSOR_PANEL_MODELS variable itself, resolved against this repo and the
       # org, so wiring the same variable through an input would be redundant.
