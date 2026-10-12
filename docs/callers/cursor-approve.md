@@ -75,14 +75,19 @@ is a *concern* and this is the absence of one — conflating them is what made
 axis reports `n/a` is withheld: nothing was actually judged. An `n/a` must name
 what the axis looked for and where; one that does not is untrusted.
 
-The card shows ONE line per axis — the axis's `headline`, capped at 100
-characters and required, which has to state **what decided the verdict** rather
-than what the axis read. The full `summary` and the confidence are in the job
-summary behind the run link; the card is the glance, not the record. A missing
-headline makes that axis untrusted, since a verdict with no reason beside it is
-the exact failure the field was added to fix. An over-long one is clamped to the
-cap at a word boundary with "…" rather than rejected, because the model's length
-is not deterministic; one with nothing but punctuation to keep is untrusted.
+The card's table shows each axis's `headline` whole — one sentence, capped at
+240 characters and required, which has to state **what decided the verdict**
+rather than what the axis read. Under the result, one collapsed "full
+reasoning" block per axis carries its `summary` and confidence, so the detail
+is one click away on the PR itself; the run's job summary records the same. A
+missing headline makes that axis untrusted, since a verdict with no reason
+beside it is the exact failure the field was added to fix. An over-long one is
+clamped rather than rejected, because the model's length is not deterministic:
+the clamp keeps every whole sentence that fits, and only a first sentence
+longer than the cap is cut at a word boundary with "…"; one with nothing but
+punctuation to keep is untrusted. Every model string on the card — the cells
+and the blocks — is sanitised, so none can add a table row, a heading, a
+mention or a contract marker.
 
 ## The status card contract
 
@@ -476,7 +481,7 @@ Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
 transcript, plus the proxy's call log for the context axes. On a context axis
 each tool call in it is cut to the tool's name: no arguments and no results, so
 no Linear, Notion or Slack content. Only the verdict
-JSON (`verdict`, `confidence`, `headline` capped at 100 characters, `summary`
+JSON (`verdict`, `confidence`, `headline` capped at 240 characters, `summary`
 capped at 1200) reaches `cursor-approve.yml`; its `axis-*` download never
 matches a transcript.
 

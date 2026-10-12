@@ -36,20 +36,24 @@ Each verdict carries two strings, with different jobs and different audiences:
 
 | Field | Cap | Where it goes |
 |---|---|---|
-| `headline` | 100 chars, **required** | the PR card — ONE line, the reason for the verdict |
-| `summary` | 1200 chars | the run's job summary, behind the card's "workflow run" link |
+| `headline` | 240 chars, **required** | the PR card's Why cell — ONE sentence, the reason for the verdict, shown whole |
+| `summary` | 1200 chars | a collapsed "full reasoning" block under the card's table, and the run's job summary |
 
 The split exists because one field could not do both. The card used to show the
 first sentence of `summary`, and `summary` is where a model writes its process
 ("Checked the only changed file…", "I read root AGENTS.md and CLAUDE.md…") — so
 the card said what the axis *did* and never why it ruled as it did, which is
 unreadable on a yellow. `headline` must state what decided the verdict, and a
-missing one makes the axis untrusted. An over-long one is clamped to the cap at
-a word boundary with "…", not rejected: the model's length is not
-deterministic, and rejecting turned a sound verdict's axis job red on length
-alone. The opening words carry the reason, so the clamp keeps it — falling
-back to a hard cut when the last fitting space is in the first half, and
-rejecting one that leaves nothing but punctuation before the "…".
+missing one makes the axis untrusted. An over-long one is clamped, not
+rejected: the model's length is not deterministic, and rejecting turned a sound
+verdict's axis job red on length alone. The clamp keeps every whole sentence
+that fits, with no "…" (a `.`, `!` or `?` before whitespace ends a sentence,
+except after "e.g." and similar abbreviations), because the card exists to
+show a reason and a sentence stopped mid-thought does not (BE-20249: at the
+old 100-character cap it cut ordinary one-sentence reasons). Only a first
+sentence longer than the cap is cut at a word boundary with "…" — falling back
+to a hard cut when the last fitting space is in the first half, and rejecting
+one that leaves nothing but punctuation before the "…".
 
 Placeholders — `{{pr_number}}`, `{{repo}}`, `{{head_sha}}`,
 `{{merge_base_sha}}`, `{{base_ref}}`, `{{context_file}}` — are filled by

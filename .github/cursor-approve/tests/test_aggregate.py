@@ -549,7 +549,7 @@ class ExtractCli(unittest.TestCase):
     def test_an_overlong_headline_is_clamped_in_the_artifact(self):
         """The axis job's "Extract the verdict" step used to exit 1 here on a
         headline a few characters over the cap, failing the whole axis job."""
-        long = "The handler " + "reads the payload twice " * 5 + "on the retry path."
+        long = "The handler " + "reads the payload twice " * 12 + "on the retry path."
         self.assertGreater(len(long), AG.HEADLINE_MAX)
         code, _, err = self.extract(json.dumps(
             {"verdict": "green", "confidence": 1, "headline": long, "summary": "ok"}))
@@ -622,7 +622,9 @@ class HeadlineTest(DecideCase):
         # the model's length is not deterministic, so the cap is enforced here.
         self.write_all()
         long = ("The new retry loop drops the context deadline on the second "
-                "attempt, so a cancelled request keeps retrying past its budget.")
+                "attempt, so a cancelled request keeps retrying past its budget, holds its "
+                "connection-pool slot for the whole backoff window, and reports the late "
+                "failure as a fresh upstream error on the dashboard that pages nobody.")
         self.assertGreater(len(long), AG.HEADLINE_MAX)
         self.write("business", self.raw(headline=long))
         result = self.decide()
@@ -633,14 +635,16 @@ class HeadlineTest(DecideCase):
         self.assertTrue(long.startswith(headline[:-1]))
 
     def test_the_clamp_cuts_at_a_word_boundary(self):
-        headline = AG.clamp_headline("word " * 30)
+        fits = AG.HEADLINE_MAX // 5  # "word " is five characters
+        self.assertEqual(AG.HEADLINE_MAX % 5, 0)
+        headline = AG.clamp_headline("word " * (fits + 10))
         self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
-        self.assertEqual(headline, ("word " * 20).rstrip() + "…")
+        self.assertEqual(headline, ("word " * fits).rstrip() + "…")
         self.assertEqual(len(headline), AG.HEADLINE_MAX)
 
     def test_the_clamp_hard_cuts_when_the_only_space_is_early(self):
         # "Fix…" would keep almost none of the reason.
-        long = "Fix: " + "x" * 200
+        long = "Fix: " + "x" * (AG.HEADLINE_MAX * 2)
         headline = AG.clamp_headline(long)
         self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
 
@@ -649,24 +653,82 @@ class HeadlineTest(DecideCase):
         self.assertEqual(headline, "x" * (AG.HEADLINE_MAX - 1) + "…")
 
     def test_the_clamp_drops_trailing_punctuation_before_the_ellipsis(self):
-        headline = AG.clamp_headline("a" * 90 + ", " + "b" * 20)
-        self.assertEqual(headline, "a" * 90 + "…")
+        keep = AG.HEADLINE_MAX - 10
+        headline = AG.clamp_headline("a" * keep + ", " + "b" * 20)
+        self.assertEqual(headline, "a" * keep + "…")
 
     def test_the_clamp_rejects_a_separator_only_headline(self):
-        for long in ("-" * 101, ";" * 150, ", " * 80):
+        for long in ("-" * (AG.HEADLINE_MAX + 1), ";" * (AG.HEADLINE_MAX + 50), ", " * AG.HEADLINE_MAX):
             with self.subTest(long=long[:10]):
                 with self.assertRaises(ValueError):
                     AG.clamp_headline(long)
 
     def test_a_separator_only_overlong_headline_is_untrusted(self):
         self.write_all()
-        self.write("business", self.raw(headline="-" * 101))
+        self.write("business", self.raw(headline="-" * (AG.HEADLINE_MAX + 1)))
         self.assertEqual(self.decide()["event"], AG.NONE)
 
     def test_the_clamp_falls_back_when_the_word_cut_is_all_separators(self):
-        long = "-" * 60 + " " + "abc" * 20
+        long = "-" * (AG.HEADLINE_MAX // 2 + 10) + " " + "abc" * AG.HEADLINE_MAX
         headline = AG.clamp_headline(long)
         self.assertEqual(headline, long[:AG.HEADLINE_MAX - 1] + "…")
+
+    def test_a_headline_within_the_cap_is_kept_whole(self):
+        # BE-20249: at 100 characters the clamp cut ordinary one-sentence
+        # reasons mid-thought; within the cap a headline is never touched.
+        headline = ("Round-4 changes hold up and each new test fails without its fix; "
+                    "the cache is still not wired into the request path.")
+        self.assertGreater(len(headline), 100)
+        self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
+        self.assertEqual(AG.clamp_headline(headline), headline)
+
+    def test_the_clamp_keeps_the_whole_first_sentence(self):
+        first = "Both new branches handle an empty payload."
+        long = first + " " + "The second sentence runs on " * 12 + "past the cap."
+        self.assertGreater(len(long), AG.HEADLINE_MAX)
+        self.assertEqual(AG.clamp_headline(long), first)
+
+    def test_the_clamp_keeps_every_whole_sentence_that_fits(self):
+        two = "Backfill rewrites rows the API still reads. The new index covers it!"
+        long = two + " " + "And a third sentence that never ends " * 8 + "here."
+        self.assertEqual(AG.clamp_headline(long), two)
+
+    def test_a_question_mark_ends_a_sentence_too(self):
+        first = "Is the retry budget shared across replicas?"
+        self.assertEqual(AG.clamp_headline(first + " " + "word " * AG.HEADLINE_MAX), first)
+
+    def test_an_abbreviation_does_not_end_a_sentence(self):
+        # "e.g." followed by a space is not a sentence end: cutting there is
+        # the mid-thought cut the clamp exists to avoid, so this one sentence
+        # past the cap takes the word-boundary "…" instead.
+        long = "Every empty case is handled, e.g. a missing body, " + "and then some more words " * 12
+        headline = AG.clamp_headline(long)
+        self.assertTrue(headline.endswith("…"))
+        self.assertGreater(len(headline), len("Every empty case is handled, e.g."))
+        for abbrev in ("(e.g.", "i.e.", "vs.", "etc."):
+            with self.subTest(abbrev=abbrev):
+                text = f"Rebuild {abbrev} Observe " + "keeps every late charge " * 12
+                self.assertTrue(AG.clamp_headline(text).endswith("…"))
+
+    def test_a_decimal_or_a_file_name_does_not_end_a_sentence(self):
+        long = "The quote costs $1.50 more in store.go when " + "the tier changes again " * 12
+        headline = AG.clamp_headline(long)
+        self.assertTrue(headline.endswith("…"))
+        self.assertTrue(long.startswith(headline[:-1]))
+
+    def test_a_sentence_end_that_keeps_no_word_is_ignored(self):
+        long = "-. " + "the reason runs on " * 20
+        headline = AG.clamp_headline(long)
+        self.assertNotEqual(headline, "-.")
+        self.assertTrue(headline.endswith("…"))
+
+    def test_an_overlong_multi_sentence_headline_reaches_decide_whole_sentences(self):
+        self.write_all()
+        first = "The cache key ignores the tenant, so two workspaces share entries."
+        self.write("business", self.raw(headline=first + " " + "More detail follows here " * 12))
+        result = self.decide()
+        self.assertEqual(result["event"], AG.APPROVE)
+        self.assertEqual(result["axes"]["business"]["headline"], first)
 
     def test_the_limit_itself_is_accepted(self):
         self.write_all()
