@@ -169,7 +169,8 @@ was written for. A later event on the same head leaves it alone; a newer push
 rewrites it again.
 
 With cursor-review's `auto_rereview_after_dismissal`, the next step reads
-"a new round starts automatically in about N minutes", still `relabel` on the
+"a new round starts automatically at HH:MM UTC (N min after the latest push)" —
+the start time, rewritten by each newer push's dismissal — still `relabel` on the
 contract marker. After `auto_rereview_delay_minutes` the workflow relabels only
 if the head has not moved again (a newer push schedules its own wait), the
 review label has not been applied since the card was written (a human, the

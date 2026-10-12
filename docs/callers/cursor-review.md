@@ -326,7 +326,8 @@ What happens, in order:
    capacity error from a provider, a cell that timed out, an artifact that never
    arrived. Nothing in the diff caused it.
 2. `decide` posts its standing block and status card saying the round is being
-   re-run automatically, **naming the wait** (`in about 5 minutes`). Said in
+   re-run automatically, **naming when** (`at 05:42 UTC (5 min after this round ended)`,
+   in UTC, with the date only across a UTC midnight). Said in
    advance on purpose: an author who reads "re-run automatically" and then sees
    nothing happen for five minutes re-runs it by hand, which is the work this
    input exists to remove.

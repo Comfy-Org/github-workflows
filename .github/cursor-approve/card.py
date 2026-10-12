@@ -70,6 +70,7 @@ heading, fire a mention or forge the card marker.
 import argparse
 import base64
 import binascii
+import datetime
 import importlib.util
 import json
 import os
@@ -204,8 +205,15 @@ def next_push_text(label=DEFAULT_REVIEW_LABEL) -> str:
             f"skips a head that already carries a review — then re-run the round: {relabel(label)}.")
 
 
-def retry_delay_phrase(delay_minutes=0) -> str:
-    """" in about N minutes", or "" — the advance notice for a delayed retry.
+def retry_delay_phrase(delay_minutes=0, after="", now=None) -> str:
+    """" at HH:MM UTC (N min after <after>)", or "" — the advance notice for a
+    delayed retry.
+
+    The start time, not the wait: an author reads the card minutes after it
+    was written, when "in about 5 minutes" no longer says when. It is `now`
+    (the moment the wait is scheduled; injectable for tests) plus the clamped
+    delay, in UTC, with the date only when it falls on another UTC day. A
+    newer push's dismissal rewrites the card, so the time is the live schedule.
 
     Sanitised here as well as in the workflow that clamps the input, because
     this text is posted as the approver: the value arrives as a caller input,
@@ -219,10 +227,16 @@ def retry_delay_phrase(delay_minutes=0) -> str:
     if mins < 1:
         return ""
     mins = min(mins, RETRY_DELAY_CAP)
-    return f" in about {mins} minute{'s' if mins != 1 else ''}"
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    now = now.astimezone(datetime.timezone.utc) if now.tzinfo else now.replace(tzinfo=datetime.timezone.utc)
+    start = now + datetime.timedelta(minutes=mins)
+    when = start.strftime("%H:%M UTC")
+    if start.date() != now.date():
+        when += start.strftime(" on %Y-%m-%d")
+    return f" at {when} ({mins} min after {after or 'now'})"
 
 
-def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0) -> str:
+def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=None) -> str:
     """The relabel the workflow is doing itself (BE-19526).
 
     Still ``NEXT_RELABEL``: the next step IS a relabel, and an agent reading the
@@ -237,8 +251,9 @@ def next_auto_retry_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0) -> str:
     five minutes otherwise re-runs it by hand. Zero (every caller that has not
     set it) leaves the sentence exactly as it was.
     """
-    return (f"Nothing — the round is being re-run automatically{retry_delay_phrase(delay_minutes)} "
-            f"({relabel(label)}). Once only; "
+    when = retry_delay_phrase(delay_minutes, "this round ended", now)
+    how = f": {relabel(label)}." if when else f" ({relabel(label)})."
+    return (f"Nothing — the round is being re-run automatically{when}{how} Once only; "
             "if no new round starts, or it is wrong again, re-run it by hand.")
 
 
@@ -662,11 +677,12 @@ def with_rereview_history(body: str, existing_body) -> str:
     return _append_line(body, rereview_sentinel(rereview_heads(existing_body)))
 
 
-def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0) -> str:
+def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=None) -> str:
     """The relabel the dismiss path schedules itself (BE-20262), announced
     before the wait. A promise it may not keep — a newer push, a human's own
     relabel or the round cap all cancel it — hence the fallback."""
-    return (f"Nothing — a new round starts automatically{retry_delay_phrase(delay_minutes)} if no further "
+    when = retry_delay_phrase(delay_minutes, "the latest push", now)
+    return (f"Nothing — a new round starts automatically{when} if no further "
             f"commit lands ({relabel(label)}). If none starts, re-run it by hand.")
 
 

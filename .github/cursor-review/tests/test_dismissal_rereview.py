@@ -218,7 +218,9 @@ class DismissalCardTest(Base):
     def test_flag_on_schedules_the_round_and_says_so(self):
         fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X)])
         self.dismiss(fake, auto="true")
-        self.assertIn("a new round starts automatically in about 10 minutes", fake.patches[-1])
+        # The start time, from the moment the dismissal scheduled the wait.
+        self.assertRegex(fake.patches[-1], r"a new round starts automatically at \d\d:\d\d UTC "
+                                           r"(on \d{4}-\d\d-\d\d )?\(10 min after the latest push\)")
         self.assertIn("<!-- cursor-approve-next: relabel -->", fake.patches[-1])
         self.assertEqual(self.outputs().get("auto_rereview"), "true")
         self.assertEqual(self.outputs().get("rereview_head"), Y)

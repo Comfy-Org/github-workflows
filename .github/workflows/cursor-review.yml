@@ -309,7 +309,7 @@ on:
           happens on a runner, so it costs runner-minutes on a private repo —
           that is the whole cost of this feature. Clamped to 30 rather than
           holding a runner all day; anything unparsable waits not at all. The
-          status card names the wait before it starts.
+          status card names the start time (UTC) before the wait begins.
         type: number
         required: false
         default: 0
@@ -334,7 +334,7 @@ on:
           How long `auto_rereview_after_dismissal` waits before relabelling, in
           minutes: the debounce that lets a burst of pushes settle. Default 10.
           The wait happens on a runner. Clamped to 30; anything unparsable
-          waits not at all. The status card names the wait before it starts.
+          waits not at all. The status card names the start time (UTC) before the wait begins.
         type: number
         required: false
         default: 10
