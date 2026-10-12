@@ -83,6 +83,7 @@ class FakeGitHub:
         self.reviews = list(reviews or [])
         self.timeline = list(timeline or [])
         self.fail_patch = fail_patch
+        self.fail_put = self.fail_label = False
         self.patches, self.labels = [], []
 
     def __call__(self, args, payload=None):
@@ -102,8 +103,12 @@ class FakeGitHub:
             self.card["body"] = payload["body"]
             return json.dumps(self.card)
         if args[:3] == ["api", "-X", "PUT"]:
+            if self.fail_put:
+                raise RuntimeError("gh api failed: HTTP 403")
             return "{}"
         if args[:3] in (["api", "-X", "DELETE"], ["api", "-X", "POST"]) and "/labels" in args[3]:
+            if self.fail_label and args[2] == "POST":
+                raise RuntimeError("gh api failed: HTTP 502")
             self.labels.append(args[2])
             return "{}"
         raise AssertionError(f"unexpected gh call {args}")
@@ -255,6 +260,37 @@ class DismissalCardTest(Base):
         self.assertEqual(fake.patches, [])
         self.assertEqual(self.outputs().get("auto_rereview"), "false")
 
+    def test_an_approval_withdrawn_on_its_own_head_marks_the_card(self):
+        # Same head, same base: the veto, the hand-off or `--all-approvals`
+        # withdrew it this run, or it was already dismissed. Never "Approved".
+        cases = [({"labels": [AA.SKIP_REVIEW_LABEL]}, "no_decision", f"Approved `{X[:7]}`; that approval was "
+                  f"withdrawn, and the PR carries `{AA.SKIP_REVIEW_LABEL}`."),
+                 ({"labels": [AA.HUMAN_REVIEW_LABEL]}, "capped", f"withdrawn (the PR carries `{AA.HUMAN_REVIEW_LABEL}`)"),
+                 ({"reviews": [approval(1, X, state="DISMISSED")]}, "no_decision", "withdrawn (it was dismissed)")]
+        for fake_kw, state, text in cases:
+            fake = FakeGitHub(**{"head": X, "card": pass_card(), "reviews": [approval(1, X)], **fake_kw})
+            self.dismiss(fake, auto="true")
+            self.assertEqual(CARD.card_state(fake.patches[-1]), state, fake_kw)
+            self.assertIn(text, fake.patches[-1], fake_kw)
+            self.assertEqual(self.outputs().get("auto_rereview"), "false", fake_kw)
+
+    def test_a_failed_dismissal_leaves_the_card_and_schedules_nothing(self):
+        fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X)])
+        fake.fail_put = True
+        self.assertEqual(self.dismiss(fake, auto="true"), 1)
+        self.assertEqual(fake.patches, [])
+        self.assertNotEqual(self.outputs().get("auto_rereview"), "true")
+
+    def test_a_veto_rewrites_a_card_whose_round_already_started(self):
+        fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X)])
+        self.dismiss(fake, auto="true")
+        fake.card["body"] = CARD.mark_auto_rereview(fake.card["body"], Y)
+        fake.pr["labels"] = [{"name": AA.SKIP_REVIEW_LABEL}]
+        self.dismiss(fake, auto="true")
+        self.assertIn("<!-- cursor-approve-next: human -->", fake.patches[-1])
+        self.assertEqual(CARD.rereview_heads(fake.patches[-1]), [Y])
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
     def test_a_failed_card_write_is_a_warning_and_schedules_nothing(self):
         fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X)], fail_patch=True)
         self.assertEqual(self.dismiss(fake, auto="true"), 0)
@@ -309,6 +345,16 @@ class AutoRereviewTest(Base):
         fake = FakeGitHub(card=self.stale_card(), timeline=earlier)
         self.rereview(fake)
         self.assertEqual(fake.labels, ["DELETE", "POST"])
+
+    def test_a_failed_relabel_says_so_on_the_card_and_keeps_the_record(self):
+        fake = FakeGitHub(card=self.stale_card(), reviews=[approval(1, X)])
+        fake.fail_label = True
+        self.assertEqual(self.rereview(fake), 1)
+        body = fake.card["body"]
+        self.assertNotIn("was started automatically", body)
+        self.assertIn(f"Starting a new round for `{Y[:7]}` automatically failed: remove and re-add the "
+                      "`cursor-review` label to start it.", body)
+        self.assertEqual(CARD.rereview_heads(body), [Y])
 
     def test_no_record_no_relabel(self):
         fake = FakeGitHub(card=self.stale_card(), fail_patch=True)

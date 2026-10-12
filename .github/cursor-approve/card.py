@@ -687,7 +687,7 @@ def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=Non
 
 
 def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, capped: bool, next_text: str,
-                     run_url: str, same_head: bool = False, vetoed: bool = False) -> str:
+                     run_url: str, same_head: bool = False, vetoed: bool = False, why=None) -> str:
     """The card once the approval of `approved_sha` stopped counting.
 
     Below the cap: `no_decision` / `relabel` — the new head needs its own
@@ -696,15 +696,18 @@ def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, cap
     relabel is deduped away: `push_then_relabel`, as decide's `retargeted`. At
     the cap (or already handed to a human): `capped` / `human`, as the cap
     path. Vetoed (`skip-cursor-review`): `no_decision` / `human`, as decide's
-    `vetoed`.
+    `vetoed`. `why` replaces the `same_head` reason in parentheses ("" drops
+    it), for an approval withdrawn on its own head and base.
 
     The round heading of the card it replaces is kept (its round, and the
     approved commit), and so is the axes history (`upsert`).
     """
     old7 = approved_sha[:7] if SHA_RE.fullmatch(approved_sha or "") else "unknown"
     new7 = head_sha[:7] if SHA_RE.fullmatch(head_sha or "") else "unknown"
-    moved = (f"Approved `{old7}`; that approval was withdrawn (the base branch changed, or the head moved and "
-             "came back)" if same_head else f"Approved `{old7}`; the head moved to `{new7}`")
+    if why is None:
+        why = "the base branch changed, or the head moved and came back"
+    moved = (f"Approved `{old7}`; that approval was withdrawn" + (f" ({why})" if why else "")
+             if same_head else f"Approved `{old7}`; the head moved to `{new7}`")
     if capped:
         state, next_step, next_text = STATE_CAPPED, NEXT_HUMAN, NEXT_HUMAN_CAPPED_TEXT
         headline = f"{moved}, and the round limit is reached, so a human is needed."
@@ -736,6 +739,16 @@ def mark_auto_rereview(body: str, head_sha: str, delay_note: str = "") -> str:
     lines = [body, "", f"🔁 _A new round for `{head_sha[:7]}` was started automatically{delay_note}._",
              "", rereview_sentinel(heads + [head_sha])]
     return "\n".join(lines) + "\n"
+
+
+def mark_auto_rereview_failed(body: str, head_sha: str, label=DEFAULT_REVIEW_LABEL) -> str:
+    """`body` (from `mark_auto_rereview`) once the relabel itself failed: the
+    "started automatically" line says it did not, and the record stays."""
+    started = re.compile(r"^🔁 _A new round for `" + re.escape(head_sha[:7]) + r"` was started automatically[^\n]*$",
+                         re.MULTILINE)
+    failed = (f"⚠️ _Starting a new round for `{head_sha[:7]}` automatically failed: "
+              f"{relabel(label)} to start it._")
+    return started.sub(lambda _: failed, body, count=1)
 
 
 def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, headline: str,

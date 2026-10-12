@@ -154,8 +154,11 @@ withdraws it — the ruleset's stale-approval dismissal, or cursor-review's
 then rewrites the card, so it no longer says `pass` for a commit nothing
 approves any more. It does so for a `pass` card whose commit the approver
 actually approved (dismissed or not); a `pass` card with no such approval is a
-round in progress, and is left alone. The round heading and the axes history
-are kept, and a failed write is a warning, never a failure:
+round in progress, and is left alone. An approval withdrawn on its own head and
+base (a veto, `needs-human-review`, or a dismissal) rewrites it too, naming that
+reason. The round heading and the axes history are kept, a failed write is a
+warning, never a failure, and a run that could not withdraw every stale approval
+leaves the card as it is:
 
 | Case | `state` / `next` | Card says |
 |---|---|---|
@@ -180,7 +183,8 @@ unvetoed, and it is under `max_rounds`. It records the head on the card first �
 a visible line, plus `<!-- cursor-approve:auto-rereview v1 <sha>,… -->`, which
 every later card write carries forward — so each head gets at most one
 automatic round, and a head that flips back gets none. It never runs past the
-cap: there the card asks for a human.
+cap: there the card asks for a human. If the relabel itself fails, that visible
+line is rewritten to say so and to relabel by hand; the record stays.
 
 ### Why a relabel alone is not always enough (BE-19527)
 

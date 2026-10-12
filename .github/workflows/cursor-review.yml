@@ -7327,8 +7327,12 @@ jobs:
     # that was dismissed, nothing has started a round since the card was
     # written, the PR is open, not a draft, unvetoed and under `max_rounds`.
     # A newer push during the wait reaches its own dismiss job, which
-    # schedules its own wait; a caller whose concurrency group cancels on
-    # every PR event loses this one to it, which is the same outcome.
+    # schedules its own wait. KNOWN GAP: the wait lives in the source run, so
+    # any later event in the same `label-` concurrency slot cancels it. A
+    # `pull_request`/`pull_request_target` event replaces it (its dismiss job
+    # re-schedules from the stale card); a `pull_request_review_thread` run,
+    # e.g. resolving a thread right after the push, does not, and no round
+    # starts. The card's "If none starts, re-run it by hand" covers that.
     name: Start the next round after a dismissal
     needs: dismiss-stale-approval
     if: ${{ !cancelled() && needs.dismiss-stale-approval.outputs.auto_rereview == 'true' }}

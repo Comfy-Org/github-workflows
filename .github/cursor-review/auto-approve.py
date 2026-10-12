@@ -2698,9 +2698,12 @@ def cmd_dismiss_stale(args) -> int:
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
     approval_stands = any(rid not in withdrawn for rid in own_approvals(reviews, args.approver_login))
     blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review, approval_stands)
-    if read_error is None and SHA_HEX_RE.fullmatch(live_head or ""):
+    # Only once every stale approval is actually withdrawn: a card that says
+    # "withdrawn" over an approval still counting (and a round scheduled on
+    # top of it) is worse than the old "Approved" card the red run reports.
+    if read_error is None and SHA_HEX_RE.fullmatch(live_head or "") and not failed and not others:
         try:
-            mark_card_stale(args, pr, reviews, live_head, live_base, vetoed, human_review)
+            mark_card_stale(args, pr, reviews, live_head, live_base, vetoed, human_review, withdrawn)
         except Exception as e:  # noqa: BLE001 — the card is a report; never fail the dismissal for it
             print(f"::warning::Could not mark the cursor-approve card stale: {annotation_cause(e, 'unknown error')}")
     return 1 if failed or others or blocks_failed else 0
@@ -2773,7 +2776,8 @@ def _true(value) -> bool:
     return str(value or "").strip().lower() == "true"
 
 
-def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, vetoed, human_review: bool) -> None:
+def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, vetoed, human_review: bool,
+                    withdrawn=()) -> None:
     """Rewrite a card whose approved commit stopped counting, and decide
     whether the workflow re-runs the round itself (`auto_rereview` output).
 
@@ -2781,14 +2785,17 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     author passes `approve_authors` — and only for the card the approver
     wrote. The card qualifies when it says `pass` for a commit this identity
     actually approved (dismissed or not: the ruleset may have withdrawn it
-    first) and that commit is no longer the head, or the base moved under it;
-    or when it is already the stale card for an older head. A `pass` card
+    first) and that commit is no longer the head, or the base moved under it,
+    or that approval no longer counts on the head it names (this run withdrew
+    it — a veto, `needs-human-review`, `--all-approvals` — or it was already
+    dismissed); or when it is already the stale card for an older head. A `pass` card
     without such an approval is a round in progress (the pending and start
     cards), which is left alone.
 
     Written only when it changes, since this job runs on every PR event.
     """
     set_output("auto_rereview", "false")
+    why = None
     login = (args.approver_login or "").strip()
     if not login or not (getattr(args, "threshold", None) or "").strip():
         return
@@ -2809,11 +2816,17 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
             return
         base = recorded_base(approval.get("body") or "")
         base_moved = live_base is not None and base is not None and base != live_base
+        counts = approval.get("state") == "APPROVED" and approval.get("id") not in withdrawn
         if approved == live_head and not base_moved:
-            return
-    elif stale_for == live_head and live_head in card.rereview_heads(body):
+            if counts:
+                return
+            # Same head, same base: say why it went, not "the base changed".
+            why = ("" if vetoed else f"the PR carries `{HUMAN_REVIEW_LABEL}`" if human_review
+                   else "it was dismissed")
+    elif stale_for == live_head and live_head in card.rereview_heads(body) and not (vetoed or human_review):
         # The round started for this head owns the card now; a rewrite here
-        # would replace "started automatically" with a by-hand relabel.
+        # would replace "started automatically" with a by-hand relabel. A veto
+        # or the hand-off still rewrites it: no round is coming after either.
         return
     # A stale card already written for the live head keeps its reason: one
     # written when the base moved names the approved commit as its head.
@@ -2835,7 +2848,7 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     else:
         next_text = card.next_push_text(label)
     new = card.render_dismissed(body, approved, live_head, getattr(args, "max_rounds", ""), capped, next_text,
-                                "", same_head=not head_moved, vetoed=bool(vetoed))
+                                "", same_head=not head_moved, vetoed=bool(vetoed), why=why)
     new = card.with_rereview_history(card.with_axes_history(new, body), body)
     if new.strip() != body.strip():
         try:
@@ -2946,13 +2959,22 @@ def cmd_auto_rereview(args) -> int:
     if labeled_after(timeline, label, found.get("updated_at")):
         return skip(f"`{label}` was applied since the card was written, so a round is already under way")
     try:
-        card.upsert(args.repo, args.pr_number, args.approver_login, card.mark_auto_rereview(body, head), card=found)
+        recorded = card.mark_auto_rereview(body, head)
+        written = card.upsert(args.repo, args.pr_number, args.approver_login, recorded, card=found)
     except (RuntimeError, ValueError) as e:
         return skip(f"the card could not record it ({annotation_cause(e, 'unknown error')}), and without that "
                     "record nothing stops a second automatic round for this head")
     err = relabel_review_label(args.repo, args.pr_number, label)
     if err:
         print(f"::error::Could not start the round automatically: {err}")
+        # The card said the round started; say it did not. The record stays,
+        # so this head is still never relabelled twice automatically.
+        try:
+            card.upsert(args.repo, args.pr_number, args.approver_login,
+                        card.mark_auto_rereview_failed(recorded, head, label), card=written)
+        except (RuntimeError, ValueError) as e:
+            print(f"::warning::Could not correct the card after the failed relabel: "
+                  f"{annotation_cause(e, 'unknown error')}")
         return 1
     emit(f"🔁 **Auto-approve: started a round for `{head[:7]}`** — `{label}` was removed and re-added.")
     return 0
