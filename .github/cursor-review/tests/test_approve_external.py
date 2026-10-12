@@ -578,20 +578,24 @@ class ApproveExternal(unittest.TestCase):
 
     def test_agrees_with_aggregate_on_every_verdict_combination(self):
         # The two halves of the decide path must share one rule: every
-        # decision aggregate.py reaches, approve-external reaches too.
+        # decision aggregate.py reaches, approve-external reaches too, under
+        # every cap the CLI accepts for two axes (0..1), so the yellow-overflow
+        # branch is exercised. The cap itself is not re-checked (see the
+        # docstring): a NONE over the cap stays NONE via the event alone.
         agg_spec = importlib.util.spec_from_file_location(
             "aggregate", os.path.join(HERE, "..", "..", "cursor-approve", "aggregate.py"))
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
         axes = AXES.split(",")
         kinds = ("green", "yellow", "red", agg.NA)
-        for a in kinds:
-            for b in kinds:
-                outputs = {axes[0]: (a, 0.9, "s", "h"), axes[1]: (b, 0.9, "s", "h")}
-                decision = agg.decide(outputs, axes, max_yellow=2)
-                with self.subTest(verdicts=(a, b)):
-                    self.assertEqual(aa.external_decision_approves(decision, axes),
-                                     decision["event"] == agg.APPROVE)
+        for max_yellow in range(len(axes)):
+            for a in kinds:
+                for b in kinds:
+                    outputs = {axes[0]: (a, 0.9, "s", "h"), axes[1]: (b, 0.9, "s", "h")}
+                    decision = agg.decide(outputs, axes, max_yellow=max_yellow)
+                    with self.subTest(verdicts=(a, b), max_yellow=max_yellow):
+                        self.assertEqual(aa.external_decision_approves(decision, axes),
+                                         decision["event"] == agg.APPROVE)
 
 
 if __name__ == "__main__":
