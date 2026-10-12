@@ -79,7 +79,9 @@ class ApproveExternal(unittest.TestCase):
     def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster="",
                 card_url=CARD_URL, **extra):
         if event is None:
-            event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
+            vs = list(verdicts.values())
+            event = ("APPROVE" if vs and all(v in ("green", "yellow", "n/a") for v in vs)
+                     and any(v != "n/a" for v in vs) else "NONE")
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "decision.json")
             with open(path, "w", encoding="utf-8") as f:
@@ -559,6 +561,37 @@ class ApproveExternal(unittest.TestCase):
     def test_unreadable_decision_posts_nothing(self):
         self.assertFalse(aa.external_decision_approves(None, ["correctness"]))
         self.assertFalse(aa.external_decision_approves({"event": "APPROVE", "verdicts": "x"}, ["correctness"]))
+
+    def test_one_na_axis_beside_a_green_one_approves(self):
+        # A comment-only PR: correctness has nothing in scope, conformance is
+        # green. aggregate.py approves this; approve-external must post it.
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "n/a", "conformance": "green"})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+
+    def test_all_na_withholds_even_if_the_file_says_approve(self):
+        fake = FakeGitHub()
+        rc, outcome = self.run_cmd(fake, {"correctness": "n/a", "conformance": "n/a"}, event="APPROVE")
+        self.assertEqual((rc, outcome), (0, "not_approved"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+
+    def test_agrees_with_aggregate_on_every_verdict_combination(self):
+        # The two halves of the decide path must share one rule: every
+        # decision aggregate.py reaches, approve-external reaches too.
+        agg_spec = importlib.util.spec_from_file_location(
+            "aggregate", os.path.join(HERE, "..", "..", "cursor-approve", "aggregate.py"))
+        agg = importlib.util.module_from_spec(agg_spec)
+        agg_spec.loader.exec_module(agg)
+        axes = AXES.split(",")
+        kinds = ("green", "yellow", "red", agg.NA)
+        for a in kinds:
+            for b in kinds:
+                outputs = {axes[0]: (a, 0.9, "s", "h"), axes[1]: (b, 0.9, "s", "h")}
+                decision = agg.decide(outputs, axes, max_yellow=2)
+                with self.subTest(verdicts=(a, b)):
+                    self.assertEqual(aa.external_decision_approves(decision, axes),
+                                     decision["event"] == agg.APPROVE)
 
 
 if __name__ == "__main__":
