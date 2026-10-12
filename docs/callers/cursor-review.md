@@ -1030,7 +1030,7 @@ cursor-approve) from **`pull_request_target`** and pass
    deployment-branch policy is the base branch only, and store
    `APPROVER_TOKEN` there as an **environment** secret — delete the repo-level
    secret. Only the jobs that read it (`post-review`, `dismiss-stale-approval`,
-   `auto-retry`, cursor-approve's `approve`) declare that environment, and
+   `auto-retry`, `auto-rereview`, cursor-approve's `approve`) declare that environment, and
    only on `pull_request_target` runs; no job that checks out PR code does.
 2. **Public repositories:** check the repo's Actions policy insights first.
    GitHub's default event policy blocks `pull_request_target` in public

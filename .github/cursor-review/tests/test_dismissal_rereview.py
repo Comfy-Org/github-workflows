@@ -372,6 +372,16 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIn("auto-approve.py\" auto-rereview", job)
         self.assertIn("--head-sha \"$HEAD_SHA\"", job)
 
+    def test_approver_token_promises_a_round_only_where_auto_rereview_accepts_it(self):
+        # auto-rereview exits 1 on APPROVER_TOKEN off pull_request_target, so
+        # the dismiss job must not schedule (or promise on the card) that round.
+        step = self.text[self.text.index("          CAN_RELABEL=false\n          if [ -n \"$APPROVER_TOKEN\" ]; then"):]
+        approver = step[:step.index("          elif [ -n \"$BOT_TOKEN\" ]; then")]
+        self.assertIn('if [ "$EVENT_NAME" = "pull_request_target" ]; then CAN_RELABEL=true; fi', approver)
+        self.assertNotIn("            CAN_RELABEL=true\n", approver)
+        job = self.text[self.text.index("  auto-rereview:\n"):]
+        self.assertIn('if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then', job)
+
     def test_the_delay_clamp_matches_the_card_sentence(self):
         job = self.text[self.text.index("  auto-rereview:\n"):]
         self.assertIn(f"if [ \"$mins\" -gt {CARD.RETRY_DELAY_CAP} ]; then mins={CARD.RETRY_DELAY_CAP}; fi", job)

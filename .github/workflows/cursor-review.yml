@@ -682,8 +682,8 @@ on:
         description: >-
           The caller-repo environment that holds APPROVER_TOKEN, declared as
           `environment:` on exactly the jobs that read it (`post-review`,
-          `dismiss-stale-approval`, `auto-retry`), on `pull_request_target`
-          runs only. Give the environment a
+          `dismiss-stale-approval`, `auto-retry`, `auto-rereview`), on
+          `pull_request_target` runs only. Give the environment a
           deployment-branch policy of the base branch only and store
           APPROVER_TOKEN as an ENVIRONMENT secret there (not a repo secret):
           the token is then unreachable from `pull_request` runs, which a PR
@@ -6260,7 +6260,9 @@ jobs:
           if [ -n "$APPROVER_TOKEN" ]; then
             export GH_TOKEN="$APPROVER_TOKEN"
             LOGIN="$(gh api user --jq .login)"
-            CAN_RELABEL=true
+            # `auto-rereview` refuses APPROVER_TOKEN off pull_request_target,
+            # so promise no automatic round the card cannot keep.
+            if [ "$EVENT_NAME" = "pull_request_target" ]; then CAN_RELABEL=true; fi
           elif [ -n "$BOT_TOKEN" ]; then
             export GH_TOKEN="$BOT_TOKEN"
             LOGIN="${APP_SLUG}[bot]"
