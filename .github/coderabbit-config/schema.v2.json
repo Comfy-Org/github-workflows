@@ -886,7 +886,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.7",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.8",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -902,7 +902,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable markdownlint | markdownlint-cli2 is a static analysis tool to enforce standards and consistency for Markdown files. | Enable markdownlint integration. | v0.23.2",
+									"description": "Enable markdownlint | markdownlint-cli2 is a static analysis tool to enforce standards and consistency for Markdown files. | Enable markdownlint integration. | v0.23.3",
 									"type": "boolean"
 								}
 							}
@@ -981,7 +981,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.13",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.14",
 									"type": "boolean"
 								}
 							}
@@ -1128,7 +1128,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.17",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.19",
 									"type": "boolean"
 								}
 							}
@@ -1182,7 +1182,7 @@
 									"properties": {
 										"enabled": {
 											"default": true,
-											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.8.0",
+											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.8.1",
 											"type": "boolean"
 										}
 									}
@@ -1196,7 +1196,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Flake8 | Flake8 is a Python linter that wraps PyFlakes, pycodestyle and Ned Batchelder's McCabe script. | v7.3.0",
+									"description": "Enable Flake8 | Flake8 is a Python linter that wraps PyFlakes, pycodestyle and Ned Batchelder's McCabe script. | v7.4.1",
 									"type": "boolean"
 								}
 							}
@@ -1325,7 +1325,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Cppcheck | Cppcheck is a static code analysis tool for the C and C++ programming languages. | v2.21.0",
+									"description": "Enable Cppcheck | Cppcheck is a static code analysis tool for the C and C++ programming languages. | v2.22.0",
 									"type": "boolean"
 								}
 							}
@@ -1337,7 +1337,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.21.0",
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.22.0",
 									"type": "boolean"
 								}
 							}
@@ -1361,7 +1361,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.30.0",
+									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.30.1",
 									"type": "boolean"
 								}
 							}
@@ -1389,7 +1389,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.50462",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.50961",
 									"type": "boolean"
 								}
 							}
@@ -1477,7 +1477,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.83.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.85.0",
 									"type": "boolean"
 								}
 							}
@@ -1623,7 +1623,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.27",
+									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.31",
 									"type": "boolean"
 								}
 							}
