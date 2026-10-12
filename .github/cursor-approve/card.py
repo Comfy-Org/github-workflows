@@ -33,6 +33,13 @@ whatever the outcome, while every phase here runs only after a ``pass`` (or a
 ``capped``) the caller's ``if:`` let through. On a ``pass`` the start phase
 then overwrites it with the axes table, as before.
 
+Every review that decide posts links the card (BE-20246), and so must exist
+before it: a review cannot be edited afterwards to add the link, because
+auto-approve.py treats an edited approval as stale and never withdraws an
+edited request for changes. So on a PR's first round decide calls ``ensure``
+just before its review, which creates the card from ``render_pending`` when
+there is none, and the round's ``render_round`` replaces that in the same step.
+
 Every card carries two machine-readable markers on the lines right after
 ``CARD_MARKER`` — ``STATE_MARKER`` and ``NEXT_MARKER`` — a stable contract
 for agents, documented in docs/callers/cursor-approve.md.
@@ -496,6 +503,25 @@ def _gating_row(finding: dict) -> str:
     return f"- **{sev}** — {ref} — {link}" + (f" — gated: {why}" if why else "")
 
 
+PENDING_TEXT = ("Deciding this round. This card is rewritten with the result in a moment; if it still says "
+                "this, the card was not updated, so this round's latest auto-approve review is the decision and "
+                "the workflow run says why.")
+
+
+def render_pending(round_no, max_rounds, sha: str, run_url: str) -> str:
+    """The card decide creates on a PR's first round, just before posting the
+    review that links to it (BE-20246); ``render_round`` replaces it seconds
+    later, in the same step.
+
+    ``no_decision``/``none``: nothing has been decided yet, and nothing is asked
+    of an agent that reads the card in that window. A ``next`` with a remedy in
+    it would have an agent push or relabel under a round that may be approving.
+    """
+    lines = card_head(STATE_NO_DECISION, NEXT_NONE) + [heading(round_no, max_rounds, sha), "", f"**{PENDING_TEXT}**"]
+    lines += ["", _reviewed_line(sha, run_url)]
+    return "\n".join(lines) + "\n"
+
+
 def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, headline: str,
                  reasons: list, next_text: str, run_url: str, gating=None, threshold: str = "") -> str:
     """The card cursor-review's decide writes for the round it just decided.
@@ -722,13 +748,39 @@ def list_comments(repo: str, pr_number) -> list:
     return [c for page in pages for c in page] if pages and isinstance(pages[0], list) else pages
 
 
-def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None) -> dict:
+def _comment(text: str) -> dict:
+    """A comment write's response, which must name the comment it wrote."""
+    comment = json.loads(text)
+    if not isinstance(comment, dict) or comment.get("id") is None:
+        raise ValueError(f"the comment write returned no comment id ({type(comment).__name__})")
+    return comment
+
+
+def ensure(repo: str, pr_number, login: str, body: str) -> tuple:
+    """(card, created): this PR's card, created with `body` when there is none.
+
+    For a review that links the card, which needs the comment's URL before it
+    is posted: this file's ``ensure`` phase, and cursor-review's decide on a
+    PR's first round (BE-20246).
+    """
+    card = find_card(list_comments(repo, pr_number), login)
+    if card is not None:
+        return card, False
+    return _comment(gh(["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "--input", "-"],
+                       {"body": body})), True
+
+
+def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None, card=None) -> dict:
     """Edit the existing card in place, or create it when there is none.
 
     The card's axes sentinel is carried into `body` (see `with_axes_history`);
     `entry` and `keep` are decide's; `keep` stays None for every other writer.
+    `card` is a card this run created seconds ago (``ensure``): it is edited
+    without listing the comments again, since a listing taken that soon after
+    the write could miss it and post a second card.
     """
-    card = find_card(list_comments(repo, pr_number), login)
+    if card is None:
+        card = find_card(list_comments(repo, pr_number), login)
     body = with_axes_history(body, card.get("body") if card is not None else "", entry, keep)
     if card is not None:
         return json.loads(gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{card['id']}", "--input", "-"],
@@ -795,10 +847,8 @@ def main(argv=None) -> int:
         body = render_start(args.round, args.max_rounds, args.commit_sha, axes, args.approve_gate, args.run_url)
     elif args.cmd == "ensure":
         try:
-            card = find_card(list_comments(args.repo, args.pr_number), args.login)
-            if card is None:
-                body = render_start(args.round, args.max_rounds, args.commit_sha, axes, "", args.run_url)
-                card = upsert(args.repo, args.pr_number, args.login, body)
+            card, _ = ensure(args.repo, args.pr_number, args.login,
+                             render_start(args.round, args.max_rounds, args.commit_sha, axes, "", args.run_url))
         except (RuntimeError, ValueError) as e:
             print(f"::warning::Could not find or create the cursor-approve card: {e}")
             return 0

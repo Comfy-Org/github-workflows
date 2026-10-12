@@ -48,7 +48,8 @@ the context axes (business, design, completeness) are not available yet.
    label-keyed concurrency group cannot cancel that in-flight decide),
    records the reviewed SHA in the review body, and withdraws this identity's
    own earlier approvals whenever it does not approve. An approval is one line
-   linking the card. The card is rewritten with the verdicts, the result and
+   linking the card, and the standing block a withheld round leaves links it
+   too. The card is rewritten with the verdicts, the result and
    the rule — or "Superseded by a newer commit" when the head moved. The same
    step writes the axes' full summaries and confidences to **this run's job
    summary**, which is what the card's "workflow run" link leads to.
@@ -116,6 +117,15 @@ Read them from the start of the comment body. A released value is not renamed (t
 | `changes_requested` | cursor-review decide | "Not approved: N finding(s) above `<threshold>` gate this round", one line per gating finding (severity, `file:line`, thread link, why it gated: inside this round's changes, a live re-raise, High/Critical anywhere, or `full` scope), or the earlier open threads that held it | `resolve_then_relabel` | Fix or reply to the gating threads, resolve them, then start a new round: remove and re-add the `cursor-review` label. |
 | `no_decision` | cursor-review decide | "No decision this round", with `decide_gate`'s reasons verbatim (e.g. "2/6 panel reviewers did not complete") | `relabel` when the head moved (the one transient cause a relabel alone clears); `push_then_relabel` for a transient cause that left the head where it was (a reviewer or the judge errored, the PR could not be read, the base alone was retargeted); `human` for a structural one (the findings did not land as threads, the reviewed diff is empty) | Re-run the round: remove and re-add the `cursor-review` label. / Nothing — the round is being re-run automatically (see below). / Push a commit so the head moves, then re-run the round. / A human is needed: <cause>. |
 | `capped` | cursor-review decide, or this workflow's start phase | Needs a human (`needs-human-review`, or the round limit) | `human` | A human is needed: the bot withdraws its own request for changes on this hand-off, so a human's review decides this PR — if one still shows, its withdrawal failed (see the run log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the round count. |
+
+**The pending card (BE-20246).** Every auto-approve review links the card, so
+the card has to exist before the review does. On a PR's first round,
+cursor-review's decide therefore creates it a few seconds early, just before
+posting its review. That card reads "Deciding this round" with
+`no_decision` / `none`, and the round's card replaces it in the same step.
+`none` means wait. A remedy there would have an agent push or relabel during a
+round that may be approving. If the pending card stays, the card write failed:
+the latest auto-approve review is the decision, and the workflow run says why.
 
 The decide phase maps its outcome onto the same contract: `approved` →
 `pass`/`none`; `not_approved` (an axis was red, missing, had no headline, too

@@ -12,7 +12,11 @@ Five subcommands, each run from a job that checks out NO PR code:
     (see below). The review is pinned (`commit_id`) to the commit the panel
     reviewed. With ``--card true`` it then writes cursor-approve's status card
     (``.github/cursor-approve/card.py``) for the outcome — every outcome except
-    an author ``approve_authors`` does not list.
+    an author ``approve_authors`` does not list. Every review it posts links
+    that card (BE-20246). On a PR's first round there is no card yet, so it
+    creates a pending one just before the review (``review_card_url``): a
+    review edited afterwards to add the link would read as stale, or never be
+    withdrawn.
 
 ``dismiss-stale`` (in `dismiss-stale-approval`, on every same-repo
 `pull_request` event of an open PR; ``--all-approvals`` on a base retarget)
@@ -62,6 +66,7 @@ Five subcommands, each run from a job that checks out NO PR code:
     An outcome that withholds (``EXTERNAL_BLOCK_OUTCOMES``) leaves the same
     standing REQUEST_CHANGES a no-decision ``decide`` does (BE-19489); one that
     hands the PR to a human (``needs_human``, ``vetoed``) withdraws it instead.
+    The approval and that block both link the card ``--card-url`` names.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
@@ -1526,8 +1531,73 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
     return counts
 
 
+# What a review body may link as the status card: an https URL with nothing in
+# it that could close the markdown link or start another one.
+CARD_URL_RE = re.compile(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./#-]+")
+
+
+def safe_card_url(url) -> str:
+    """`url` when it is safe to put in a review body's markdown link, else ""."""
+    return url if isinstance(url, str) and CARD_URL_RE.fullmatch(url) else ""
+
+
+def card_link_line(url) -> str:
+    """The line every auto-approve review carries to the status card (BE-20246),
+    or "" when there is no card URL safe to link."""
+    url = safe_card_url(url)
+    return f"Live status: the [cursor-approve card]({url}), updated in place every round." if url else ""
+
+
+def review_card_url(args) -> str:
+    """The status card's URL for the review about to be posted, or "".
+
+    approve-external is handed it (``--card-url``, from cursor-approve.yml's
+    ``ensure`` step). decide looks it up the first time it needs it and keeps it
+    for the rest of the run. On a PR's first round there is no card yet, so it
+    creates one from ``card.render_pending`` first: the link cannot be added
+    after the review is posted, because an edited approval reads as stale and
+    an edited request for changes is never withdrawn (see ``_review_node``).
+    The round's card replaces the pending one in the same step, after the
+    review, as before.
+
+    Never fatal: a card that cannot be found or created costs the review its
+    link, nothing else.
+    """
+    url = getattr(args, "card_url", None)
+    if url is None:
+        url = args.card_url = _ensure_card_url(args)
+    return safe_card_url(url)
+
+
+def _ensure_card_url(args) -> str:
+    login = (getattr(args, "approver_login", "") or "").strip()
+    # The same switch write_round_card obeys: without it decide writes no card,
+    # so there is nothing to link.
+    if not login or (getattr(args, "card", "") or "").strip().lower() != "true":
+        return ""
+    # GitHub refuses the approver a review of its own PR, so there is nothing
+    # to link, and cmd_decide returns on that refusal without writing the card
+    # that would replace a pending one.
+    if (getattr(args, "pr_author", "") or "").strip().lower() == login.lower():
+        return ""
+    try:
+        card = _load_card()
+        found, created = card.ensure(args.repo, args.pr_number, login,
+                                     card.render_pending(getattr(args, "round", ""), getattr(args, "max_rounds", ""),
+                                                         args.commit_sha, getattr(args, "run_url", "") or ""))
+        if created:
+            # write_round_card edits this comment by id: a listing taken
+            # seconds after it was created could miss it and post a second card.
+            args.created_card = found
+        return found.get("html_url") or ""
+    except Exception as e:  # noqa: BLE001 — a link is a convenience; it must never cost the review
+        print(f"::warning::Could not find or create the cursor-approve status card, so this review does not "
+              f"link it: {annotation_cause(e, 'unknown error')}")
+        return ""
+
+
 def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "",
-                base_ref: str = "") -> str:
+                base_ref: str = "", card_url: str = "") -> str:
     lines = [APPROVE_MARKER]
     if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
         lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
@@ -1552,6 +1622,9 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
                 line = str(line) if isinstance(line, int) and not isinstance(line, bool) else "?"
                 path = f.get("file") if isinstance(f.get("file"), str) else "?"
                 lines.append(f"- **{sev}** — {render_code_ref(path[:300], line)}")
+    link = card_link_line(card_url)
+    if link:
+        lines.append(f"\n{link}")
     # The scope note is scope_note()'s own sentence, so it is not routed
     # through card.reason_text: an unloadable card.py must not cost the APPROVE.
     if scope_note_of(reasons):
@@ -1564,7 +1637,7 @@ def render_body(event: str, reasons: list, threshold: str, blocking: list, revie
 
 def render_standing_body(headline: str, reasons: list, next_text: str, threshold: str,
                          reviewed_sha: str = "", base_ref: str = "", prerendered: bool = False,
-                         retry: bool = False) -> str:
+                         retry: bool = False, card_url: str = "") -> str:
     """The standing REQUEST_CHANGES a no-decision round leaves (BE-19489).
 
     Same markers as every other auto-approve review, so dismiss_own_change_requests
@@ -1588,6 +1661,9 @@ def render_standing_body(headline: str, reasons: list, next_text: str, threshold
     # is already markdown-safe (axis reasons sanitized as on the card).
     lines += [f"- {r if prerendered else reason_text(r)}" for r in reasons if isinstance(r, str) and r.strip()]
     lines.append(f"\n**Next step:** {next_text}")
+    link = card_link_line(card_url)
+    if link:
+        lines.append(f"\n{link}")
     if threshold in ALLOWED_THRESHOLDS:
         lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
@@ -1640,9 +1716,10 @@ def post_standing_change_request(args, headline: str, reasons: list, next_text: 
     the body's reviewed-SHA marker still naming what was reviewed. `result`,
     when given, receives the posted review's `id`.
     """
+    card_url = review_card_url(args)
     try:
         body = render_standing_body(headline, reasons, next_text, threshold, args.commit_sha, args.base_ref,
-                                    prerendered, retry)
+                                    prerendered, retry, card_url)
     except Exception as e:  # noqa: BLE001 — card.py failing to load must not traceback here
         print(f"::error::Could not render the standing request for changes: {annotation_cause(e, 'unknown error')}")
         return 1
@@ -1690,7 +1767,8 @@ def write_round_card(args, state: str, next_step: str, headline: str, reasons: l
         body = card.render_round(getattr(args, "round", ""), getattr(args, "max_rounds", ""), args.commit_sha,
                                  state, next_step, headline, reasons, next_text,
                                  getattr(args, "run_url", "") or "", gating, threshold)
-        card.upsert(args.repo, args.pr_number, login, body)
+        # The pending card review_card_url created for this round's review, if it did.
+        card.upsert(args.repo, args.pr_number, login, body, card=getattr(args, "created_card", None))
     except Exception as e:  # noqa: BLE001 — a report: it runs after the decision landed, never undoes it
         print(f"::warning::Could not write the cursor-approve status card: {annotation_cause(e, 'unknown error')}")
 
@@ -1918,7 +1996,7 @@ def cmd_decide(args) -> int:
                              why, next_text, threshold)
         return rc
 
-    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, review_card_url(args))
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
         # The recorded SHA is the only staleness anchor an approval has (see
         # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
@@ -2972,7 +3050,7 @@ def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str
         lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
     if base_ref:
         lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
-    if re.fullmatch(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./#-]+", card_url or ""):
+    if safe_card_url(card_url):
         lines.append(f"Approved, see the [cursor-approve card]({card_url}).")
     else:
         lines.append("Approved, see the cursor-approve card.")
