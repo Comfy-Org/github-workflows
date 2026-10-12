@@ -1694,43 +1694,98 @@ class RoundCounterTest(unittest.TestCase):
             body = AA.render_standing_body(AA.NO_DECISION_HEADLINE, reasons, "relabel", "low", reviewed_sha=sha)
         return dict(review(rid, at, login=login, body=body.replace("\n", "\r\n"), state=event), commit_id=sha)
 
+    def _panel(self, rid, at, sha, commit_id=None):
+        # A consolidated review as post-review.py writes it: the round sentinel
+        # records what it reviewed. `commit_id` is GitHub's, and may have moved.
+        sentinel = AA._load_post_review().render_round_sentinel(sha, "", "")
+        body = f"{MARKER}\n{sentinel}\n…".replace("\n", "\r\n")
+        return dict(review(rid, at, body=body), commit_id=commit_id or sha)
+
     def test_a_round_whose_decision_found_the_head_moved_does_not_count(self):
         # BE-20267: the panel posted on OLD, then its decision found the head
         # had moved. That round is excused; the rounds that decided on their
         # own head (approve, request changes, no decision for another reason)
         # all count.
         new, third = "c" * 40, "d" * 40
-        moved = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
-        approved = dict(review(3, "2026-01-02T00:00:00Z"), commit_id=new)
-        other = dict(review(5, "2026-01-03T00:00:00Z"), commit_id=third)
+        moved = self._panel(1, "2026-01-01T00:00:00Z", OLD)
+        approved = self._panel(3, "2026-01-02T00:00:00Z", new)
+        other = self._panel(5, "2026-01-03T00:00:00Z", third)
         reviews = [
             moved, self._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED]),
             approved, self._decision(4, "2026-01-02T00:05:00Z", new, ["no finding above `low`"], event="APPROVED"),
             other, self._decision(6, "2026-01-03T00:05:00Z", third, ["the judge failed"]),
         ]
-        self.assertTrue(AA.superseded_by_push(moved, reviews, BOT))
-        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [3, 5])
+        self.assertEqual(AA.superseded_by_push(moved, reviews, BOT, MARKER), OLD)
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER, 5)], [3, 5])
+        # No excusal budget (`max_rounds` 0, or a caller that passes none): it counts.
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [1, 3, 5])
+
+    def test_the_reviewed_commit_comes_from_the_sentinel_not_commit_id(self):
+        # GitHub moved the panel's commit_id forward to the new head: the
+        # sentinel still says OLD, and OLD's decision is the one that governs.
+        new = "c" * 40
+        panel = self._panel(1, "2026-01-01T00:00:00Z", OLD, commit_id=new)
+        moved = self._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        self.assertEqual(AA.superseded_by_push(panel, [panel, moved], BOT, MARKER), OLD)
+        next_round = self._decision(3, "2026-01-01T00:05:00Z", new, [AA.REASON_HEAD_MOVED])
+        self.assertEqual(AA.superseded_by_push(panel, [panel, next_round], BOT, MARKER), "")
+        # No sentinel (an older body): nothing trustworthy to match on, so it counts.
+        bare = dict(review(4, "2026-01-01T00:00:00Z"), commit_id=OLD)
+        self.assertEqual(AA.superseded_by_push(bare, [bare, moved], BOT, MARKER), "")
 
     def test_a_round_with_no_head_moved_decision_still_counts(self):
-        panel = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
-        forged = self._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED], login="mallory")
-        earlier = self._decision(3, "2026-01-01T00:00:00Z", OLD, [AA.REASON_HEAD_MOVED])
-        earlier["submitted_at"] = "2025-12-31T00:00:00Z"  # a previous round's decision on this commit
-        other_sha = self._decision(4, "2026-01-01T00:05:00Z", "e" * 40, [AA.REASON_HEAD_MOVED])
-        for reviews in ([panel], [panel, forged], [panel, earlier], [panel, other_sha]):
-            self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [1])
-        # No commit on the panel review: nothing to match a decision to, so it counts.
-        bare = review(5, "2026-01-01T00:00:00Z")
-        self.assertFalse(AA.superseded_by_push(bare, [bare, self._decision(
-            6, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED])], BOT))
+        panel = self._panel(5, "2026-01-01T00:00:00Z", OLD)
+        forged = self._decision(6, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED], login="mallory")
+        earlier = self._decision(3, "2025-12-31T00:00:00Z", OLD, [AA.REASON_HEAD_MOVED])  # a previous round's
+        other_sha = self._decision(7, "2026-01-01T00:05:00Z", "e" * 40, [AA.REASON_HEAD_MOVED])
+        edited = dict(self._decision(8, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED]), edited=True)
+        # The marker anywhere but the start is a quote, not a decision.
+        quoted = self._decision(9, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        quoted["body"] = "> " + quoted["body"]
+        for reviews in ([panel], [panel, forged], [panel, earlier], [panel, other_sha], [panel, edited],
+                        [panel, quoted]):
+            self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER, 5)], [5])
 
     def test_the_rounds_own_decision_governs_not_a_later_one(self):
         # The first decision after the panel is that round's; a later re-run on
         # the same commit deciding "head moved" does not excuse it.
-        panel = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
+        panel = self._panel(1, "2026-01-01T00:00:00Z", OLD)
         own = self._decision(2, "2026-01-01T00:05:00Z", OLD, ["1 finding above `low`"])
         later = self._decision(3, "2026-01-01T01:00:00Z", OLD, [AA.REASON_HEAD_MOVED])
-        self.assertFalse(AA.superseded_by_push(panel, [panel, own, later], BOT))
+        self.assertEqual(AA.superseded_by_push(panel, [panel, own, later], BOT, MARKER), "")
+
+    def test_a_round_with_no_decision_does_not_borrow_the_next_rounds(self):
+        # Round 1 on OLD never decided; round 2 re-ran OLD and found the head
+        # moved. Only round 2 is excused. Same-second timestamps: id orders.
+        first = self._panel(1, "2026-01-01T00:00:00Z", OLD)
+        second = self._panel(2, "2026-01-01T00:00:00Z", OLD)
+        moved = self._decision(3, "2026-01-01T00:00:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        reviews = [first, second, moved]
+        self.assertEqual(AA.superseded_by_push(first, reviews, BOT, MARKER), "")
+        self.assertEqual(AA.superseded_by_push(second, reviews, BOT, MARKER), OLD)
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER, 5)], [1])
+
+    def test_excused_rounds_are_bounded(self):
+        # One per reviewed commit (a head flipping A→B→A excuses A once), and at
+        # most `max_excused` overall: past that a superseded round counts.
+        a, b, c = OLD, "b" * 40, "c" * 40
+        reviews, rid = [], 0
+        for sha in (a, b, a, c):
+            reviews += [self._panel(rid + 1, f"2026-01-0{rid // 2 + 1}T00:00:00Z", sha),
+                        self._decision(rid + 2, f"2026-01-0{rid // 2 + 1}T00:05:00Z", sha, [AA.REASON_HEAD_MOVED])]
+            rid += 2
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER, 5)], [5])
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER, 1)], [3, 5, 7])
+
+    def test_an_unreadable_live_head_is_not_a_moved_head(self):
+        # A shapeless PR payload must not hand out the head-moved reason, which
+        # would excuse the round from the cap with no push behind it.
+        _, gate, reasons, _ = AA.decide_gate("low", [], [], "ok", True, OLD, "", [])
+        self.assertEqual(gate, AA.GATE_UNTRUSTED)
+        self.assertIn(AA.REASON_HEAD_UNREAD, reasons)
+        self.assertNotIn(AA.REASON_HEAD_MOVED, reasons)
+        _, _, reasons, _ = AA.decide_gate("low", [], [], "ok", True, OLD, OLD.upper(), [])
+        self.assertNotIn(AA.REASON_HEAD_MOVED, reasons)
 
     def test_cap_comment_is_once_per_cap(self):
         mine = {"user": {"login": BOT}, "body": AA.ROUND_CAP_MARKER + "\n…", "created_at": "2026-01-02T00:00:00Z"}
