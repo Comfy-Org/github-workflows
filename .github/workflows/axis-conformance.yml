@@ -1,13 +1,16 @@
 name: Cursor axis (conformance)
 
 # The conformance axis of cursor-approve: a thin wrapper over cursor-axis-base.yml
-# with a full read-only checkout of the PR head. Declares ONLY CURSOR_API_KEY —
+# with a full read-only checkout of the PR head. Declares ONLY CURSOR_API_KEY
+# and the opt-in ANTHROPIC_API_KEY —
 # an axis never sees another axis's credentials (a test enforces this).
 # Run it only after a cursor-review round passed; see
 # docs/callers/cursor-approve.md for the caller.
 #
-# Inputs (passed through): commit_sha, model, runs_on, prior_rounds.
-# Secrets: CURSOR_API_KEY.
+# Inputs (passed through): commit_sha, model, runs_on, prior_rounds,
+# axis_direct_model (opt-in: run on the Anthropic API directly instead of
+# Cursor; see cursor-axis-base.yml).
+# Secrets: CURSOR_API_KEY; ANTHROPIC_API_KEY, needed only with axis_direct_model.
 
 on:
   workflow_call:
@@ -24,9 +27,14 @@ on:
       prior_rounds:
         type: number
         default: 0
+      axis_direct_model:
+        type: string
+        default: ''
     secrets:
       CURSOR_API_KEY:
         required: true
+      ANTHROPIC_API_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -43,5 +51,7 @@ jobs:
       model: ${{ inputs.model }}
       runs_on: ${{ inputs.runs_on }}
       prior_rounds: ${{ inputs.prior_rounds }}
+      axis_direct_model: ${{ inputs.axis_direct_model }}
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

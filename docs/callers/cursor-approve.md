@@ -477,6 +477,22 @@ diff the workflow fetches from the GitHub API.)
 | `runs_on` | `"ubuntu-latest"` | JSON-encoded `runs-on`, as in cursor-review. |
 | `prior_rounds` | `0` | 0–3, passed to the base: the same value as `cursor-approve.yml`'s. See [Prior rounds](#prior-rounds). |
 
+`axis-correctness.yml` and `axis-conformance.yml` also take `axis_direct_model`;
+see [Checkout axis inputs](#checkout-axis-inputs).
+
+## Checkout axis inputs
+
+`axis-correctness.yml` and `axis-conformance.yml` take the four inputs above
+plus one opt-in, and accept a second, optional secret, `ANTHROPIC_API_KEY`.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `commit_sha` | — (required) | As above. |
+| `model` | `claude-opus-5-5-xhigh` | As above; ignored (not even validated) when `axis_direct_model` is set. |
+| `runs_on` | `"ubuntu-latest"` | As above; ignored when `axis_direct_model` is set — the direct runner always runs on GitHub-hosted `ubuntu-latest`. |
+| `prior_rounds` | `0` | As above. |
+| `axis_direct_model` | `''` | Opt-in. An Anthropic model id (e.g. `claude-opus-5-5`) that runs the axis through the Anthropic API directly, via the pinned Claude Code CLI and `secrets.ANTHROPIC_API_KEY`, instead of `model` through Cursor — in its own job, `axis: <axis> (direct)`, on GitHub-hosted `ubuntu-latest` (the Cursor job is skipped and never sees the key), with the same CLI, flags and confinement as cursor-review's `anthropic_direct_model` cells: Read, Grep and Glob only over the read-only checkout, `--restricted`, `/proc` and `/sys` denied, `--setting-sources ""`, effort `xhigh`. With no shell, the workflow writes the merge-base diff into the checkout for it. The verdict artifact, card line and job summary are unchanged. A missing key, a failure or a timeout uploads no verdict — untrusted, exactly as a Cursor failure — and never falls back to Cursor; the run's notice and job summary name the runner. Also uploads `usage-direct-axis-<axis>-<model>` (kept 30 days): the direct cells' token-count record, so the run can be priced at list price. **Cost:** Cursor bills list price plus a flat per-token surcharge on every token, cache reads included; review agents are mostly cache reads, so the direct key avoids a large markup. **Rollout:** wire this input only after your pin includes it (an undeclared input fails every run at startup), e.g. `axis_direct_model: ${{ vars.CURSOR_AXIS_DIRECT_MODEL }}`, inert until the variable is set. **Private repos:** use a key from an organization with zero data retention. |
+
 ## Base inputs
 
 `cursor-axis-base.yml` is the shared body the axis wrappers call; consumers do
@@ -492,6 +508,7 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
 | `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
 | `prior_rounds` | `0` | 0–3; outside that range fails `Check inputs`. Above 0, download this run's `prior-axes` artifact (`continue-on-error`: missing means no block) and render the prompt with `--prior-file`. |
+| `axis_direct_model` | `''` | Run the axis on the Anthropic API via Claude Code instead of Cursor, in the separate `axis-direct` job on `ubuntu-latest` (see [Checkout axis inputs](#checkout-axis-inputs)); a plain id, a checkout axis, and never with `context_sources` — otherwise `Check inputs` fails. Needs the optional `ANTHROPIC_API_KEY` secret; with the direct runner, the uploaded transcript is Claude Code's result JSON. |
 
 Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
 transcript, plus the proxy's call log for the context axes. On a context axis
