@@ -417,19 +417,20 @@ def _secrets_declared(path):
 
 
 class WorkflowWiring(unittest.TestCase):
-    def test_axis_workflows_declare_only_cursor_api_key(self):
+    def test_axis_workflows_declare_only_cursor_and_anthropic_keys(self):
+        # ANTHROPIC_API_KEY only for the opt-in direct runner (axis_direct_model).
         for name in ("axis-correctness.yml", "axis-conformance.yml"):
             path = os.path.join(WORKFLOWS, name)
-            self.assertEqual(_secrets_declared(path), ["CURSOR_API_KEY"], name)
+            self.assertEqual(_secrets_declared(path), ["CURSOR_API_KEY", "ANTHROPIC_API_KEY"], name)
             text = open(path, encoding="utf-8").read()
             used = set(re.findall(r"secrets\.([A-Za-z_]+)", text))
-            self.assertEqual(used, {"CURSOR_API_KEY"}, name)
+            self.assertEqual(used, {"CURSOR_API_KEY", "ANTHROPIC_API_KEY"}, name)
             self.assertNotIn("secrets: inherit", text, name)
 
     def test_axis_base_declares_only_its_known_secrets_and_reads_only(self):
         path = os.path.join(WORKFLOWS, "cursor-axis-base.yml")
         self.assertEqual(_secrets_declared(path),
-                         ["CURSOR_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"])
+                         ["CURSOR_API_KEY", "ANTHROPIC_API_KEY", "LINEAR_KEY", "NOTION_TOKEN", "SLACK_TOKEN"])
         text = open(path, encoding="utf-8").read()
         self.assertNotRegex(text, r":\s*write\b")
         self.assertIn("persist-credentials: false", text)

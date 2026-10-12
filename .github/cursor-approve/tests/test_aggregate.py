@@ -296,8 +296,8 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(used, set(AG.PLACEHOLDERS))
 
     def test_one_prompt_file_per_axis(self):
-        # The two addenda cursor-axis-base.yml appends are not axis prompts.
-        addenda = {"prompt-no-checkout.md", "prompt-context-tools.md"}
+        # The three addenda cursor-axis-base.yml appends are not axis prompts.
+        addenda = {"prompt-no-checkout.md", "prompt-context-tools.md", "prompt-direct-runner.md"}
         names = {n for n in os.listdir(AG.PROMPT_DIR) if n.startswith("prompt-")} - addenda
         self.assertEqual(names, {"prompt-common.md", *(f"prompt-{a}.md" for a in AG.AXES)})
 

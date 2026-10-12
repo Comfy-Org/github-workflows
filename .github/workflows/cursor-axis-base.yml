@@ -24,8 +24,24 @@ name: Cursor axis (base)
 #               append this axis's own earlier verdicts to the prompt as one
 #               fenced DATA block. A missing artifact, or no entry for this
 #               axis, appends nothing.
+#   axis_direct_model  OPT-IN (default '' = the Cursor CLI, unchanged): an
+#               Anthropic model id (e.g. `claude-opus-5-5`) that runs this axis
+#               through the Anthropic API directly, via the pinned Claude Code
+#               CLI (`.github/cursor-review/package.json`), exactly as
+#               cursor-review's direct cells and direct judge do. Same prompt
+#               plus prompt-direct-runner.md (no shell: the workflow writes the
+#               merge-base diff into the checkout instead), tools Read, Grep and
+#               Glob only, `--restricted` + deny rules on /proc and /sys,
+#               `--setting-sources ""`, never `--bare` (it drops Grep and Glob).
+#               Same `axis-<axis>` verdict artifact; a failure or timeout uploads
+#               no verdict, exactly like a Cursor failure, and there is NO
+#               fallback to Cursor. Also uploads `usage-direct-axis-<axis>-<model>`
+#               (the cells' token-usage record, kept 30 days). Not combinable
+#               with context_sources.
 # Secrets:
 #   CURSOR_API_KEY
+#   ANTHROPIC_API_KEY  required only with axis_direct_model; read by the
+#               direct run step alone, in its env, never written to disk.
 #   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
 #               the context proxy. They are written to a 0600 file in their own
 #               step; the proxy reads and deletes it BEFORE the agent starts, so
@@ -80,9 +96,15 @@ on:
         description: 0..3 earlier rounds of this axis's own verdicts to show it; 0 = off.
         type: number
         default: 0
+      axis_direct_model:
+        description: Anthropic model id to run this axis on the direct API instead of Cursor; empty = Cursor.
+        type: string
+        default: ''
     secrets:
       CURSOR_API_KEY:
         required: true
+      ANTHROPIC_API_KEY:
+        required: false
       LINEAR_KEY:
         required: false
       NOTION_TOKEN:
@@ -118,6 +140,7 @@ jobs:
           CHECKOUT: ${{ inputs.checkout }}
           NO_SHELL: ${{ inputs.no_shell }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          AXIS_DIRECT_MODEL: ${{ inputs.axis_direct_model }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -138,6 +161,23 @@ jobs:
           fi
           if ! printf '%s' "$MODEL" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
             echo "::error::model must be a Cursor model id"; exit 1
+          fi
+          # The direct runner: a plain Anthropic id or nothing. Validated, not
+          # warned past: the caller opted in, so a typo must not quietly run
+          # Cursor instead (no fallback — the run names its runner).
+          if [ -n "$AXIS_DIRECT_MODEL" ]; then
+            if ! [[ "$AXIS_DIRECT_MODEL" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+              echo "::error::axis_direct_model must be a plain Anthropic model id (letters, digits, '.', '_', '-'; at most 100)"; exit 1
+            fi
+            # The direct runner carries no MCP server, so the context proxy's
+            # tools are not wired for it.
+            if [ -n "$CONTEXT_SOURCES" ]; then
+              echo "::error::axis_direct_model cannot be combined with context_sources: the direct runner has no context tools"; exit 1
+            fi
+            echo "::notice::axis $AXIS runs on the direct Anthropic API (Claude Code CLI, model $AXIS_DIRECT_MODEL), not Cursor"
+            echo "Runner: direct Anthropic API, \`$AXIS_DIRECT_MODEL\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Runner: Cursor CLI, \`$MODEL\`" >> "$GITHUB_STEP_SUMMARY"
           fi
           # [[ =~ ]] anchors the whole value; grep's ^...$ would anchor one line.
           if ! [[ "$CONTEXT_SOURCES" =~ ^((linear|notion|slack)(,(linear|notion|slack))*)?$ ]]; then
@@ -268,6 +308,7 @@ jobs:
           CHECKOUT: ${{ inputs.checkout }}
           CONTEXT_SOURCES: ${{ inputs.context_sources }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          AXIS_DIRECT_MODEL: ${{ inputs.axis_direct_model }}
         run: |
           mkdir -p pr
           prior=()
@@ -283,6 +324,12 @@ jobs:
           if [ "$CHECKOUT" = "true" ]; then
             merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
           fi
+          # The direct runner has no shell, so it cannot run rule 1's
+          # `git diff`, so put that exact diff beside the context file instead.
+          if [ -n "$AXIS_DIRECT_MODEL" ] && [ "$CHECKOUT" = "true" ]; then
+            git -C pr diff "$merge_base...$COMMIT_SHA" > "$ctx_dir/cursor-approve-pr.diff"
+            echo "diff bytes: $(wc -c < "$ctx_dir/cursor-approve-pr.diff")"
+          fi
           {
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
               --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
@@ -292,9 +339,14 @@ jobs:
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
             esac
             if [ -n "$CONTEXT_SOURCES" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-context-tools.md"; fi
+            # A no-checkout axis already has no shell and its own note above.
+            if [ -n "$AXIS_DIRECT_MODEL" ] && [ "$CHECKOUT" = "true" ]; then
+              cat "$CURSOR_APPROVE_ASSETS/prompt-direct-runner.md"
+            fi
           } > "$RUNNER_TEMP/axis-prompt.txt"
 
       - name: Install Cursor agent CLI
+        if: inputs.axis_direct_model == ''
         run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Write the context token file
@@ -322,6 +374,7 @@ jobs:
           PY
 
       - name: Run the axis
+        if: inputs.axis_direct_model == ''
         working-directory: pr
         # No LINEAR_KEY / NOTION_TOKEN / SLACK_TOKEN here, ever (a test enforces
         # it): this step only knows where the proxy's token file WAS.
@@ -479,6 +532,165 @@ jobs:
               f.write(result)
           PY
 
+      - name: Check the Anthropic API key
+        # The direct runner only. An absent key FAILS the axis — no verdict,
+        # which decide reads as untrusted — never a quiet fall back to Cursor.
+        if: inputs.axis_direct_model != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::axis_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow; the axis does not fall back to Cursor. Pass the secret through from the caller."
+            exit 1
+          fi
+
+      - name: Install Claude Code CLI
+        if: inputs.axis_direct_model != ''
+        # Pinned in .github/cursor-review/package.json, read exactly as
+        # `review-openai-direct`'s `Install Codex CLI` reads its pin.
+        run: |
+          manifest="$CURSOR_REVIEW_ASSETS/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the direct runner's CLI pin."
+            exit 1
+          fi
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@anthropic-ai/claude-code"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the direct runner's CLI pin."
+            exit 1
+          fi
+          version="$(printf '%s' "$version" | tr -d '\r\n')"
+          case "$version" in
+            ""|*[!0-9.]*)
+              echo "::error::dependencies[\"@anthropic-ai/claude-code\"] must be an EXACT version (digits and dots only, no ^ or ~); got a value this job will not install."
+              exit 1 ;;
+          esac
+          echo "CLAUDE_CLI_VERSION=$version" >> "$GITHUB_ENV"
+          npm install -g "@anthropic-ai/claude-code@${version}"
+
+      - name: Verify Claude Code CLI version
+        if: inputs.axis_direct_model != ''
+        # As `Verify Codex CLI version`: `claude --version` prints
+        # `2.1.286 (Claude Code)`, so the FIRST field is the version.
+        run: |
+          installed="$(claude --version 2>/dev/null | head -n 1 | tr -d '\r' | awk '{print $1}')"
+          if [ "$installed" != "$CLAUDE_CLI_VERSION" ]; then
+            echo "::error::claude reports '${installed}', expected the pinned '${CLAUDE_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "claude ${installed}"
+          # The confinement rests on these flags, so a bump whose CLI dropped
+          # or renamed one fails HERE, by name, rather than at argv parsing
+          # mid-review — or, worse, by silently running unconfined.
+          help="$(claude --help 2>&1)"
+          for flag in --restricted --setting-sources --strict-mcp-config \
+                      --disallowedTools --permission-prompts --no-session-persistence; do
+            if ! printf '%s\n' "$help" | grep -qE -- "(^|[[:space:],])${flag}([[:space:],]|$)"; then
+              echo "::error::claude ${installed} does not advertise ${flag}, which the direct runner's confinement relies on."
+              exit 1
+            fi
+          done
+
+      - name: Prepare the checkout for the direct runner
+        # cursor-review's direct cells, for the same reasons: a planted
+        # symlink could lead the file tools out of the tree, and a PR-authored
+        # Claude config (settings env, hooks, MCP servers) must never be
+        # there to load. `--restricted` and `--setting-sources ""` already
+        # ignore the config; this removes it outright.
+        if: inputs.axis_direct_model != ''
+        run: |
+          find pr -type l -delete
+          rm -rf pr/.claude pr/.mcp.json pr/CLAUDE.local.md
+
+      - name: Run the axis (direct)
+        id: axis_direct
+        if: inputs.axis_direct_model != ''
+        # Step-capped below the job's 20, so the usage record still runs after
+        # a timeout. A timeout or any failure leaves no raw reply, so the
+        # verdict is not extracted or uploaded: decide reads "no result".
+        timeout-minutes: 15
+        working-directory: pr
+        env:
+          AXIS: ${{ inputs.axis }}
+          MODEL: ${{ inputs.axis_direct_model }}
+          # Process env of this ONE step only: never argv, never a file.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # No telemetry or error report may carry private-diff context.
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: |
+          out="$RUNNER_TEMP/axis-transcript"
+          mkdir -p "$out"
+          # A fresh, empty config dir, as the direct cells use.
+          CLAUDE_CONFIG_DIR="$(mktemp -d -p "$RUNNER_TEMP")"
+          export CLAUDE_CONFIG_DIR
+          # The direct cells' invocation, minus their submission MCP server
+          # (the axis answers in its reply, as the Cursor runner's does): Read,
+          # Grep and Glob only, confined to the checkout by `--restricted`, with
+          # /proc and /sys denied independently of it (`/proc/self/environ`
+          # holds the key). `--strict-mcp-config` with no config = no MCP at
+          # all. Deliberately NOT `--bare`: on the pinned CLI it drops Grep and
+          # Glob. `xhigh` is the effort tier the Cursor default
+          # (`claude-opus-5-5-xhigh`) runs at. The result JSON is never echoed:
+          # the run log is public and the reply is steered by PR text.
+          claude -p --restricted --setting-sources "" \
+            --tools "Read,Grep,Glob" \
+            --strict-mcp-config \
+            --allowedTools "Read,Grep,Glob" \
+            --disallowedTools "Read(//proc/**),Read(//sys/**)" \
+            --permission-prompts none \
+            --model "$MODEL" --effort xhigh \
+            --output-format json --no-session-persistence \
+            < "$RUNNER_TEMP/axis-prompt.txt" > /tmp/axis-claude-result.json \
+            && rc=0 || rc=$?
+          echo "claude exit code: $rc"
+          if [ "$rc" != "0" ]; then
+            # WHY, from an allowlist of provider error metadata, never prose.
+            python3 -I "$CURSOR_REVIEW_ASSETS/agent-error.py" \
+              --events /tmp/axis-claude-result.json --label "axis-${AXIS}/${MODEL}" || true
+          fi
+          # `-I`: the cwd is the PR checkout, and a stdin script puts the cwd
+          # first on sys.path, so a PR-planted json.py would run with the key
+          # in its env. The same three guards as the Cursor runner: the agent
+          # exited 0, it read something (one turn = answered blind), and it
+          # produced a reply. Plus groom's tripwire: a reply carrying the key
+          # literally is never published (to the transcript, the card or the
+          # job summary).
+          AGENT_RC="$rc" python3 -I - /tmp/axis-claude-result.json "$RUNNER_TEMP/axis-raw.txt" \
+            "$out/result.json" <<'PY'
+          import json, os, sys
+          try:
+              with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+                  text = f.read()
+          except OSError:
+              text = ""
+          key = os.environ.get("ANTHROPIC_API_KEY", "")
+          if key and key in text:
+              sys.exit("::error::the direct axis reply contains ANTHROPIC_API_KEY; refusing to publish it (possible prompt-injection exfil)")
+          with open(sys.argv[3], "w", encoding="utf-8") as f:
+              f.write(text)
+          if os.environ["AGENT_RC"] != "0":
+              sys.exit(int(os.environ["AGENT_RC"]))
+          try:
+              result = json.loads(text)
+          except ValueError:
+              result = None
+          if not isinstance(result, dict):
+              sys.exit("::error::claude left no JSON result object")
+          if result.get("is_error") is True:
+              sys.exit("::error::claude reported an error result")
+          turns = result.get("num_turns")
+          if type(turns) is int and turns < 2:
+              sys.exit("::error::the direct axis answered in one turn, without reading the change")
+          reply = result.get("result")
+          if not isinstance(reply, str):
+              sys.exit("::error::the claude result has no reply text")
+          with open(sys.argv[2], "w", encoding="utf-8") as f:
+              f.write(reply)
+          PY
+
       - name: Remove the context token file
         if: always() && inputs.context_sources != ''
         run: rm -f -- "$RUNNER_TEMP/cursor-approve-tokens.json"
@@ -510,3 +722,112 @@ jobs:
           path: ${{ runner.temp }}/axis-out/${{ inputs.axis }}.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Record token usage
+        # The direct runner only: cursor-review's direct cells' script, byte
+        # for byte but for the result path (a test pins it), review type
+        # `axis-<axis>`. Counts and model ids only, nothing model-written; an
+        # axis that left no result (a timeout) records `measured: false`,
+        # never a guessed zero. Last, and best effort: accounting must never
+        # fail the axis or delay its verdict upload.
+        if: always() && steps.axis_direct.outcome != 'skipped'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          MODEL: ${{ inputs.axis_direct_model }}
+          REVIEW_TYPE: axis-${{ inputs.axis }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          mkdir -p /tmp/usage-out
+          python3 -I - <<'PY'
+          import json, os, re
+
+          malformed = []
+
+          def count(value, field):
+              # A token count is a plain non-negative integer; absent reads as
+              # 0. Anything else makes the whole record unmeasured.
+              if value is None:
+                  return 0
+              if type(value) is int and value >= 0:
+                  return value
+              malformed.append(field)
+              return 0
+
+          def mapping(value, field):
+              if value is None or isinstance(value, dict):
+                  return value or {}
+              malformed.append(field)
+              return {}
+
+          try:
+              with open("/tmp/axis-claude-result.json", encoding="utf-8") as f:
+                  result = json.load(f)
+          except (OSError, ValueError):
+              result = None
+          if not isinstance(result, dict):
+              result = {}
+          usage = result.get("usage")
+          record = {
+              "model": os.environ["MODEL"],
+              "review_type": os.environ["REVIEW_TYPE"],
+              "run_attempt": int(os.environ.get("RUN_ATTEMPT") or 0),
+              "measured": False,
+          }
+          if isinstance(usage, dict):
+              written = mapping(usage.get("cache_creation"), "cache_creation")
+              totals = {
+                  "input_tokens": count(usage.get("input_tokens"), "input_tokens"),
+                  "output_tokens": count(usage.get("output_tokens"), "output_tokens"),
+                  "cache_read_input_tokens": count(usage.get("cache_read_input_tokens"), "cache_read_input_tokens"),
+                  "cache_creation_input_tokens": count(usage.get("cache_creation_input_tokens"), "cache_creation_input_tokens"),
+                  "ephemeral_5m_input_tokens": count(written.get("ephemeral_5m_input_tokens"), "ephemeral_5m_input_tokens"),
+                  "ephemeral_1h_input_tokens": count(written.get("ephemeral_1h_input_tokens"), "ephemeral_1h_input_tokens"),
+              }
+              # Per model, in case the CLI ever spends on a second one.
+              models = {}
+              for name, m in mapping(result.get("modelUsage"), "modelUsage").items():
+                  if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name) or not isinstance(m, dict):
+                      malformed.append("modelUsage")
+                      continue
+                  models[name] = {
+                      "input_tokens": count(m.get("inputTokens"), "inputTokens"),
+                      "output_tokens": count(m.get("outputTokens"), "outputTokens"),
+                      "cache_read_input_tokens": count(m.get("cacheReadInputTokens"), "cacheReadInputTokens"),
+                      "cache_creation_input_tokens": count(m.get("cacheCreationInputTokens"), "cacheCreationInputTokens"),
+                  }
+              if not malformed:
+                  record.update(measured=True, usage=totals, models=models)
+                  for field in ("num_turns", "duration_ms"):
+                      value = result.get(field)
+                      record[field] = value if type(value) is int and value >= 0 else 0
+          with open("/tmp/usage-out/usage.json", "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2)
+          # Field names only, never values: the run log is public.
+          print(f"Token usage recorded: measured={str(record['measured']).lower()}"
+                + (f" (malformed: {', '.join(sorted(set(malformed)))})." if malformed else "."))
+          PY
+
+
+      - name: Upload usage artifact
+        # The cells' `usage-direct-<review_type>-<model>` family. Not `axis-*`,
+        # so decide never reads it as a verdict. Time-boxed and best effort.
+        id: usage_upload
+        if: always() && steps.axis_direct.outcome != 'skipped'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: usage-direct-axis-${{ inputs.axis }}-${{ inputs.axis_direct_model }}
+          path: /tmp/usage-out/usage.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Warn on unrecorded usage
+        # `continue-on-error` hides a failed upload (a squatted name 409s);
+        # say so on the run, so the scorecard does not price a missing record
+        # as zero.
+        if: always() && steps.usage_upload.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: echo "::warning::The direct axis's usage artifact did not upload; this axis's direct-API spend is unrecorded for this run."
