@@ -17,6 +17,7 @@ spec.loader.exec_module(aa)
 SHA = "b" * 40
 LOGIN = "approver-bot"
 AXES = "correctness,conformance"
+CARD_URL = "https://github.com/o/r/pull/1#issuecomment-9"
 
 
 class FakeGitHub:
@@ -75,7 +76,8 @@ def handoff_reviews():
 
 
 class ApproveExternal(unittest.TestCase):
-    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster="", **extra):
+    def run_cmd(self, fake, verdicts, event=None, login=LOGIN, base_ref="main", threshold="", poster="",
+                card_url=CARD_URL, **extra):
         if event is None:
             event = "APPROVE" if all(v in ("green", "yellow") for v in verdicts.values()) and verdicts else "NONE"
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,7 +86,7 @@ class ApproveExternal(unittest.TestCase):
                 json.dump({"event": event, "verdicts": verdicts, "axes": {}, "reasons": []}, f)
             out = os.path.join(tmp, "out")
             args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes=AXES, decision=path,
-                                      approver_login=login, base_ref=base_ref, card_url="https://github.com/o/r/pull/1#issuecomment-9",
+                                      approver_login=login, base_ref=base_ref, card_url=card_url,
                                       threshold=threshold, poster_login=poster, **extra)
             self.resolve_calls = []
             with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
@@ -136,6 +138,27 @@ class ApproveExternal(unittest.TestCase):
         self.assertIn("- no decision was reached", review["body"])
         self.assertIn(f"**Next step:** {card.DECIDE_NEXT_TEXT['not_approved']}", review["body"])
         self.assertIn("_Threshold: `low`", review["body"])
+
+    def test_the_block_links_the_card_the_ensure_step_found(self):
+        # BE-20246: its next step says "Address the axis verdicts above", and
+        # the verdicts are on the card, so the block has to link it.
+        for outcome, fake in (("not_approved", FakeGitHub()), ("superseded", FakeGitHub(head="d" * 40)),
+                              ("error", FakeGitHub(read_error=True))):
+            with self.subTest(outcome=outcome):
+                self.run_cmd(fake, {"correctness": "red", "conformance": "green"})
+                self.assertEqual([p["event"] for p in fake.posted], ["REQUEST_CHANGES"])
+                self.assertIn(f"Live status: the [cursor-approve card]({CARD_URL}), updated in place every round.",
+                              fake.posted[0]["body"].split("\n"))
+
+    def test_an_unsafe_card_url_is_never_linked(self):
+        url = "https://github.com/o/r/pull/1) [forged](https://evil.example"
+        fake = FakeGitHub()
+        self.run_cmd(fake, {"correctness": "green", "conformance": "green"}, card_url=url)
+        self.assertIn("Approved, see the cursor-approve card.", fake.posted[0]["body"])
+        fake = FakeGitHub()
+        self.run_cmd(fake, {"correctness": "red", "conformance": "green"}, card_url=url)
+        for p in fake.posted:
+            self.assertNotIn("](", p["body"])
 
     def test_the_block_carries_the_axis_reasons_sanitized(self):
         fake = FakeGitHub()

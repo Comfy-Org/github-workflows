@@ -129,6 +129,20 @@ class ContractMarkers(unittest.TestCase):
         self.assertIn(f"Reviewed commit: `{SHA}`", body)
         self.assertNotIn("Next step", body)
 
+    def test_pending_asks_nothing_of_an_agent(self):
+        # BE-20246: on screen for the seconds between a first round's review
+        # and its real card. It carries the start phase's "round in progress"
+        # pair, which every agent already reads as nothing to do: the fleet
+        # escalates `no_decision`/`none` to a human, and a remedy in `next`
+        # would have an agent push or relabel under a round that may be approving.
+        body = card.render_pending("1", "5", SHA, RUN)
+        self.assertEqual(markers(body), markers(card.render_start("1", "5", SHA, ["correctness"], "pass", RUN)))
+        self.assertEqual(markers(body), ("pass", "none"))
+        self.assertIn("Cursor approve · round 1 of 5 · `aaaaaaa`", body)
+        self.assertIn(f"**{card.PENDING_TEXT}**", body)
+        self.assertIn(f"Reviewed commit: `{SHA}` · [workflow run]({RUN})", body)
+        self.assertNotIn("Next step", body)
+
     def test_start_capped(self):
         body = card.render_start("5", "5", SHA, ["correctness"], "capped", RUN)
         self.assertEqual(markers(body), ("capped", "human"))
@@ -392,6 +406,118 @@ class Upsert(unittest.TestCase):
         writes = [c for c in calls if "-X" in c[0]]
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][0][2], "POST")
+
+    def test_a_card_this_run_created_is_edited_without_listing_again(self):
+        # BE-20246: a listing taken seconds after `ensure` created the card
+        # could miss it, and upsert would then post a second card.
+        calls = []
+
+        def fake_gh(args, payload=None):
+            calls.append((args, payload))
+            return json.dumps({"id": 9})
+
+        with mock.patch.object(card, "gh", fake_gh):
+            card.upsert("o/r", 1, LOGIN, card.CARD_MARKER + "\nnew",
+                        card={"id": 9, "user": {"login": LOGIN}, "body": card.render_pending("1", "5", SHA, RUN)})
+        self.assertEqual([c[0][:4] for c in calls], [["api", "-X", "PATCH", "repos/o/r/issues/comments/9"]])
+        self.assertEqual(calls[0][1], {"body": card.CARD_MARKER + "\nnew"})
+
+
+class Ensure(unittest.TestCase):
+    """`ensure`: the card a review links to, created first when there is none."""
+
+    URL = "https://github.com/o/r/pull/1#issuecomment-9"
+
+    def run_ensure(self, comments, reply=None):
+        self.writes = []
+
+        def fake_gh(args, payload=None):
+            if "--paginate" in args:
+                return json.dumps([comments])
+            self.writes.append((args[2], args[3], payload))
+            return json.dumps({"id": 9, "html_url": self.URL}) if reply is None else reply
+
+        with mock.patch.object(card, "gh", fake_gh):
+            return card.ensure("o/r", 1, LOGIN, "PENDING")
+
+    def test_an_existing_card_is_returned_untouched(self):
+        existing = {"id": 7, "user": {"login": LOGIN}, "body": card.CARD_MARKER + "\nold",
+                    "html_url": "https://github.com/o/r/pull/1#issuecomment-7"}
+        self.assertEqual(self.run_ensure([existing]), (existing, False))
+        self.assertEqual(self.writes, [])
+
+    def test_no_card_creates_one_from_the_body_given(self):
+        found, created = self.run_ensure([])
+        self.assertTrue(created)
+        self.assertEqual(found["html_url"], self.URL)
+        self.assertEqual(self.writes, [("POST", "repos/o/r/issues/1/comments", {"body": "PENDING"})])
+
+    def test_a_marker_from_another_author_is_not_the_card(self):
+        _, created = self.run_ensure([{"id": 7, "user": {"login": "attacker"}, "body": card.CARD_MARKER}])
+        self.assertTrue(created)
+
+    def test_a_reply_without_a_comment_id_is_an_error(self):
+        for reply in ("null", "[]", "{}", '{"html_url": "https://github.com/o/r/pull/1"}'):
+            with self.subTest(reply=reply), self.assertRaises(ValueError):
+                self.run_ensure([], reply=reply)
+
+    def test_an_ambiguous_create_that_landed_is_found_and_returned_as_created(self):
+        # A timeout or a reply without an id may still have written the card:
+        # the caller must edit that one by id, not post a second.
+        landed = {"id": 9, "user": {"login": LOGIN}, "body": card.CARD_MARKER + "\nPENDING", "html_url": self.URL}
+        for failure in (RuntimeError("gh api failed: timed out"), "{}"):
+            with self.subTest(failure=failure):
+                listings = iter([[], [landed]])
+
+                def fake_gh(args, payload=None, failure=failure):
+                    if "--paginate" in args:
+                        return json.dumps([next(listings)])
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+
+                with mock.patch.object(card, "gh", fake_gh):
+                    self.assertEqual(card.ensure("o/r", 1, LOGIN, "PENDING"), (landed, True))
+
+    def test_a_failed_create_with_no_card_after_it_still_raises(self):
+        def fake_gh(args, payload=None):
+            if "--paginate" in args:
+                return json.dumps([[]])
+            raise RuntimeError("gh api failed: HTTP 502")
+
+        with mock.patch.object(card, "gh", fake_gh), self.assertRaises(RuntimeError):
+            card.ensure("o/r", 1, LOGIN, "PENDING")
+
+    def test_the_ensure_phase_prints_the_url_it_found_or_created(self):
+        for comments, want in (([], self.URL),
+                               ([{"id": 7, "user": {"login": LOGIN}, "body": card.CARD_MARKER,
+                                  "html_url": "https://github.com/o/r/pull/1#issuecomment-7"}],
+                                "https://github.com/o/r/pull/1#issuecomment-7")):
+            with self.subTest(want=want), tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out")
+
+                def fake_gh(args, payload=None, comments=comments):
+                    if "--paginate" in args:
+                        return json.dumps([comments])
+                    return json.dumps({"id": 9, "html_url": self.URL})
+
+                with mock.patch.object(card, "gh", fake_gh), mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}):
+                    self.assertEqual(card.main(["ensure", "--repo", "o/r", "--pr-number", "1", "--login", LOGIN,
+                                                "--commit-sha", SHA, "--axes", "correctness"]), 0)
+                with open(out, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), f"card_url={want}\n")
+
+    def test_the_ensure_phase_never_fails_the_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            open(out, "w").close()
+            with mock.patch.object(card, "gh", side_effect=RuntimeError("gh api failed: HTTP 502")), \
+                    mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(card.main(["ensure", "--repo", "o/r", "--pr-number", "1", "--login", LOGIN,
+                                            "--commit-sha", SHA, "--axes", "correctness"]), 0)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "")
 
 
 def _secrets_declared(path):

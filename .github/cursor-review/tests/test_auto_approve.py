@@ -1273,6 +1273,41 @@ class RenderBodyTest(unittest.TestCase):
         self.assertNotIn("pwn", body)
         self.assertIn(":?", body)
 
+    URL = "https://github.com/o/r/pull/1#issuecomment-7"
+    LINK = f"Live status: the [cursor-approve card]({URL}), updated in place every round."
+
+    def test_every_review_body_links_the_card_and_keeps_its_markers(self):
+        # BE-20246. The markers sit above the link and are what everything
+        # parses back: staleness, the recorded base, the retry budget.
+        bodies = {
+            "approve": AA.render_body(AA.APPROVE, ["every finding is at or below `low`"], "low", [],
+                                      SHA, "main", self.URL),
+            "changes": AA.render_body(AA.REQUEST_CHANGES, ["1 finding(s) above `low`"], "low",
+                                      [finding("high")], SHA, "main", self.URL),
+            "standing": AA.render_standing_body(AA.NO_DECISION_HEADLINE, ["the judge errored"], "Re-run the round.",
+                                                "low", SHA, "main", retry=True, card_url=self.URL),
+        }
+        for name, body in bodies.items():
+            with self.subTest(name):
+                self.assertIn(self.LINK, body.split("\n"))
+                self.assertTrue(body.startswith(AA.APPROVE_MARKER + "\n"))
+                self.assertEqual(AA.REVIEWED_SHA_RE.search(body).group(1), SHA)
+                self.assertEqual(AA.recorded_base(body), "main")
+                self.assertTrue(body.endswith("(set by this repo's `approve_max_severity`)._"))
+        self.assertIn(AA.AUTO_RETRY_MARKER, bodies["standing"].split("\n"))
+
+    def test_an_unsafe_or_missing_card_url_is_never_linked(self):
+        for url in ("", None, 42, "http://github.com/o/r/pull/1", "javascript:alert(1)",
+                    "https://github.com/o/r/pull/1) [forged](https://evil.example",
+                    "https://github.com/o/r/pull/1#x\n## forged", "https://github.com/o/r/pull/1 @someone"):
+            with self.subTest(url=url):
+                self.assertEqual((AA.safe_card_url(url), AA.card_link_line(url)), ("", ""))
+                for body in (AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main", url),
+                             AA.render_standing_body("h", ["r"], "n", "low", SHA, "main", card_url=url),
+                             AA.render_external_body(url, SHA, "main")):
+                    self.assertNotIn("](", body)
+                    self.assertNotIn("Live status", body)
+
 
 def read_outputs(path):
     """$GITHUB_OUTPUT as a dict; a later write of a key wins, as in Actions."""
@@ -2515,12 +2550,19 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
     def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
                    reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
                    head=SHA, card="true", review_label="", refuse_pin=False, head_seq=None,
-                   fail_first_post=False):
+                   fail_first_post=False, comments_fail=False, post_error="", pr_author="someone",
+                   dismiss_error=""):
         self.reviews_posted, self.dismissed, self.card_writes = [], [], []
+        # Every write, in order, and every comment listing (BE-20246).
+        self.writes, self.listings = [], 0
         failed = []
 
         def fake_gh(args, payload=None):
+            if args[:2] == ["api", "-X"]:
+                self.writes.append((args[2], args[3]))
             if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/reviews"):
+                if post_error:
+                    raise RuntimeError(post_error)
                 if refuse_pin and "commit_id" in payload and payload["event"] == AA.REQUEST_CHANGES:
                     raise RuntimeError("gh api failed: HTTP 422: No commit found for SHA")
                 if fail_first_post and not failed:
@@ -2529,12 +2571,19 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                 self.reviews_posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
+                if dismiss_error:
+                    raise RuntimeError(dismiss_error)
                 self.dismissed.append((int(args[3].split("/")[-2]), payload["message"]))
                 return "{}"
+            if args[:3] == ["api", "-X", "DELETE"]:
+                return ""
             if args[:3] == ["api", "-X", "PATCH"] or (args[:3] == ["api", "-X", "POST"] and "/comments" in args[3]):
                 self.card_writes.append((args[2], args[3], payload["body"]))
                 return json.dumps({"id": 7, "html_url": "https://github.com/o/r/pull/1#issuecomment-7"})
             if args[:2] == ["api", "--paginate"]:
+                self.listings += 1
+                if comments_fail:
+                    raise RuntimeError("gh api failed: HTTP 502")
                 return json.dumps([list(comments)])
             if args[:2] == ["api", "graphql"]:
                 return graphql_reviews(list(reviews))
@@ -2558,7 +2607,7 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                                       commit_sha=SHA, judge_status=judge, delivered=delivered,
                                       ungated="0", approver_login=APPROVER, reviewed_diff=dpath,
                                       base_ref="main", poster_login=POSTER, defer_approval=defer,
-                                      author_enabled=author_enabled, pr_author="someone",
+                                      author_enabled=author_enabled, pr_author=pr_author,
                                       card=card, round="2", max_rounds="5", review_label=review_label,
                                       run_url="https://github.com/o/r/actions/runs/1")
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
@@ -2566,13 +2615,24 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                     mock.patch.object(AA, "open_thread_severities", fake_threads), \
                     mock.patch.object(AA, "resolve_eligible_threads", lambda *a: None), \
                     mock.patch.object(AA, "emit", lambda *a: None), \
-                    mock.patch("builtins.print", lambda *a, **k: None):
+                    mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+                self.printed = []
                 rc = AA.cmd_decide(args)
             return rc, read_outputs(out).get("approve_gate")
 
     def card_body(self):
-        self.assertEqual(len(self.card_writes), 1, self.card_writes)
-        return self.card_writes[0][2]
+        """The card this round ended on. Every write lands on ONE comment: only
+        the first may create it (the pending card a first round links its
+        review to, BE-20246), and nothing re-creates it — this fake's listing
+        never shows the comment it created, so a writer that re-listed would
+        POST a second card here."""
+        self.assertIn(len(self.card_writes), (1, 2), self.card_writes)
+        self.assertNotIn("POST", [m for m, _, _ in self.card_writes[1:]], self.card_writes)
+        if len(self.card_writes) == 2:
+            self.assertEqual(self.card_writes[1][:2], ("PATCH", "repos/o/r/issues/comments/7"))
+            self.assertIn("<!-- cursor-approve-state: pass -->\n<!-- cursor-approve-next: none -->",
+                          self.card_writes[0][2])
+        return self.card_writes[-1][2]
 
     def assert_markers(self, body, state, nxt):
         lines = body.splitlines()
@@ -2780,6 +2840,106 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.run_decide(judge="error", review_label="x` <!-- y -->")
         self.assertIn("remove and re-add the review label", self.card_body())
         self.assertNotIn("<!-- y", self.card_body())
+
+    # -- every review links the card (BE-20246) ------------------------------
+
+    CARD_URL = "https://github.com/o/r/pull/1#issuecomment-7"
+    LINK = f"Live status: the [cursor-approve card]({CARD_URL}), updated in place every round."
+
+    def test_a_first_round_creates_the_card_before_its_review_and_links_it(self):
+        for kwargs, event in (({}, AA.APPROVE), ({"findings": [finding("high")]}, AA.REQUEST_CHANGES),
+                              ({"judge": "error"}, AA.REQUEST_CHANGES)):
+            with self.subTest(case=str(kwargs)):
+                self.run_decide(**kwargs)
+                self.assertEqual([p["event"] for p in self.reviews_posted], [event])
+                self.assertIn(self.LINK, self.reviews_posted[0]["body"])
+                # The pending card, then the review, then the round's card over it.
+                self.assertEqual(self.writes, [("POST", "repos/o/r/issues/1/comments"),
+                                               ("POST", "repos/o/r/pulls/1/reviews"),
+                                               ("PATCH", "repos/o/r/issues/comments/7")])
+                self.assertIn(CARD.PENDING_TEXT, self.card_writes[0][2])
+                self.assertNotIn(CARD.PENDING_TEXT, self.card_body())
+
+    def test_reviews_are_never_edited_to_add_the_link(self):
+        # An edited approval reads as stale, and the bot never withdraws an
+        # edited request for changes: the link has to be there at post time.
+        for kwargs in ({}, {"findings": [finding("high")]}, {"judge": "error"},
+                       {"head_seq": iter([SHA, "b" * 40])}):
+            with self.subTest(case=sorted(kwargs)):
+                self.run_decide(**kwargs)
+                self.assertTrue(self.reviews_posted)
+                self.assertEqual([w for w in self.writes if "/reviews/" in w[1] and not w[1].endswith("/dismissals")],
+                                 [])
+
+    def test_a_later_round_links_the_card_it_finds_without_writing_it_first(self):
+        old_card = {"id": 7, "user": {"login": APPROVER}, "body": CARD.CARD_MARKER + "\nround 1",
+                    "html_url": self.CARD_URL}
+        self.run_decide(findings=[finding("high")], comments=[old_card])
+        self.assertIn(self.LINK, self.reviews_posted[0]["body"])
+        self.assertEqual([(m, u) for m, u, _ in self.card_writes], [("PATCH", "repos/o/r/issues/comments/7")])
+
+    def test_every_review_of_one_round_links_the_one_card(self):
+        # The post-write re-check withdrew the APPROVE and left a block: both
+        # link the card, created and looked up once.
+        self.run_decide(head_seq=iter([SHA, "b" * 40]))
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.APPROVE, AA.REQUEST_CHANGES])
+        for p in self.reviews_posted:
+            self.assertIn(self.LINK, p["body"])
+        self.assertEqual(self.listings, 1)
+        self.assert_markers(self.card_body(), "no_decision", "relabel")
+
+    def test_a_card_that_cannot_be_read_costs_the_review_only_its_link(self):
+        rc, gate = self.run_decide(comments_fail=True)
+        self.assertEqual((rc, gate), (0, AA.GATE_PASS))
+        self.assertEqual([p["event"] for p in self.reviews_posted], [AA.APPROVE])
+        self.assertNotIn("cursor-approve card", self.reviews_posted[0]["body"])
+        self.assertTrue(any("does not link it" in line for line in self.printed), self.printed)
+
+    def test_no_card_lookup_without_the_card_flag(self):
+        self.run_decide(card="")
+        self.assertEqual((self.listings, self.card_writes), (0, []))
+        self.assertNotIn("cursor-approve card", self.reviews_posted[0]["body"])
+
+    def test_the_approvers_own_pr_gets_no_pending_card(self):
+        # GitHub refuses that review, and decide returns on the refusal without
+        # writing a card, so a pending one would never be replaced.
+        rc, _ = self.run_decide(pr_author=APPROVER.upper(),
+                                post_error="gh api failed: HTTP 422: Can not approve your own pull request")
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.listings, self.card_writes), (0, []))
+
+    def test_a_refused_review_on_the_approvers_own_pr_deletes_the_pending_card(self):
+        # An empty (or stale) --pr-author lets the own-PR check pass, so the
+        # pending card is created; nothing of this round would replace it.
+        rc, _ = self.run_decide(pr_author="",
+                                post_error="gh api failed: HTTP 422: Can not approve your own pull request")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.writes, [("POST", "repos/o/r/issues/1/comments"),
+                                       ("POST", "repos/o/r/pulls/1/reviews"),
+                                       ("DELETE", "repos/o/r/issues/comments/7")])
+
+    def test_a_body_that_cannot_be_rendered_creates_no_pending_card(self):
+        with mock.patch.object(AA, "_load_post_review", side_effect=RuntimeError("post-review.py failed to load")), \
+                self.assertRaises(RuntimeError):
+            self.run_decide(findings=[finding("high")])
+        self.assertEqual((self.card_writes, self.reviews_posted), ([], []))
+
+    def test_a_review_that_cannot_be_withdrawn_replaces_the_pending_card(self):
+        # The pending card says the latest review is the decision; that review
+        # is the one the run failed to withdraw.
+        rc, _ = self.run_decide(head_seq=iter([SHA, "b" * 40]), dismiss_error="gh api failed: HTTP 403")
+        self.assertEqual(rc, 1)
+        body = self.card_body()
+        self.assert_markers(body, "no_decision", "human")
+        self.assertIn("withdrawing it failed", body)
+
+    def test_rounds_that_post_no_review_create_no_pending_card(self):
+        for kwargs in ({"defer": "true"}, {"labels": ["needs-human-review"]}):
+            with self.subTest(case=str(kwargs)):
+                self.run_decide(**kwargs)
+                self.assertEqual(self.reviews_posted, [])
+                self.assertEqual([m for m, _, _ in self.card_writes], ["POST"])
+                self.assertNotIn(CARD.PENDING_TEXT, self.card_writes[0][2])
 
     def test_workflow_passes_the_card_inputs(self):
         src = open(WORKFLOW_PATH, encoding="utf-8").read()
@@ -3368,7 +3528,11 @@ class AutoRetryTest(unittest.TestCase):
                 self.card_writes.append(payload["body"])
                 return json.dumps({"id": 7, "html_url": "https://github.com/o/r/pull/1#issuecomment-7"})
             if args[:2] == ["api", "--paginate"]:
-                return json.dumps([[]])
+                # Round 2 by default: an earlier round's card is already there,
+                # so the round's card is the one write (a first round's pending
+                # card is tested in StatusCardAndStandingBlockTest).
+                return json.dumps([[{"id": 7, "user": {"login": approver}, "body": CARD.CARD_MARKER + "\nround 1",
+                                     "html_url": "https://github.com/o/r/pull/1#issuecomment-7"}]])
             if args[:2] == ["api", "graphql"]:
                 if reviews_fail:
                     raise RuntimeError("gh api failed: HTTP 502")
@@ -3455,6 +3619,15 @@ class AutoRetryTest(unittest.TestCase):
         self.assertIn("re-run automatically", body)
         self.assertIn("if no new round starts", body)
         self.assertNotIn("**Next step:** Re-run the round: remove and re-add", body)
+
+    def test_the_linked_block_still_passes_the_gates_retry_check(self):
+        # cursor-review.yml's gate counts the block only while it starts with
+        # the auto-approve marker and carries the retry marker as a line of its own.
+        self.run_decide()
+        body = self.reviews_posted[0]["body"]
+        self.assertIn("[cursor-approve card](https://github.com/o/r/pull/1#issuecomment-7)", body)
+        self.assertTrue(body.startswith(AA.APPROVE_MARKER))
+        self.assertIn(AA.AUTO_RETRY_MARKER, body.split("\n"))
 
     def test_the_card_still_reports_relabel_so_agents_wait_for_the_new_round(self):
         self.run_decide()
