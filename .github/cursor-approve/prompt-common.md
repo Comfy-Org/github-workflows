@@ -71,10 +71,11 @@ the merge base.
 
    - `verdict`: one of `red`, `yellow`, `green`, `n/a`.
    - `confidence`: a number from 0 to 1 — how sure you are of the verdict.
-   - `headline`: **the one line a human reads.** Plain text, at most 100
-     characters, no markdown. State WHAT DECIDED THE VERDICT, not what you did
-     to decide it. It is the only part of your answer shown on the PR; the
-     `summary` sits behind a link that most readers will not open.
+   - `headline`: **the one line a human reads.** Plain text, ONE sentence,
+     no markdown — aim for about 120 characters, never more than 240. State
+     WHAT DECIDED THE VERDICT, not what you did to decide it. It is the line
+     the PR card's table shows for your axis; the `summary` sits in a
+     collapsed block under it that most readers will not open.
 
      A reader who sees only this line must understand why the verdict is what
      it is. Write it so that is true:
@@ -91,7 +92,7 @@ the merge base.
      finding.
    - `summary`: plain text, at most 1200 characters, no markdown. The detail
      behind the headline — what you checked, where you looked, and what decided
-     the verdict. For `red` or `yellow`, name the files and the concern. This
-     goes to the run's job summary, not the PR comment.
+     the verdict. For `red` or `yellow`, name the files and the concern. It is
+     shown collapsed under the card's table and in the run's job summary.
 
 ## Your axis

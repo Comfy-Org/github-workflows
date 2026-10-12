@@ -18,11 +18,12 @@ round:
 ``decide`` (after auto-approve.py ``approve-external``)
     The per-axis verdicts from ``aggregate.py decide``, the overall result and
     the rule applied — or "Superseded by a newer commit" when the head moved.
-    Each axis shows its `headline` only — ONE line naming what decided the
-    verdict. The same phase writes ``render_job_summary`` to
-    ``GITHUB_STEP_SUMMARY``: the full summaries and confidences, which is what
-    the card's "workflow run" link now leads to. The card is the glance; the
-    job summary is the record.
+    Each axis's row shows its whole `headline` — the sentence naming what
+    decided the verdict — and under the result sits one collapsed
+    ``<details>`` block per axis with its full `summary` and confidence
+    (BE-20249), so the reasoning is one click away on the PR itself. The same
+    phase writes ``render_job_summary`` to ``GITHUB_STEP_SUMMARY``, the run's
+    own record of the same detail.
 
 cursor-review's ``auto-approve.py decide`` writes it too, through
 ``render_round`` and ``upsert``, on every round it decides for an author
@@ -73,8 +74,12 @@ import sys
 
 CARD_MARKER = "<!-- cursor-approve-card -->"
 SUMMARY_LIMIT = 200
-# The job summary behind the run link is the detail surface, so an axis
-# summary is not cut to one table cell there.
+# The Why cell holds a whole headline, so it is exactly aggregate.py's
+# HEADLINE_MAX (a test pins the two equal): any lower and the cell would cut a
+# headline aggregate.py had already let through whole.
+WHY_LIMIT = 240
+# The detail surfaces — the collapsed per-axis blocks on the card and the job
+# summary — carry an axis summary whole rather than cut to one table cell.
 SUMMARY_DETAIL_LIMIT = 2000
 AXES = ("business", "design", "correctness", "completeness", "conformance")
 VERDICT_ICONS = {"green": "🟢 green", "yellow": "🟡 yellow", "red": "🔴 red",
@@ -309,6 +314,56 @@ def sanitize(text, limit: int = SUMMARY_LIMIT) -> str:
     return _ESCAPE_RE.sub(r"\\\1", text)
 
 
+def why_text(entry: dict) -> str:
+    """One axis's Why cell: its whole headline, sanitised.
+
+    aggregate.py already clamped the headline to whole sentences within
+    HEADLINE_MAX; the same clamp runs again here because the card is the last
+    stop before the PR and must not depend on its input being well-formed. A
+    missing headline, or one the clamp rejects as reason-free (aggregate.py
+    rejects both, so this is defence only), falls back to the summary's first
+    sentence rather than an empty cell.
+    """
+    headline = entry.get("headline")
+    candidates = [headline] if isinstance(headline, str) else []
+    candidates.append(first_sentence(entry.get("summary")))
+    for text in candidates:
+        text = " ".join(str(text or "").split())
+        try:
+            text = _clamp_headline(text) if text else ""
+        except ValueError:
+            text = ""
+        if text:
+            return sanitize(text, WHY_LIMIT)
+    return ""
+
+
+def reasoning_blocks(axes: list, detail: dict) -> list:
+    """Card lines: one collapsed ``<details>`` block per axis that reported a
+    summary — the full reasoning behind its row, one click away on the PR
+    itself rather than behind the run link (BE-20249).
+
+    They sit below the table and the result, so the contract markers and the
+    `| Axis | Verdict | Why |` rows agents parse are exactly as before. The
+    summary goes through `sanitize` like every model string on the card, which
+    folds it to one line and backslash-escapes every `|` and `<`: no line here
+    can open a table row, an HTML comment or a forged marker. The blank lines
+    around it are what make GitHub render it as markdown inside the block.
+    """
+    lines = []
+    for axis in axes:
+        entry = detail.get(axis)
+        if not isinstance(entry, dict) or entry.get("verdict") not in VERDICT_ICONS:
+            continue
+        summary = sanitize(entry.get("summary"), SUMMARY_DETAIL_LIMIT)
+        if not summary:
+            continue
+        confidence = _confidence(entry.get("confidence"))
+        label = f"{axis} — full reasoning" + (f" (confidence {confidence})" if confidence else "")
+        lines += ["", "<details>", f"<summary>{label}</summary>", "", summary, "", "</details>"]
+    return lines
+
+
 def parse_axes(value: str) -> list:
     axes = []
     for name in (value or "").split(","):
@@ -396,7 +451,9 @@ def render_job_summary(round_no, max_rounds, sha: str, axes: list, decision, out
         icon = VERDICT_ICONS.get(verdict, NO_RESULT)
         confidence = _confidence(entry.get("confidence"))
         lines += ["", f"#### {axis} — {icon}" + (f" (confidence {confidence})" if confidence else "")]
-        headline = sanitize(entry.get("headline"))
+        # The card's Why cell, word for word: the same clamp and fallback, so
+        # the two surfaces never show a different headline for one axis.
+        headline = why_text(entry)
         if headline:
             lines.append(f"**{headline}**")
         summary = sanitize(entry.get("summary"), SUMMARY_DETAIL_LIMIT)
@@ -419,13 +476,13 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None
     detail = detail if isinstance(detail, dict) else {}
-    # Three columns, and the third is the axis's `headline` — ONE line stating
-    # what decided the verdict. It used to be the first sentence of `summary`,
-    # which is where the models put their process log ("Checked the only
-    # changed file...", "I read root AGENTS.md and CLAUDE.md..."), so the card
-    # showed what the axis DID and never why it ruled as it did. The full
-    # summary and the confidence now live in the run's job summary, one click
-    # behind the link below — this card is the glance, not the record.
+    # Three columns, and the third is the axis's `headline` — the sentence
+    # stating what decided the verdict, shown whole (BE-20249: at 100
+    # characters it was cut mid-sentence). It used to be the first sentence of
+    # `summary`, which is where the models put their process log ("Checked the
+    # only changed file...", "I read root AGENTS.md and CLAUDE.md..."), so the
+    # card showed what the axis DID and never why it ruled as it did. The full
+    # summary and the confidence sit in the collapsed blocks under the result.
     lines += ["| Axis | Verdict | Why |", "|---|---|---|"]
     for axis in axes:
         entry = detail.get(axis)
@@ -433,8 +490,7 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         if verdict not in VERDICT_ICONS:
             lines.append(f"| {axis} | {NO_RESULT} | |")
             continue
-        why = sanitize(entry.get("headline") or first_sentence(entry.get("summary")))
-        lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {why} |")
+        lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {why_text(entry)} |")
     lines.append("")
     if outcome == OUTCOME_APPROVED:
         lines.append("**Result: ✅ Approved.**")
@@ -442,11 +498,14 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         lines.append("**Result: ❌ Not approved.**")
         lines += [f"- {r}" for r in decide_reasons(outcome, decision)]
         lines += ["", f"**Next step:** {next_text}"]
+    lines += reasoning_blocks(axes, detail)
     limit = _int_or_q(max_yellow)
+    # The run link sits on the reviewed-commit line, as on every other card;
+    # it used to close the rule line instead, leaving this line's "workflow
+    # run" as unlinked text right under a linked one.
     lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report "
-              f"(⚪ n/a counts as reporting and does not block, but all-n/a withholds). "
-              f"{_run_link(run_url)}_",
-              "", _reviewed_line(sha, "")]
+              f"(⚪ n/a counts as reporting and does not block, but all-n/a withholds)._",
+              "", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
 
 
