@@ -3097,7 +3097,8 @@ def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
     Body AND author: the marker is public text anyone can put in a review, so a
     body match alone would let any user burn a PR's rounds. Dismissed reviews
     still count — a round was spent either way. A body reporting that the round
-    reviewed nothing (NON_ROUND_BANNERS) does not.
+    reviewed nothing (NON_ROUND_BANNERS) does not, and neither does a round a
+    push superseded (`superseded_by_push`).
     """
     out = [
         r for r in reviews
@@ -3106,8 +3107,44 @@ def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
         and (r.get("body") or "").startswith(marker)
         and not any(b in _lf(r.get("body")) for b in NON_ROUND_BANNERS)
         and _after(r.get("submitted_at"), since)
+        and not superseded_by_push(r, reviews, poster_login)
     ]
     return sorted(out, key=lambda r: r.get("submitted_at") or "")
+
+
+# The line render_standing_body writes for decide_gate's head-moved reason.
+HEAD_MOVED_LINE = f"\n- {REASON_HEAD_MOVED}"
+
+
+def superseded_by_push(panel: dict, reviews: list, login: str) -> bool:
+    """Whether a push made this consolidated review's round moot (BE-20267).
+
+    The evidence is the round's own decision: the first auto-approve review
+    `login` left for the panel's commit (`commit_id`, the SHA in its body)
+    at or after the panel posted, carrying decide_gate's head-moved reason.
+    That reason is only ever given when a newer head exists, so each round
+    excused here cost a new commit, and the cap stays bounded. `login` is the
+    POSTING identity — the decision is matched on author as well as body, so
+    a forged marker cannot excuse a round. A decision posted by a separate
+    APPROVER_TOKEN identity is not read, and its round still counts: the
+    conservative side. A round that decided on its own head (approve, request
+    changes, or no decision for any other reason) counts, as does one with no
+    decision on the PR at all.
+    """
+    sha = panel.get("commit_id") if isinstance(panel.get("commit_id"), str) else ""
+    posted = panel.get("submitted_at") if isinstance(panel.get("submitted_at"), str) else ""
+    if not SHA_HEX_RE.fullmatch(sha) or not posted:
+        return False
+    decisions = sorted(
+        (r for r in reviews
+         if isinstance(r, dict)
+         and ((r.get("user") or {}).get("login") or "").lower() == (login or "").lower()
+         and APPROVE_MARKER in _lf(r.get("body"))
+         and (m := REVIEWED_SHA_RE.search(_lf(r.get("body")))) and m.group(1) == sha
+         and isinstance(r.get("submitted_at"), str) and r["submitted_at"] >= posted),
+        key=lambda r: r["submitted_at"],
+    )
+    return bool(decisions) and HEAD_MOVED_LINE in _lf(decisions[0].get("body"))
 
 
 def cap_comment_posted(comments: list, poster_login: str, since) -> bool:

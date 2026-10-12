@@ -1687,6 +1687,51 @@ class RoundCounterTest(unittest.TestCase):
         self.assertIsNone(AA.last_unlabeled_at([{"event": "labeled", "label": {"name": "needs-human-review"},
                                                  "created_at": "2026-01-01T00:00:00Z"}], AA.HUMAN_REVIEW_LABEL))
 
+    def _decision(self, rid, at, sha, reasons, login=BOT, event="REQUEST_CHANGES"):
+        if event == "APPROVED":
+            body = AA.render_body(AA.APPROVE, reasons, "low", [], reviewed_sha=sha)
+        else:
+            body = AA.render_standing_body(AA.NO_DECISION_HEADLINE, reasons, "relabel", "low", reviewed_sha=sha)
+        return dict(review(rid, at, login=login, body=body.replace("\n", "\r\n"), state=event), commit_id=sha)
+
+    def test_a_round_whose_decision_found_the_head_moved_does_not_count(self):
+        # BE-20267: the panel posted on OLD, then its decision found the head
+        # had moved. That round is excused; the rounds that decided on their
+        # own head (approve, request changes, no decision for another reason)
+        # all count.
+        new, third = "c" * 40, "d" * 40
+        moved = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
+        approved = dict(review(3, "2026-01-02T00:00:00Z"), commit_id=new)
+        other = dict(review(5, "2026-01-03T00:00:00Z"), commit_id=third)
+        reviews = [
+            moved, self._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED]),
+            approved, self._decision(4, "2026-01-02T00:05:00Z", new, ["no finding above `low`"], event="APPROVED"),
+            other, self._decision(6, "2026-01-03T00:05:00Z", third, ["the judge failed"]),
+        ]
+        self.assertTrue(AA.superseded_by_push(moved, reviews, BOT))
+        self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [3, 5])
+
+    def test_a_round_with_no_head_moved_decision_still_counts(self):
+        panel = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
+        forged = self._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED], login="mallory")
+        earlier = self._decision(3, "2026-01-01T00:00:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        earlier["submitted_at"] = "2025-12-31T00:00:00Z"  # a previous round's decision on this commit
+        other_sha = self._decision(4, "2026-01-01T00:05:00Z", "e" * 40, [AA.REASON_HEAD_MOVED])
+        for reviews in ([panel], [panel, forged], [panel, earlier], [panel, other_sha]):
+            self.assertEqual([r["id"] for r in AA.round_reviews(reviews, BOT, None, MARKER)], [1])
+        # No commit on the panel review: nothing to match a decision to, so it counts.
+        bare = review(5, "2026-01-01T00:00:00Z")
+        self.assertFalse(AA.superseded_by_push(bare, [bare, self._decision(
+            6, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED])], BOT))
+
+    def test_the_rounds_own_decision_governs_not_a_later_one(self):
+        # The first decision after the panel is that round's; a later re-run on
+        # the same commit deciding "head moved" does not excuse it.
+        panel = dict(review(1, "2026-01-01T00:00:00Z"), commit_id=OLD)
+        own = self._decision(2, "2026-01-01T00:05:00Z", OLD, ["1 finding above `low`"])
+        later = self._decision(3, "2026-01-01T01:00:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        self.assertFalse(AA.superseded_by_push(panel, [panel, own, later], BOT))
+
     def test_cap_comment_is_once_per_cap(self):
         mine = {"user": {"login": BOT}, "body": AA.ROUND_CAP_MARKER + "\n…", "created_at": "2026-01-02T00:00:00Z"}
         forged = dict(mine, user={"login": "mallory"})
