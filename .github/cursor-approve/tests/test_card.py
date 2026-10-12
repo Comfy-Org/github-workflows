@@ -131,10 +131,13 @@ class ContractMarkers(unittest.TestCase):
 
     def test_pending_asks_nothing_of_an_agent(self):
         # BE-20246: on screen for the seconds between a first round's review
-        # and its real card. A remedy in `next` would have an agent push or
-        # relabel under a round that may be approving.
+        # and its real card. It carries the start phase's "round in progress"
+        # pair, which every agent already reads as nothing to do: the fleet
+        # escalates `no_decision`/`none` to a human, and a remedy in `next`
+        # would have an agent push or relabel under a round that may be approving.
         body = card.render_pending("1", "5", SHA, RUN)
-        self.assertEqual(markers(body), ("no_decision", "none"))
+        self.assertEqual(markers(body), markers(card.render_start("1", "5", SHA, ["correctness"], "pass", RUN)))
+        self.assertEqual(markers(body), ("pass", "none"))
         self.assertIn("Cursor approve · round 1 of 5 · `aaaaaaa`", body)
         self.assertIn(f"**{card.PENDING_TEXT}**", body)
         self.assertIn(f"Reviewed commit: `{SHA}` · [workflow run]({RUN})", body)

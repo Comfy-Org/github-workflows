@@ -2625,7 +2625,7 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
         self.assertNotIn("POST", [m for m, _, _ in self.card_writes[1:]], self.card_writes)
         if len(self.card_writes) == 2:
             self.assertEqual(self.card_writes[1][:2], ("PATCH", "repos/o/r/issues/comments/7"))
-            self.assertIn("<!-- cursor-approve-state: no_decision -->\n<!-- cursor-approve-next: none -->",
+            self.assertIn("<!-- cursor-approve-state: pass -->\n<!-- cursor-approve-next: none -->",
                           self.card_writes[0][2])
         return self.card_writes[-1][2]
 

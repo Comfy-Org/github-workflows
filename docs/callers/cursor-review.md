@@ -867,8 +867,9 @@ reach the live state in one click. The link has to be in the review when it is
 posted. Editing a review later would break it: an edited approval is treated as
 stale, and the bot never withdraws an edited request for changes. So on a PR's
 first round, before any card exists, `decide` creates one just before the
-review. That card is pending (`no_decision` / `none`, "Deciding this round"),
-and the round's card replaces it in the same step (see
+review. That card is pending ("Deciding this round", with the start phase's
+`pass` / `none` pair: a round in progress, nothing to do), and the round's
+card replaces it in the same step (see
 [cursor-approve.md](cursor-approve.md#the-status-card-contract)).
 
 **Tolerating an errored reviewer.** By default a single panel cell that errors

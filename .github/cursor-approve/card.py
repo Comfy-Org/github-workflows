@@ -513,11 +513,14 @@ def render_pending(round_no, max_rounds, sha: str, run_url: str) -> str:
     review that links to it (BE-20246); ``render_round`` replaces it seconds
     later, in the same step.
 
-    ``no_decision``/``none``: nothing has been decided yet, and nothing is asked
-    of an agent that reads the card in that window. A ``next`` with a remedy in
-    it would have an agent push or relabel under a round that may be approving.
+    ``pass``/``none``, the pair ``render_start`` writes while the axes are
+    pending: a round in progress, nothing to do. Agents already read it that
+    way. Any other pair would ask something of an agent that reads the card
+    in that window. ``no_decision``/``none`` reads as "escalate to a human",
+    and a remedy in ``next`` would have it push or relabel under a round that
+    may be approving.
     """
-    lines = card_head(STATE_NO_DECISION, NEXT_NONE) + [heading(round_no, max_rounds, sha), "", f"**{PENDING_TEXT}**"]
+    lines = card_head(STATE_PASS, NEXT_NONE) + [heading(round_no, max_rounds, sha), "", f"**{PENDING_TEXT}**"]
     lines += ["", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
 
