@@ -647,7 +647,11 @@ on:
           `approve_max_severity` (every open finding when that is empty), and
           sets the `approve_gate` output to `capped`. Auto-approve never
           approves a PR carrying that label. Removing the label resets the
-          count: only rounds after its most recent removal count. 0 → no cap. A
+          count: only rounds after its most recent removal count. A round whose
+          own decision found the PR head had moved (a newer push superseded
+          it) does not count either, at most once per reviewed commit and at
+          most `max_rounds` times, so a PR runs at most twice the cap's
+          panels. 0 → no cap. A
           count that cannot be read, or a label that cannot be applied, fails
           open (the panel runs). Creating the label needs `issues: write`, so
           pre-create it unless the bot App has it. Default 5.
@@ -754,7 +758,10 @@ on:
           The 1-based number of the review round this run delivered, counted
           the way `max_rounds` counts (the posting identity's consolidated
           reviews since `needs-human-review` was last removed; a round that
-          reviewed nothing does not count). When this run hit the cap, the
+          reviewed nothing, or whose decision found the head had moved, does
+          not count). It is computed before the round runs, so a round its own
+          decision later excuses still reports N, and the next counted round
+          reports N again. When this run hit the cap, the
           number of the last round instead. Empty when the run delivered no
           round, the count could not be read, or `max_rounds` is 0 (nothing is
           counted then).

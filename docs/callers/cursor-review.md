@@ -144,7 +144,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `auto_retry_delay_minutes` | `0` | How long an automatic retry waits before relabelling, in minutes — provider capacity is the usual cause, and a few minutes is what makes the second attempt different from the first. `0` relabels immediately, which is what every caller had before this input. The wait happens on a runner, so it costs runner-minutes on a private repo; that is the whole cost. Clamped to `30`; anything unparsable waits not at all. No effect without `approve_max_severity`. |
 | `auto_rereview_after_dismissal` | `false` | When a push dismisses the approver's approval, start the next round **automatically** after `auto_rereview_delay_minutes` — but only if the head is still the commit whose push dismissed it (so a burst of pushes costs one round, not one per push), the head has no consolidated review yet, the review label has not been applied since the approval the card reports (no round in flight), the PR is open and not a draft, it carries neither `skip-cursor-review` nor `needs-human-review`, and it is under `max_rounds`. Once per head commit, recorded on the status card, so a head that flips back is never re-run twice. With it off, the dismissal still marks the card stale (`no_decision`/`relabel`, or `capped`/`human` at the round cap) and nothing relabels. Needs `bot_app_id` or `APPROVER_TOKEN`. No effect without `approve_max_severity`, for an author `approve_authors` does not list, or under `run_without_label`, where the push already starts the round. See [cursor-approve's card contract](cursor-approve.md#a-push-that-dismisses-the-approval). |
 | `auto_rereview_delay_minutes` | `10` | The debounce before `auto_rereview_after_dismissal` relabels, in minutes. A newer push during the wait means no relabel; that push's own dismissal schedules its own wait. The wait happens on a runner, inside the push's run, so a later event in the same concurrency slot cancels it: a `pull_request`/`pull_request_target` event schedules a new one, but a `pull_request_review_thread` run (resolving a thread during the wait) does not, and the card's fallback (re-run by hand) applies. Clamped to `30`; anything unparsable waits not at all. |
-| `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
+| `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. A round whose own decision found the PR head had moved (a newer push superseded it) does not count, at most once per reviewed commit and at most `max_rounds` times. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 | `approver_environment` | `''` | The caller-repo environment that holds `APPROVER_TOKEN` (as an environment secret). Declared as `environment:` on the four jobs that read the token, only under `pull_request_target`, and on none that checks out PR code. With a deployment-branch policy of the base branch only, the token is unreachable from `pull_request` runs. Use with a `pull_request_target` caller — see the [trust model](#trust-model). Empty = no environment. |
 
@@ -1112,7 +1112,16 @@ job counts the consolidated reviews (`## 🔍 Cursor Review — Consolidated pan
 the posting identity — the `bot_app_id` App, else `github-actions[bot]` — has
 already left on the PR. Reviews by anyone else carrying the same heading are not
 counted, and neither are rounds that reviewed nothing (a "Review failed" error
-review, or one where every panel cell failed). At or over the cap it:
+review, or one where every panel cell failed). Nor is a round a newer push
+superseded: one whose own auto-approve decision (the first unedited one that
+same identity posted for the round's commit, before any later round on that
+commit) reports that the PR head moved while the review ran. The round's commit
+is the one its round sentinel records, not the review's `commit_id`, which
+GitHub can move forward. At most one round per reviewed commit is excused, and
+at most `max_rounds` in all, so a PR runs at most twice the cap's panels. Still
+counted: a round decided by a separate `APPROVER_TOKEN` identity (not read), a
+round with no decision, and one whose head moved during the decision's own post
+(that follow-up is worded differently). At or over the cap it:
 
 - runs **no panel** (`Diff size check`, and everything after it, is skipped);
 - adds the `needs-human-review` label, creating it if the repo lacks it.
@@ -1166,7 +1175,7 @@ Two more outputs carry the count, for a "round R of M" display:
 
 | Output | Value |
 |---|---|
-| `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing is not counted). If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
+| `round` | The 1-based number of the round this run delivered, counted the way the cap counts (the posting identity's consolidated reviews since `needs-human-review` was last removed; a round that reviewed nothing, or whose decision found the head had moved, is not counted). It is computed before the round runs, so a round its own decision later excuses still reports its number, and the next counted round reports the same number again. If this run hit the cap, it is the number of the last round. It is **empty** when the run delivered no round, the count could not be read, or `max_rounds` is `0`, because nothing is counted then. |
 | `max_rounds` | The effective cap: the `max_rounds` input as applied, or `0` for no cap. A value the cap step rejects as not a whole number reports `0`, because it is not applied. |
 
 One more, for [cursor-approve](cursor-approve.md) under `defer_approval: true`:

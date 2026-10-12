@@ -703,6 +703,7 @@ STRUCTURAL_CAUSES = (
 # already-reviewed — see the gate's `dup` step. Those still ask for a human.
 REASON_HEAD_MOVED = "the PR head moved while the review ran"
 REASON_BASE_CHANGED = "the PR base branch changed while the review ran"
+REASON_HEAD_UNREAD = "the PR head could not be read"
 RETRYABLE_CAUSES = (REASON_HEAD_MOVED, REASON_BASE_CHANGED)
 
 
@@ -749,7 +750,11 @@ def decide_gate(
         reasons.append(REASON_NOT_DELIVERED)
     elif ungated:
         reasons.append(f"{ungated} {REASON_UNGATED_TAIL}")
-    if not reviewed_sha or reviewed_sha != live_head_sha:
+    if not live_head_sha:
+        # A shapeless PR payload is not evidence of a push, and a head-moved
+        # reason excuses the round from `max_rounds` (superseded_by_push).
+        reasons.append(REASON_HEAD_UNREAD)
+    elif not reviewed_sha or reviewed_sha.lower() != live_head_sha.lower():
         reasons.append(REASON_HEAD_MOVED)
     if reviewed_base != live_base:
         # A retarget never moves the head, so the head check cannot see it.
@@ -2765,7 +2770,8 @@ def rounds_so_far(args, reviews: list, timeline=None):
         if timeline is None:
             timeline = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100")
         since = last_unlabeled_at(timeline, HUMAN_REVIEW_LABEL)
-        return len(round_reviews(reviews, args.poster_login, since, _load_post_review().CONSOLIDATED_MARKER))
+        return len(round_reviews(reviews, args.poster_login, since, _load_post_review().CONSOLIDATED_MARKER,
+                                 _max_rounds(args)))
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not count this PR's review rounds: {annotation_cause(e, 'unknown error')}")
         return None
@@ -3091,23 +3097,97 @@ def _lf(body) -> str:
     return body.replace("\r\n", "\n") if isinstance(body, str) else ""
 
 
-def round_reviews(reviews: list, poster_login: str, since, marker: str) -> list:
+def round_reviews(reviews: list, poster_login: str, since, marker: str, max_excused: int = 0) -> list:
     """The consolidated reviews `poster_login` posted after `since`, oldest first.
 
     Body AND author: the marker is public text anyone can put in a review, so a
     body match alone would let any user burn a PR's rounds. Dismissed reviews
     still count — a round was spent either way. A body reporting that the round
-    reviewed nothing (NON_ROUND_BANNERS) does not.
+    reviewed nothing (NON_ROUND_BANNERS) does not, and neither does a round a
+    push superseded (`superseded_by_push`) — but at most `max_excused` of those
+    (the callers pass `max_rounds`, so a PR runs at most twice the cap's panels),
+    and at most one per reviewed commit, so a head flipping between two commits
+    excuses each once. Past either bound a superseded round counts.
     """
-    out = [
+    out = sorted((
         r for r in reviews
         if isinstance(r, dict)
-        and ((r.get("user") or {}).get("login") or "").lower() == poster_login.lower()
+        and ((r.get("user") or {}).get("login") or "").lower() == (poster_login or "").lower()
         and (r.get("body") or "").startswith(marker)
         and not any(b in _lf(r.get("body")) for b in NON_ROUND_BANNERS)
         and _after(r.get("submitted_at"), since)
-    ]
-    return sorted(out, key=lambda r: r.get("submitted_at") or "")
+    ), key=lambda r: r.get("submitted_at") or "")
+    counted, excused = [], set()
+    for r in out:
+        sha = superseded_by_push(r, reviews, poster_login, marker)
+        if sha and sha not in excused and len(excused) < max_excused:
+            excused.add(sha)
+        else:
+            counted.append(r)
+    return counted
+
+
+# The line render_standing_body writes for decide_gate's head-moved reason.
+HEAD_MOVED_LINE = f"\n- {REASON_HEAD_MOVED}"
+# post-review.py's round sentinel (render_round_sentinel), at the start of a
+# line. Forged copies inside quoted text are defanged by post-review.py.
+ROUND_SENTINEL_RE = re.compile(r"^<!-- cursor-review:round v1 (\{[^\n]*?\}) -->$", re.MULTILINE)
+
+
+def round_head(panel: dict) -> str:
+    """The commit a consolidated review reviewed, from its round sentinel; ""
+    when the body carries none. Not `commit_id`: GitHub can move that forward
+    to a newer head (see REVIEWED_SHA_RE)."""
+    match = ROUND_SENTINEL_RE.search(_lf(panel.get("body")))
+    try:
+        head = json.loads(match.group(1)).get("head") if match else ""
+    except (ValueError, AttributeError, RecursionError):
+        return ""
+    return head if isinstance(head, str) and SHA_HEX_RE.fullmatch(head) else ""
+
+
+def _review_id(r: dict):
+    rid = r.get("id")
+    return rid if isinstance(rid, int) and not isinstance(rid, bool) else None
+
+
+def superseded_by_push(panel: dict, reviews: list, login: str, marker: str) -> str:
+    """The reviewed commit when a push made this consolidated review's round
+    moot (BE-20267), else "".
+
+    The evidence is the round's own decision: the first unedited auto-approve
+    review `login` left for the panel's commit (its round sentinel's `head`,
+    the SHA in the decision's body) after the panel and before the next
+    consolidated review `login` posted on that commit, carrying decide_gate's
+    head-moved reason. Order is by review id, which GitHub assigns in sequence
+    (`submitted_at` has one-second ties). `login` is the POSTING identity — the
+    decision is matched on author as well as body, so a forged marker cannot
+    excuse a round. A decision posted by a separate APPROVER_TOKEN identity is
+    not read, and its round still counts: the conservative side. A round that
+    decided on its own head (approve, request changes, or no decision for any
+    other reason) counts, as does one with no decision — including a decision
+    the head moved under DURING its post, whose follow-up uses other wording —
+    and one whose body carries no round sentinel.
+    """
+    sha, pid = round_head(panel), _review_id(panel)
+    if not sha or pid is None:
+        return ""
+    mine = sorted(
+        (r for r in reviews
+         if isinstance(r, dict) and _review_id(r) is not None and _review_id(r) > pid
+         and ((r.get("user") or {}).get("login") or "").lower() == (login or "").lower()),
+        key=_review_id,
+    )
+    for r in mine:
+        body = _lf(r.get("body"))
+        if body.startswith(marker) and round_head(r) == sha:
+            return ""  # the next round on this commit: this one never decided
+        if r.get("edited") or not body.startswith(APPROVE_MARKER):
+            continue
+        match = REVIEWED_SHA_RE.search(body)
+        if match and match.group(1) == sha:
+            return sha if HEAD_MOVED_LINE in body else ""
+    return ""
 
 
 def cap_comment_posted(comments: list, poster_login: str, since) -> bool:
@@ -3285,7 +3365,8 @@ def cmd_round_cap(args) -> int:
         since = last_unlabeled_at(
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
         )
-        rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, since, marker)
+        rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, since, marker,
+                               max_rounds)
     except (RuntimeError, ValueError) as e:
         # Fail OPEN: the panel runs exactly as it did before the cap existed.
         print(f"::warning::Could not count this PR's review rounds, so the round cap is not applied this run: {e}")
