@@ -2550,7 +2550,8 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
     def run_decide(self, findings=(), panel=PANEL_OK, judge="ok", delivered="true", diff=DIFF,
                    reviews=(), comments=(), threads=(), labels=(), defer="", author_enabled="",
                    head=SHA, card="true", review_label="", refuse_pin=False, head_seq=None,
-                   fail_first_post=False, comments_fail=False, post_error="", pr_author="someone"):
+                   fail_first_post=False, comments_fail=False, post_error="", pr_author="someone",
+                   dismiss_error=""):
         self.reviews_posted, self.dismissed, self.card_writes = [], [], []
         # Every write, in order, and every comment listing (BE-20246).
         self.writes, self.listings = [], 0
@@ -2570,8 +2571,12 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                 self.reviews_posted.append(payload)
                 return json.dumps({"id": 99})
             if args[:3] == ["api", "-X", "PUT"]:
+                if dismiss_error:
+                    raise RuntimeError(dismiss_error)
                 self.dismissed.append((int(args[3].split("/")[-2]), payload["message"]))
                 return "{}"
+            if args[:3] == ["api", "-X", "DELETE"]:
+                return ""
             if args[:3] == ["api", "-X", "PATCH"] or (args[:3] == ["api", "-X", "POST"] and "/comments" in args[3]):
                 self.card_writes.append((args[2], args[3], payload["body"]))
                 return json.dumps({"id": 7, "html_url": "https://github.com/o/r/pull/1#issuecomment-7"})
@@ -2902,6 +2907,31 @@ class StatusCardAndStandingBlockTest(unittest.TestCase):
                                 post_error="gh api failed: HTTP 422: Can not approve your own pull request")
         self.assertEqual(rc, 0)
         self.assertEqual((self.listings, self.card_writes), (0, []))
+
+    def test_a_refused_review_on_the_approvers_own_pr_deletes_the_pending_card(self):
+        # An empty (or stale) --pr-author lets the own-PR check pass, so the
+        # pending card is created; nothing of this round would replace it.
+        rc, _ = self.run_decide(pr_author="",
+                                post_error="gh api failed: HTTP 422: Can not approve your own pull request")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.writes, [("POST", "repos/o/r/issues/1/comments"),
+                                       ("POST", "repos/o/r/pulls/1/reviews"),
+                                       ("DELETE", "repos/o/r/issues/comments/7")])
+
+    def test_a_body_that_cannot_be_rendered_creates_no_pending_card(self):
+        with mock.patch.object(AA, "_load_post_review", side_effect=RuntimeError("post-review.py failed to load")), \
+                self.assertRaises(RuntimeError):
+            self.run_decide(findings=[finding("high")])
+        self.assertEqual((self.card_writes, self.reviews_posted), ([], []))
+
+    def test_a_review_that_cannot_be_withdrawn_replaces_the_pending_card(self):
+        # The pending card says the latest review is the decision; that review
+        # is the one the run failed to withdraw.
+        rc, _ = self.run_decide(head_seq=iter([SHA, "b" * 40]), dismiss_error="gh api failed: HTTP 403")
+        self.assertEqual(rc, 1)
+        body = self.card_body()
+        self.assert_markers(body, "no_decision", "human")
+        self.assertIn("withdrawing it failed", body)
 
     def test_rounds_that_post_no_review_create_no_pending_card(self):
         for kwargs in ({"defer": "true"}, {"labels": ["needs-human-review"]}):

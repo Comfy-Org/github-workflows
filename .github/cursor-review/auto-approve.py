@@ -1576,8 +1576,8 @@ def _ensure_card_url(args) -> str:
     if not login or (getattr(args, "card", "") or "").strip().lower() != "true":
         return ""
     # GitHub refuses the approver a review of its own PR, so there is nothing
-    # to link, and cmd_decide returns on that refusal without writing the card
-    # that would replace a pending one.
+    # to link. cmd_decide deletes a pending card on that refusal (an empty or
+    # stale --pr-author gets past this check); this check saves the write.
     if (getattr(args, "pr_author", "") or "").strip().lower() == login.lower():
         return ""
     try:
@@ -1594,6 +1594,23 @@ def _ensure_card_url(args) -> str:
         print(f"::warning::Could not find or create the cursor-approve status card, so this review does not "
               f"link it: {annotation_cause(e, 'unknown error')}")
         return ""
+
+
+def discard_pending_card(args) -> None:
+    """Delete the pending card ``review_card_url`` created this run, when
+    GitHub then refused the review outright (the approver's own PR, which a
+    stale or missing ``--pr-author`` lets through to the POST). No card of this
+    round replaces it on that path, so it would say "Deciding this round" for
+    good. Never fatal."""
+    created = getattr(args, "created_card", None)
+    if not created:
+        return
+    try:
+        gh(["api", "-X", "DELETE", f"repos/{args.repo}/issues/comments/{created['id']}"])
+        args.created_card = None
+    except RuntimeError as e:
+        print(f"::warning::Could not delete the pending cursor-approve status card: "
+              f"{annotation_cause(e, 'unknown error')}")
 
 
 def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "",
@@ -1996,7 +2013,13 @@ def cmd_decide(args) -> int:
                              why, next_text, threshold)
         return rc
 
-    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, review_card_url(args))
+    # Rendered once before the card is looked up: a body that cannot be
+    # rendered posts no review, and a first round's pending card created for
+    # it would never be replaced by this round's.
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
+    card_url = review_card_url(args)
+    if card_url:
+        body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, card_url)
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
         # The recorded SHA is the only staleness anchor an approval has (see
         # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
@@ -2027,6 +2050,7 @@ def cmd_decide(args) -> int:
         # who authored the PR, not a broken review — report it, don't go red.
         if "own pull request" in str(e).lower():
             emit(f"ℹ️ **Auto-approve: skipped** — the approver authored this PR ({e}).")
+            discard_pending_card(args)
             return 0
         # No review landed, so this round's verdict stands behind nothing: the
         # gate must not read pass/fail, and an earlier approval must not keep
@@ -2071,6 +2095,12 @@ def cmd_decide(args) -> int:
             dismiss(args.repo, args.pr_number, posted["id"], HUMAN_REVIEW_MESSAGE if labelled_now else STALE_MESSAGE)
         except RuntimeError as e:
             print(f"::error::{why[0].upper()}{why[1:]} while the {event} review was posted, and withdrawing it failed: {annotation_cause(e, 'unknown error')}. {DISMISS_PERMISSION_HINT}")
+            # Not the pending card's "the latest review is the decision": that
+            # review is the one this run could not withdraw.
+            write_round_card(args, CARD_NO_DECISION, CARD_NEXT_HUMAN, NO_DECISION_HEADLINE,
+                             [f"{why} while the {event} review was being posted, and withdrawing it failed"],
+                             f"A human is needed: dismiss this round's {event} review. {DISMISS_PERMISSION_HINT}",
+                             threshold)
             return 1
         emit(f"ℹ️ **Auto-approve: withdrawn** — {why} while the {event} review was being posted.")
         if not labelled_now:

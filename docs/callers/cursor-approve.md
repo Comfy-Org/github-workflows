@@ -126,9 +126,12 @@ posting its review. That card reads "Deciding this round" and carries
 pending: a round in progress, nothing to do. The round's card replaces it in
 the same step. Any other pair would ask something of an agent that reads the
 card in that window: `no_decision` / `none` reads as "hand to a human", and a
-remedy would have it push or relabel during a round that may be approving. If
-the pending card stays, the card write failed: the latest auto-approve review
-is the decision, and the workflow run says why.
+remedy would have it push or relabel during a round that may be approving.
+decide creates it only once the review's body has rendered, deletes it if
+GitHub then refuses the review as the approver's own PR, and replaces it with
+a `no_decision` / `human` card when it cannot withdraw a review it must
+withdraw. If the pending card stays, the card write failed: the latest
+auto-approve review is the decision, and the workflow run says why.
 
 The decide phase maps its outcome onto the same contract: `approved` →
 `pass`/`none`; `not_approved` (an axis was red, missing, had no headline, too

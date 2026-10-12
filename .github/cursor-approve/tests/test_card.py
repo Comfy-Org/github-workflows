@@ -461,6 +461,33 @@ class Ensure(unittest.TestCase):
             with self.subTest(reply=reply), self.assertRaises(ValueError):
                 self.run_ensure([], reply=reply)
 
+    def test_an_ambiguous_create_that_landed_is_found_and_returned_as_created(self):
+        # A timeout or a reply without an id may still have written the card:
+        # the caller must edit that one by id, not post a second.
+        landed = {"id": 9, "user": {"login": LOGIN}, "body": card.CARD_MARKER + "\nPENDING", "html_url": self.URL}
+        for failure in (RuntimeError("gh api failed: timed out"), "{}"):
+            with self.subTest(failure=failure):
+                listings = iter([[], [landed]])
+
+                def fake_gh(args, payload=None, failure=failure):
+                    if "--paginate" in args:
+                        return json.dumps([next(listings)])
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+
+                with mock.patch.object(card, "gh", fake_gh):
+                    self.assertEqual(card.ensure("o/r", 1, LOGIN, "PENDING"), (landed, True))
+
+    def test_a_failed_create_with_no_card_after_it_still_raises(self):
+        def fake_gh(args, payload=None):
+            if "--paginate" in args:
+                return json.dumps([[]])
+            raise RuntimeError("gh api failed: HTTP 502")
+
+        with mock.patch.object(card, "gh", fake_gh), self.assertRaises(RuntimeError):
+            card.ensure("o/r", 1, LOGIN, "PENDING")
+
     def test_the_ensure_phase_prints_the_url_it_found_or_created(self):
         for comments, want in (([], self.URL),
                                ([{"id": 7, "user": {"login": LOGIN}, "body": card.CARD_MARKER,

@@ -769,8 +769,17 @@ def ensure(repo: str, pr_number, login: str, body: str) -> tuple:
     card = find_card(list_comments(repo, pr_number), login)
     if card is not None:
         return card, False
-    return _comment(gh(["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "--input", "-"],
-                       {"body": body})), True
+    try:
+        return _comment(gh(["api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "--input", "-"],
+                           {"body": body})), True
+    except (RuntimeError, ValueError):
+        # A POST that failed ambiguously (a timeout, a reply without an id)
+        # may have written the card anyway. Look once more, so the caller edits
+        # that card by id rather than posting a second one.
+        card = find_card(list_comments(repo, pr_number), login)
+        if card is None:
+            raise
+        return card, True
 
 
 def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None, card=None) -> dict:
