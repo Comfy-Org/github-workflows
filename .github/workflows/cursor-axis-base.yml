@@ -28,7 +28,9 @@ name: Cursor axis (base)
 #               Anthropic model id (e.g. `claude-opus-5-5`) that runs this axis
 #               through the Anthropic API directly, via the pinned Claude Code
 #               CLI (`.github/cursor-review/package.json`), exactly as
-#               cursor-review's direct cells and direct judge do. Same prompt
+#               cursor-review's direct cells and direct judge do, in its OWN
+#               job (`axis-direct`) on GitHub-hosted `ubuntu-latest` — never
+#               `runs_on` — the Cursor job skipped. Checkout axes only. Same prompt
 #               plus prompt-direct-runner.md (no shell: the workflow writes the
 #               merge-base diff into the checkout instead), tools Read, Grep and
 #               Glob only, `--restricted` + deny rules on /proc and /sys,
@@ -40,8 +42,9 @@ name: Cursor axis (base)
 #               with context_sources.
 # Secrets:
 #   CURSOR_API_KEY
-#   ANTHROPIC_API_KEY  required only with axis_direct_model; read by the
-#               direct run step alone, in its env, never written to disk.
+#   ANTHROPIC_API_KEY  required only with axis_direct_model; referenced by the
+#               `axis-direct` job alone (its key check, run and verdict-extract
+#               steps, in their env), never by the Cursor job, never on disk.
 #   LINEAR_KEY, NOTION_TOKEN, SLACK_TOKEN  optional, read-only bot tokens for
 #               the context proxy. They are written to a 0600 file in their own
 #               step; the proxy reads and deletes it BEFORE the agent starts, so
@@ -126,6 +129,9 @@ env:
 jobs:
   axis:
     name: 'axis: ${{ inputs.axis }}'
+    # The default runner. The direct runner is the `axis-direct` job below,
+    # so this job never references ANTHROPIC_API_KEY.
+    if: inputs.axis_direct_model == ''
     runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 20
     permissions:
@@ -140,7 +146,6 @@ jobs:
           CHECKOUT: ${{ inputs.checkout }}
           NO_SHELL: ${{ inputs.no_shell }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
-          AXIS_DIRECT_MODEL: ${{ inputs.axis_direct_model }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -162,23 +167,7 @@ jobs:
           if ! printf '%s' "$MODEL" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
             echo "::error::model must be a Cursor model id"; exit 1
           fi
-          # The direct runner: a plain Anthropic id or nothing. Validated, not
-          # warned past: the caller opted in, so a typo must not quietly run
-          # Cursor instead (no fallback — the run names its runner).
-          if [ -n "$AXIS_DIRECT_MODEL" ]; then
-            if ! [[ "$AXIS_DIRECT_MODEL" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
-              echo "::error::axis_direct_model must be a plain Anthropic model id (letters, digits, '.', '_', '-'; at most 100)"; exit 1
-            fi
-            # The direct runner carries no MCP server, so the context proxy's
-            # tools are not wired for it.
-            if [ -n "$CONTEXT_SOURCES" ]; then
-              echo "::error::axis_direct_model cannot be combined with context_sources: the direct runner has no context tools"; exit 1
-            fi
-            echo "::notice::axis $AXIS runs on the direct Anthropic API (Claude Code CLI, model $AXIS_DIRECT_MODEL), not Cursor"
-            echo "Runner: direct Anthropic API, \`$AXIS_DIRECT_MODEL\`" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Runner: Cursor CLI, \`$MODEL\`" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "Runner: Cursor CLI, \`$MODEL\`" >> "$GITHUB_STEP_SUMMARY"
           # [[ =~ ]] anchors the whole value; grep's ^...$ would anchor one line.
           if ! [[ "$CONTEXT_SOURCES" =~ ^((linear|notion|slack)(,(linear|notion|slack))*)?$ ]]; then
             echo "::error::context_sources must be a comma list of linear, notion, slack"; exit 1
@@ -308,7 +297,6 @@ jobs:
           CHECKOUT: ${{ inputs.checkout }}
           CONTEXT_SOURCES: ${{ inputs.context_sources }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
-          AXIS_DIRECT_MODEL: ${{ inputs.axis_direct_model }}
         run: |
           mkdir -p pr
           prior=()
@@ -324,12 +312,6 @@ jobs:
           if [ "$CHECKOUT" = "true" ]; then
             merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
           fi
-          # The direct runner has no shell, so it cannot run rule 1's
-          # `git diff`, so put that exact diff beside the context file instead.
-          if [ -n "$AXIS_DIRECT_MODEL" ] && [ "$CHECKOUT" = "true" ]; then
-            git -C pr diff "$merge_base...$COMMIT_SHA" > "$ctx_dir/cursor-approve-pr.diff"
-            echo "diff bytes: $(wc -c < "$ctx_dir/cursor-approve-pr.diff")"
-          fi
           {
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
               --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
@@ -339,14 +321,9 @@ jobs:
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
             esac
             if [ -n "$CONTEXT_SOURCES" ]; then cat "$CURSOR_APPROVE_ASSETS/prompt-context-tools.md"; fi
-            # A no-checkout axis already has no shell and its own note above.
-            if [ -n "$AXIS_DIRECT_MODEL" ] && [ "$CHECKOUT" = "true" ]; then
-              cat "$CURSOR_APPROVE_ASSETS/prompt-direct-runner.md"
-            fi
           } > "$RUNNER_TEMP/axis-prompt.txt"
 
       - name: Install Cursor agent CLI
-        if: inputs.axis_direct_model == ''
         run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Write the context token file
@@ -374,7 +351,6 @@ jobs:
           PY
 
       - name: Run the axis
-        if: inputs.axis_direct_model == ''
         working-directory: pr
         # No LINEAR_KEY / NOTION_TOKEN / SLACK_TOKEN here, ever (a test enforces
         # it): this step only knows where the proxy's token file WAS.
@@ -532,10 +508,174 @@ jobs:
               f.write(result)
           PY
 
+      - name: Remove the context token file
+        if: always() && inputs.context_sources != ''
+        run: rm -f -- "$RUNNER_TEMP/cursor-approve-tokens.json"
+
+      - name: Upload the transcript
+        # Its own artifact, never named axis-*: only the verdict JSON flows on.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: transcript-axis-${{ inputs.axis }}
+          path: ${{ runner.temp }}/axis-transcript/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Extract the verdict
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/axis-out"
+          python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" extract --commit-sha "$COMMIT_SHA" \
+            --raw "$RUNNER_TEMP/axis-raw.txt" --out "$RUNNER_TEMP/axis-out/$AXIS.json"
+          cat "$RUNNER_TEMP/axis-out/$AXIS.json"
+
+      - name: Upload the verdict
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: axis-${{ inputs.axis }}
+          path: ${{ runner.temp }}/axis-out/${{ inputs.axis }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  axis-direct:
+    # The opt-in direct runner (axis_direct_model), in its OWN job, hard-pinned
+    # to GitHub-hosted `ubuntu-latest` whatever `runs_on` says — the split
+    # cursor-review makes for its direct cells and direct judge. This is the
+    # ONLY job that references ANTHROPIC_API_KEY, so the key never reaches the
+    # Cursor job's runner (where a prompt-injected `cursor-agent` shell runs
+    # over PR code), even for a caller that forwards it with the input empty,
+    # and never a caller's self-hosted pool. A distinct check name, so a
+    # skipped Cursor job is never mistaken for this one's result.
+    name: 'axis: ${{ inputs.axis }} (direct)'
+    if: inputs.axis_direct_model != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        # The Cursor job's checks that apply here, plus the direct id. `model`
+        # and `runs_on` are not read by this job, so they are not checked.
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          CONTEXT_SOURCES: ${{ inputs.context_sources }}
+          CHECKOUT: ${{ inputs.checkout }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          AXIS_DIRECT_MODEL: ${{ inputs.axis_direct_model }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # The checkout axes only: business and design read a workflow-fetched
+          # change through the Cursor runner's no-shell path.
+          case "$AXIS" in
+            correctness|completeness|conformance) ;;
+            *) echo "::error::axis_direct_model runs the checkout axes only (correctness, completeness, conformance), not '$AXIS'"; exit 1 ;;
+          esac
+          if [ "$CHECKOUT" != "true" ]; then
+            echo "::error::the $AXIS axis requires checkout true"; exit 1
+          fi
+          # A `type: number` can render as `1.0`.
+          case "$PRIOR_ROUNDS" in
+            0|1|2|3|0.0|1.0|2.0|3.0) ;;
+            *) echo "::error::prior_rounds must be an integer from 0 to 3, got '$PRIOR_ROUNDS'"; exit 1 ;;
+          esac
+          if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit_sha must be a full 40-hex SHA"; exit 1
+          fi
+          # Validated, not warned past: the caller opted in, so a typo must not
+          # quietly run Cursor instead (no fallback — the run names its runner).
+          if ! [[ "$AXIS_DIRECT_MODEL" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+            echo "::error::axis_direct_model must be a plain Anthropic model id (letters, digits, '.', '_', '-'; at most 100)"; exit 1
+          fi
+          # The direct runner carries no MCP server, so the context proxy's
+          # tools are not wired for it.
+          if [ -n "$CONTEXT_SOURCES" ]; then
+            echo "::error::axis_direct_model cannot be combined with context_sources: the direct runner has no context tools"; exit 1
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::an axis runs on a pull_request(_target) event only"; exit 1
+          fi
+          # As the Cursor job: never a fork PR's checkout beside an API key.
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error::PR is from a fork ($HEAD_REPO != $BASE_REPO); the axes do not run on fork PRs"; exit 1
+          fi
+          if ! printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::job.workflow_sha is empty or malformed (Actions runner older than v2.334.0?); refusing to load the axis prompts from a mutable ref"
+            exit 1
+          fi
+          echo "::notice::axis $AXIS runs on the direct Anthropic API (Claude Code CLI, model $AXIS_DIRECT_MODEL), not Cursor"
+          echo "Runner: direct Anthropic API, \`$AXIS_DIRECT_MODEL\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Load cursor-approve assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ job.workflow_sha }}
+          path: _cursor_approve_assets
+          persist-credentials: false
+
+      - name: Check out the PR head (read-only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the prior verdicts
+        if: inputs.prior_rounds > 0
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: prior-axes
+          path: ${{ runner.temp }}/prior
+
+      - name: Render prompt
+        # The Cursor job's render, plus the diff the direct runner cannot run
+        # `git diff` for, and its no-shell addendum.
+        env:
+          AXIS: ${{ inputs.axis }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO: ${{ github.repository }}
+          PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+        run: |
+          prior=()
+          prior_file="$RUNNER_TEMP/prior/prior-axes.json"
+          if [ "$PRIOR_ROUNDS" != "0" ] && [ -f "$prior_file" ]; then prior=(--prior-file "$prior_file"); fi
+          # Under .git, so neither file ever shows in a diff.
+          ctx_dir="pr/.git"
+          ctx="$ctx_dir/cursor-approve-context.md"
+          { printf '# %s\n\n' "$PR_TITLE"; printf '%s\n' "$PR_BODY"; } > "$ctx"
+          merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
+          # Rule 1's exact diff. `--text --no-textconv --no-ext-diff`: the
+          # checkout's own .gitattributes (`-diff`, `binary`, a textconv
+          # driver) must not shrink a file's change to "Binary files differ"
+          # in front of the axis judging it, which has no shell to look past it.
+          git -C pr diff --text --no-textconv --no-ext-diff \
+            "$merge_base...$COMMIT_SHA" > "$ctx_dir/cursor-approve-pr.diff"
+          echo "diff bytes: $(wc -c < "$ctx_dir/cursor-approve-pr.diff")"
+          {
+            python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
+              --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
+              --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
+              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}"
+            cat "$CURSOR_APPROVE_ASSETS/prompt-direct-runner.md"
+          } > "$RUNNER_TEMP/axis-prompt.txt"
+
       - name: Check the Anthropic API key
         # The direct runner only. An absent key FAILS the axis — no verdict,
         # which decide reads as untrusted — never a quiet fall back to Cursor.
-        if: inputs.axis_direct_model != ''
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -545,7 +685,6 @@ jobs:
           fi
 
       - name: Install Claude Code CLI
-        if: inputs.axis_direct_model != ''
         # Pinned in .github/cursor-review/package.json, read exactly as
         # `review-openai-direct`'s `Install Codex CLI` reads its pin.
         run: |
@@ -572,7 +711,6 @@ jobs:
           npm install -g "@anthropic-ai/claude-code@${version}"
 
       - name: Verify Claude Code CLI version
-        if: inputs.axis_direct_model != ''
         # As `Verify Codex CLI version`: `claude --version` prints
         # `2.1.286 (Claude Code)`, so the FIRST field is the version.
         run: |
@@ -599,15 +737,18 @@ jobs:
         # symlink could lead the file tools out of the tree, and a PR-authored
         # Claude config (settings env, hooks, MCP servers) must never be
         # there to load. `--restricted` and `--setting-sources ""` already
-        # ignore the config; this removes it outright.
-        if: inputs.axis_direct_model != ''
+        # ignore the config; this removes it outright. And, as the Cursor
+        # runner drops `.cursorignore`: Grep and Glob are ripgrep, which obeys
+        # `.ignore` and `.rgignore`, so a PR could plant one to hide its own
+        # files from the search. (`.gitignore` stays: deleting it would hide
+        # its own content, and the written diff lists every changed file.)
         run: |
           find pr -type l -delete
           rm -rf pr/.claude pr/.mcp.json pr/CLAUDE.local.md
+          find pr -type f \( -name .ignore -o -name .rgignore \) -not -path 'pr/.git/*' -delete
 
       - name: Run the axis (direct)
         id: axis_direct
-        if: inputs.axis_direct_model != ''
         # Step-capped below the job's 20, so the usage record still runs after
         # a timeout. A timeout or any failure leaves no raw reply, so the
         # verdict is not extracted or uploaded: decide reads "no result".
@@ -655,9 +796,12 @@ jobs:
           # first on sys.path, so a PR-planted json.py would run with the key
           # in its env. The same three guards as the Cursor runner: the agent
           # exited 0, it read something (one turn = answered blind), and it
-          # produced a reply. Plus groom's tripwire: a reply carrying the key
-          # literally is never published (to the transcript, the card or the
-          # job summary).
+          # produced a reply. All three fail CLOSED: a result shape this guard
+          # does not recognize (a CLI bump renaming `num_turns`) is not a pass.
+          # Plus groom's tripwire: a reply carrying the key is never published
+          # (to the transcript, the card or the job summary) — checked on the
+          # raw file AND on the decoded result, where a JSON-escaped key turns
+          # literal; `Extract the verdict` checks once more after its decode.
           AGENT_RC="$rc" python3 -I - /tmp/axis-claude-result.json "$RUNNER_TEMP/axis-raw.txt" \
             "$out/result.json" <<'PY'
           import json, os, sys
@@ -666,23 +810,25 @@ jobs:
                   text = f.read()
           except OSError:
               text = ""
+          try:
+              result = json.loads(text)
+          except ValueError:
+              result = None
           key = os.environ.get("ANTHROPIC_API_KEY", "")
-          if key and key in text:
+          if key and (key in text or key in json.dumps(result, ensure_ascii=False)):
               sys.exit("::error::the direct axis reply contains ANTHROPIC_API_KEY; refusing to publish it (possible prompt-injection exfil)")
           with open(sys.argv[3], "w", encoding="utf-8") as f:
               f.write(text)
           if os.environ["AGENT_RC"] != "0":
               sys.exit(int(os.environ["AGENT_RC"]))
-          try:
-              result = json.loads(text)
-          except ValueError:
-              result = None
           if not isinstance(result, dict):
               sys.exit("::error::claude left no JSON result object")
           if result.get("is_error") is True:
               sys.exit("::error::claude reported an error result")
           turns = result.get("num_turns")
-          if type(turns) is int and turns < 2:
+          if type(turns) is not int:
+              sys.exit("::error::the claude result has no integer num_turns; cannot tell whether the axis read the change")
+          if turns < 2:
               sys.exit("::error::the direct axis answered in one turn, without reading the change")
           reply = result.get("result")
           if not isinstance(reply, str):
@@ -690,10 +836,6 @@ jobs:
           with open(sys.argv[2], "w", encoding="utf-8") as f:
               f.write(reply)
           PY
-
-      - name: Remove the context token file
-        if: always() && inputs.context_sources != ''
-        run: rm -f -- "$RUNNER_TEMP/cursor-approve-tokens.json"
 
       - name: Upload the transcript
         # Its own artifact, never named axis-*: only the verdict JSON flows on.
@@ -706,13 +848,27 @@ jobs:
           retention-days: 7
 
       - name: Extract the verdict
+        # The key tripwire again, AFTER extraction has decoded the reply: a key
+        # the model wrote with JSON escapes passes the raw check in the run
+        # step and only becomes literal here. Checked before the verdict is
+        # printed to the (public) log or uploaded for the card.
         env:
           AXIS: ${{ inputs.axis }}
           COMMIT_SHA: ${{ inputs.commit_sha }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           mkdir -p "$RUNNER_TEMP/axis-out"
           python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" extract --commit-sha "$COMMIT_SHA" \
             --raw "$RUNNER_TEMP/axis-raw.txt" --out "$RUNNER_TEMP/axis-out/$AXIS.json"
+          python3 -I - "$RUNNER_TEMP/axis-out/$AXIS.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              text = f.read()
+          key = os.environ.get("ANTHROPIC_API_KEY", "")
+          if key and (key in text or key in json.dumps(json.loads(text), ensure_ascii=False)):
+              os.remove(sys.argv[1])
+              sys.exit("::error::the direct axis verdict contains ANTHROPIC_API_KEY; refusing to publish it (possible prompt-injection exfil)")
+          PY
           cat "$RUNNER_TEMP/axis-out/$AXIS.json"
 
       - name: Upload the verdict
@@ -820,11 +976,14 @@ jobs:
         with:
           name: usage-direct-axis-${{ inputs.axis }}-${{ inputs.axis_direct_model }}
           path: /tmp/usage-out/usage.json
-          if-no-files-found: ignore
+          # `error`, not `ignore`: a record step that died before writing must
+          # reach the warning below, not upload nothing silently.
+          if-no-files-found: error
           retention-days: 30
 
       - name: Warn on unrecorded usage
-        # `continue-on-error` hides a failed upload (a squatted name 409s);
+        # `continue-on-error` hides a failed upload (a squatted name 409s, or
+        # no usage.json because the record step died before writing one);
         # say so on the run, so the scorecard does not price a missing record
         # as zero.
         if: always() && steps.usage_upload.outcome == 'failure'

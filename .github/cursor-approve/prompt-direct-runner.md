@@ -2,9 +2,9 @@
 ## No shell on this runner
 
 This axis runs with NO shell: the `git` commands in rules 1 and 2 (and in any
-prior-verdicts block below) are not available to you. Your tools are Read, Grep
-and Glob over the checkout of the head commit. Instead of running rule 1's
-`git diff`, read the workflow's copy of exactly that diff:
+prior-verdicts block earlier in this prompt) are not available to you. Your
+tools are Read, Grep and Glob over the checkout of the head commit. Instead of
+running rule 1's `git diff`, read the workflow's copy of exactly that diff:
 
 - `.git/cursor-approve-pr.diff` — `git diff {merge base}...{head}`, untruncated.
 

@@ -91,7 +91,10 @@ class Wrappers(unittest.TestCase):
 class Base(unittest.TestCase):
     def setUp(self):
         self.text = read("cursor-axis-base.yml")
-        self.steps = steps(self.text)
+        # The Cursor job: the only one with context tools. The opt-in direct
+        # runner's `axis-direct` job is test_axis_direct.py's.
+        jobs = self.text[self.text.index("\njobs:\n"):]
+        self.steps = steps(jobs[:jobs.index("\n  axis-direct:\n")])
 
     def test_agent_step_env_has_no_context_token(self):
         run = self.steps["Run the axis"]
@@ -105,7 +108,9 @@ class Base(unittest.TestCase):
             self.assertNotIn(token, top_env)
 
     def test_tokens_appear_only_in_the_token_file_step(self):
-        for name, body in self.steps.items():
+        # Every job's steps, not only the Cursor job's.
+        for body in re.split(r"\n      - name: ", self.text)[1:]:
+            name = body.split("\n", 1)[0].strip()
             if name == "Write the context token file":
                 continue
             for token in TOKENS:

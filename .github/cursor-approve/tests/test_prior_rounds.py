@@ -504,7 +504,10 @@ class Wiring(unittest.TestCase):
         base = self.read("cursor-axis-base.yml")
         self.assertIn("prior_rounds must be an integer from 0 to 3", base)
         self.assertIn('--prior-file "$prior_file"', base)
-        self.assertEqual(re.findall(r"^    permissions:\n((?:      .*\n)+)", base, re.MULTILINE), ["      contents: read\n"])
+        # Every job (the Cursor job and the opt-in `axis-direct` job) reads only.
+        jobs = re.findall(r"^  [A-Za-z0-9_-]+:\n", base[base.index("\njobs:\n"):], re.MULTILINE)
+        self.assertEqual(re.findall(r"^    permissions:\n((?:      .*\n)+)", base, re.MULTILINE),
+                         ["      contents: read\n"] * len(jobs))
         approve = self.read("cursor-approve.yml")
         self.assertIn('--prior-rounds "$PRIOR_ROUNDS"', approve)
         self.assertIn("card.py\" prior", approve)
