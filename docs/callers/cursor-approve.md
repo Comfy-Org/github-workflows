@@ -184,8 +184,12 @@ writes the card), the head has no consolidated review yet (the `dup` step would
 skip it), the card is still the stale card for that head (no round has decided
 since), the PR is open, not a draft and unvetoed, and it is under `max_rounds`.
 Waiters for one head run one at a time (a job concurrency group on PR + head,
-not cancel-in-progress), since every later PR event schedules another. It
-records the head on the card first —
+not cancel-in-progress), since a later `pull_request`/`pull_request_target`
+event schedules another. The wait itself runs inside the push's run, so a later
+event in the workflow's concurrency slot can cancel it: a `pull_request`/
+`pull_request_target` event schedules a replacement, but a
+`pull_request_review_thread` run (resolving a thread during the wait) does not,
+and the fallback is to relabel by hand. It records the head on the card first —
 a visible line, plus `<!-- cursor-approve:auto-rereview v1 <sha>,… -->`, which
 every later card write carries forward — so each head gets at most one
 automatic round, and a head that flips back gets none. It never runs past the
