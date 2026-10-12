@@ -41,6 +41,11 @@ edited request for changes. So on a PR's first round decide calls ``ensure``
 just before its review, which creates the card from ``render_pending`` when
 there is none, and the round's ``render_round`` replaces that in the same step.
 
+cursor-review's dismiss job rewrites it too (``render_dismissed``, BE-20262):
+a ``pass`` card whose approved commit a push (or retarget) left behind, so it
+stops saying "Approved" for an approval GitHub no longer counts; and its
+``auto-rereview`` job records on it the round it starts (``mark_auto_rereview``).
+
 Every card carries two machine-readable markers on the lines right after
 ``CARD_MARKER`` — ``STATE_MARKER`` and ``NEXT_MARKER`` — a stable contract
 for agents, documented in docs/callers/cursor-approve.md.
@@ -584,6 +589,139 @@ def render_pending(round_no, max_rounds, sha: str, run_url: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --- the card after a push dismissed its approval ----------------------------
+#
+# cursor-review's dismiss job rewrites a `pass` card whose approved commit is no
+# longer the head (BE-20262): GitHub stopped counting that approval, so the
+# card must stop saying "Approved". Two line-start markers, read back only from
+# the card `find_card` trusts (every model string on a card is `sanitize`d or
+# `reason_text`ed, which escapes `<`, so neither can be forged from model text):
+#
+# STALE_HEAD_MARKER  the head this stale card was written for. A later event on
+#                    the same head leaves the card alone; a newer head rewrites
+#                    it again. Gone the moment a round rewrites the card, which
+#                    is how the delayed re-run knows no round has decided since.
+# REREVIEW_SENTINEL  every head the workflow already started a round for on its
+#                    own (`auto_rereview_after_dismissal`), newest last. Carried
+#                    through every later rewrite by `upsert`, like the axes
+#                    sentinel, so a head that flips back is never auto-run twice.
+STALE_HEAD_MARKER = "<!-- cursor-approve-stale-head: {} -->"
+_STALE_HEAD_RE = re.compile(r"^<!-- cursor-approve-stale-head: ([0-9a-f]{40}) -->[ \t\r]*$", re.MULTILINE)
+REREVIEW_SENTINEL_OPENER = "<!-- cursor-approve:auto-rereview v1 "
+_REREVIEW_SENTINEL_RE = re.compile(r"^<!-- cursor-approve:auto-rereview v1 ([0-9a-f,]*) -->[ \t\r]*$", re.MULTILINE)
+REREVIEW_HEADS_KEPT = 20
+_HEADING_RE = re.compile(r"^### Cursor approve · round ([0-9?]+) of ([0-9?]+) · ", re.MULTILINE)
+_REVIEWED_RE = re.compile(r"^_Reviewed commit: `([0-9a-f]{40})`", re.MULTILINE)
+_STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-approve-state: ([a-z_]+) -->")
+
+
+def card_state(body) -> str:
+    """The card's `cursor-approve-state` value, or "" when it has none."""
+    match = _STATE_RE.match(body or "")
+    return match.group(1) if match else ""
+
+
+def reviewed_sha(body) -> str:
+    """The full commit SHA on the card's "Reviewed commit" line, or ""."""
+    match = _REVIEWED_RE.search(body or "")
+    return match.group(1) if match else ""
+
+
+def stale_head(body) -> str:
+    """The head a dismissal-stale card was written for, or ""."""
+    match = _STALE_HEAD_RE.search(body or "")
+    return match.group(1) if match else ""
+
+
+def card_round(body) -> str:
+    """The round number on the card's heading, or ""."""
+    match = _HEADING_RE.search(body or "")
+    return match.group(1) if match else ""
+
+
+def rereview_heads(body) -> list:
+    """The heads already given an automatic round, oldest first. Malformed
+    entries are dropped, so a damaged line can only under-record — and the
+    worst an under-recorded head costs is one more round, bounded by
+    `max_rounds`."""
+    match = _REREVIEW_SENTINEL_RE.search(body or "")
+    heads = match.group(1).split(",") if match else []
+    return [h for h in heads if SHA_RE.fullmatch(h)]
+
+
+def rereview_sentinel(heads: list) -> str:
+    heads = [h for h in heads if SHA_RE.fullmatch(h or "")][-REREVIEW_HEADS_KEPT:]
+    return f"{REREVIEW_SENTINEL_OPENER}{','.join(heads)} -->" if heads else ""
+
+
+def with_rereview_history(body: str, existing_body) -> str:
+    """`body` carrying the existing card's auto-rereview heads, unless it
+    writes its own."""
+    if _REREVIEW_SENTINEL_RE.search(body):
+        return body
+    return _append_line(body, rereview_sentinel(rereview_heads(existing_body)))
+
+
+def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0) -> str:
+    """The relabel the dismiss path schedules itself (BE-20262), announced
+    before the wait. A promise it may not keep — a newer push, a human's own
+    relabel or the round cap all cancel it — hence the fallback."""
+    return (f"Nothing — a new round starts automatically{retry_delay_phrase(delay_minutes)} if no further "
+            f"commit lands ({relabel(label)}). If none starts, re-run it by hand.")
+
+
+def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, capped: bool, next_text: str,
+                     run_url: str, same_head: bool = False, vetoed: bool = False) -> str:
+    """The card once the approval of `approved_sha` stopped counting.
+
+    Below the cap: `no_decision` / `relabel` — the new head needs its own
+    round. `same_head`: the approval stopped counting with the head where it
+    was (the base was retargeted, or the head moved and came back), so a
+    relabel is deduped away: `push_then_relabel`, as decide's `retargeted`. At
+    the cap (or already handed to a human): `capped` / `human`, as the cap
+    path. Vetoed (`skip-cursor-review`): `no_decision` / `human`, as decide's
+    `vetoed`.
+
+    The round heading of the card it replaces is kept (its round, and the
+    approved commit), and so is the axes history (`upsert`).
+    """
+    old7 = approved_sha[:7] if SHA_RE.fullmatch(approved_sha or "") else "unknown"
+    new7 = head_sha[:7] if SHA_RE.fullmatch(head_sha or "") else "unknown"
+    moved = (f"Approved `{old7}`; that approval was withdrawn (the base branch changed, or the head moved and "
+             "came back)" if same_head else f"Approved `{old7}`; the head moved to `{new7}`")
+    if capped:
+        state, next_step, next_text = STATE_CAPPED, NEXT_HUMAN, NEXT_HUMAN_CAPPED_TEXT
+        headline = f"{moved}, and the round limit is reached, so a human is needed."
+    elif vetoed:
+        state, next_step, next_text = STATE_NO_DECISION, NEXT_HUMAN, DECIDE_NEXT_TEXT[OUTCOME_VETOED]
+        headline = f"{moved}, and the PR carries `skip-cursor-review`."
+    elif same_head:
+        state, next_step = STATE_NO_DECISION, NEXT_PUSH
+        headline = f"{moved}, so this commit needs its own round."
+    else:
+        state, next_step = STATE_NO_DECISION, NEXT_RELABEL
+        headline = f"{moved}, which needs its own round."
+    match = _HEADING_RE.search(old_body or "")
+    lines = card_head(state, next_step)
+    lines += [heading(match.group(1) if match else "", max_rounds if not match else match.group(2), approved_sha), ""]
+    lines += [f"**{headline}**", "", f"**Next step:** {reason_text(next_text)}",
+              "", _reviewed_line(approved_sha, run_url) if run_url else
+              f"_Reviewed commit: `{approved_sha}`_" if SHA_RE.fullmatch(approved_sha or "") else "_Reviewed commit: unknown_",
+              "", STALE_HEAD_MARKER.format(head_sha)]
+    return "\n".join(lines) + "\n"
+
+
+def mark_auto_rereview(body: str, head_sha: str, delay_note: str = "") -> str:
+    """`body` (a stale card) with the auto-started round recorded: one visible
+    line, and `head_sha` appended to the auto-rereview sentinel."""
+    body = body.rstrip("\n")
+    heads = rereview_heads(body)
+    body = _REREVIEW_SENTINEL_RE.sub("", body).rstrip("\n")
+    lines = [body, "", f"🔁 _A new round for `{head_sha[:7]}` was started automatically{delay_note}._",
+             "", rereview_sentinel(heads + [head_sha])]
+    return "\n".join(lines) + "\n"
+
+
 def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, headline: str,
                  reasons: list, next_text: str, run_url: str, gating=None, threshold: str = "") -> str:
     """The card cursor-review's decide writes for the round it just decided.
@@ -852,7 +990,8 @@ def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None, c
     """
     if card is None:
         card = find_card(list_comments(repo, pr_number), login)
-    body = with_axes_history(body, card.get("body") if card is not None else "", entry, keep)
+    existing = card.get("body") if card is not None else ""
+    body = with_rereview_history(with_axes_history(body, existing, entry, keep), existing)
     if card is not None:
         return json.loads(gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{card['id']}", "--input", "-"],
                              {"body": body}))

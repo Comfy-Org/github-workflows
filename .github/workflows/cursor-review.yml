@@ -313,6 +313,31 @@ on:
         type: number
         required: false
         default: 0
+      auto_rereview_after_dismissal:
+        description: >-
+          Opt-in: when a push dismisses the approver's approval, start the next
+          round AUTOMATICALLY — after `auto_rereview_delay_minutes`, and only if
+          the head is still the one that dismissed it (so a burst of pushes
+          costs one round), no round has started since, the PR is open and not
+          a draft, it carries neither `skip-cursor-review` nor
+          `needs-human-review`, and it is under `max_rounds`. Once per head
+          commit, recorded on the status card. Default false: the card is still
+          marked stale on every such dismissal, and asks for a relabel. Needs
+          `bot_app_id` or APPROVER_TOKEN to relabel. No effect without
+          `approve_max_severity`, for an author `approve_authors` does not
+          list, or under `run_without_label` (the push starts that round).
+        type: boolean
+        required: false
+        default: false
+      auto_rereview_delay_minutes:
+        description: >-
+          How long `auto_rereview_after_dismissal` waits before relabelling, in
+          minutes: the debounce that lets a burst of pushes settle. Default 10.
+          The wait happens on a runner. Clamped to 30; anything unparsable
+          waits not at all. The status card names the wait before it starts.
+        type: number
+        required: false
+        default: 10
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -6106,6 +6131,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    outputs:
+      # BE-20262: set when the step marked the card stale for a moved head and
+      # `auto_rereview_after_dismissal` wants the next round started.
+      auto_rereview: ${{ steps.dismiss.outputs.auto_rereview }}
+      rereview_head: ${{ steps.dismiss.outputs.rereview_head }}
     env:
       # Now that this job runs for every caller, not only auto-approve ones, a
       # `bot_app_id` caller reaches it on runs with no secrets (Dependabot PRs
@@ -6187,6 +6217,7 @@ jobs:
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Dismiss stale auto-approve reviews
+        id: dismiss
         env:
           APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
@@ -6205,6 +6236,12 @@ jobs:
           THRESHOLD: ${{ inputs.approve_max_severity }}
           EVENT_NAME: ${{ github.event_name }}
           APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
+          # BE-20262: the stale card, and whether the next round starts itself.
+          APPROVE_AUTHORS: ${{ inputs.approve_authors }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          AUTO_REREVIEW: ${{ inputs.auto_rereview_after_dismissal }}
+          AUTO_REREVIEW_DELAY: ${{ inputs.auto_rereview_delay_minutes }}
+          RUN_WITHOUT_LABEL: ${{ inputs.run_without_label }}
         run: |
           # Trust model (docs/callers/cursor-review.md#trust-model). Like
           # `Auto-approve decision` this step still ACTS as APPROVER_TOKEN under
@@ -6217,12 +6254,17 @@ jobs:
           fi
           # Same identity precedence as `Auto-approve decision`, so the login
           # whose reviews are dismissed is the login that posted them.
+          # CAN_RELABEL as in `Auto-approve decision`: a GITHUB_TOKEN-applied
+          # label fires no run, so only these two identities may start a round.
+          CAN_RELABEL=false
           if [ -n "$APPROVER_TOKEN" ]; then
             export GH_TOKEN="$APPROVER_TOKEN"
             LOGIN="$(gh api user --jq .login)"
+            CAN_RELABEL=true
           elif [ -n "$BOT_TOKEN" ]; then
             export GH_TOKEN="$BOT_TOKEN"
             LOGIN="${APP_SLUG}[bot]"
+            CAN_RELABEL=true
           elif [ -n "$BOT_APP_ID" ]; then
             # The App is the approver identity but its key is not in this run's
             # secrets (e.g. a Dependabot PR), so we can neither name nor act as
@@ -6245,12 +6287,22 @@ jobs:
           if [ -n "$BASE_FROM" ]; then
             ALL=(--all-approvals)
           fi
+          # The identity round-cap counts rounds under (its `Count review rounds`).
+          if [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"; fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --approver-login "$LOGIN" \
             --head-sha "$EVENT_HEAD_SHA" \
             --threshold "$THRESHOLD" \
+            --approve-authors "$APPROVE_AUTHORS" \
+            --max-rounds "$MAX_ROUNDS" \
+            --poster-login "$POSTER" \
+            --review-label "$REVIEW_LABEL" \
+            --auto-rereview "$AUTO_REREVIEW" \
+            --auto-rereview-delay-minutes "$AUTO_REREVIEW_DELAY" \
+            --can-relabel "$CAN_RELABEL" \
+            --run-without-label "$RUN_WITHOUT_LABEL" \
             "${ALL[@]}"
 
   panel-integrity:
@@ -7264,3 +7316,154 @@ jobs:
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --review-label "$REVIEW_LABEL"
+
+  auto-rereview:
+    # BE-20262: start the round a dismissal left wanting, once per head, after
+    # a debounce. `Dismiss stale auto-approval` decides it (and marks the card
+    # stale either way); this job waits, then `auto-approve.py auto-rereview`
+    # re-reads everything live and relabels only if the head is still the one
+    # that was dismissed, nothing has started a round since the card was
+    # written, the PR is open, not a draft, unvetoed and under `max_rounds`.
+    # A newer push during the wait reaches its own dismiss job, which
+    # schedules its own wait; a caller whose concurrency group cancels on
+    # every PR event loses this one to it, which is the same outcome.
+    name: Start the next round after a dismissal
+    needs: dismiss-stale-approval
+    if: ${{ !cancelled() && needs.dismiss-stale-approval.outputs.auto_rereview == 'true' }}
+    # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
+    # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
+    # checks out PR code — and only under `pull_request_target`: any other
+    # event runs on `refs/pull/<n>/merge`, which a base-branch-only deployment
+    # policy rejects before a step runs.
+    environment: ${{ github.event_name == 'pull_request_target' && inputs.approver_environment || '' }}
+    runs-on: ubuntu-latest
+    # 5 for the relabel, plus the 30 `auto_rereview_delay_minutes` is clamped to.
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+          # Equality with the commit the caller's `uses:` line resolved to — the
+          # same guard public-repo-hygiene.yml runs, and the check that turns
+          # "workflows_ref must be the same SHA as uses:" from a header comment
+          # into a fact. `job.workflow_sha` is computed by the RUNNER from the
+          # `uses:` pin, so a caller cannot set it. Without this, a caller can
+          # pin `uses:` to one commit and load this workflow's prompts, scripts
+          # and model list from another. (`job.workflow_sha`, NOT
+          # `github.job_workflow_sha` — that one is an OIDC token claim, absent
+          # from the `github` context, and expands to ''.) Both sides are
+          # lower-cased: hex is case-insensitive, and unlike hygiene's the
+          # 40-hex test above only WARNS, so an upper-case ref naming the RIGHT
+          # commit reaches here and must not fail. $REF itself is left alone so
+          # the messages quote what the caller wrote. (BE-15927)
+          REF_LC="$(printf '%s' "$REF" | tr 'A-Z' 'a-z')"
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # Cannot check, NOT a mismatch. `job.workflow_sha` is the `job`-context
+            # accessor added in Actions runner v2.334.0, so only an older runner
+            # gets here. GitHub stops queueing jobs to a self-hosted runner more
+            # than 30 days behind the latest release, so on any pool — hosted
+            # `ubuntu-latest`, or the caller's `runs_on` pool the read-only
+            # model jobs may use — that is a transient window. Warn and continue: a
+            # property nothing could EVALUATE is not evidence of a violation, and
+            # failing would take the whole review down on a caller that changed
+            # nothing. (public-repo-hygiene.yml fails closed in this branch on
+            # purpose — it is the checker whose own integrity rests on the
+            # equality. Here the ledger's warn-and-degrade posture is the fit.)
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0?), so workflows_ref could not be cross-checked against the uses: pin. The empty and 40-hex tests above still apply."
+          elif [ "$REF_LC" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but its prompts and scripts are loaded from a different version. Set both to $SHA. (The bump-callers fleet rewrites both together; Dependabot rewrites only uses:, so a caller that lets Dependabot bump this reusable needs a dependabot.yml ignore entry for Comfy-Org/github-workflows.)"
+            exit 1
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ inputs.bot_app_id != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: Wait before starting the round
+        # The debounce: a burst of pushes settles into one round. Clamped to
+        # 30 minutes; anything unparsable is treated as 0.
+        env:
+          DELAY_MINUTES: ${{ inputs.auto_rereview_delay_minutes }}
+        run: |
+          mins="${DELAY_MINUTES:-0}"
+          case "$mins" in ''|*[!0-9]*) mins=0 ;; esac
+          if [ "${#mins}" -gt 3 ]; then mins=30; fi
+          if [ "$mins" -gt 30 ]; then mins=30; fi
+          echo "Waiting ${mins} minute(s) before starting the round, so further pushes can land first."
+          sleep "$(( mins * 60 ))"
+
+      - name: Start the round if it is still wanted
+        env:
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.dismiss-stale-approval.outputs.rereview_head }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          EVENT_NAME: ${{ github.event_name }}
+          APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
+        run: |
+          # Trust model as in `Re-run the round`; the same identity the dismiss
+          # job wrote the card under, so it finds (and records on) that card.
+          if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "::error::APPROVER_TOKEN on a '$EVENT_NAME' run is readable by any PR-head workflow; call this reusable from pull_request_target with approver_environment (docs/callers/cursor-review.md#trust-model)"
+            exit 1
+          elif [ -n "$APPROVER_TOKEN" ] && [ -z "$APPROVER_ENVIRONMENT" ]; then
+            echo "::warning::APPROVER_TOKEN without approver_environment is a repo secret that any PR-head pull_request workflow can read; move it into a base-branch-only environment and pass approver_environment (docs/callers/cursor-review.md#trust-model)"
+          fi
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+            LOGIN="$(gh api user --jq .login)"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+            LOGIN="${APP_SLUG}[bot]"
+          else
+            echo "::error::No APPROVER_TOKEN or bot App token, so the round cannot be started (a GITHUB_TOKEN label fires no run). Re-run it by hand."
+            exit 1
+          fi
+          if [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"; fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" auto-rereview \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --approver-login "$LOGIN" \
+            --poster-login "$POSTER" \
+            --review-label "$REVIEW_LABEL" \
+            --max-rounds "$MAX_ROUNDS"
