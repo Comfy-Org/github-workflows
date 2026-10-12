@@ -146,6 +146,56 @@ many were yellow, or every one was `n/a`) →
 `needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
 `no_decision`/`human`. Every card also shows the reviewed commit SHA.
 
+### A push that dismisses the approval
+
+An approval is pinned to the commit it reviewed. A push (or a base retarget)
+withdraws it — the ruleset's stale-approval dismissal, or cursor-review's
+**Dismiss stale auto-approval** job — and GitHub stops counting it. That job
+then rewrites the card, so it no longer says `pass` for a commit nothing
+approves any more. It does so for a `pass` card whose commit the approver
+actually approved (dismissed or not); a `pass` card with no such approval is a
+round in progress, and is left alone. An approval withdrawn on its own head and
+base (a veto, `needs-human-review`, or a dismissal) rewrites it too, naming that
+reason. The round heading and the axes history are kept, a failed write is a
+warning, never a failure, and a run that could not withdraw every stale approval
+leaves the card as it is:
+
+| Case | `state` / `next` | Card says |
+|---|---|---|
+| The head moved, below the round cap | `no_decision` / `relabel` | "Approved `<old7>`; the head moved to `<new7>`, which needs its own round." |
+| The base changed, or the head moved to a commit that already had a round (it came back) | `no_decision` / `push_then_relabel` | The approval was withdrawn, so this commit needs its own round — a relabel alone is deduped away (see below). |
+| The PR carries `needs-human-review` | `capped` / `human` | The same hand-off as the cap path. Removing `needs-human-review` resets the count. |
+| At the round cap, without that label | `capped` / `human` | A human is needed; no round starts by itself. Nothing applied the label on a push, so adding and then removing it resets the count. |
+| The PR carries `skip-cursor-review` | `no_decision` / `human` | As decide's `vetoed`. |
+
+The card also carries `<!-- cursor-approve-stale-head: <sha> -->`: the head it
+was written for. A later event on the same head leaves it alone; a newer push
+rewrites it again.
+
+With cursor-review's `auto_rereview_after_dismissal`, the next step reads
+"a new round starts automatically at HH:MM UTC (N min after the latest push)" —
+the start time, rewritten by each newer push's dismissal — still `relabel` on the
+contract marker. After `auto_rereview_delay_minutes` the workflow relabels only
+if the head has not moved again (a newer push schedules its own wait), the
+review label has not been applied since the approval the card reports (a human,
+the fleet or auto-retry already started a round — the approval, not the card's
+write, because a relabel right after the push lands before the dismiss job
+writes the card), the head has no consolidated review yet (the `dup` step would
+skip it), the card is still the stale card for that head (no round has decided
+since), the PR is open, not a draft and unvetoed, and it is under `max_rounds`.
+Waiters for one head run one at a time (a job concurrency group on PR + head,
+not cancel-in-progress), since a later `pull_request`/`pull_request_target`
+event schedules another. The wait itself runs inside the push's run, so a later
+event in the workflow's concurrency slot can cancel it: a `pull_request`/
+`pull_request_target` event schedules a replacement, but a
+`pull_request_review_thread` run (resolving a thread during the wait) does not,
+and the fallback is to relabel by hand. It records the head on the card first —
+a visible line, plus `<!-- cursor-approve:auto-rereview v1 <sha>,… -->`, which
+every later card write carries forward — so each head gets at most one
+automatic round, and a head that flips back gets none. It never runs past the
+cap: there the card asks for a human. If the relabel itself fails, that visible
+line is rewritten to say so and to relabel by hand; the record stays.
+
 ### Why a relabel alone is not always enough (BE-19527)
 
 The gate's `dup` step skips any head that already carries a bot-posted

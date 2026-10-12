@@ -299,9 +299,10 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             name for name, body in self.jobs.items() if references_bot_key(body)
         }
         # `auto-retry` (BE-19526): the round's relabel, which must fire runs, so
-        # never GITHUB_TOKEN. It checks out only this repo's pinned assets.
+        # never GITHUB_TOKEN. It checks out only this repo's pinned assets. So
+        # does `auto-rereview` (BE-20262), the relabel a dismissal schedules.
         self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap",
-                                   "auto-retry"})
+                                   "auto-retry", "auto-rereview"})
 
     def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
         # `gate` only resolves a presence boolean; the cells and the direct
@@ -451,7 +452,7 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             if any("secrets.APPROVER_TOKEN" in line for line in code_lines(body))
         )
         self.assertEqual(
-            token_jobs, ["auto-retry", "dismiss-stale-approval", "post-review"]
+            token_jobs, ["auto-rereview", "auto-retry", "dismiss-stale-approval", "post-review"]
         )
         env_jobs = sorted(
             name

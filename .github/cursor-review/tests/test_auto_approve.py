@@ -3747,11 +3747,11 @@ class AutoRetryTest(unittest.TestCase):
                         retry_errored="true", retry_delay="5")
         self.assertTrue(self.retried())
         for body in (self.reviews_posted[0]["body"], self.card_writes[0]):
-            self.assertIn("in about 5 minutes", body)
+            self.assertRegex(body, r"at \d\d:\d\d UTC (on \d{4}-\d\d-\d\d )?\(5 min after this round ended\)")
 
     def test_no_wait_is_announced_when_none_is_configured(self):
         self.run_decide(head=SHA, panel=self.PANEL_ERR, retry_errored="true")
-        self.assertNotIn("in about", self.reviews_posted[0]["body"])
+        self.assertNotIn(" UTC", self.reviews_posted[0]["body"])
 
     def test_the_card_marker_says_relabel_not_push(self):
         # On an unchanged head the hand recovery is `push_then_relabel`; an

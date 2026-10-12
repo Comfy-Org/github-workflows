@@ -28,6 +28,7 @@ installs no requirements for these tests.
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 """
 
+import datetime
 import importlib.util
 import io
 import json
@@ -380,24 +381,37 @@ class CardDelayTest(unittest.TestCase):
             card.next_auto_retry_text(self.LABEL),
             card.next_auto_retry_text(self.LABEL, 0),
         )
-        self.assertNotIn("in about", card.next_auto_retry_text(self.LABEL, 0))
+        self.assertNotIn(" UTC", card.next_auto_retry_text(self.LABEL, 0))
 
-    def test_a_configured_delay_is_named(self):
-        text = card.next_auto_retry_text(self.LABEL, 5)
-        self.assertIn("in about 5 minutes", text)
+    # 05:37:20 UTC: a fixed clock, so the start time is exact.
+    NOW = datetime.datetime(2026, 10, 12, 5, 37, 20, tzinfo=datetime.timezone.utc)
+
+    def test_a_configured_delay_names_the_start_time(self):
+        text = card.next_auto_retry_text(self.LABEL, 5, now=self.NOW)
+        self.assertIn("at 05:42 UTC (5 min after this round ended)", text)
+        self.assertNotIn("in about", text)
         # Still the same next step, so an agent reading the card does not
         # conclude a human has to act.
         self.assertIn("being re-run automatically", text)
         self.assertIn("remove and re-add the `cursor-review` label", text)
 
-    def test_one_minute_is_singular(self):
-        self.assertIn("in about 1 minute (", card.next_auto_retry_text(self.LABEL, 1))
+    def test_the_date_is_added_only_across_a_utc_midnight(self):
+        late = datetime.datetime(2026, 10, 12, 23, 50, tzinfo=datetime.timezone.utc)
+        self.assertEqual(" at 00:05 UTC on 2026-10-13 (15 min after x)",
+                         card.retry_delay_phrase(15, "x", late))
+        self.assertEqual(" at 23:59 UTC (9 min after x)", card.retry_delay_phrase(9, "x", late))
+
+    def test_a_non_utc_clock_is_shown_in_utc(self):
+        tz = datetime.timezone(datetime.timedelta(hours=-7))
+        local = datetime.datetime(2026, 10, 11, 22, 37, tzinfo=tz)  # 05:37 UTC on the 12th
+        # The local date is the 11th; the UTC one is the 12th on both ends, so no date.
+        self.assertEqual(" at 05:42 UTC (5 min after x)", card.retry_delay_phrase(5, "x", local))
 
     def test_the_phrase_is_clamped_like_the_workflow(self):
         for given in (31, 999, 10 ** 9):
             with self.subTest(given=given):
-                self.assertEqual(" in about 30 minutes",
-                                 card.retry_delay_phrase(given))
+                self.assertEqual(" at 06:07 UTC (30 min after x)",
+                                 card.retry_delay_phrase(given, "x", self.NOW))
 
     def test_an_unusable_delay_promises_no_wait(self):
         # The value is a caller input; it must not reach the sentence raw, and

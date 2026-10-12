@@ -1274,25 +1274,9 @@ def cmd_auto_retry(args) -> int:
         if has_label(pr, HUMAN_REVIEW_LABEL):
             emit(f"⏭️ **Auto-approve: not re-running the round** — the PR now carries `{HUMAN_REVIEW_LABEL}`.")
             return 0
-    url = f"repos/{args.repo}/issues/{args.pr_number}/labels"
-    try:
-        gh(["api", "-X", "DELETE", f"{url}/{urllib.parse.quote(label, safe='')}"])
-    except (RuntimeError, ValueError) as e:
-        if "404" not in str(e):
-            print(f"::error::Could not re-run the round automatically: removing `{label}` failed "
-                  f"({annotation_cause(e, 'unknown error')}). Re-run it by hand: remove and re-add `{label}`.")
-            return 1
-    err = None
-    for _ in range(2):
-        try:
-            gh(["api", "-X", "POST", url, "--input", "-"], {"labels": [label]})
-            break
-        except (RuntimeError, ValueError) as e:
-            err = e
-    else:
-        print(f"::error::Could not re-run the round automatically: re-adding `{label}` failed "
-              f"({annotation_cause(err, 'unknown error')}), so the PR may now be WITHOUT the label. "
-              f"Add `{label}` back by hand to start the round.")
+    err = relabel_review_label(args.repo, args.pr_number, label)
+    if err:
+        print(f"::error::Could not re-run the round automatically: {err}")
         return 1
     emit(f"🔁 **Auto-approve: re-running the round** — `{label}` was removed and re-added.")
     return 0
@@ -2399,6 +2383,9 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
           # round by `url`. REST names them `submitted_at` and `html_url`.
           submittedAt
           url
+          # The commit the review was posted on, which the gate's `dup` step
+          # reads as REST `commit_id` (`head_already_reviewed`).
+          commit { oid }
           # GraphQL reports a Bot's login WITHOUT the `[bot]` suffix that REST
           # reports and that the workflow passes as --approver-login. The suffix
           # is restored in `_review_node`; without it the identity comparison in
@@ -2440,6 +2427,8 @@ def _review_node(node: dict) -> dict:
     if isinstance(rid, bool) or not isinstance(rid, (int, str)):
         raise ValueError(f"a review in the GraphQL response has a non-numeric id ({type(rid).__name__})")
     state, body = node.get("state"), node.get("body")
+    commit = node.get("commit")
+    oid = commit.get("oid") if isinstance(commit, dict) else None
     return {
         "id": int(rid),
         "user": {"login": login},
@@ -2448,6 +2437,7 @@ def _review_node(node: dict) -> dict:
         "edited": node.get("lastEditedAt") is not None,
         "submitted_at": node.get("submittedAt"),
         "html_url": node.get("url") or "",
+        "commit_id": oid if isinstance(oid, str) else "",
     }
 
 
@@ -2714,7 +2704,318 @@ def cmd_dismiss_stale(args) -> int:
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
     approval_stands = any(rid not in withdrawn for rid in own_approvals(reviews, args.approver_login))
     blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review, approval_stands)
+    # Only once every stale approval is actually withdrawn: a card that says
+    # "withdrawn" over an approval still counting (and a round scheduled on
+    # top of it) is worse than the old "Approved" card the red run reports.
+    if read_error is None and SHA_HEX_RE.fullmatch(live_head or "") and not failed and not others:
+        try:
+            mark_card_stale(args, pr, reviews, live_head, live_base, vetoed, human_review, withdrawn)
+        except Exception as e:  # noqa: BLE001 — the card is a report; never fail the dismissal for it
+            print(f"::warning::Could not mark the cursor-approve card stale: {annotation_cause(e, 'unknown error')}")
     return 1 if failed or others or blocks_failed else 0
+
+
+# --- the card after a dismissal, and the round it can start (BE-20262) -------
+#
+# A push that dismisses the approver's approval leaves the card saying
+# "Approved" for a commit GitHub no longer counts, and on a label-only caller
+# nothing starts the next round. `mark_card_stale` (end of dismiss-stale)
+# rewrites the card; with `auto_rereview_after_dismissal` it also asks the
+# workflow's `auto-rereview` job to relabel, after a debounce, via
+# `cmd_auto_rereview`.
+
+SHA_HEX_RE = re.compile(r"[0-9a-f]{40}")
+# The approval lines render_body and render_external_body write. A DISMISSED
+# review has lost its APPROVED state, and a dismissed standing REQUEST_CHANGES
+# carries the same markers, so this is how the two are told apart (a test pins
+# both renderers to it).
+APPROVAL_BODY_LINES = ("\n✅ Approved: ", "\nApproved, see the ")
+
+
+def author_opted_in(approve_authors, author) -> bool:
+    """The gate's `approve_authors` rule (its `author` step), for the dismiss job,
+    which does not wait on `gate`: empty is everyone, `@` and case ignored, and
+    a list naming nobody (or no author to check) admits no one."""
+    words = [w.lstrip("@").lower() for w in str(approve_authors or "").replace(",", " ").split()]
+    if not str(approve_authors or "").strip():
+        return True
+    return bool(author) and str(author).lower() in [w for w in words if w]
+
+
+def approval_of(reviews: list, login: str, sha: str):
+    """This identity's latest marked approval of `sha`, dismissed or not, or None."""
+    found = None
+    for r in reviews:
+        if ((r.get("user") or {}).get("login") or "").lower() != (login or "").lower():
+            continue
+        body = _lf(r.get("body"))
+        match = REVIEWED_SHA_RE.search(body)
+        if APPROVE_MARKER not in body or not match or match.group(1) != sha:
+            continue
+        if r.get("state") == "APPROVED" or (r.get("state") == "DISMISSED"
+                                            and any(line in body for line in APPROVAL_BODY_LINES)):
+            found = r
+    return found
+
+
+def rounds_so_far(args, reviews: list, timeline=None):
+    """The delivered rounds round-cap counts (since `needs-human-review` last
+    came off), or None when they cannot be read."""
+    try:
+        if timeline is None:
+            timeline = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100")
+        since = last_unlabeled_at(timeline, HUMAN_REVIEW_LABEL)
+        return len(round_reviews(reviews, args.poster_login, since, _load_post_review().CONSOLIDATED_MARKER))
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not count this PR's review rounds: {annotation_cause(e, 'unknown error')}")
+        return None
+
+
+def head_already_reviewed(reviews: list, sha: str) -> bool:
+    """Whether `sha` carries a consolidated review the gate's `dup` step would
+    skip a relabel for (Bot-posted, not dismissed, on that commit) — a head
+    that moved back to an earlier reviewed commit. A relabel there starts a
+    run that no-ops, so no round is promised or started for it."""
+    marker = _load_post_review().CONSOLIDATED_MARKER
+    return any(isinstance(r, dict) and r.get("commit_id") == sha and r.get("state") != "DISMISSED"
+               and ((r.get("user") or {}).get("login") or "").endswith("[bot]")
+               and (r.get("body") or "").startswith(marker)
+               for r in reviews)
+
+
+def _max_rounds(args) -> int:
+    try:
+        return max(parse_max_rounds(getattr(args, "max_rounds", "") or "0"), 0)
+    except ValueError:
+        return 0
+
+
+def _true(value) -> bool:
+    return str(value or "").strip().lower() == "true"
+
+
+def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, vetoed, human_review: bool,
+                    withdrawn=()) -> None:
+    """Rewrite a card whose approved commit stopped counting, and decide
+    whether the workflow re-runs the round itself (`auto_rereview` output).
+
+    Only for a PR in the approval lane — `approve_max_severity` set and the
+    author passes `approve_authors` — and only for the card the approver
+    wrote. The card qualifies when it says `pass` for a commit this identity
+    actually approved (dismissed or not: the ruleset may have withdrawn it
+    first) and that commit is no longer the head, or the base moved under it,
+    or that approval no longer counts on the head it names (this run withdrew
+    it — a veto, `needs-human-review`, `--all-approvals` — or it was already
+    dismissed); or when it is already the stale card for an older head. A `pass` card
+    without such an approval is a round in progress (the pending and start
+    cards), which is left alone.
+
+    Written only when it changes, since this job runs on every PR event.
+    """
+    set_output("auto_rereview", "false")
+    why = None
+    login = (args.approver_login or "").strip()
+    if not login or not (getattr(args, "threshold", None) or "").strip():
+        return
+    author = ((pr.get("user") or {}).get("login") or "") if isinstance(pr.get("user"), dict) else ""
+    if not author_opted_in(getattr(args, "approve_authors", ""), author):
+        return
+    card = _load_card()
+    found = card.find_card(card.list_comments(args.repo, args.pr_number), login)
+    if found is None:
+        return
+    body = _lf(found.get("body"))
+    approved, stale_for = card.reviewed_sha(body), card.stale_head(body)
+    if not approved:
+        return
+    if not stale_for:
+        approval = approval_of(reviews, login, approved) if card.card_state(body) == CARD_PASS else None
+        if approval is None:
+            return
+        base = recorded_base(approval.get("body") or "")
+        base_moved = live_base is not None and base is not None and base != live_base
+        counts = approval.get("state") == "APPROVED" and approval.get("id") not in withdrawn
+        if approved == live_head and not base_moved:
+            if counts:
+                return
+            # Same head, same base: say why it went, not "the base changed".
+            why = ("" if vetoed else f"the PR carries `{HUMAN_REVIEW_LABEL}`" if human_review
+                   else "it was dismissed")
+    elif stale_for == live_head and live_head in card.rereview_heads(body) and not (vetoed or human_review):
+        # The round started for this head owns the card now; a rewrite here
+        # would replace "started automatically" with a by-hand relabel. A veto
+        # or the hand-off still rewrites it: no round is coming after either.
+        return
+    # A stale card already written for the live head keeps its reason: one
+    # written when the base moved names the approved commit as its head.
+    head_moved = (stale_for if stale_for == live_head else live_head) != approved
+    if head_moved and head_already_reviewed(reviews, live_head):
+        # Back on a commit that already had its round: a relabel is deduped
+        # away, so this is the same-head card (push, then relabel).
+        head_moved = False
+        why = f"the head moved to `{live_head[:7]}`, which already had a review round"
+    max_rounds = _max_rounds(args)
+    rounds = rounds_so_far(args, reviews) if max_rounds else 0
+    capped = human_review or (rounds is not None and max_rounds > 0 and rounds >= max_rounds)
+    label = getattr(args, "review_label", "") or ""
+    auto = (head_moved and not capped and not vetoed and rounds is not None
+            and _true(getattr(args, "auto_rereview", "")) and _true(getattr(args, "can_relabel", ""))
+            and not _true(getattr(args, "run_without_label", "")) and not pr.get("draft")
+            and live_head not in card.rereview_heads(body))
+    if auto:
+        next_text = card.next_auto_rereview_text(label, getattr(args, "auto_rereview_delay_minutes", 0))
+    elif head_moved and _true(getattr(args, "run_without_label", "")):
+        next_text = f"This push starts a new round by itself; if none starts, {card.relabel(label)}."
+    elif head_moved:
+        next_text = card.next_relabel_text(label)
+    else:
+        next_text = card.next_push_text(label)
+    # At the cap without the label, nothing has handed the PR off (round-cap
+    # does not run on a label-gated push), so the card cannot say it did.
+    capped_text = None if human_review else card.next_capped_unlabelled_text()
+    new = card.render_dismissed(body, approved, live_head, getattr(args, "max_rounds", ""), capped, next_text,
+                                "", same_head=not head_moved, vetoed=bool(vetoed), why=why, capped_text=capped_text)
+    new = card.with_rereview_history(card.with_axes_history(new, body), body)
+    if new.strip() != body.strip():
+        try:
+            card.upsert(args.repo, args.pr_number, login, new, card=found)
+        except (RuntimeError, ValueError) as e:
+            # Nothing announced the round, so nothing starts one either.
+            print(f"::warning::Could not mark the cursor-approve card stale: {annotation_cause(e, 'unknown error')}")
+            return
+        emit(f"Auto-approve: the card's approval of `{approved[:7]}` no longer counts (head `{live_head[:7]}`) — "
+             "card marked stale.")
+    if auto:
+        set_output("auto_rereview", "true")
+        set_output("rereview_head", live_head)
+
+
+def relabel_review_label(repo: str, pr_number, label: str):
+    """Remove and re-add `label`, which starts a round. None, or the error text.
+
+    The DELETE tolerates a 404 — the label is already off (a run_without_label
+    caller, or a human removed it) and the POST alone starts the round. The
+    POST is tried twice, since a failed one after a successful DELETE leaves
+    the trigger label stripped.
+    """
+    url = f"repos/{repo}/issues/{pr_number}/labels"
+    try:
+        gh(["api", "-X", "DELETE", f"{url}/{urllib.parse.quote(label, safe='')}"])
+    except (RuntimeError, ValueError) as e:
+        if "404" not in str(e):
+            return (f"removing `{label}` failed ({annotation_cause(e, 'unknown error')}). "
+                    f"Re-run it by hand: remove and re-add `{label}`.")
+    err = None
+    for _ in range(2):
+        try:
+            gh(["api", "-X", "POST", url, "--input", "-"], {"labels": [label]})
+            return None
+        except (RuntimeError, ValueError) as e:
+            err = e
+    return (f"re-adding `{label}` failed ({annotation_cause(err, 'unknown error')}), so the PR may now be "
+            f"WITHOUT the label. Add `{label}` back by hand to start the round.")
+
+
+def labeled_after(timeline: list, label: str, since) -> bool:
+    """Whether `label` was applied at or after `since` — a round someone (a
+    human, the fleet, auto-retry) already started. Timestamps are whole
+    seconds, hence `>=`; an event with no readable time counts."""
+    return any(isinstance(e, dict) and e.get("event") == "labeled"
+               and ((e.get("label") or {}).get("name") or "").lower() == label.lower()
+               and (not isinstance(e.get("created_at"), str) or e["created_at"] >= since)
+               for e in timeline)
+
+
+def cmd_auto_rereview(args) -> int:
+    """The `auto-rereview` job: start the round a dismissal scheduled, if it is
+    still wanted after the wait.
+
+    Everything is re-read live, and anything unreadable skips (the card already
+    says to re-run by hand if no round starts): the head must still be the one
+    the dismissal saw — a newer push owns its own debounce — the PR open, not a
+    draft, carrying neither veto label, and under `max_rounds`. The card must
+    still be the stale card for that head (a round that decided since rewrote
+    it), must not record an automatic round for it already, the head must not
+    already carry a round (the `dup` step would no-op it), and the review label
+    must not have been applied since the approval the card reports (a round in
+    flight). That cutoff is the approval, not the card's write: the card lands
+    a dismiss job after the push, so a relabel right after the push would
+    predate it. A label applied for an intermediate head also counts, which
+    skips rather than risk cancelling a round for this one. The record goes on
+    the card BEFORE the relabel; the job's concurrency group (PR + head)
+    serialises waiters, so a second one reads that record and never starts a
+    second round for this head.
+    """
+    head = (args.head_sha or "").strip().lower()
+    label = (args.review_label or "").strip() or DEFAULT_REVIEW_LABEL
+
+    def skip(why: str) -> int:
+        emit(f"⏭️ **Auto-approve: not starting a round after the dismissal** — {why}.")
+        return 0
+
+    if not SHA_HEX_RE.fullmatch(head):
+        return skip("no head to re-review")
+    try:
+        pr = read_pr(args.repo, args.pr_number)
+        timeline = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100")
+        reviews = list_reviews(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        return skip(f"the PR could not be read ({annotation_cause(e, 'unknown error')})")
+    live_head, _ = pr_head_base(pr)
+    if (pr.get("state") or "") != "open":
+        return skip("the PR is no longer open")
+    if pr.get("draft"):
+        return skip("the PR is a draft")
+    if live_head.lower() != head:
+        return skip(f"the head moved on to `{live_head[:7]}`; that push schedules its own round")
+    if not live_labels_readable(pr):
+        return skip("its labels could not be read")
+    for name in (*VETO_LABELS, HUMAN_REVIEW_LABEL):
+        if has_label(pr, name):
+            return skip(f"the PR carries `{name}`")
+    max_rounds = _max_rounds(args)
+    if max_rounds:
+        rounds = rounds_so_far(args, reviews, timeline)
+        if rounds is None or rounds >= max_rounds:
+            return skip("the round count is unreadable" if rounds is None else f"it is at the round cap ({rounds}/{max_rounds})")
+    card = _load_card()
+    try:
+        found = card.find_card(card.list_comments(args.repo, args.pr_number), args.approver_login)
+    except (RuntimeError, ValueError) as e:
+        return skip(f"the card could not be read ({annotation_cause(e, 'unknown error')})")
+    body = _lf((found or {}).get("body"))
+    if found is None or card.stale_head(body) != head:
+        return skip("the card is no longer the stale card for this head (a round has run since)")
+    if head in card.rereview_heads(body):
+        return skip("a round was already started automatically for this head")
+    if head_already_reviewed(reviews, head):
+        return skip("this head already had a review round, so a relabel would be skipped as a duplicate")
+    approval = approval_of(reviews, args.approver_login, card.reviewed_sha(body) or "")
+    since = (approval or {}).get("submitted_at")
+    if not isinstance(since, str) or not since:
+        return skip("the approval the card reports could not be read, so a round in flight cannot be ruled out")
+    if labeled_after(timeline, label, since):
+        return skip(f"`{label}` was applied since the approval, so a round is already under way")
+    try:
+        recorded = card.mark_auto_rereview(body, head)
+        written = card.upsert(args.repo, args.pr_number, args.approver_login, recorded, card=found)
+    except (RuntimeError, ValueError) as e:
+        return skip(f"the card could not record it ({annotation_cause(e, 'unknown error')}), and without that "
+                    "record nothing stops a second automatic round for this head")
+    err = relabel_review_label(args.repo, args.pr_number, label)
+    if err:
+        print(f"::error::Could not start the round automatically: {err}")
+        # The card said the round started; say it did not. The record stays,
+        # so this head is still never relabelled twice automatically.
+        try:
+            card.upsert(args.repo, args.pr_number, args.approver_login,
+                        card.mark_auto_rereview_failed(recorded, head, label), card=written)
+        except (RuntimeError, ValueError) as e:
+            print(f"::warning::Could not correct the card after the failed relabel: "
+                  f"{annotation_cause(e, 'unknown error')}")
+        return 1
+    emit(f"🔁 **Auto-approve: started a round for `{head[:7]}`** — `{label}` was removed and re-added.")
+    return 0
 
 
 THRESHOLD_OFF_MESSAGE = ("cursor-review auto-approve is off for this repo (`approve_max_severity` is empty) — "
@@ -3450,6 +3751,23 @@ def main() -> int:
     # cursor-review's `approve_scope_effective`: `delta` exempts marked
     # non-gating threads from blocking resolution, as decide did. Default `full`.
     e.add_argument("--approve-scope", default=SCOPE_FULL)
+    # BE-20262: the card after a dismissal, and whether to start the next round.
+    s.add_argument("--approve-authors", default="")
+    s.add_argument("--max-rounds", default="0")
+    s.add_argument("--poster-login", default="github-actions[bot]")
+    s.add_argument("--review-label", default="")
+    s.add_argument("--auto-rereview", default="false")
+    s.add_argument("--auto-rereview-delay-minutes", default="0")
+    s.add_argument("--can-relabel", default="false")
+    s.add_argument("--run-without-label", default="false")
+    q = sub.add_parser("auto-rereview")
+    q.add_argument("--repo", required=True)
+    q.add_argument("--pr-number", required=True)
+    q.add_argument("--head-sha", required=True)
+    q.add_argument("--approver-login", required=True)
+    q.add_argument("--poster-login", required=True)
+    q.add_argument("--review-label", default="")
+    q.add_argument("--max-rounds", default="0")
     r = sub.add_parser("auto-retry")
     r.add_argument("--repo", required=True)
     r.add_argument("--pr-number", required=True)
@@ -3469,6 +3787,8 @@ def main() -> int:
         return cmd_round_cap(args)
     if args.cmd == "auto-retry":
         return cmd_auto_retry(args)
+    if args.cmd == "auto-rereview":
+        return cmd_auto_rereview(args)
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)
 
 
