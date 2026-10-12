@@ -722,6 +722,45 @@ class HeadlineTest(DecideCase):
         self.assertNotEqual(headline, "-.")
         self.assertTrue(headline.endswith("…"))
 
+    def test_a_short_lead_sentence_takes_the_word_cut(self):
+        # "OK." alone keeps no reason: a token-length lead is no sentence cut,
+        # so the long sentence behind it is word-cut instead.
+        for lead in ("OK.", "Red.", "1.", "Looks good."):
+            with self.subTest(lead=lead):
+                long = f"{lead} The retry loop " + "drops the deadline on every replica " * 8
+                headline = AG.clamp_headline(long)
+                self.assertTrue(headline.endswith("…"), headline)
+                self.assertGreater(len(headline), AG.HEADLINE_MAX // 2)
+
+    def test_initialisms_initials_list_numbers_and_ellipses_do_not_end_a_sentence(self):
+        for lead in ("The U.S. region", "Same as a.k.a. the old path", "Owned by J. Smith",
+                     "Step one and 2. the index", "The retry may... continue", "Per \u201ce.g. the flag"):
+            with self.subTest(lead=lead):
+                headline = AG.clamp_headline(f"{lead} " + "keeps every late charge " * 12)
+                self.assertTrue(headline.endswith("…"), headline)
+
+    def test_a_sentence_ends_after_a_closing_quote_or_bracket(self):
+        for first in ('The handler returns "ok." ', "Both paths are tested (see store.go.) ",
+                      "The flag is read only in config.\u201d "):
+            with self.subTest(first=first):
+                self.assertEqual(AG.clamp_headline(first + "Then " + "word " * AG.HEADLINE_MAX), first.rstrip())
+
+    def test_etc_ends_a_sentence_only_before_a_capital(self):
+        first = "It covers retries, backoff, jitter etc."
+        self.assertEqual(AG.clamp_headline(first + " The dashboard " + "word " * AG.HEADLINE_MAX), first)
+        self.assertTrue(AG.clamp_headline(first + " and the dashboard " + "word " * AG.HEADLINE_MAX).endswith("…"))
+
+    def test_a_word_less_headline_within_the_cap_is_rejected_too(self):
+        for short in ("-" * 150, "…", "--- ;;; ---"):
+            with self.subTest(short=short[:10]):
+                with self.assertRaises(ValueError):
+                    AG.clamp_headline(short)
+
+    def test_a_word_less_headline_within_the_cap_is_untrusted(self):
+        self.write_all()
+        self.write("business", self.raw(headline="-" * 150))
+        self.assertEqual(self.decide()["event"], AG.NONE)
+
     def test_an_overlong_multi_sentence_headline_reaches_decide_whole_sentences(self):
         self.write_all()
         first = "The cache key ignores the tenant, so two workspaces share entries."

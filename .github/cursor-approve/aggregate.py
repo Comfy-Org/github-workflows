@@ -71,11 +71,19 @@ NA = "n/a"
 # full sentence (the prompt asks for about 120 characters). At 100 it cut the
 # models' ordinary 110-140 character reasons mid-sentence (BE-20249).
 HEADLINE_MAX = 240
-# A `.`/`!`/`?` before whitespace ends a sentence, unless it closes one of
-# these: "e.g. the retry" is one thought, and cutting there is the mid-sentence
-# cut the clamp exists to avoid.
-_SENTENCE_END_RE = re.compile(r"[.!?](?=\s)")
-_ABBREVIATIONS = frozenset(("e.g.", "i.e.", "vs.", "etc.", "cf.", "approx.", "incl.", "esp.", "resp.", "no."))
+# A `.`/`!`/`?` before whitespace ends a sentence — after any closing quotes or
+# brackets, so `returns "ok." Then` ends at the quote — unless the word it
+# closes is an abbreviation, an initialism (`U.S.`, `a.k.a.`), a one-character
+# initial or list number (`J.`, `2.`), or an ellipsis: "e.g. the retry" is one
+# thought, and cutting there is the mid-sentence cut the clamp exists to avoid.
+# `etc.` does end a sentence when a capital follows it.
+_SENTENCE_END_RE = re.compile(r"[.!?][\"')\]}\u201d\u2019]*(?=\s)")
+_ABBREVIATIONS = frozenset(("e.g.", "i.e.", "vs.", "etc.", "cf.", "approx.", "incl.", "esp.", "resp.", "no.",
+                            "dr.", "mr.", "mrs.", "ms.", "st.", "fig."))
+_OPENERS = "([{\"'\u201c\u2018"
+# A sentence cut that keeps fewer words than this ("OK.", "Red.") keeps no
+# reason; the clamp word-cuts the long sentence behind it instead.
+_MIN_SENTENCE_CUT_WORDS = 4
 MAX_YELLOW_LIMIT = 3
 SUMMARY_LIMIT = 1200
 # An axis output is one small JSON object; the cap is what decide will read of
@@ -385,10 +393,26 @@ def _last_sentence_end(text: str, limit: int) -> int:
         end = match.end()
         if end > limit:
             break
-        token = text[:end].rsplit(None, 1)[-1].lstrip("([{\"'").lower()
-        if token not in _ABBREVIATIONS and re.search(r"\w", text[:end]):
+        if _ends_sentence(text, match.start()) and re.search(r"\w", text[:end]):
             best = end
     return best
+
+
+def _ends_sentence(text: str, mark: int) -> bool:
+    """Whether the `.`/`!`/`?` at `text[mark]` closes a sentence rather than an
+    abbreviation, initialism, initial, list number or ellipsis."""
+    if text[mark] != ".":
+        return True
+    token = text[:mark + 1].rsplit(None, 1)[-1].lstrip(_OPENERS).lower()
+    if token.endswith(".."):
+        return False
+    if token == "etc.":
+        rest = text[mark + 1:].lstrip("\"')]}\u201d\u2019").lstrip()
+        return rest[:1].isupper()
+    # An initialism is all one-letter parts ("u.s", "a.k.a"); "store.go" is a
+    # file name, and its closing dot can end a sentence.
+    initialism = all(len(part) <= 1 for part in token[:-1].split("."))
+    return token not in _ABBREVIATIONS and not initialism
 
 
 def clamp_headline(headline: str) -> str:
@@ -400,13 +424,18 @@ def clamp_headline(headline: str) -> str:
     sentence alone runs past the cap is it cut at a word boundary, with "…" —
     falling back to a hard cut when the last space that fits sits in the first
     half (one long token, or "Fix: <long path>"), so the clamp never throws
-    away most of the reason. Raises ValueError when nothing but separators
-    survives: a bare "…" is the reason-free row the headline exists to prevent.
+    away most of the reason. Raises ValueError when the headline holds no word
+    at all, at any length, or nothing but separators survives the cut: a bare
+    "…" is the reason-free row the headline exists to prevent. The sentence cut is taken only when it keeps at least
+    _MIN_SENTENCE_CUT_WORDS words: "OK. <one long sentence>" must not clamp to
+    a reason-free "OK.", so a token-length lead falls through to the word cut.
     """
+    if not re.search(r"\w", headline):
+        raise ValueError("headline holds no reason to keep")
     if len(headline) <= HEADLINE_MAX:
         return headline
     sentence_end = _last_sentence_end(headline, HEADLINE_MAX)
-    if sentence_end > 0:
+    if sentence_end > 0 and len(re.findall(r"\w+", headline[:sentence_end])) >= _MIN_SENTENCE_CUT_WORDS:
         return headline[:sentence_end]
     hard = headline[:HEADLINE_MAX - 1]
     space = headline.rfind(" ", 0, HEADLINE_MAX)

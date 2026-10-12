@@ -313,17 +313,22 @@ def why_text(entry: dict) -> str:
     aggregate.py already clamped the headline to whole sentences within
     HEADLINE_MAX; the same clamp runs again here because the card is the last
     stop before the PR and must not depend on its input being well-formed. A
-    missing headline (aggregate.py rejects one, so this is defence only) falls
-    back to the summary's first sentence rather than an empty cell.
+    missing headline, or one the clamp rejects as reason-free (aggregate.py
+    rejects both, so this is defence only), falls back to the summary's first
+    sentence rather than an empty cell.
     """
     headline = entry.get("headline")
-    text = headline if isinstance(headline, str) and headline.strip() else first_sentence(entry.get("summary"))
-    text = " ".join(str(text or "").split())
-    try:
-        text = _clamp_headline(text) if text else ""
-    except ValueError:
-        text = ""
-    return sanitize(text, WHY_LIMIT)
+    candidates = [headline] if isinstance(headline, str) else []
+    candidates.append(first_sentence(entry.get("summary")))
+    for text in candidates:
+        text = " ".join(str(text or "").split())
+        try:
+            text = _clamp_headline(text) if text else ""
+        except ValueError:
+            text = ""
+        if text:
+            return sanitize(text, WHY_LIMIT)
+    return ""
 
 
 def reasoning_blocks(axes: list, detail: dict) -> list:
@@ -439,7 +444,9 @@ def render_job_summary(round_no, max_rounds, sha: str, axes: list, decision, out
         icon = VERDICT_ICONS.get(verdict, NO_RESULT)
         confidence = _confidence(entry.get("confidence"))
         lines += ["", f"#### {axis} — {icon}" + (f" (confidence {confidence})" if confidence else "")]
-        headline = sanitize(entry.get("headline"), WHY_LIMIT)
+        # The card's Why cell, word for word: the same clamp and fallback, so
+        # the two surfaces never show a different headline for one axis.
+        headline = why_text(entry)
         if headline:
             lines.append(f"**{headline}**")
         summary = sanitize(entry.get("summary"), SUMMARY_DETAIL_LIMIT)

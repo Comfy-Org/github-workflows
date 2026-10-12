@@ -84,8 +84,8 @@ missing headline makes that axis untrusted, since a verdict with no reason
 beside it is the exact failure the field was added to fix. An over-long one is
 clamped rather than rejected, because the model's length is not deterministic:
 the clamp keeps every whole sentence that fits, and only a first sentence
-longer than the cap is cut at a word boundary with "…"; one with nothing but
-punctuation to keep is untrusted. Every model string on the card — the cells
+longer than the cap (or one too short to carry a reason, like "OK.") is cut at
+a word boundary with "…"; a headline with no word in it is untrusted. Every model string on the card — the cells
 and the blocks — is sanitised, so none can add a table row, a heading, a
 mention or a contract marker.
 

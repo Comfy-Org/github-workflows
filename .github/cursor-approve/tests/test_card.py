@@ -405,6 +405,26 @@ class FullSentenceWhy(unittest.TestCase):
         self.assertNotIn("…", body)
 
 
+class WhyFallbackAndJobSummary(unittest.TestCase):
+    """The Why cell's summary fallback covers a headline the clamp rejects, and
+    the job summary shows the same headline as the card."""
+
+    def test_a_reason_free_headline_falls_back_to_the_summary(self):
+        d = decision(correctness="green")
+        d["axes"]["correctness"]["headline"] = "-" * 300
+        d["axes"]["correctness"]["summary"] = "The cache key ignores the tenant. More follows."
+        row = table_row(card.render_decide("5", "5", SHA, ["correctness"], d, "approved", "0", RUN), "correctness")
+        self.assertEqual(row, "| correctness | 🟢 green | The cache key ignores the tenant. |")
+
+    def test_the_job_summary_shows_the_cards_clamped_headline(self):
+        d = decision(correctness="green")
+        first = "Backfill rewrites rows the API still reads."
+        d["axes"]["correctness"]["headline"] = first + " " + "and it keeps going " * 20
+        body = card.render_job_summary("1", "5", SHA, ["correctness"], d, "approved", "0")
+        self.assertIn(f"**{card.why_text(d['axes']['correctness'])}**", body)
+        self.assertIn(f"**{card.sanitize(first, card.WHY_LIMIT)}**", body)
+
+
 class ReasoningBlocks(unittest.TestCase):
     """BE-20249: each axis's full summary and confidence sit in a collapsed
     block under the result, one click away on the PR itself."""

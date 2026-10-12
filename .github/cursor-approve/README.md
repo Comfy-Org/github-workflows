@@ -48,12 +48,15 @@ missing one makes the axis untrusted. An over-long one is clamped, not
 rejected: the model's length is not deterministic, and rejecting turned a sound
 verdict's axis job red on length alone. The clamp keeps every whole sentence
 that fits, with no "…" (a `.`, `!` or `?` before whitespace ends a sentence,
-except after "e.g." and similar abbreviations), because the card exists to
-show a reason and a sentence stopped mid-thought does not (BE-20249: at the
-old 100-character cap it cut ordinary one-sentence reasons). Only a first
-sentence longer than the cap is cut at a word boundary with "…" — falling back
-to a hard cut when the last fitting space is in the first half, and rejecting
-one that leaves nothing but punctuation before the "…".
+after any closing quote or bracket, except after "e.g." and similar
+abbreviations, an initialism like "U.S.", a one-character initial or list
+number, or an ellipsis), because the card exists to show a reason and a
+sentence stopped mid-thought does not (BE-20249: at the old 100-character cap
+it cut ordinary one-sentence reasons). A sentence cut that keeps fewer than
+four words ("OK.") is not taken. Otherwise, as when the first sentence alone
+is longer than the cap, the cut is at a word boundary with "…" — falling back
+to a hard cut when the last fitting space is in the first half. A headline with
+no word character at all, at any length, is rejected.
 
 Placeholders — `{{pr_number}}`, `{{repo}}`, `{{head_sha}}`,
 `{{merge_base_sha}}`, `{{base_ref}}`, `{{context_file}}` — are filled by
