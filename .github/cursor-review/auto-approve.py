@@ -3446,14 +3446,21 @@ EXTERNAL_AXES = ("business", "design", "correctness", "completeness", "conforman
 
 def external_decision_approves(decision, axes: list) -> bool:
     """True only for an APPROVE decision whose every expected axis reported a
-    non-red verdict. aggregate.py already guarantees that; re-checking it here
-    keeps a hand-edited or truncated decision file from reaching an approval."""
+    non-red verdict, at least one of them other than `n/a`. aggregate.py already
+    guarantees that; re-checking it here keeps a hand-edited or truncated
+    decision file from reaching an approval. The per-axis rule must stay
+    aggregate.py's: `n/a` reports and does not block, but all-`n/a` withholds.
+    Accepting only green/yellow here once withheld every comment-only PR that
+    aggregate.py had approved. aggregate.py's `max_yellow_axes` cap is
+    deliberately NOT re-checked: it is caller policy this command is never
+    passed, so a hand-edited APPROVE over the cap still clears this check."""
     if not isinstance(decision, dict) or decision.get("event") != APPROVE or not axes:
         return False
     verdicts = decision.get("verdicts")
     if not isinstance(verdicts, dict):
         return False
-    return all(verdicts.get(axis) in ("green", "yellow") for axis in axes)
+    reported = [verdicts.get(axis) for axis in axes]
+    return all(v in ("green", "yellow", "n/a") for v in reported) and any(v != "n/a" for v in reported)
 
 
 def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str:
