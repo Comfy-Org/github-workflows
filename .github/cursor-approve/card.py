@@ -686,8 +686,16 @@ def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=Non
             f"commit lands ({relabel(label)}). If none starts, re-run it by hand.")
 
 
+def next_capped_unlabelled_text() -> str:
+    """The capped card's next step when nothing has applied `needs-human-review`
+    (a push found the PR at the cap; the round-cap job runs on rounds only)."""
+    return ("A human is needed: the round limit is reached, so no round starts by itself, and a human's review "
+            "decides this PR. Adding and then removing the `needs-human-review` label resets the round count.")
+
+
 def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, capped: bool, next_text: str,
-                     run_url: str, same_head: bool = False, vetoed: bool = False, why=None) -> str:
+                     run_url: str, same_head: bool = False, vetoed: bool = False, why=None,
+                     capped_text=None) -> str:
     """The card once the approval of `approved_sha` stopped counting.
 
     Below the cap: `no_decision` / `relabel` — the new head needs its own
@@ -697,7 +705,8 @@ def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, cap
     the cap (or already handed to a human): `capped` / `human`, as the cap
     path. Vetoed (`skip-cursor-review`): `no_decision` / `human`, as decide's
     `vetoed`. `why` replaces the `same_head` reason in parentheses ("" drops
-    it), for an approval withdrawn on its own head and base.
+    it), for an approval withdrawn on its own head and base. `capped_text`
+    replaces the capped next step (default: the hand-off's).
 
     The round heading of the card it replaces is kept (its round, and the
     approved commit), and so is the axes history (`upsert`).
@@ -709,7 +718,7 @@ def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, cap
     moved = (f"Approved `{old7}`; that approval was withdrawn" + (f" ({why})" if why else "")
              if same_head else f"Approved `{old7}`; the head moved to `{new7}`")
     if capped:
-        state, next_step, next_text = STATE_CAPPED, NEXT_HUMAN, NEXT_HUMAN_CAPPED_TEXT
+        state, next_step, next_text = STATE_CAPPED, NEXT_HUMAN, capped_text or NEXT_HUMAN_CAPPED_TEXT
         headline = f"{moved}, and the round limit is reached, so a human is needed."
     elif vetoed:
         state, next_step, next_text = STATE_NO_DECISION, NEXT_HUMAN, DECIDE_NEXT_TEXT[OUTCOME_VETOED]

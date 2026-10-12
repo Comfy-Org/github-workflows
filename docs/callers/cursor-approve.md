@@ -163,8 +163,9 @@ leaves the card as it is:
 | Case | `state` / `next` | Card says |
 |---|---|---|
 | The head moved, below the round cap | `no_decision` / `relabel` | "Approved `<old7>`; the head moved to `<new7>`, which needs its own round." |
-| The base changed (or the head moved and came back) | `no_decision` / `push_then_relabel` | The approval was withdrawn, so this commit needs its own round — a relabel alone is deduped away (see below). |
-| At the round cap, or the PR carries `needs-human-review` | `capped` / `human` | The same hand-off as the cap path. Removing `needs-human-review` resets the count. |
+| The base changed, or the head moved to a commit that already had a round (it came back) | `no_decision` / `push_then_relabel` | The approval was withdrawn, so this commit needs its own round — a relabel alone is deduped away (see below). |
+| The PR carries `needs-human-review` | `capped` / `human` | The same hand-off as the cap path. Removing `needs-human-review` resets the count. |
+| At the round cap, without that label | `capped` / `human` | A human is needed; no round starts by itself. Nothing applied the label on a push, so adding and then removing it resets the count. |
 | The PR carries `skip-cursor-review` | `no_decision` / `human` | As decide's `vetoed`. |
 
 The card also carries `<!-- cursor-approve-stale-head: <sha> -->`: the head it
@@ -176,10 +177,15 @@ With cursor-review's `auto_rereview_after_dismissal`, the next step reads
 the start time, rewritten by each newer push's dismissal — still `relabel` on the
 contract marker. After `auto_rereview_delay_minutes` the workflow relabels only
 if the head has not moved again (a newer push schedules its own wait), the
-review label has not been applied since the card was written (a human, the
-fleet or auto-retry already started a round), the card is still the stale card
-for that head (no round has decided since), the PR is open, not a draft and
-unvetoed, and it is under `max_rounds`. It records the head on the card first —
+review label has not been applied since the approval the card reports (a human,
+the fleet or auto-retry already started a round — the approval, not the card's
+write, because a relabel right after the push lands before the dismiss job
+writes the card), the head has no consolidated review yet (the `dup` step would
+skip it), the card is still the stale card for that head (no round has decided
+since), the PR is open, not a draft and unvetoed, and it is under `max_rounds`.
+Waiters for one head run one at a time (a job concurrency group on PR + head,
+not cancel-in-progress), since every later PR event schedules another. It
+records the head on the card first —
 a visible line, plus `<!-- cursor-approve:auto-rereview v1 <sha>,… -->`, which
 every later card write carries forward — so each head gets at most one
 automatic round, and a head that flips back gets none. It never runs past the

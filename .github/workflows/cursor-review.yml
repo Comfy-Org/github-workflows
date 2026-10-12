@@ -7324,8 +7324,9 @@ jobs:
     # a debounce. `Dismiss stale auto-approval` decides it (and marks the card
     # stale either way); this job waits, then `auto-approve.py auto-rereview`
     # re-reads everything live and relabels only if the head is still the one
-    # that was dismissed, nothing has started a round since the card was
-    # written, the PR is open, not a draft, unvetoed and under `max_rounds`.
+    # that was dismissed and has no round of its own yet, nothing has started
+    # a round since the approval the card reports, the PR is open, not a
+    # draft, unvetoed and under `max_rounds`.
     # A newer push during the wait reaches its own dismiss job, which
     # schedules its own wait. KNOWN GAP: the wait lives in the source run, so
     # any later event in the same `label-` concurrency slot cancels it. A
@@ -7336,6 +7337,14 @@ jobs:
     name: Start the next round after a dismissal
     needs: dismiss-stale-approval
     if: ${{ !cancelled() && needs.dismiss-stale-approval.outputs.auto_rereview == 'true' }}
+    # Every later PR event re-schedules a waiter from the stale card, so
+    # waiters for one head are serialised, never run side by side: the next
+    # one starts after the first has recorded its round on the card, reads
+    # that record and skips. Not cancel-in-progress — that would kill the
+    # wait a burst of label/edit events keeps re-scheduling.
+    concurrency:
+      group: cursor-review-reusable-auto-rereview-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ needs.dismiss-stale-approval.outputs.rereview_head }}
+      cancel-in-progress: false
     # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
     # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
     # checks out PR code — and only under `pull_request_target`: any other

@@ -43,13 +43,13 @@ POSTER = "cursor-bot[bot]"
 CONSOLIDATED = AA._load_post_review().CONSOLIDATED_MARKER
 
 
-def approval(rid, sha, state="APPROVED", base="main"):
-    return {"id": rid, "user": {"login": LOGIN}, "state": state,
+def approval(rid, sha, state="APPROVED", base="main", submitted_at="2026-10-12T08:00:00Z"):
+    return {"id": rid, "user": {"login": LOGIN}, "state": state, "submitted_at": submitted_at,
             "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha, base)}
 
 
-def round_review(rid):
-    return {"id": rid, "user": {"login": POSTER}, "state": "COMMENTED",
+def round_review(rid, sha=X):
+    return {"id": rid, "user": {"login": POSTER}, "state": "COMMENTED", "commit_id": sha,
             "body": f"{CONSOLIDATED}\n\nfindings", "submitted_at": f"2026-10-12T0{rid}:00:00Z"}
 
 
@@ -66,6 +66,7 @@ def graphql(reviews):
         bot = login.endswith("[bot]")
         nodes.append({"fullDatabaseId": str(r["id"]), "databaseId": r["id"], "state": r["state"],
                       "body": r["body"], "lastEditedAt": None, "submittedAt": r.get("submitted_at"), "url": "",
+                      "commit": {"oid": r["commit_id"]} if r.get("commit_id") else None,
                       "author": {"__typename": "Bot" if bot else "User",
                                  "login": login[:-5] if bot else login}})
     return json.dumps({"data": {"repository": {"pullRequest": {"reviews": {
@@ -162,13 +163,31 @@ class DismissalCardTest(Base):
         self.assertEqual(CARD.card_state(body), "capped")
         self.assertIn("<!-- cursor-approve-next: human -->", body)
         self.assertIn("round limit is reached", body)
+        # Nothing applied `needs-human-review` (round-cap runs on rounds, not
+        # pushes), so the card does not describe the hand-off as done.
+        self.assertIn(CARD.next_capped_unlabelled_text(), body)
+        self.assertNotIn(CARD.NEXT_HUMAN_CAPPED_TEXT, body)
         self.assertEqual(self.outputs().get("auto_rereview"), "false")
 
     def test_needs_human_review_is_capped_too(self):
         fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X)], labels=[AA.HUMAN_REVIEW_LABEL])
         self.dismiss(fake, auto="true")
         self.assertEqual(CARD.card_state(fake.patches[-1]), "capped")
+        self.assertIn(CARD.NEXT_HUMAN_CAPPED_TEXT, fake.patches[-1])
         self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
+    def test_a_head_back_on_an_already_reviewed_commit_asks_for_a_push(self):
+        # The gate's `dup` step skips a relabel on a head with a consolidated
+        # review, so neither promise nor schedule a round there.
+        fake = FakeGitHub(card=pass_card(), reviews=[round_review(1, sha=Y), approval(2, X)])
+        self.dismiss(fake, auto="true")
+        body = fake.patches[-1]
+        self.assertIn("<!-- cursor-approve-next: push_then_relabel -->", body)
+        self.assertIn(f"the head moved to `{Y[:7]}`, which already had a review round", body)
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+        fake.patches.clear()
+        self.dismiss(fake, auto="true")
+        self.assertEqual(fake.patches, [])  # stable on the next event
 
     def test_an_approval_the_ruleset_already_dismissed_still_counts(self):
         fake = FakeGitHub(card=pass_card(), reviews=[approval(1, X, state="DISMISSED")])
@@ -324,9 +343,19 @@ class AutoRereviewTest(Base):
         self.assertEqual((fake.labels, fake.patches), ([], []))
 
     def test_nothing_fires_in_flight_capped_draft_or_vetoed(self):
-        in_flight = [{"event": "labeled", "label": {"name": "cursor-review"}, "created_at": "2026-10-12T10:05:00Z"}]
+        def labeled(at):
+            return [{"event": "labeled", "label": {"name": "cursor-review"}, "created_at": at}]
         cases = {
-            "in flight": FakeGitHub(card=self.stale_card(), timeline=in_flight),
+            "in flight": FakeGitHub(card=self.stale_card(), reviews=[approval(1, X)],
+                                    timeline=labeled("2026-10-12T10:05:00Z")),
+            # Relabelled right after the push, before the dismiss job wrote
+            # the card (updated_at 10:00): still a round in flight.
+            "relabelled before the card was written": FakeGitHub(card=self.stale_card(), reviews=[approval(1, X)],
+                                                                 timeline=labeled("2026-10-12T09:59:30Z")),
+            "labelled in the approval's second": FakeGitHub(card=self.stale_card(), reviews=[approval(1, X)],
+                                                            timeline=labeled("2026-10-12T08:00:00Z")),
+            "no readable approval": FakeGitHub(card=self.stale_card()),
+            "head already reviewed": FakeGitHub(card=self.stale_card(), reviews=[round_review(1, sha=Y), approval(2, X)]),
             "capped": FakeGitHub(card=self.stale_card(), reviews=[round_review(i) for i in range(1, 6)]),
             "draft": FakeGitHub(card=self.stale_card(), draft=True),
             "skip label": FakeGitHub(card=self.stale_card(), labels=[AA.SKIP_REVIEW_LABEL]),
@@ -340,9 +369,9 @@ class AutoRereviewTest(Base):
             self.assertEqual(self.rereview(fake), 0, name)
             self.assertEqual((fake.labels, fake.patches), ([], []), name)
 
-    def test_a_label_applied_before_the_card_was_written_is_not_in_flight(self):
-        earlier = [{"event": "labeled", "label": {"name": "cursor-review"}, "created_at": "2026-10-12T09:00:00Z"}]
-        fake = FakeGitHub(card=self.stale_card(), timeline=earlier)
+    def test_the_label_that_started_the_approved_round_is_not_in_flight(self):
+        earlier = [{"event": "labeled", "label": {"name": "cursor-review"}, "created_at": "2026-10-12T07:00:00Z"}]
+        fake = FakeGitHub(card=self.stale_card(), reviews=[approval(1, X)], timeline=earlier)
         self.rereview(fake)
         self.assertEqual(fake.labels, ["DELETE", "POST"])
 
@@ -429,6 +458,15 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertNotIn("            CAN_RELABEL=true\n", approver)
         job = self.text[self.text.index("  auto-rereview:\n"):]
         self.assertIn('if [ -n "$APPROVER_TOKEN" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then', job)
+
+    def test_waiters_for_one_head_are_serialised_not_cancelled(self):
+        # Every later PR event re-schedules a waiter; running two side by
+        # side lets both pass the record check and relabel twice.
+        job = self.text[self.text.index("  auto-rereview:\n"):]
+        job = job[:job.index("    steps:\n")]
+        self.assertIn("    concurrency:\n      group: cursor-review-reusable-auto-rereview-${{ github.repository }}-"
+                      "${{ github.event.pull_request.number }}-${{ needs.dismiss-stale-approval.outputs.rereview_head }}\n"
+                      "      cancel-in-progress: false\n", job)
 
     def test_the_delay_clamp_matches_the_card_sentence(self):
         job = self.text[self.text.index("  auto-rereview:\n"):]
