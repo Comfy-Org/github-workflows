@@ -516,9 +516,10 @@ class Wiring(unittest.TestCase):
                     approve,
                     rf"name: axis-{axis}\n\s+path: \$\{{\{{ runner\.temp \}}\}}/axes/axis-{axis}\n",
                 )
-                # gated on the caller actually asking for this axis, matched as a
-                # whole comma-delimited entry rather than a substring
-                self.assertIn(f"',{axis},')", approve)
+        # Never gated on the RAW `inputs.axes` string: aggregate.py strips and
+        # lowercases each entry, so `correctness, conformance` would skip the
+        # conformance download and withhold approval on a healthy axis.
+        self.assertNotRegex(approve, r"contains\([^\n]*inputs\.axes")
 
     def test_prior_rounds_declared_and_passed_everywhere(self):
         for name in ("cursor-approve.yml", "cursor-axis-base.yml"):

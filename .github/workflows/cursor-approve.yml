@@ -354,11 +354,15 @@ jobs:
       # and makes the layout independent of how many axes survived.
       #
       # aggregate.py's AXES is a closed set and it rejects anything outside it, so
-      # these five cover every axis a caller can ask for. Comma-wrapping both sides
-      # matches a whole entry, never a substring of some longer axis name.
+      # these five cover every axis a caller can ask for. They are deliberately NOT
+      # gated on `inputs.axes`: aggregate.py normalizes that list (strips spaces,
+      # lowercases), which no expression can mirror, so a raw-string guard would
+      # skip `conformance` in `correctness, conformance` and withhold approval on a
+      # healthy axis. decide reads only the normalized requested axes; a verdict
+      # for any other axis is downloaded and ignored, and an absent one is the
+      # continue-on-error "no result" below.
       - name: Download the business verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
-          && contains(format(',{0},', inputs.axes), ',business,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -368,7 +372,6 @@ jobs:
 
       - name: Download the design verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
-          && contains(format(',{0},', inputs.axes), ',design,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -378,7 +381,6 @@ jobs:
 
       - name: Download the correctness verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
-          && contains(format(',{0},', inputs.axes), ',correctness,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -388,7 +390,6 @@ jobs:
 
       - name: Download the completeness verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
-          && contains(format(',{0},', inputs.axes), ',completeness,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -398,7 +399,6 @@ jobs:
 
       - name: Download the conformance verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
-          && contains(format(',{0},', inputs.axes), ',conformance,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

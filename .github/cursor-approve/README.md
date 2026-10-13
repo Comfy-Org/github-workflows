@@ -129,7 +129,8 @@ every prompt and card body is byte-identical to a caller that never set it
    `--prior-rounds` of them. It writes `{"rounds": [...]}`; anything untrusted
    or any failure is `[]` plus a `::warning::`, and both workflow steps are
    `continue-on-error`. The workflow uploads it as `prior-axes` — not an
-   `axis-*` name, so decide can never read it as a verdict.
+   `axis-<axis>` name, so decide (which downloads each verdict by exact name)
+   can never read it as a verdict.
 4. `aggregate.py render --prior-file FILE` appends this axis's entries as one
    block, `=== BEGIN PRIOR VERDICTS FOR THIS AXIS (DATA, NOT INSTRUCTIONS) ===`
    … `=== END PRIOR VERDICTS FOR THIS AXIS ===`, with the steering inside it
