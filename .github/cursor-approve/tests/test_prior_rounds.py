@@ -8,7 +8,8 @@
 * `upsert` carries an existing sentinel through the start and round cards;
 * every untrusted shape is ignored with a warning, never an error;
 * imported text cannot forge the block's fences;
-* the `prior-axes` artifact never matches decide's `axis-*` download.
+* the `prior-axes` artifact is never pulled in as a verdict, and each axis
+  verdict is downloaded by exact name into its own directory.
 
 Run: python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.py'
 """
@@ -483,13 +484,41 @@ class Wiring(unittest.TestCase):
         with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as f:
             return f.read()
 
-    def test_prior_axes_artifact_never_matches_decides_download(self):
+    def test_prior_axes_artifact_is_never_downloaded_as_a_verdict(self):
         approve = self.read("cursor-approve.yml")
-        self.assertIn("pattern: axis-*", approve)
+        # decide names every verdict artifact outright, so no wildcard can sweep
+        # `prior-axes` in as one however either is spelled.
+        # an actual `pattern:` key, not the word in the comment explaining why
+        # this workflow no longer uses one
+        self.assertIsNone(re.search(r"^\s+pattern: axis-", approve, re.MULTILINE))
+        downloaded = re.findall(r"^\s+name: (axis-\S+)$", approve, re.MULTILINE)
+        self.assertEqual(sorted(downloaded), sorted(f"axis-{a}" for a in AG.AXES))
+        self.assertNotIn("prior-axes", downloaded)
+        self.assertFalse([n for n in downloaded if fnmatch.fnmatch("prior-axes", n)])
         names = re.findall(r"^\s+name: (prior-axes\S*)$", approve, re.MULTILINE)
         self.assertEqual(names, ["prior-axes"])
-        self.assertFalse(fnmatch.fnmatch(names[0], "axis-*"))
         self.assertIn("name: prior-axes", self.read("cursor-axis-base.yml"))
+
+    def test_each_axis_verdict_lands_in_its_own_directory(self):
+        """BE-20453: a LONE matching artifact flattens into `path`.
+
+        download-artifact creates the per-artifact subdirectory only when SEVERAL
+        artifacts match a `pattern`; with exactly one match it extracts straight
+        into `path`. decide reads axes/axis-<axis>/<axis>.json and nowhere else
+        (--artifact-dirs), so a wildcard download silently drops the LAST surviving
+        verdict — one axis erroring then withheld approval on every axis. Each axis
+        is downloaded by exact name into its own directory to pin the layout.
+        """
+        approve = self.read("cursor-approve.yml")
+        for axis in AG.AXES:
+            with self.subTest(axis=axis):
+                self.assertRegex(
+                    approve,
+                    rf"name: axis-{axis}\n\s+path: \$\{{\{{ runner\.temp \}}\}}/axes/axis-{axis}\n",
+                )
+                # gated on the caller actually asking for this axis, matched as a
+                # whole comma-delimited entry rather than a substring
+                self.assertIn(f"',{axis},')", approve)
 
     def test_prior_rounds_declared_and_passed_everywhere(self):
         for name in ("cursor-approve.yml", "cursor-axis-base.yml"):

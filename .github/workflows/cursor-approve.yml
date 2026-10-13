@@ -340,17 +340,71 @@ jobs:
           overwrite: true
           retention-days: 7
 
-      - name: Download the axis verdicts
+      # One download per axis, by EXACT artifact name, into that axis's own
+      # directory. A single `pattern: axis-*` step cannot do this: download-artifact
+      # creates the per-artifact subdirectory only when SEVERAL artifacts match, and
+      # flattens a LONE match straight into `path`. So once every axis but one had
+      # errored, the survivor landed at axes/<axis>.json, decide looked for
+      # axes/axis-<axis>/<axis>.json (--artifact-dirs), found nothing, and reported a
+      # HEALTHY axis as "no result" — one axis erroring withheld approval on all of
+      # them, and the card named failures that never happened (BE-20453).
+      #
+      # Naming each artifact keeps exactly what the pattern form was there for — an
+      # artifact under any other name can neither supply nor overwrite a verdict —
+      # and makes the layout independent of how many axes survived.
+      #
+      # aggregate.py's AXES is a closed set and it rejects anything outside it, so
+      # these five cover every axis a caller can ask for. Comma-wrapping both sides
+      # matches a whole entry, never a substring of some longer axis name.
+      - name: Download the business verdict
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+          && contains(format(',{0},', inputs.axes), ',business,')
         # A failed axis uploaded nothing; that is "no result", not an error here.
-        # No merge-multiple: each artifact lands in its own axis-<name>/ directory
-        # and decide reads <axis>.json ONLY from there (--artifact-dirs), so an
-        # artifact under any other name cannot supply or overwrite a verdict.
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: axis-*
-          path: ${{ runner.temp }}/axes
+          name: axis-business
+          path: ${{ runner.temp }}/axes/axis-business
+
+      - name: Download the design verdict
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+          && contains(format(',{0},', inputs.axes), ',design,')
+        # A failed axis uploaded nothing; that is "no result", not an error here.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: axis-design
+          path: ${{ runner.temp }}/axes/axis-design
+
+      - name: Download the correctness verdict
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+          && contains(format(',{0},', inputs.axes), ',correctness,')
+        # A failed axis uploaded nothing; that is "no result", not an error here.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: axis-correctness
+          path: ${{ runner.temp }}/axes/axis-correctness
+
+      - name: Download the completeness verdict
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+          && contains(format(',{0},', inputs.axes), ',completeness,')
+        # A failed axis uploaded nothing; that is "no result", not an error here.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: axis-completeness
+          path: ${{ runner.temp }}/axes/axis-completeness
+
+      - name: Download the conformance verdict
+        if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
+          && contains(format(',{0},', inputs.axes), ',conformance,')
+        # A failed axis uploaded nothing; that is "no result", not an error here.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: axis-conformance
+          path: ${{ runner.temp }}/axes/axis-conformance
 
       - name: Decide
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
