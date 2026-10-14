@@ -788,7 +788,20 @@ jobs:
             < "$RUNNER_TEMP/axis-prompt.txt" > /tmp/axis-claude-result.json \
             && rc=0 || rc=$?
           echo "claude exit code: $rc"
-          if [ "$rc" != "0" ]; then
+          # Gated on the OUTCOME, not the exit code alone, exactly as the panel's
+          # direct cell gates it (`Report cell outcome`, on `status != ok`).
+          # Claude Code reports an API-level failure as `{"type":"result",
+          # "subtype":"success","is_error":true,"result":"API Error: 400 ..."}`
+          # and EXITS 0 — so an rc-only gate skipped the single shape
+          # `_api_error_cause` exists to name, and the axis reported `no output`
+          # with the cause sitting unread in the file. A capped key
+          # ("You have reached your specified API usage limits") then looked
+          # exactly like a model that answered nothing.
+          # `jq` loads no module from the cwd, so it needs no `-I` equivalent;
+          # a missing, non-object or invalid file yields false and the guards
+          # below still report. agent-error.py screens the cause for the key
+          # and caps it, so this adds no new publishing surface.
+          if [ "$rc" != "0" ] || jq -e '.is_error == true' /tmp/axis-claude-result.json >/dev/null 2>&1; then
             # WHY, from an allowlist of provider error metadata, never prose.
             python3 -I "$CURSOR_REVIEW_ASSETS/agent-error.py" \
               --events /tmp/axis-claude-result.json --label "axis-${AXIS}/${MODEL}" || true
@@ -825,7 +838,7 @@ jobs:
           if not isinstance(result, dict):
               sys.exit("::error::claude left no JSON result object")
           if result.get("is_error") is True:
-              sys.exit("::error::claude reported an error result")
+              sys.exit("::error::claude reported an error result; the cause, if the CLI named one, is printed above")
           turns = result.get("num_turns")
           if type(turns) is not int:
               sys.exit("::error::the claude result has no integer num_turns; cannot tell whether the axis read the change")
