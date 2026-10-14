@@ -1372,6 +1372,7 @@ class ApproveGateTest(unittest.TestCase):
             "value: ${{ (jobs.round-cap.outputs.capped == 'true' || jobs.round-cap.outputs.labelled == 'true') "
             "&& 'capped' || "
             "(inputs.approve_max_severity == '' || jobs.gate.outputs.approve_author_ok == 'false') && 'off' || "
+            "jobs.approve-only.outputs.go == 'true' && 'pass' || "
             "jobs.post-review.outputs.approve_gate || 'untrusted' }}",
             text,
         )
@@ -1387,7 +1388,8 @@ class ApproveGateTest(unittest.TestCase):
             text = f.read()
         self.assertIn(
             "value: ${{ jobs.round-cap.outputs.capped == 'true' && jobs.round-cap.outputs.rounds || "
-            "jobs.post-review.outputs.delivered == 'true' && jobs.round-cap.outputs.next_round || '' }}",
+            "jobs.post-review.outputs.delivered == 'true' && jobs.round-cap.outputs.next_round || "
+            "jobs.approve-only.outputs.go == 'true' && jobs.approve-only.outputs.round || '' }}",
             text,
         )
         self.assertIn(

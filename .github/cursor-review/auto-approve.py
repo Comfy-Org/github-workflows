@@ -3443,7 +3443,16 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
             and _true(getattr(args, "auto_rereview", "")) and _true(getattr(args, "can_relabel", ""))
             and not _true(getattr(args, "run_without_label", "")) and not pr.get("draft")
             and live_head not in card.rereview_heads(body))
-    if auto:
+    # `approve_only_on_push`: a card past a passing panel is re-checked by the
+    # axes alone, which the `approve-only` job decides for itself after this.
+    # Only the sentence differs: `auto` still asks for the round, and the
+    # workflow skips that relabel when `approve-only` takes the push.
+    recheck = (head_moved and not capped and not vetoed and _true(getattr(args, "approve_only", ""))
+               and card.in_axes_lane(body) and not _true(getattr(args, "run_without_label", ""))
+               and not pr.get("draft"))
+    if recheck:
+        next_text = card.next_recheck_text(label, getattr(args, "approve_only_delay_minutes", 0))
+    elif auto:
         next_text = card.next_auto_rereview_text(label, getattr(args, "auto_rereview_delay_minutes", 0))
     elif head_moved and _true(getattr(args, "run_without_label", "")):
         next_text = f"This push starts a new round by itself; if none starts, {card.relabel(label)}."
@@ -3596,6 +3605,172 @@ def cmd_auto_rereview(args) -> int:
                   f"{annotation_cause(e, 'unknown error')}")
         return 1
     emit(f"🔁 **Auto-approve: started a round for `{head[:7]}`** — `{label}` was removed and re-added.")
+    return 0
+
+
+# --- approve-only: the axes alone on a push past a passing panel -------------
+#
+# `approve_only_on_push`. After a round whose panel passed, the panel's job is
+# done: what is left to decide on a later push is what the axes decide. So a
+# push re-runs only the axes, on the new head — by setting cursor-review's
+# `approve_gate` output to `pass` without a panel, so the caller's EXISTING
+# approve-start → axis-* → decide jobs run against the pushed commit — and
+# never consumes `max_rounds` (no consolidated review is posted). Relabelling
+# still runs a full round. Two stages, either side of the debounce:
+#
+#   check  — before the wait. Is this push eligible at all? Writes the
+#            `eligible` output (which also stands down `auto-rereview`'s full
+#            round) and, when it is, announces the re-check on the card.
+#   start  — after the wait. Everything re-read live; records the head on the
+#            card's re-check sentinel (the record that stops a second re-check
+#            of the same head) and writes `go` and `round`.
+#
+# Eligibility is read only from the approver identity's own card (LANE_MARKER:
+# the last panel round passed and its axes ran) and the live PR, never from PR
+# content. Anything unreadable is "not eligible", which leaves today's
+# behaviour: the card asks for a relabel, or `auto-rereview` starts a round.
+
+APPROVE_ONLY_STAGES = ("check", "start")
+
+
+def _last_decision_at(reviews: list, login: str):
+    """When the approver identity last decided (approved, requested changes,
+    or had either dismissed), or None. Every decide posts one of those, so a
+    review label applied after it is a round still in flight."""
+    login = (login or "").strip().lower()
+    stamps = [r.get("submitted_at") for r in reviews
+              if isinstance(r, dict) and ((r.get("user") or {}).get("login") or "").lower() == login
+              and r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+              and isinstance(r.get("submitted_at"), str) and r.get("submitted_at")]
+    return max(stamps) if stamps else None
+
+
+def approve_only_blocker(args, pr: dict, reviews: list, timeline: list, body: str, head: str, threads=None):
+    """Why this push may NOT be re-checked by the axes alone, or None.
+
+    `threads` is open_thread_severities' list, or None when it could not be
+    read. Order matters only for the reason reported.
+    """
+    card = _load_card()
+    label = (getattr(args, "review_label", "") or "").strip() or DEFAULT_REVIEW_LABEL
+    live_head, _ = pr_head_base(pr)
+    if (pr.get("state") or "") != "open":
+        return "the PR is not open"
+    if pr.get("draft"):
+        return "the PR is a draft"
+    if live_head.lower() != head:
+        return f"the head moved on to `{live_head[:7]}`; that push is judged on its own"
+    if not (getattr(args, "threshold", "") or "").strip():
+        return "auto-approve is off (`approve_max_severity` is empty)"
+    author = ((pr.get("user") or {}).get("login") or "") if isinstance(pr.get("user"), dict) else ""
+    if not author_opted_in(getattr(args, "approve_authors", ""), author):
+        return "`approve_authors` does not list the PR author"
+    if not live_labels_readable(pr):
+        return "its labels could not be read"
+    if not has_label(pr, label):
+        return f"the PR does not carry `{label}`"
+    for name in (*VETO_LABELS, HUMAN_REVIEW_LABEL):
+        if has_label(pr, name):
+            return f"the PR carries `{name}`"
+    if not body:
+        return "there is no cursor-approve card, so no round has run its axes"
+    if not card.in_axes_lane(body):
+        return "the last round's panel did not pass (or its axes never ran), so the push needs a full round"
+    if card.card_state(body) == CARD_CAPPED:
+        return "the card hands the PR to a human"
+    round_no = card.card_round(body)
+    if not round_no.isdigit():
+        return "the card names no round"
+    heads = card.rechecks_this_round(body)
+    if head in heads:
+        return "this head was already re-checked"
+    cap = _approve_only_cap(args)
+    if len(heads) >= cap:
+        return (f"round {round_no} already had {len(heads)} approver-only re-check(s), the cap "
+                f"(`approve_only_max_runs`); relabel `{label}` for a full round")
+    if head_already_reviewed(reviews, head):
+        return "a panel round already reviewed this head"
+    if approval_of([r for r in reviews if r.get("state") == "APPROVED"], args.approver_login, head):
+        return "the approver's approval already stands on this head (carried forward)"
+    since = _last_decision_at(reviews, args.approver_login)
+    if since is None:
+        return "the approver's last decision could not be read, so a round in flight cannot be ruled out"
+    if labeled_after(timeline, label, since):
+        return f"`{label}` was applied since the last decision, so a full round is under way"
+    if threads is None:
+        return "the open review threads could not be read"
+    threshold = (getattr(args, "threshold", "") or "").strip().lower()
+    # As a full-scope round's own decide: an open thread above the threshold,
+    # or unbadged, blocks. The panel does not run here, so nothing would ever
+    # re-judge it; it is the author's to resolve, then this re-check runs on
+    # the next push (or a relabel runs the panel).
+    if any(sev is None or above_threshold(sev, threshold) for sev, _marked in threads):
+        return f"an open review thread above `{threshold}` (or unbadged) is unresolved"
+    return None
+
+
+def _approve_only_cap(args) -> int:
+    raw = str(getattr(args, "max_runs", "") or "").strip()
+    match = re.fullmatch(r"([0-9]+)(?:\.0+)?", raw)
+    return min(int(match.group(1)), 999) if match else 0
+
+
+def cmd_approve_only(args) -> int:
+    """cursor-review's `approve-only` job, stage `check` or `start` (above)."""
+    set_output("eligible" if args.stage == "check" else "go", "false")
+    head = (args.head_sha or "").strip().lower()
+    label = (args.review_label or "").strip() or DEFAULT_REVIEW_LABEL
+
+    def skip(why: str) -> int:
+        emit(f"⏭️ **Approver-only re-check: not running** — {why}.")
+        return 0
+
+    if args.stage not in APPROVE_ONLY_STAGES:
+        print(f"::error::--stage must be one of {', '.join(APPROVE_ONLY_STAGES)}, got {args.stage!r}")
+        return 2
+    if not SHA_HEX_RE.fullmatch(head):
+        return skip("no head to re-check")
+    if not (args.approver_login or "").strip():
+        return skip("no approver identity, whose card the re-check is read from")
+    card = _load_card()
+    try:
+        pr = read_pr(args.repo, args.pr_number)
+        timeline = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100")
+        reviews = list_reviews(args.repo, args.pr_number)
+        found = card.find_card(card.list_comments(args.repo, args.pr_number), args.approver_login)
+    except (RuntimeError, ValueError) as e:
+        return skip(f"the PR could not be read ({annotation_cause(e, 'unknown error')})")
+    body = _lf((found or {}).get("body"))
+    try:
+        threads = open_thread_severities(args.repo, int(args.pr_number))
+    except Exception as e:  # noqa: BLE001 — unreadable threads are "not eligible", never a traceback
+        print(f"::warning::Could not read the open review threads: {annotation_cause(e, 'unknown error')}")
+        threads = None
+    why = approve_only_blocker(args, pr, reviews, timeline, body, head, threads)
+    if why:
+        return skip(why)
+    if args.stage == "check":
+        set_output("eligible", "true")
+        try:
+            card.upsert(args.repo, args.pr_number, args.approver_login,
+                        card.mark_recheck_scheduled(body, head, args.delay_minutes, label), card=found)
+        except (RuntimeError, ValueError) as e:
+            # The card is what the author reads; the re-check still runs.
+            print(f"::warning::Could not announce the re-check on the card: {annotation_cause(e, 'unknown error')}")
+        emit(f"⏳ **Approver-only re-check of `{head[:7]}` scheduled** — after the debounce, if no further "
+             "commit lands.")
+        return 0
+    round_no = card.card_round(body)
+    try:
+        card.upsert(args.repo, args.pr_number, args.approver_login,
+                    card.mark_recheck_started(body, round_no, _approve_only_cap(args), head, label), card=found)
+    except (RuntimeError, ValueError) as e:
+        return skip(f"the card could not record it ({annotation_cause(e, 'unknown error')}), and without that "
+                    "record nothing stops a second re-check of this head")
+    set_output("go", "true")
+    set_output("round", round_no)
+    emit(f"🔍 **Approver-only re-check of `{head[:7]}`** — the axes judge it under round {round_no}; "
+         "the panel does not re-run.")
     return 0
 
 
@@ -4437,6 +4612,9 @@ def main() -> int:
     # own changes identical; posts only when --event-name is pull_request_target.
     s.add_argument("--carry-forward", default="false")
     s.add_argument("--event-name", default="")
+    # `approve_only_on_push`: only the stale card's next-step sentence.
+    s.add_argument("--approve-only", default="false")
+    s.add_argument("--approve-only-delay-minutes", default="0")
     q = sub.add_parser("auto-rereview")
     q.add_argument("--repo", required=True)
     q.add_argument("--pr-number", required=True)
@@ -4445,6 +4623,19 @@ def main() -> int:
     q.add_argument("--poster-login", required=True)
     q.add_argument("--review-label", default="")
     q.add_argument("--max-rounds", default="0")
+    o = sub.add_parser("approve-only")
+    o.add_argument("--stage", required=True)
+    o.add_argument("--repo", required=True)
+    o.add_argument("--pr-number", required=True)
+    o.add_argument("--head-sha", required=True)
+    o.add_argument("--approver-login", required=True)
+    o.add_argument("--review-label", default="")
+    o.add_argument("--threshold", default="")
+    o.add_argument("--approve-authors", default="")
+    # `approve_only_max_runs`: re-checks per panel round.
+    o.add_argument("--max-runs", default="0")
+    # Announced on the card at `check`, not waited for here — the job waits.
+    o.add_argument("--delay-minutes", default="0")
     r = sub.add_parser("auto-retry")
     r.add_argument("--repo", required=True)
     r.add_argument("--pr-number", required=True)
@@ -4466,6 +4657,8 @@ def main() -> int:
         return cmd_auto_retry(args)
     if args.cmd == "auto-rereview":
         return cmd_auto_rereview(args)
+    if args.cmd == "approve-only":
+        return cmd_approve_only(args)
     return cmd_decide(args) if args.cmd == "decide" else cmd_dismiss_stale(args)
 
 

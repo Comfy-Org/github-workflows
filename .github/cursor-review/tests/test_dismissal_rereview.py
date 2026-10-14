@@ -445,8 +445,10 @@ class WorkflowWiringTest(unittest.TestCase):
 
     def test_the_rereview_job_runs_only_when_the_dismiss_job_asks(self):
         job = self.text[self.text.index("  auto-rereview:\n"):]
-        self.assertIn("needs: dismiss-stale-approval", job)
+        self.assertIn("needs: [dismiss-stale-approval, approve-only]", job)
         self.assertIn("needs.dismiss-stale-approval.outputs.auto_rereview == 'true'", job)
+        # …and stands down when `approve_only_on_push` re-checks the push.
+        self.assertIn("needs.approve-only.outputs.eligible != 'true'", job)
         self.assertIn("auto-approve.py\" auto-rereview", job)
         self.assertIn("--head-sha \"$HEAD_SHA\"", job)
 

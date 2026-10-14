@@ -454,6 +454,8 @@ def render_start(round_no, max_rounds, sha: str, axes: list, approve_gate: str, 
         lines += ["| Axis | Verdict | Why |", "|---|---|---|"]
         lines += [f"| {axis} | ⏳ pending | |" for axis in axes]
     lines += ["", _reviewed_line(sha, run_url)]
+    if not capped:
+        lines += ["", LANE_MARKER]
     return "\n".join(lines) + "\n"
 
 
@@ -509,7 +511,7 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
     if outcome in (OUTCOME_SUPERSEDED, OUTCOME_RETARGETED):
         what = "a newer commit" if outcome == OUTCOME_SUPERSEDED else "a base retarget"
         lines += [f"**Superseded by {what}.**", "", f"**Next step:** {next_text}",
-                  "", _reviewed_line(sha, run_url)]
+                  "", _reviewed_line(sha, run_url), "", LANE_MARKER]
         return "\n".join(lines) + "\n"
     detail = decision.get("axes") if isinstance(decision, dict) else None
     detail = detail if isinstance(detail, dict) else {}
@@ -543,6 +545,10 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
     lines += ["", f"_Rule: no red, {YELLOW_RULE.format(limit)}; every axis must report "
               f"(⚪ n/a counts as reporting and does not block, but all-n/a withholds)._",
               "", _reviewed_line(sha, run_url)]
+    # Still past a passing panel — except once handed to a human, where no
+    # push may be re-checked by the axes alone.
+    if state != STATE_CAPPED:
+        lines += ["", LANE_MARKER]
     return "\n".join(lines) + "\n"
 
 
@@ -646,6 +652,34 @@ _HEADING_RE = re.compile(r"^### Cursor approve · round ([0-9?]+) of ([0-9?]+) �
 _REVIEWED_RE = re.compile(r"^_Reviewed commit: `([0-9a-f]{40})`", re.MULTILINE)
 _STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-approve-state: ([a-z_]+) -->")
 
+# --- approver-only re-checks (cursor-review's `approve_only_on_push`) --------
+#
+# A push after a round whose PANEL passed re-runs only the axes on the new head,
+# not the panel. Two more line-start markers, read back only from the card
+# `find_card` trusts (model text is `sanitize`d or `reason_text`ed, which
+# escapes `<`, so neither can be forged from it):
+#
+# LANE_MARKER       written by every card that sits past a passing panel: the
+#                   start card (not at the cap) and the decide card (not handed
+#                   to a human), and carried by `render_dismissed`. Absent from
+#                   cursor-review's own round card, so the moment a panel round
+#                   decides — whatever it decided — the PR is out of the lane
+#                   until its axes run again. That is what "the last panel
+#                   round passed" means to cursor-review's `approve-only` job.
+# RECHECK_SENTINEL  `<round> <cap> <head,head,…>`: the heads already re-checked
+#                   for panel round <round>, oldest first, and the cap they ran
+#                   under. Carried through every rewrite by `upsert`; a card
+#                   whose heading names another round reads as no re-checks, so
+#                   a new panel round resets the count without anyone clearing
+#                   the line.
+LANE_MARKER = "<!-- cursor-approve-lane: axes -->"
+_LANE_RE = re.compile(r"^<!-- cursor-approve-lane: axes -->[ \t\r]*$", re.MULTILINE)
+RECHECK_SENTINEL_OPENER = "<!-- cursor-approve:recheck v1 "
+_RECHECK_SENTINEL_RE = re.compile(
+    r"^<!-- cursor-approve:recheck v1 ([0-9]{1,4}) ([0-9]{1,3}) ([0-9a-f,]*) -->[ \t\r]*$", re.MULTILINE)
+RECHECK_HEADS_KEPT = 50
+_RECHECK_LINE_RE = re.compile(r"^(?:🔍|⏳) _Approver-only re-check[^\n]*\n?", re.MULTILINE)
+
 
 def card_state(body) -> str:
     """The card's `cursor-approve-state` value, or "" when it has none."""
@@ -703,6 +737,101 @@ def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=Non
             f"commit lands ({relabel(label)}). If none starts, re-run it by hand.")
 
 
+def in_axes_lane(body) -> bool:
+    """Whether the card sits past a passing panel round (LANE_MARKER)."""
+    return bool(_LANE_RE.search(body or ""))
+
+
+
+def recheck_record(body) -> tuple:
+    """(round, cap, heads) from the card's re-check sentinel, or ("", 0, [])."""
+    match = _RECHECK_SENTINEL_RE.search(body or "")
+    if not match:
+        return "", 0, []
+    heads = [h for h in match.group(3).split(",") if SHA_RE.fullmatch(h)]
+    return str(int(match.group(1))), int(match.group(2)), heads
+
+
+def rechecks_this_round(body) -> list:
+    """The heads re-checked under the panel round the card's heading names.
+    A record for any other round (an older panel round) counts as none."""
+    round_no, _cap, heads = recheck_record(body)
+    current = card_round(body)
+    return heads if round_no and current.isdigit() and str(int(current)) == round_no else []
+
+
+def recheck_sentinel(round_no, cap, heads: list) -> str:
+    number = _int_or_q(round_no)
+    heads = [h for h in heads if SHA_RE.fullmatch(h or "")][-RECHECK_HEADS_KEPT:]
+    if not number.isdigit() or not heads:
+        return ""
+    cap = max(0, min(int(_int_or_q(cap)) if _int_or_q(cap).isdigit() else 0, 999))
+    return f"{RECHECK_SENTINEL_OPENER}{int(number)} {cap} {','.join(heads)} -->"
+
+
+def recheck_note(n: int, cap: int, head_sha: str, label=DEFAULT_REVIEW_LABEL) -> str:
+    """The visible line a re-check's cards carry, under the heading."""
+    of = f" of {cap}" if cap else ""
+    return (f"🔍 _Approver-only re-check {n}{of} for `{head_sha[:7]}`: this push re-ran the axes only, not the "
+            f"panel. To run the full panel on it, {relabel(label)}._")
+
+
+def _insert_after_heading(body: str, line: str) -> str:
+    lines = body.split("\n")
+    for i, text in enumerate(lines):
+        if _HEADING_RE.match(text):
+            return "\n".join(lines[:i + 1] + ["", line] + lines[i + 1:])
+    return _append_line(body, line)
+
+
+def with_recheck_history(body: str, existing_body, recheck_sha=None) -> str:
+    """`body` carrying the existing card's re-check record, unless it writes
+    its own, and — for a card written for `recheck_sha` (the start and decide
+    phases) when that head is the record's latest under this round — the
+    visible re-check line, so a re-check's card never reads as a full round."""
+    if not _RECHECK_SENTINEL_RE.search(body):
+        round_no, cap, heads = recheck_record(existing_body)
+        body = _append_line(body, recheck_sentinel(round_no, cap, heads))
+    heads = rechecks_this_round(body)
+    if recheck_sha and heads and heads[-1] == recheck_sha and not _RECHECK_LINE_RE.search(body):
+        _r, cap, _h = recheck_record(body)
+        body = _insert_after_heading(body, recheck_note(len(heads), cap, recheck_sha))
+    return body
+
+
+def mark_recheck_scheduled(body: str, head_sha: str, delay_minutes=0, label=DEFAULT_REVIEW_LABEL, now=None) -> str:
+    """`body` with the re-check cursor-review's `approve-only` job scheduled,
+    announced before its debounce: one visible line, replacing any earlier
+    re-check line. A promise it may not keep — a newer push or a relabel
+    cancels it — hence the fallback."""
+    when = retry_delay_phrase(delay_minutes, "the latest push", now)
+    line = (f"⏳ _Approver-only re-check of `{head_sha[:7]}` starts{when} if no further commit lands: the axes "
+            f"judge the new head, the panel does not re-run. For the full panel instead, {relabel(label)}._")
+    body = _RECHECK_LINE_RE.sub("", body)
+    return _insert_after_heading(body.rstrip("\n") + "\n", line).rstrip("\n") + "\n"
+
+
+def mark_recheck_started(body: str, round_no, cap, head_sha: str, label=DEFAULT_REVIEW_LABEL) -> str:
+    """`body` with `head_sha` recorded as re-checked under `round_no` — the
+    record that stops a second re-check of the same head — and the visible
+    line saying it started."""
+    heads = rechecks_this_round(body)
+    if head_sha not in heads:
+        heads = heads + [head_sha]
+    body = _RECHECK_LINE_RE.sub("", _RECHECK_SENTINEL_RE.sub("", body)).rstrip("\n") + "\n"
+    body = _insert_after_heading(body, recheck_note(len(heads), int(_int_or_q(cap)) if _int_or_q(cap).isdigit()
+                                                    else 0, head_sha, label))
+    return _append_line(body, recheck_sentinel(round_no, cap, heads))
+
+
+def next_recheck_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=None) -> str:
+    """The dismissed card's next step when the push is re-checked by the axes
+    alone (`approve_only_on_push`) rather than by a new round."""
+    when = retry_delay_phrase(delay_minutes, "the latest push", now)
+    return (f"Nothing — cursor-approve re-checks the new head automatically{when} if no further commit lands "
+            f"(the axes only; the panel does not re-run). For the full panel instead, {relabel(label)}.")
+
+
 def next_capped_unlabelled_text() -> str:
     """The capped card's next step when nothing has applied `needs-human-review`
     (a push found the PR at the cap; the round-cap job runs on rounds only)."""
@@ -753,6 +882,8 @@ def render_dismissed(old_body, approved_sha: str, head_sha: str, max_rounds, cap
               "", _reviewed_line(approved_sha, run_url) if run_url else
               f"_Reviewed commit: `{approved_sha}`_" if SHA_RE.fullmatch(approved_sha or "") else "_Reviewed commit: unknown_",
               "", STALE_HEAD_MARKER.format(head_sha)]
+    if in_axes_lane(old_body) and not capped and not vetoed:
+        lines += ["", LANE_MARKER]
     return "\n".join(lines) + "\n"
 
 
@@ -1045,19 +1176,22 @@ def ensure(repo: str, pr_number, login: str, body: str) -> tuple:
         return card, True
 
 
-def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None, card=None) -> dict:
+def upsert(repo: str, pr_number, login: str, body: str, entry=None, keep=None, card=None,
+           recheck_sha=None) -> dict:
     """Edit the existing card in place, or create it when there is none.
 
     The card's axes sentinel is carried into `body` (see `with_axes_history`);
     `entry` and `keep` are decide's; `keep` stays None for every other writer.
     `card` is a card this run created seconds ago (``ensure``): it is edited
     without listing the comments again, since a listing taken that soon after
-    the write could miss it and post a second card.
+    the write could miss it and post a second card. `recheck_sha` is the
+    commit a start or decide card is for (``with_recheck_history``).
     """
     if card is None:
         card = find_card(list_comments(repo, pr_number), login)
     existing = card.get("body") if card is not None else ""
     body = with_rereview_history(with_axes_history(body, existing, entry, keep), existing)
+    body = with_recheck_history(body, existing, recheck_sha)
     if card is not None:
         return json.loads(gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{card['id']}", "--input", "-"],
                              {"body": body}))
@@ -1093,6 +1227,9 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--round", default="")
     p.add_argument("--prior-rounds", default="")
+    # The commit this round's axes judge: an approver-only re-check shares its
+    # panel round's number, so a same-round entry for ANOTHER commit is prior.
+    p.add_argument("--commit-sha", default="")
     for name in ("start", "ensure", "decide"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
@@ -1151,7 +1288,7 @@ def main(argv=None) -> int:
         _write_job_summary(render_job_summary(args.round, args.max_rounds, args.commit_sha, axes,
                                               decision, args.outcome, args.max_yellow_axes))
     try:
-        upsert(args.repo, args.pr_number, args.login, body, entry, keep)
+        upsert(args.repo, args.pr_number, args.login, body, entry, keep, recheck_sha=args.commit_sha)
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not update the cursor-approve card: {e}")
     return 0
@@ -1162,7 +1299,10 @@ def _prior_history(args) -> list:
 
     A re-run of this round (or a later one recorded by a re-run of an older
     round) is not a PRIOR verdict: showing the axis its own output for this
-    round would anchor it on itself. So only rounds below `--round` are kept,
+    round would anchor it on itself. The one exception is this round's entry
+    for ANOTHER commit (`--commit-sha`): an approver-only re-check keeps its
+    panel round's number, and the verdict on the commit before the push is
+    exactly the prior it should say is resolved or not. So only rounds below `--round` are kept,
     and only the last `--prior-rounds` of those, so lowering the input takes
     effect in the very next round rather than after decide re-trims the card.
     """
@@ -1180,8 +1320,10 @@ def _prior_history(args) -> list:
     if problem:
         print(f"::warning::Ignoring the card's prior-axes history: {problem}")
     current = _int_or_q(args.round)
+    sha = (getattr(args, "commit_sha", "") or "").strip().lower()
     if current.isdigit():
-        rounds = [r for r in rounds if r["round"] < int(current)]
+        rounds = [r for r in rounds if r["round"] < int(current)
+                  or (r["round"] == int(current) and SHA_RE.fullmatch(sha) and r["commit_sha"] != sha)]
     if str(args.prior_rounds or "").strip():
         keep = parse_prior_rounds(args.prior_rounds)
         rounds = sorted(rounds, key=lambda r: r["round"])[-keep:] if keep else []

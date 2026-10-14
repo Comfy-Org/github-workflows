@@ -452,7 +452,7 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             if any("secrets.APPROVER_TOKEN" in line for line in code_lines(body))
         )
         self.assertEqual(
-            token_jobs, ["auto-rereview", "auto-retry", "dismiss-stale-approval", "post-review"]
+            token_jobs, ["approve-only", "auto-rereview", "auto-retry", "dismiss-stale-approval", "post-review"]
         )
         env_jobs = sorted(
             name

@@ -218,6 +218,31 @@ automatic round, and a head that flips back gets none. It never runs past the
 cap: there the card asks for a human. If the relabel itself fails, that visible
 line is rewritten to say so and to relabel by hand; the record stays.
 
+### A push re-checked by the axes alone
+
+With cursor-review's `approve_only_on_push`, a push after a round whose panel
+passed re-runs only the axes: cursor-review runs no panel, reports
+`approve_gate: pass`, and this workflow's start and decide phases judge the
+pushed head as usual. Two more line-start markers make that decidable from the
+card alone:
+
+- `<!-- cursor-approve-lane: axes -->` — written by the start card (not at the
+  cap) and every decide card except the hand-off, and kept by the dismissed
+  card. cursor-review's own round card never carries it, so a panel round that
+  did not pass takes the PR out of the lane until its axes run again.
+- `<!-- cursor-approve:recheck v1 <round> <cap> <sha>,… -->` — the heads
+  already re-checked under panel round `<round>`, carried through every
+  rewrite. A card whose heading names another round reads as none, so a new
+  panel round resets the count; a head is never re-checked twice.
+
+A re-check keeps its panel round's number, so the heading still says "round N
+of M"; the line under it says "Approver-only re-check K of C for `<sha7>`".
+Before the debounce the card announces it ("Approver-only re-check of `<sha7>`
+starts at HH:MM UTC…"), and a dismissed card's next step says the new head is
+re-checked automatically. The `state` / `next` markers keep their meanings.
+With `prior_rounds`, a re-check's axes see this round's verdict on the commit
+before the push as their prior.
+
 ### Why a relabel alone is not always enough (BE-19527)
 
 The gate's `dup` step skips any head that already carries a bot-posted

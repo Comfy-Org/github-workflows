@@ -321,10 +321,14 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ROUND: ${{ inputs.round }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          # An approver-only re-check (cursor-review's `approve_only_on_push`)
+          # keeps its panel round's number: this round's verdict on ANOTHER
+          # commit is the prior it judges against.
+          COMMIT_SHA: ${{ inputs.commit_sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/prior"
           python3 "$CURSOR_APPROVE_ASSETS/card.py" prior --repo "$REPO" --pr-number "$PR_NUMBER" \
-            --login "$LOGIN" --round "$ROUND" --prior-rounds "$PRIOR_ROUNDS" \
+            --login "$LOGIN" --round "$ROUND" --prior-rounds "$PRIOR_ROUNDS" --commit-sha "$COMMIT_SHA" \
             --out "$RUNNER_TEMP/prior/prior-axes.json"
 
       - name: Upload the prior axis verdicts
