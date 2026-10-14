@@ -190,7 +190,27 @@ class SentinelRoundTrip(unittest.TestCase):
             "axes": {"correctness": {"verdict": "green", "headline": "correctness headline.",
                                      "summary": "correctness summary."},
                      "conformance": {"verdict": "yellow", "headline": "conformance headline.",
-                                     "summary": "conformance summary."}}}]})
+                                     "summary": "conformance summary.", "yellow_kind": "unjudged"}}}]})
+
+    def test_a_yellow_kind_is_recorded_and_read_back(self):
+        """The sentinel is the per-round record that outlives the artifacts, so
+        it keeps each yellow's kind; decide's normalised kind, an unsaid one as
+        `unjudged`, and none on any other verdict."""
+        dec = decision(correctness="yellow", conformance="yellow", design="green")
+        dec["axes"]["correctness"]["yellow_kind"] = "concern"
+        entry = card.round_entry("1", SHA1, dec)
+        self.assertEqual(entry["axes"]["correctness"]["yellow_kind"], "concern")
+        self.assertEqual(entry["axes"]["conformance"]["yellow_kind"], "unjudged")
+        self.assertNotIn("yellow_kind", entry["axes"]["design"])
+        self.assertEqual(card.read_axes_sentinel(card.axes_sentinel([entry])), ([entry], None))
+
+    def test_a_round_from_before_the_split_or_a_bad_kind_reads_as_kind_unknown(self):
+        legacy = good_round(1, SHA1, conformance="yellow", correctness="green")
+        self.assertEqual(card.read_axes_sentinel(sentinel_for([legacy])), ([legacy], None))
+        bad = json.loads(json.dumps(legacy))
+        bad["axes"]["conformance"]["yellow_kind"] = "CONCERN"
+        bad["axes"]["correctness"]["yellow_kind"] = "concern"
+        self.assertEqual(card.read_axes_sentinel(sentinel_for([bad])), ([legacy], None))
 
     def test_keeps_last_n_and_replaces_same_round(self):
         fake = FakeGitHub()
@@ -431,6 +451,17 @@ class RenderedBlock(unittest.TestCase):
         self.assertNotIn("correctness", block.split(AG.PRIOR_STEERING.format(head_sha=VALUES["head_sha"]))[1])
         self.assertIn(f"git diff <prior_sha>..{VALUES['head_sha']}", block)
         self.assertIn("as if this block were\n   absent", block)
+
+    def test_a_prior_yellow_shows_its_kind(self):
+        rounds = [good_round(n, sha, conformance="yellow") for n, sha in ((1, SHA1), (2, SHA2), (3, SHA3))]
+        rounds[0]["axes"]["conformance"]["yellow_kind"] = "concern"
+        rounds[1]["axes"]["conformance"]["yellow_kind"] = "unjudged"
+        block = self.render(rounds)
+        self.assertIn(f"(full: {SHA1}) · verdict: yellow (concern)\n", block)
+        self.assertIn(f"(full: {SHA2}) · verdict: yellow (could not judge)\n", block)
+        # A round recorded before the split shows a bare yellow.
+        self.assertIn(f"(full: {SHA3}) · verdict: yellow\n", block)
+        self.assertIn("A prior `yellow (could not judge)`", block)
 
     def test_cli_appends_block_after_the_axis_section(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,4 +8,6 @@ unhandled, a test that should exist and does not, documentation or
 configuration that the change makes stale, a TODO standing in for part of the
 fix. A criterion the PR does not meet and does not explain is `red`. Partial
 work that the PR body states openly, with the remainder tracked elsewhere, is
-at most `yellow`.
+at most a `yellow` `concern`. With no stated problem or criteria, say so, and
+still judge what the diff alone shows: the call sites, error paths, tests, docs
+and TODOs above do not need a stated problem to check.

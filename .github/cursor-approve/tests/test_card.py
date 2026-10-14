@@ -375,6 +375,112 @@ def fleet_axis_rows(body):
     return rows
 
 
+class YellowKind(unittest.TestCase):
+    """A yellow's two meanings — a material concern, or the axis could not
+    judge — render distinguishably, so a reader sees which kind gated a round.
+    Reporting only: the rule line counts both alike."""
+
+    CONCERN = "🟡 yellow · concern"
+    UNJUDGED = "🟡 yellow · could not judge"
+
+    def body(self, kinds, outcome="not_approved", limit="0"):
+        d = decision(**{axis: "yellow" for axis in kinds})
+        for axis, kind in kinds.items():
+            if kind is not None:
+                d["axes"][axis]["yellow_kind"] = kind
+        return card.render_decide("1", "5", SHA, list(kinds), d, outcome, limit, "")
+
+    def test_each_kind_has_its_own_cell(self):
+        body = self.body({"correctness": "concern", "conformance": "unjudged"})
+        self.assertIn(f"| correctness | {self.CONCERN} | correctness headline. |", body)
+        self.assertIn(f"| conformance | {self.UNJUDGED} | conformance headline. |", body)
+
+    def test_an_unsaid_or_unknown_kind_renders_as_could_not_judge(self):
+        for kind in (None, "", "Concern", 1, ["concern"]):
+            with self.subTest(kind=kind):
+                self.assertIn(f"| correctness | {self.UNJUDGED} |", self.body({"correctness": kind}))
+
+    def test_the_job_summary_shows_the_kind_too(self):
+        d = decision(correctness="yellow", conformance="yellow")
+        d["axes"]["correctness"]["yellow_kind"] = "concern"
+        body = card.render_job_summary("1", "5", SHA, ["correctness", "conformance"], d, "not_approved", "0")
+        self.assertIn(f"#### correctness — {self.CONCERN} (confidence 0.90)", body)
+        self.assertIn(f"#### conformance — {self.UNJUDGED} (confidence 0.90)", body)
+
+    def test_the_rule_line_counts_both_kinds_alike(self):
+        body = self.body({"correctness": "concern"}, outcome="approved", limit="1")
+        self.assertIn("no red, at most 1 yellow (a concern and a could-not-judge count alike)", body)
+
+    def test_other_verdicts_ignore_a_stray_kind(self):
+        d = decision(correctness="green", conformance="red")
+        d["axes"]["correctness"]["yellow_kind"] = "concern"
+        d["axes"]["conformance"]["yellow_kind"] = "unjudged"
+        body = card.render_decide("1", "5", SHA, ["correctness", "conformance"], d, "not_approved", "0", "")
+        self.assertIn("| correctness | 🟢 green |", body)
+        self.assertIn("| conformance | 🔴 red |", body)
+
+    def test_the_fleet_reads_both_kinds_as_a_yellow_work_item(self):
+        """The fleet's card parser reduces a verdict cell to red / yellow /
+        unrecognized by SUBSTRING, red first and after dropping green, n/a and
+        pending: a kind label holding `red` (`covered`, `required`) would read
+        as a red, one holding `n/a` would vanish. Both must stay a yellow."""
+        for label in card.YELLOW_KIND_ICONS.values():
+            with self.subTest(label=label):
+                for token in ("red", "green", "n/a", "pending"):
+                    self.assertNotIn(token, label.lower())
+        body = self.body({"correctness": "concern", "conformance": "unjudged", "design": None})
+        self.assertEqual(fleet_axis_rows(body),
+                         [("correctness", "yellow"), ("conformance", "yellow"), ("design", "yellow")])
+
+    def test_end_to_end_from_the_model_reply_to_the_card(self):
+        """A model reply per axis → `extract` (the uploaded artifact) →
+        `decide --artifact-dirs` → the decide card, as the workflow runs them.
+        The gate counts both kinds as yellow; the card tells them apart."""
+        replies = {
+            "correctness": {"verdict": "yellow", "yellow_kind": "concern",
+                            "headline": "Retry path swallows the timeout error."},
+            "conformance": {"verdict": "yellow", "yellow_kind": "unjudged",
+                            "headline": "No guidance file says how releases are cut here."},
+            # A yellow that never said which kind it was: recorded as unjudged.
+            "design": {"verdict": "yellow", "headline": "The linked plan could not be read."},
+            "business": {"verdict": "green", "headline": "The issue asks for exactly this change."},
+        }
+        axes = list(replies)
+        with tempfile.TemporaryDirectory() as tmp:
+            for axis, reply in replies.items():
+                raw = os.path.join(tmp, f"{axis}.raw")
+                with open(raw, "w", encoding="utf-8") as f:
+                    f.write("Here is my verdict:\n" + json.dumps({"confidence": 0.7, "summary": "s", **reply}))
+                os.makedirs(os.path.join(tmp, "out", f"axis-{axis}"))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(AGGREGATE.main(["extract", "--raw", raw, "--commit-sha", SHA, "--out",
+                                                     os.path.join(tmp, "out", f"axis-{axis}", f"{axis}.json")]), 0)
+            with open(os.path.join(tmp, "out", "axis-design", "design.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["yellow_kind"], "unjudged")
+            results = {}
+            for limit in ("0", "3"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(AGGREGATE.main(["decide", "--outputs-dir", os.path.join(tmp, "out"),
+                                                     "--artifact-dirs", "--axes", ",".join(axes),
+                                                     "--commit-sha", SHA, "--max-yellow-axes", limit]), 0)
+                results[limit] = json.loads(out.getvalue())
+        # Three yellows, of both kinds: over a limit of 0, within a limit of 3.
+        self.assertEqual(results["0"]["event"], AGGREGATE.NONE)
+        self.assertEqual(results["0"]["reasons"],
+                         ["3 yellow axes (correctness, conformance, design) exceed the limit of 0"])
+        self.assertEqual(results["3"]["event"], AGGREGATE.APPROVE)
+        self.assertEqual(results["0"]["yellow_kinds"],
+                         {"concern": ["correctness"], "unjudged": ["conformance", "design"]})
+        body = card.render_decide("1", "5", SHA, axes, results["0"], "not_approved", "0", "")
+        self.assertIn(f"| correctness | {self.CONCERN} |", body)
+        self.assertIn(f"| conformance | {self.UNJUDGED} |", body)
+        self.assertIn(f"| design | {self.UNJUDGED} |", body)
+        self.assertIn("| business | 🟢 green |", body)
+        self.assertEqual(fleet_axis_rows(body),
+                         [("correctness", "yellow"), ("conformance", "yellow"), ("design", "yellow")])
+
+
 class FullSentenceWhy(unittest.TestCase):
     """BE-20249: the Why cell shows the axis's reason as a whole sentence. At
     100 characters the headline cap cut ordinary one-sentence reasons
