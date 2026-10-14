@@ -1027,7 +1027,9 @@ or approvals posted as `github-actions[bot]` (set `bot_app_id`), or any event
 other than `pull_request_target`. After posting, it re-reads the PR and its
 reviews and withdraws the new approval if the head, base, labels or state moved
 or a request for changes landed meanwhile; a withdrawal that fails turns the
-job red. If the post itself fails, the old approval is dismissed as before. The
+job red. If the post itself fails, the old approval is dismissed as before, and
+since a timed-out post may still have landed, it re-lists the reviews and
+withdraws any carried approval of the live head it finds (red if it cannot). The
 compare reads use the job's own token (`contents: read`), not the approver's. An
 approval GitHub already dismissed (a ruleset with `dismiss_stale_reviews_on_push`
 can, on the push itself) is never carried.

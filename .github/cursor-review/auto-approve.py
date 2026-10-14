@@ -2619,7 +2619,9 @@ def annotation_cause(error, fallback: str) -> str:
 # no approval by this identity already stands on the live head. After the POST
 # it re-reads the PR and its reviews, and withdraws the new approval if the
 # head, base, labels or state moved or a newer request for changes by this
-# identity landed; a withdrawal that fails turns the job red.
+# identity landed. A POST that failed ambiguously (a timeout, no review id)
+# re-lists the reviews and withdraws any carried approval of the live head it
+# may have landed anyway. A withdrawal that fails turns the job red.
 
 COMPARE_FILE_CAP = 300
 COMPARE_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
@@ -2814,8 +2816,8 @@ def render_carried_body(card_url: str, head: str, base_ref: str, reviewed: str, 
 def try_carry_forward(args, ctx: dict, approval, reviews: list):
     """Re-post `approval` on the live head when the PR's own changes are still the
     ones a round reviewed. (the new review, None) on success; (None, None) when
-    nothing was carried; (None, failure) when an approval posted here moved and
-    could not be withdrawn again."""
+    nothing was carried; (None, failure) when an approval posted here moved, or
+    an ambiguous POST may have landed one, and it could not be withdrawn again."""
     if not isinstance(approval, dict) or approval.get("state") != "APPROVED" or approval.get("edited"):
         return None, None
     body = _lf(approval.get("body"))
@@ -2852,7 +2854,9 @@ def try_carry_forward(args, ctx: dict, approval, reviews: list):
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not carry the approval of `{from_sha[:7]}` forward, so it is dismissed instead: "
               f"{annotation_cause(e, 'unknown error')}")
-        return None, None
+        # Ambiguous, as decide's failed POST: a timeout, or a reply with no id,
+        # may still have landed an approval that skipped the re-check below.
+        return None, withdraw_unconfirmed_carries(args, ctx["head"], _review_id(approval))
     # The read → POST race approve-external closes: re-read after the write.
     # The reviews too: a round deciding in that window may have requested
     # changes, which this approval, being newer, would overrule.
@@ -2885,6 +2889,37 @@ def try_carry_forward(args, ctx: dict, approval, reviews: list):
          f"changes are identical to the ones reviewed at `{reviewed[:7]}`.")
     return {"id": posted["id"], "user": {"login": login}, "state": "APPROVED", "body": new_body, "edited": False,
             "commit_id": ctx["head"]}, None
+
+
+def withdraw_unconfirmed_carries(args, head: str, stale_id):
+    """After an ambiguous carry POST: dismiss this identity's carried approvals
+    of `head` newer than the stale approval `stale_id`. None when none is left
+    standing, else the failure (the job goes red)."""
+    login = (args.approver_login or "").strip().lower()
+    try:
+        stray = []
+        for r in list_reviews(args.repo, args.pr_number):
+            rid, body = _review_id(r), _lf(r.get("body"))
+            sha = REVIEWED_SHA_RE.search(body)
+            if (r.get("state") == "APPROVED" and rid is not None and stale_id is not None and rid > stale_id
+                    and ((r.get("user") or {}).get("login") or "").lower() == login
+                    and CARRIED_MARKER_RE.search(body) and sha and sha.group(1) == head):
+                stray.append(rid)
+    except (RuntimeError, ValueError) as e:
+        cause = annotation_cause(e, "unknown error")
+        print(f"::error::Could not re-list reviews after an ambiguous carried-forward approval POST: {cause}.")
+        return f"re-list after an ambiguous carry POST: {cause}"
+    for rid in stray:
+        try:
+            dismiss(args.repo, args.pr_number, rid, STALE_MESSAGE)
+        except RuntimeError as e:
+            cause = annotation_cause(e, "unknown error")
+            print(f"::error::A carried-forward approval landed despite a failed POST, and withdrawing it failed: "
+                  f"{cause}. {DISMISS_PERMISSION_HINT}")
+            return f"{rid}: {cause}"
+    if stray:
+        emit(f"Auto-approve: withdrew {len(stray)} carried-forward approval(s) an ambiguous POST had landed.")
+    return None
 
 
 def carry_stale_approval(args, pr, reviews: list, ids: list, handed_off):

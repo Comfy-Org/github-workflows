@@ -4009,6 +4009,7 @@ class CarryForwardTest(unittest.TestCase):
                          (self.BASE_SHA, self.LIVE): self.files(42, " func b() {")}
         self.comments = []
         self.fail_post = False
+        self.fail_relist = False
         self.fail_dismiss = set()
         self.posted, self.writes, self.patches = [], [], []
         self.dismissed = {}
@@ -4058,6 +4059,8 @@ class CarryForwardTest(unittest.TestCase):
 
     def gh(self, args, payload=None):
         if args[:2] == ["api", "graphql"]:
+            if self.fail_relist and self.posted:
+                raise RuntimeError("gh api failed: HTTP 502")
             reviews = list(self.reviews)
             if self.posted:
                 reviews += [{"id": rid, "user": {"login": self.LOGIN}, "state": "APPROVED", "body": p["body"]}
@@ -4078,11 +4081,15 @@ class CarryForwardTest(unittest.TestCase):
         if args[:4] == ["api", "-X", "POST", "repos/o/r/pulls/1/reviews"]:
             self.post_tokens.append(os.environ.get("GH_TOKEN"))
             self.writes.append(("POST", payload["commit_id"]))
-            if self.fail_post:
+            if self.fail_post is True:
                 raise RuntimeError("gh api failed: HTTP 422 Unprocessable Entity")
             rid = 100 + len(self.posted)
             self.posted.append((rid, payload))
-            return json.dumps({"id": rid})
+            # An ambiguous POST: the review landed, but `gh` timed out or
+            # returned no id.
+            if self.fail_post == "landed":
+                raise RuntimeError("gh: context deadline exceeded")
+            return json.dumps({} if self.fail_post == "no-id" else {"id": rid})
         if args[:3] == ["api", "-X", "PUT"]:
             rid = int(args[3].split("/")[-2])
             if rid in self.fail_dismiss:
@@ -4379,6 +4386,29 @@ class CarryForwardTest(unittest.TestCase):
         self.assert_dismissed_as_before(self.run_dismiss())
         self.assertEqual(self.writes[0], ("POST", self.LIVE))
         self.assertTrue(any(line.startswith("::warning::Could not carry") for line in self.printed), self.printed)
+
+    def test_an_ambiguous_post_that_landed_is_withdrawn(self):
+        # A timeout, or a reply with no id: the approval may stand anyway, and
+        # nothing re-checked it, so it is found by a re-list and taken back.
+        for mode in ("landed", "no-id"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.fail_post = mode
+                self.assertEqual(self.run_dismiss(), 0, self.printed)
+                self.assertEqual(self.dismissed, {100: AA.STALE_MESSAGE, 11: AA.STALE_MESSAGE})
+                self.emitted_line("an ambiguous POST had landed")
+
+    def test_an_ambiguous_post_that_cannot_be_cleared_goes_red(self):
+        self.fail_post = "landed"
+        self.fail_dismiss = {100}
+        self.assertEqual(self.run_dismiss(), 1)
+        self.assertTrue(any(line.startswith("::error::A carried-forward approval landed despite a failed POST")
+                            for line in self.printed), self.printed)
+        self.setUp()
+        self.fail_post, self.fail_relist = "landed", True
+        self.assertEqual(self.run_dismiss(), 1)
+        self.assertTrue(any(line.startswith("::error::Could not re-list reviews after an ambiguous")
+                            for line in self.printed), self.printed)
 
     def test_a_pr_that_moves_during_the_post_takes_the_carried_approval_back(self):
         for change in ({"head": {"sha": self.LATER}}, {"base": {"ref": "release", "sha": self.BASE_SHA}},
