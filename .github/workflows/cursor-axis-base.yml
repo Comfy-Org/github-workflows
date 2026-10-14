@@ -788,8 +788,11 @@ jobs:
             < "$RUNNER_TEMP/axis-prompt.txt" > /tmp/axis-claude-result.json \
             && rc=0 || rc=$?
           echo "claude exit code: $rc"
-          # Gated on the OUTCOME, not the exit code alone, exactly as the panel's
-          # direct cell gates it (`Report cell outcome`, on `status != ok`).
+          # Gated on the OUTCOME, not the exit code alone, as the panel's direct
+          # cell is (`Report cell outcome`, on `status != ok`) — though narrower:
+          # only the two outcomes that can carry a provider cause (rc != 0, or
+          # `is_error`). A clean result that fails a later guard (`num_turns`,
+          # reply type) has no cause to name; those guards report it themselves.
           # Claude Code reports an API-level failure as `{"type":"result",
           # "subtype":"success","is_error":true,"result":"API Error: 400 ..."}`
           # and EXITS 0 — so an rc-only gate skipped the single shape

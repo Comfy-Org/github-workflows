@@ -302,8 +302,8 @@ class ApiErrorDiagnostic(unittest.TestCase):
     `_api_error_cause` exists to name: the axis uploaded no verdict, the card
     read `no output`, and a spend-capped key was indistinguishable from a model
     that answered nothing — diagnosable only by opening the job log. The panel's
-    direct cell has always gated this on `status != ok`; these pin the axis to
-    the same rule.
+    direct cell gates this on `status != ok`; these pin the axis to the subset
+    of that rule that can carry a provider cause: a nonzero exit or `is_error`.
     """
 
     # The shape a capped key actually produces, `subtype` included.
