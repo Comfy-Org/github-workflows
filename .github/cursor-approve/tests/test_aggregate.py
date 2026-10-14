@@ -650,22 +650,27 @@ class ExtractCli(unittest.TestCase):
     def test_a_yellow_kind_reaches_the_artifact(self):
         """The artifact is where the yellow mix is counted after the fact."""
         base = {"verdict": "yellow", "confidence": 0.5, "headline": "h", "summary": "s"}
-        self.assertEqual(self.artifact({**base, "yellow_kind": "concern"})["yellow_kind"], "concern")
-        self.assertEqual(self.artifact({**base, "yellow_kind": "unjudged"})["yellow_kind"], "unjudged")
+        for kind in ("concern", "unjudged"):
+            obj = self.artifact({**base, "yellow_kind": kind})
+            self.assertEqual((obj["yellow_kind"], obj["yellow_kind_given"]), (kind, True))
 
     def test_an_unsaid_or_unparseable_yellow_kind_is_written_as_unjudged(self):
         base = {"verdict": "yellow", "confidence": 0.5, "headline": "h", "summary": "s"}
-        self.assertEqual(self.artifact(base)["yellow_kind"], "unjudged")
+        # `yellow_kind_given` keeps a defaulted `unjudged` countable apart from a stated one.
+        self.assertEqual((self.artifact(base)["yellow_kind"], self.artifact(base)["yellow_kind_given"]),
+                         ("unjudged", False))
         for bad in ("", "CONCERN", "a concern", 0, None, ["concern"]):
             with self.subTest(bad=bad):
-                self.assertEqual(self.artifact({**base, "yellow_kind": bad})["yellow_kind"], "unjudged")
+                obj = self.artifact({**base, "yellow_kind": bad})
+                self.assertEqual((obj["yellow_kind"], obj["yellow_kind_given"]), ("unjudged", False))
 
     def test_no_yellow_kind_on_any_other_verdict(self):
         for verdict in ("green", "red", "n/a"):
             with self.subTest(verdict):
                 obj = self.artifact({"verdict": verdict, "confidence": 0.5, "headline": "h", "summary": "s",
-                                     "yellow_kind": "concern"})
+                                     "yellow_kind": "concern", "yellow_kind_given": True})
                 self.assertNotIn("yellow_kind", obj)
+                self.assertNotIn("yellow_kind_given", obj)
 
     def test_rejects_a_bad_commit_sha(self):
         code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok"}', sha="main")

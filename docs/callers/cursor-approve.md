@@ -87,9 +87,11 @@ any other value, is recorded as `unjudged` — an axis that did not say is never
 credited with having judged. **The split is reporting only**: both kinds count
 against `max_yellow_axes` exactly as a bare yellow always has, the `reasons`
 are unchanged, and no value of the field can make an axis untrusted or change
-the approval. It is recorded in the `axis-<name>` artifact (`yellow_kind`), in
+the approval. It is recorded in the `axis-<name>` artifact (`yellow_kind`,
+plus `yellow_kind_given`: whether the model named that kind itself), in
 `aggregate.py decide`'s output (each axis's `yellow_kind`, and the yellow axes
-grouped by kind in `yellow_kinds`), and on the card and job summary as
+grouped by kind in `yellow_kinds`), in the prior-rounds history, and on the
+card and job summary as
 `🟡 yellow · concern` / `🟡 yellow · could not judge`, so the mix can be counted
 before any change to how either kind is gated. Both labels keep the
 `🟡 yellow` prefix and contain none of `red` / `green` / `n/a` / `pending`, so a

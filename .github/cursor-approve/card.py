@@ -858,6 +858,12 @@ def _valid_round(r) -> dict:
             raise ValueError(f"{axis}: summary is not a string")
         out[axis] = {"verdict": entry["verdict"], "headline": _clamp_headline(_utf8(headline)),
                      "summary": _utf8(summary or "")[:PRIOR_SUMMARY_CHARS]}
+        # A yellow's kind, when the round recorded one. A round written before
+        # the split carries none and stays kind-unknown; a stray or unknown kind
+        # is dropped rather than failing the round — it is reported, not judged.
+        kind = entry.get("yellow_kind")
+        if entry["verdict"] == "yellow" and isinstance(kind, str) and kind in YELLOW_KIND_ICONS:
+            out[axis]["yellow_kind"] = kind
     return {"round": number, "commit_sha": sha, "axes": out}
 
 
@@ -909,6 +915,11 @@ def round_entry(round_no, sha: str, decision):
         summary = entry.get("summary")
         axes[axis] = {"verdict": entry["verdict"], "headline": headline,
                       "summary": _utf8(summary)[:PRIOR_SUMMARY_CHARS] if isinstance(summary, str) else ""}
+        if entry["verdict"] == "yellow":
+            # Normalised as aggregate.py records it: an unsaid kind is `unjudged`.
+            kind = entry.get("yellow_kind")
+            axes[axis]["yellow_kind"] = kind if isinstance(kind, str) and kind in YELLOW_KIND_ICONS \
+                else "unjudged"
     return {"round": int(number), "commit_sha": sha, "axes": axes} if axes else None
 
 
