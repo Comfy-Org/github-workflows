@@ -459,6 +459,11 @@ jobs:
           # cursor-review's `approve_scope_effective`; `full` (the default) is
           # the fail-closed reading of the non-gating marker.
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
+          # BE-20585: read-only (this workflow grants no write anywhere), for
+          # the one compare read that records the approval's merge base, which
+          # an approver token scoped to reviews may not be able to make. Never
+          # an identity: nothing can be posted with it.
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" approve-external --repo "$REPO" \
             --pr-number "$PR_NUMBER" --commit-sha "$COMMIT_SHA" --axes "$AXES" \

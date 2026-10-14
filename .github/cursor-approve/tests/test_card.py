@@ -755,8 +755,15 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(len(checkouts), 1)
         self.assertIn("repository: Comfy-Org/github-workflows", checkouts[0])
         self.assertIn("ref: ${{ inputs.workflows_ref }}", checkouts[0])
-        self.assertNotIn("secrets.GITHUB_TOKEN", text)
-        self.assertNotIn("github.token", text)
+        # No fallback identity: the job token appears once, read-only (no
+        # permission anywhere grants a write), for approve-external's compare
+        # read alone (BE-20585).
+        token_lines = [ln.strip() for ln in text.splitlines() if "secrets.GITHUB_TOKEN" in ln or "github.token" in ln]
+        self.assertEqual(token_lines, ["FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}"])
+        step = text.split("- name: Approve or withhold\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}", step)
+        self.assertIn("auto-approve.py\" approve-external", step)
+        self.assertNotRegex(text, r"(?m)^\s+[a-z-]+: write\b")
         self.assertNotIn("bot_app_id", text)
 
     def test_cli_pin_matches_cursor_review(self):

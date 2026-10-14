@@ -24,6 +24,7 @@ Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import itertools
@@ -3987,9 +3988,13 @@ class CarryForwardTest(unittest.TestCase):
     carry is an approval no round produced, so every case that cannot vouch for
     the comparison must keep the old behaviour: dismiss, and post nothing.
 
-    The PR, unless a case says otherwise: a round (review 10) reviewed REVIEWED,
-    diffed from MERGE_BASE, and review 11 approved it. The PR now sits on LIVE
-    over BASE_SHA. Reviews this run posts get ids from 100.
+    What a round reviewed comes only from records the APPROVER signed: the merge
+    base an approval recorded (ApprovalMergeBaseTest covers how it gets there),
+    or what a carried approval copied forward — never from a bot-posted review.
+
+    The PR, unless a case says otherwise: review 11 approved REVIEWED and
+    recorded MERGE_BASE, the merge base its round diffed from. The PR now sits
+    on LIVE over BASE_SHA. Reviews this run posts get ids from 100.
     """
 
     REVIEWED, LIVE, LATER = "a" * 40, "b" * 40, "c" * 40
@@ -4001,13 +4006,16 @@ class CarryForwardTest(unittest.TestCase):
         self.pr = {"state": "open", "draft": False, "user": {"login": "dev"},
                    "head": {"sha": self.LIVE}, "base": {"ref": "main", "sha": self.BASE_SHA}, "labels": []}
         self.pr_after_post = None
-        self.reviews = [self.round_review(10), self.approval(11)]
+        self.reviews = [self.approval(11)]
         self.after_post_reviews = []
         self.after_post_changes = {}
         # The same change at other line numbers, under the same hunk heading:
-        # what a rebase onto a base that grew above it looks like.
+        # what a rebase onto a base that grew above it looks like. The base side
+        # has moved on, so the live compare is "diverged" — only the reviewed
+        # side must show its merge base as an ancestor.
         self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10, " func a() {"),
-                         (self.BASE_SHA, self.LIVE): self.files(42, " func a() {")}
+                         (self.BASE_SHA, self.LIVE): self.files(42, " func a() {", cmp_status="diverged",
+                                                                behind_by=3)}
         self.comments = []
         self.fail_post = False
         self.fail_relist = False
@@ -4023,9 +4031,12 @@ class CarryForwardTest(unittest.TestCase):
 
     # -- the PR ------------------------------------------------------------
 
-    def approval(self, rid, sha=None, base="main", edited=False, state="APPROVED", login=None):
+    def approval(self, rid, sha=None, base="main", edited=False, state="APPROVED", login=None, merge_base=None):
+        """An approval as decide posts it; `merge_base=""` is one from before
+        BE-20585, or one whose merge base could not be confirmed."""
         return {"id": rid, "user": {"login": login or self.LOGIN}, "state": state, "edited": edited,
-                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha or self.REVIEWED, base)}
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha or self.REVIEWED, base,
+                                       merge_base=self.MERGE_BASE if merge_base is None else merge_base)}
 
     def carried(self, rid, head=None, from_sha=None):
         """An approval an earlier run already carried forward to `head`."""
@@ -4033,9 +4044,9 @@ class CarryForwardTest(unittest.TestCase):
                 "body": AA.render_carried_body("", head or self.LIVE, "main", self.REVIEWED, self.MERGE_BASE,
                                                from_sha or self.REVIEWED, "low")}
 
-    def round_review(self, rid, head=None, merge_base=None, poster=None, edited=False):
+    def round_review(self, rid, head=None, merge_base=None, poster=None):
         sentinel = POST_REVIEW.render_round_sentinel(head or self.REVIEWED, "9" * 40, merge_base or self.MERGE_BASE)
-        return {"id": rid, "user": {"login": poster or self.POSTER}, "state": "COMMENTED", "edited": edited,
+        return {"id": rid, "user": {"login": poster or self.POSTER}, "state": "COMMENTED",
                 "body": f"{POST_REVIEW.CONSOLIDATED_MARKER}\n{sentinel}\n\nfindings"}
 
     def change_request(self, rid):
@@ -4046,10 +4057,12 @@ class CarryForwardTest(unittest.TestCase):
     def patch(start, heading="", added="+new", context=" keep"):
         return f"@@ -{start},3 +{start},3 @@{heading}\n{context}\n-old\n{added}\n keep"
 
-    def files(self, start=10, heading="", **entry):
+    def files(self, start=10, heading="", cmp_status="ahead", behind_by=0, **entry):
+        """A compare response listing one changed file (`entry` overrides its
+        fields); `cmp_status` and `behind_by` are the comparison's own."""
         f = {"filename": "svc/a.go", "status": "modified", "changes": 2, "patch": self.patch(start, heading)}
         f.update(entry)
-        return {"files": [f]}
+        return {"status": cmp_status, "ahead_by": 1, "behind_by": behind_by, "files": [f]}
 
     def pass_card(self):
         body = CARD.render_round(2, 5, self.REVIEWED, "pass", "none", "Approved: no finding above `low`.", [], "", "")
@@ -4106,11 +4119,11 @@ class CarryForwardTest(unittest.TestCase):
         raise AssertionError(f"unexpected gh call {args}")
 
     def run_dismiss(self, carry="true", event="pull_request_target", threshold="low", authors="",
-                    all_approvals=False, poster=None, login=None, auto="false", env=None):
+                    all_approvals=False, login=None, auto="false", env=None):
         args = argparse.Namespace(
             repo="o/r", pr_number="1", head_sha=self.pr["head"]["sha"], approver_login=login or self.LOGIN,
             all_approvals=all_approvals, threshold=threshold, approve_authors=authors, max_rounds="5",
-            poster_login=poster or self.POSTER, review_label="cursor-review", auto_rereview=auto,
+            poster_login=self.POSTER, review_label="cursor-review", auto_rereview=auto,
             auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false",
             carry_forward=carry, event_name=event)
         environ = dict({"GITHUB_OUTPUT": self.output_path}, **(env or {}))
@@ -4159,6 +4172,19 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(AA.stale_reviews_to_dismiss([posted], self.LOGIN, self.LIVE, "main"), [])
         self.assertTrue(any(line in body for line in AA.APPROVAL_BODY_LINES), body)
 
+    def test_round_reviews_play_no_part_in_a_carry(self):
+        # A bot-posted review naming another merge base — before or after the
+        # approval — changes nothing: the fake answers only the compare from the
+        # merge base the approval recorded, so reading the round's would fail.
+        for reviews in ([self.round_review(10, merge_base=self.BASE_SHA2), self.approval(11)],
+                        [self.approval(11), self.round_review(12, merge_base=self.BASE_SHA2)]):
+            with self.subTest(ids=[r["id"] for r in reviews]):
+                self.setUp()
+                self.reviews = reviews
+                self.assertEqual(self.run_dismiss(), 0, self.printed)
+                self.assertEqual(AA.CARRIED_MARKER_RE.search(self.posted_body()).groups(),
+                                 (self.REVIEWED, self.MERGE_BASE))
+
     def test_a_changed_own_diff_is_dismissed_as_before(self):
         self.compares[(self.BASE_SHA, self.LIVE)] = self.files(42, patch=self.patch(42, added="+newer"))
         self.assert_dismissed_as_before(self.run_dismiss())
@@ -4174,42 +4200,6 @@ class CarryForwardTest(unittest.TestCase):
         extra = dict(self.files(42)["files"][0], filename="svc/b.go")
         self.compares[(self.BASE_SHA, self.LIVE)]["files"].append(extra)
         self.assert_dismissed_as_before(self.run_dismiss())
-
-    def test_a_retarget_with_an_identical_own_diff_carries(self):
-        # A lower stacked PR landed and this one was retargeted: same head, a
-        # new base, and against it the same own changes.
-        self.pr["head"]["sha"] = self.REVIEWED
-        self.pr["base"] = {"ref": "release", "sha": self.BASE_SHA2}
-        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
-                         (self.BASE_SHA2, self.REVIEWED): self.files(77)}
-        self.assertEqual(self.run_dismiss(all_approvals=True), 0, self.printed)
-        body = self.posted_body()
-        self.assertEqual(self.posted[0][1]["commit_id"], self.REVIEWED)
-        self.assertEqual(AA.recorded_base(body), "release")
-        self.assertEqual(self.dismissed, {11: AA.carried_message(self.REVIEWED)})
-
-    def test_a_chained_carry_compares_against_the_recorded_baseline(self):
-        # Carried once already (to LIVE), then the base moved again. No round ever
-        # reviewed LIVE: the comparison reaches back to what one did read. The
-        # fake answers no other compare, so any other baseline fails closed.
-        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
-        self.pr["head"]["sha"] = self.LATER
-        self.pr["base"]["sha"] = self.BASE_SHA2
-        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
-                         (self.BASE_SHA2, self.LATER): self.files(90)}
-        self.assertEqual(self.run_dismiss(), 0, self.printed)
-        body = self.posted_body()
-        self.assertEqual(AA.CARRIED_MARKER_RE.search(body).groups(), (self.REVIEWED, self.MERGE_BASE))
-        self.assertEqual(AA.REVIEWED_SHA_RE.search(body).group(1), self.LATER)
-        self.assertIn(f"Carried forward from `{self.LIVE[:7]}`", body)
-        self.assertEqual(self.dismissed, {50: AA.carried_message(self.LATER)})
-
-    def test_a_pure_rename_needs_no_patch(self):
-        rename = {"filename": "svc/new.go", "previous_filename": "svc/old.go", "status": "renamed", "changes": 0}
-        for files in self.compares.values():
-            files["files"].append(dict(rename))
-        self.assertEqual(self.run_dismiss(), 0, self.printed)
-        self.posted_body()
 
     def test_the_same_change_in_another_function_is_a_changed_diff(self):
         # Line numbers go, the hunk heading stays: deleting one of several
@@ -4235,17 +4225,106 @@ class CarryForwardTest(unittest.TestCase):
                 else:
                     self.assert_dismissed_as_before(rc)
 
-    # -- what it cannot vouch for fails closed --------------------------------
+    def test_a_retarget_with_an_identical_own_diff_carries(self):
+        # Same head, a new base, and against it the same own changes.
+        self.pr["head"]["sha"] = self.REVIEWED
+        self.pr["base"] = {"ref": "release", "sha": self.BASE_SHA2}
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
+                         (self.BASE_SHA2, self.REVIEWED): self.files(77)}
+        self.assertEqual(self.run_dismiss(all_approvals=True), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual(self.posted[0][1]["commit_id"], self.REVIEWED)
+        self.assertEqual(AA.recorded_base(body), "release")
+        self.assertEqual(self.dismissed, {11: AA.carried_message(self.REVIEWED)})
 
-    def test_an_empty_patch_fails_closed(self):
-        # Only a pure rename may come without one: an empty patch on an edit
-        # would compare by name and status alone.
-        for side in ((self.MERGE_BASE, self.REVIEWED), (self.BASE_SHA, self.LIVE)):
-            with self.subTest(side=side):
+    def test_a_squash_merged_parent_and_a_rebased_child_still_carry(self):
+        # The stack case this exists for: the child was approved over its parent
+        # branch; the parent squash-merged into main, the child was rebased onto
+        # main and retargeted there. Its own changes are the ones reviewed.
+        self.reviews = [self.approval(11, base="feat/parent")]
+        self.pr["base"] = {"ref": "main", "sha": self.BASE_SHA2}
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
+                         (self.BASE_SHA2, self.LIVE): self.files(57, cmp_status="diverged", behind_by=1)}
+        self.assertEqual(self.run_dismiss(all_approvals=True), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual((self.posted[0][1]["commit_id"], AA.recorded_base(body)), (self.LIVE, "main"))
+        self.assertEqual(self.dismissed, {11: AA.carried_message(self.LIVE)})
+
+    def test_a_retarget_cannot_smuggle_an_unmerged_parent_in(self):
+        # Retargeting the child to main while its parent is unmerged makes the
+        # child's diff parent + child. The approval reviewed the child alone
+        # (from the parent's head, the merge base it recorded), so it must not
+        # carry — the parent's changes would land under the child's approval.
+        self.reviews = [self.approval(11, base="feat/parent")]
+        self.pr["head"]["sha"] = self.REVIEWED
+        self.pr["base"] = {"ref": "main", "sha": self.BASE_SHA2}
+        parent = dict(self.files(30)["files"][0], filename="svc/parent.go")
+        both = self.files(10)
+        both["files"].insert(0, parent)
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10), (self.BASE_SHA2, self.REVIEWED): both}
+        self.assert_dismissed_as_before(self.run_dismiss(all_approvals=True), AA.BASE_CHANGED_MESSAGE)
+        self.emitted_line("differ from the ones reviewed")
+
+    def test_a_chained_carry_compares_against_the_recorded_baseline(self):
+        # Carried once already (to LIVE), then the base moved again. No round ever
+        # reviewed LIVE: the comparison reaches back to what one did read. The
+        # fake answers no other compare, so any other baseline fails closed.
+        self.reviews = [self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.pr["head"]["sha"] = self.LATER
+        self.pr["base"]["sha"] = self.BASE_SHA2
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
+                         (self.BASE_SHA2, self.LATER): self.files(90)}
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual(AA.CARRIED_MARKER_RE.search(body).groups(), (self.REVIEWED, self.MERGE_BASE))
+        self.assertEqual(AA.REVIEWED_SHA_RE.search(body).group(1), self.LATER)
+        self.assertIn(f"Carried forward from `{self.LIVE[:7]}`", body)
+        self.assertEqual(self.dismissed, {50: AA.carried_message(self.LATER)})
+
+    def test_a_pure_rename_needs_no_patch(self):
+        rename = {"filename": "svc/new.go", "previous_filename": "svc/old.go", "status": "renamed", "changes": 0}
+        for files in self.compares.values():
+            files["files"].append(dict(rename))
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.posted_body()
+
+    # -- only what the approver signed is a baseline --------------------------
+
+    def test_an_approval_without_a_recorded_merge_base_never_carries(self):
+        # Every approval from before BE-20585, and any whose merge base could
+        # not be confirmed. A round review that would agree is no substitute.
+        self.reviews = [self.round_review(10), self.approval(11, merge_base="")]
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("records no merge base")
+        self.assertEqual(self.compare_tokens, [])
+
+    def test_a_merge_base_below_the_leading_markers_is_no_record(self):
+        # Only the marker lines a body opens with are this identity's record;
+        # one further down could have come from a reason or a quoted path.
+        approval = self.approval(11, merge_base="")
+        approval["body"] += f"\n<!-- cursor-review-auto-approve-merge-base:{self.MERGE_BASE} -->"
+        self.reviews = [approval]
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.assertEqual(self.compare_tokens, [])
+
+    def test_a_merge_base_that_is_not_an_ancestor_never_carries(self):
+        # Defense in depth: GitHub must show the recorded merge base as an
+        # ancestor of the reviewed commit.
+        for cmp_status, behind_by in (("diverged", 2), ("behind", 1), ("identical", 0), ("ahead", 1),
+                                      ("ahead", None), ("ahead", False), (None, 0)):
+            with self.subTest(status=cmp_status, behind_by=behind_by):
                 self.setUp()
-                self.compares = {key: self.files(patch="") for key in self.compares}
+                self.compares[(self.MERGE_BASE, self.REVIEWED)] = self.files(10, cmp_status=cmp_status,
+                                                                             behind_by=behind_by)
                 self.assert_dismissed_as_before(self.run_dismiss())
-                self.emitted_line("could not vouch")
+                self.emitted_line("is not an ancestor of the reviewed commit")
+
+    def test_an_edited_approval_is_never_carried(self):
+        # A user with write access can edit this identity's review, markers and
+        # all: an edited approval is someone else's text.
+        self.reviews = [self.approval(11, edited=True)]
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.assertEqual(self.compare_tokens, [])
 
     def test_a_tightened_threshold_never_carries(self):
         # The approval was granted under `low`: a caller now at `nit` wants a
@@ -4265,17 +4344,26 @@ class CarryForwardTest(unittest.TestCase):
                     self.assertEqual(self.compare_tokens, [])
         # approve-external's approval records the threshold it was handed too.
         self.setUp()
-        self.reviews[1]["body"] = AA.render_external_body("", self.REVIEWED, "main", "low")
+        self.reviews[0]["body"] = AA.render_external_body("", self.REVIEWED, "main", "low",
+                                                          merge_base=self.MERGE_BASE)
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.assertEqual(AA.APPROVED_THRESHOLD_RE.search(self.posted_body()).group(1), "low")
-        # An approval that records no threshold proves none.
-        for body in (AA.render_body(AA.APPROVE, ["ok"], "", [], self.REVIEWED, "main"),
-                     AA.render_external_body("", self.REVIEWED, "main")):
+        # An approval that records no threshold proves none, merge base or not.
+        for body in (AA.render_body(AA.APPROVE, ["ok"], "", [], self.REVIEWED, "main", merge_base=self.MERGE_BASE),
+                     AA.render_external_body("", self.REVIEWED, "main", merge_base=self.MERGE_BASE)):
             with self.subTest(body=body):
                 self.setUp()
-                self.reviews[1]["body"] = body
+                self.reviews[0]["body"] = body
                 self.assert_dismissed_as_before(self.run_dismiss())
 
+    def test_github_actions_never_vouches_for_an_approval(self):
+        # Every workflow's GITHUB_TOKEN posts as that login, a PR's own included.
+        self.reviews = [self.approval(11, login="github-actions[bot]")]
+        rc = self.run_dismiss(login="github-actions[bot]")
+        self.assertEqual((rc, self.posted, self.dismissed), (0, [], {11: AA.STALE_MESSAGE}))
+        self.emitted_line("cannot vouch for what a round approved")
+
+    # -- what it cannot compare fails closed -----------------------------------
 
     def test_a_file_with_no_patch_fails_closed(self):
         # Binary, or too large for the API to return: nothing to compare. Also a
@@ -4290,14 +4378,24 @@ class CarryForwardTest(unittest.TestCase):
                     self.assert_dismissed_as_before(self.run_dismiss())
                     self.emitted_line("could not vouch")
 
+    def test_an_empty_patch_fails_closed(self):
+        # Only a pure rename may come without one: an empty patch on an edit
+        # would compare by name and status alone.
+        for side in ((self.MERGE_BASE, self.REVIEWED), (self.BASE_SHA, self.LIVE)):
+            with self.subTest(side=side):
+                self.setUp()
+                self.compares[side] = self.files(patch="")
+                self.assert_dismissed_as_before(self.run_dismiss())
+                self.emitted_line("could not vouch")
+
     def test_300_files_fail_closed(self):
         # The compare API lists at most 300 files: past that, a change could hide
         # in one the comparison never saw. One fewer still compares.
         for count, carries in ((AA.COMPARE_FILE_CAP, False), (AA.COMPARE_FILE_CAP - 1, True)):
             with self.subTest(count=count):
                 self.setUp()
-                many = {"files": [dict(self.files()["files"][0], filename=f"f{i}.go") for i in range(count)]}
-                self.compares = {key: many for key in self.compares}
+                for key, read in self.compares.items():
+                    read["files"] = [dict(read["files"][0], filename=f"f{i}.go") for i in range(count)]
                 rc = self.run_dismiss()
                 if carries:
                     self.assertEqual(rc, 0, self.printed)
@@ -4308,7 +4406,8 @@ class CarryForwardTest(unittest.TestCase):
     def test_an_empty_or_shapeless_compare_fails_closed(self):
         # An empty diff is not "identical", even on both sides: a compare that
         # lists nothing proves nothing about what the PR changes.
-        for got in ({"files": []}, {}, {"files": "x"}, [], {"files": [{"status": "modified", "patch": ""}]},
+        for got in ({"status": "ahead", "behind_by": 0, "files": []}, {}, {"files": "x"}, [],
+                    {"status": "ahead", "behind_by": 0, "files": [{"status": "modified", "patch": ""}]},
                     RuntimeError("gh api failed: HTTP 502")):
             for both in (False, True):
                 with self.subTest(got=got, both=both):
@@ -4316,81 +4415,6 @@ class CarryForwardTest(unittest.TestCase):
                     for key in self.compares if both else [(self.BASE_SHA, self.LIVE)]:
                         self.compares[key] = got
                     self.assert_dismissed_as_before(self.run_dismiss())
-
-    def test_an_edited_round_review_is_no_baseline(self):
-        self.reviews = [self.round_review(10, edited=True), self.approval(11)]
-        self.assert_dismissed_as_before(self.run_dismiss())
-        self.emitted_line("no unedited round review")
-
-    def test_an_edited_approval_is_never_carried(self):
-        self.reviews = [self.round_review(10), self.approval(11, edited=True)]
-        self.assert_dismissed_as_before(self.run_dismiss())
-        self.assertEqual(self.compare_tokens, [])
-
-    def test_no_round_review_is_no_baseline(self):
-        for reviews in ([self.approval(11)],
-                        [self.round_review(10, head=self.LATER), self.approval(11)],
-                        [self.round_review(10, poster="someone-else"), self.approval(11)],
-                        # Posted after the approval: not the round that produced it.
-                        [self.approval(11), self.round_review(12)]):
-            with self.subTest(reviews=[r["id"] for r in reviews]):
-                self.setUp()
-                self.reviews = reviews
-                self.assert_dismissed_as_before(self.run_dismiss())
-
-    def test_a_round_that_reviewed_nothing_is_no_baseline(self):
-        # The error review fences imported CLI/judge text at column 0, so a line
-        # in it can pass for a sentinel; neither it nor the all-cells-failed body
-        # reviewed anything. Between the round and the approval, it must not
-        # displace the round that did; alone, it is no baseline at all.
-        for banner in AA.NON_ROUND_BANNERS:
-            forged = self.round_review(12, merge_base=self.BASE_SHA2)
-            forged["body"] = forged["body"].replace("\n\nfindings", banner + "\nfindings")
-            for reviews, carries in (([self.round_review(10), forged, self.approval(13)], True),
-                                     ([forged, self.approval(13)], False)):
-                with self.subTest(banner=banner, ids=[r["id"] for r in reviews]):
-                    self.setUp()
-                    self.reviews = reviews
-                    rc = self.run_dismiss()
-                    if carries:
-                        self.assertEqual(rc, 0, self.printed)
-                        self.assertEqual(AA.CARRIED_MARKER_RE.search(self.posted_body()).groups(),
-                                         (self.REVIEWED, self.MERGE_BASE))
-                    else:
-                        self.assertEqual((rc, self.posted, self.dismissed), (0, [], {13: AA.STALE_MESSAGE}))
-
-    def test_an_unusable_newest_round_is_no_baseline(self):
-        # The newest round on the approved commit is the one that approved it.
-        # Edited, or with no merge base, it is no baseline — and the older
-        # round behind it (perhaps off another base, perhaps rejecting) is not
-        # one either.
-        newer_edited = self.round_review(12, edited=True)
-        no_merge_base = self.round_review(12)
-        no_merge_base["body"] = no_merge_base["body"].replace(self.MERGE_BASE, "not-a-sha")
-        for newer in (newer_edited, no_merge_base):
-            with self.subTest(newer=newer["body"][-60:]):
-                self.setUp()
-                self.reviews = [self.round_review(10), newer, self.approval(13)]
-                self.assertEqual((self.run_dismiss(), self.posted, self.dismissed), (0, [], {13: AA.STALE_MESSAGE}))
-                self.emitted_line("no unedited round review")
-
-    def test_the_baseline_is_the_round_that_approved_not_a_later_one(self):
-        # The fake answers only the earlier round's compare, so reading the later
-        # round's merge base would fail closed instead of carrying.
-        self.reviews = [self.round_review(10), self.approval(11), self.round_review(12, merge_base=self.BASE_SHA2)]
-        self.assertEqual(self.run_dismiss(), 0, self.printed)
-        self.assertEqual(AA.CARRIED_MARKER_RE.search(self.posted_body()).groups(), (self.REVIEWED, self.MERGE_BASE))
-
-    def test_github_actions_never_vouches_for_a_round_or_an_approval(self):
-        # Every workflow's GITHUB_TOKEN posts as that login, a PR's own included.
-        self.reviews = [self.round_review(10, poster="github-actions[bot]"), self.approval(11)]
-        self.assert_dismissed_as_before(self.run_dismiss(poster="github-actions[bot]"))
-        self.emitted_line("set `bot_app_id`")
-        self.setUp()
-        self.reviews = [self.round_review(10), self.approval(11, login="github-actions[bot]")]
-        rc = self.run_dismiss(login="github-actions[bot]")
-        self.assertEqual((rc, self.posted, self.dismissed), (0, [], {11: AA.STALE_MESSAGE}))
-        self.emitted_line("cannot vouch for what a round approved")
 
     # -- when it must not post at all -----------------------------------------
 
@@ -4453,9 +4477,9 @@ class CarryForwardTest(unittest.TestCase):
                 self.assert_dismissed_as_before(self.run_dismiss())
 
     def test_only_the_latest_verdict_is_offered(self):
-        # Review 13 is the newest approval and no round stands behind it, so
-        # nothing is carried — not even review 11, which would compare equal.
-        self.reviews.append(self.approval(13, sha=self.LATER))
+        # Review 13 is the newest approval and records no merge base, so nothing
+        # is carried — not even review 11, which would compare equal.
+        self.reviews.append(self.approval(13, sha=self.LATER, merge_base=""))
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.assertEqual(self.posted, [])
         self.assertEqual(self.dismissed, {11: AA.STALE_MESSAGE, 13: AA.STALE_MESSAGE})
@@ -4490,6 +4514,15 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(self.run_dismiss(), 1)
         self.assertTrue(any(line.startswith("::error::Could not re-list reviews after an ambiguous")
                             for line in self.printed), self.printed)
+
+    def test_an_ambiguous_post_withdraws_only_what_it_may_have_landed(self):
+        # The stale approval is itself a carry of the live head, gone stale by
+        # a retarget: the re-list must not take it for one this POST landed.
+        self.reviews = [self.carried(11)]
+        self.pr["base"] = {"ref": "release", "sha": self.BASE_SHA}
+        self.fail_post = "landed"
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(sorted(w[1] for w in self.writes if w[0] == "PUT"), [11, 100])
 
     def test_a_pr_that_moves_during_the_post_takes_the_carried_approval_back(self):
         for change in ({"head": {"sha": self.LATER}}, {"base": {"ref": "release", "sha": self.BASE_SHA}},
@@ -4550,7 +4583,7 @@ class CarryForwardTest(unittest.TestCase):
 
     def test_the_card_stays_on_the_next_event_too(self):
         # A label or an edit later: the carried approval stands on the head.
-        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.reviews = [self.approval(11, state="DISMISSED"), self.carried(50)]
         self.comments = [self.pass_card()]
         self.assertEqual(self.run_dismiss(auto="true"), 0, self.printed)
         self.assertEqual((self.posted, self.dismissed, self.patches), ([], {}, []))
@@ -4567,9 +4600,210 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(self.outputs().get("auto_rereview"), "true")
 
     def test_a_carried_approval_this_run_withdrew_no_longer_keeps_the_card(self):
-        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.reviews = [self.approval(11, state="DISMISSED"), self.carried(50)]
         self.pr["labels"] = [{"name": "skip-cursor-review"}]
         self.comments = [self.pass_card()]
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.assertEqual(self.dismissed, {50: AA.SKIP_REVIEW_WITHDRAWN_MESSAGE})
         self.assertEqual(len(self.patches), 1)
+
+
+class ApprovalMergeBaseTest(unittest.TestCase):
+    """What an approval records for carry-forward to compare against (BE-20585).
+
+    decide and approve-external ask GitHub for the merge base of the live base
+    and the approved commit, and record it in the approval — signed by the
+    approver identity, out of any PR workflow's reach — only when the round's
+    own sentinel (bot-posted: a cross-check, never the source) names the same
+    commit. Anything else posts the approval without it, which never carries.
+    """
+
+    MERGE_BASE, BASE_SHA, OTHER = "d" * 40, "e" * 40, "f" * 40
+
+    def setUp(self):
+        self.reviews = [self.round_review(10)]
+        self.compare_answer = {"status": "diverged", "behind_by": 2, "merge_base_commit": {"sha": self.MERGE_BASE},
+                               "files": []}
+        self.posted, self.compares, self.printed = [], [], []
+
+    def round_review(self, rid, head=SHA, merge_base=None, poster=POSTER, edited=False, banner=""):
+        sentinel = POST_REVIEW.render_round_sentinel(head, "9" * 40, merge_base or self.MERGE_BASE)
+        return {"id": rid, "user": {"login": poster}, "state": "COMMENTED", "edited": edited,
+                "body": f"{POST_REVIEW.CONSOLIDATED_MARKER}\n{sentinel}\n{banner}\nfindings"}
+
+    def gh(self, args, payload=None):
+        if args[:2] == ["api", "graphql"]:
+            if isinstance(self.reviews, Exception):
+                raise self.reviews
+            return graphql_reviews(self.reviews)
+        if len(args) == 2 and args[1].startswith("repos/o/r/compare/"):
+            self.compares.append(args[1])
+            if isinstance(self.compare_answer, Exception):
+                raise self.compare_answer
+            return json.dumps(self.compare_answer)
+        if args[:3] == ["api", "-X", "POST"]:
+            self.posted.append(payload)
+            return json.dumps({"id": 99})
+        if args[:3] == ["api", "-X", "PUT"] or args[:3] == ["api", "-X", "PATCH"]:
+            return "{}"
+        if args[:2] == ["api", "--paginate"]:
+            return json.dumps([[]])
+        return json.dumps({"state": "open", "head": {"sha": SHA}, "base": {"ref": "main", "sha": self.BASE_SHA},
+                           "labels": []})
+
+    def patches(self):
+        return (mock.patch.object(AA, "gh", self.gh), mock.patch.object(AA, "emit", lambda *a: None),
+                mock.patch.object(AA, "open_thread_severities", lambda *a: []),
+                mock.patch.object(AA, "resolve_eligible_threads", lambda *a, **k: {}),
+                mock.patch.object(AA, "dismiss_own_change_requests", lambda *a, **k: 0),
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))))
+
+    def run_decide(self, findings=(), poster=POSTER):
+        with tempfile.TemporaryDirectory() as d:
+            fpath, dpath = os.path.join(d, "c.json"), os.path.join(d, "pr.patch")
+            with open(fpath, "w") as f:
+                json.dump({"findings": list(findings), "panel": PANEL_OK}, f)
+            with open(dpath, "w") as f:
+                f.write(DIFF)
+            args = argparse.Namespace(threshold="low", findings=fpath, repo="o/r", pr_number="1",
+                                      commit_sha=SHA, judge_status="ok", delivered="true", ungated="0",
+                                      approver_login="cursor-approver", reviewed_diff=dpath, base_ref="main",
+                                      poster_login=poster)
+            with contextlib.ExitStack() as stack:
+                for p in self.patches():
+                    stack.enter_context(p)
+                stack.enter_context(mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.join(d, "out")}))
+                rc = AA.cmd_decide(args)
+        self.assertEqual(rc, 0, self.printed)
+        self.assertEqual(len(self.posted), 1, self.printed)
+        return self.posted[0]
+
+    def run_external(self, poster=POSTER, threshold=""):
+        with tempfile.TemporaryDirectory() as d:
+            decision = os.path.join(d, "decision.json")
+            with open(decision, "w") as f:
+                json.dump({"event": "APPROVE", "verdicts": {"correctness": "green"}}, f)
+            args = argparse.Namespace(repo="o/r", pr_number="1", commit_sha=SHA, axes="correctness",
+                                      decision=decision, approver_login="cursor-approver", base_ref="main",
+                                      card_url="", threshold=threshold, poster_login=poster)
+            with contextlib.ExitStack() as stack:
+                for p in self.patches():
+                    stack.enter_context(p)
+                stack.enter_context(mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.join(d, "out")}))
+                rc = AA.cmd_approve_external(args)
+        self.assertEqual(rc, 0, self.printed)
+        self.assertEqual(len(self.posted), 1, self.printed)
+        return self.posted[0]
+
+    def recorded(self, review) -> str:
+        found = AA.MERGE_BASE_MARKER_RE.search(AA.leading_markers(review["body"]))
+        return found.group(1) if found else ""
+
+    def test_decide_records_the_merge_base_github_and_the_round_agree_on(self):
+        posted = self.run_decide()
+        self.assertEqual((posted["event"], self.recorded(posted)), (AA.APPROVE, self.MERGE_BASE))
+        self.assertEqual(self.compares, [f"repos/o/r/compare/{self.BASE_SHA}...{SHA}"])
+        # Exactly what a carry reads back as its baseline.
+        approval = {"id": 99, "state": "APPROVED", "body": posted["body"]}
+        self.assertEqual(AA.carry_baseline(approval), (SHA, self.MERGE_BASE))
+
+    def test_approve_external_records_it_too(self):
+        posted = self.run_external()
+        self.assertEqual(self.recorded(posted), self.MERGE_BASE)
+        self.assertEqual(AA.carry_baseline({"body": posted["body"]}), (SHA, self.MERGE_BASE))
+        # With the threshold it was handed, which a carry also needs.
+        self.setUp()
+        posted = self.run_external(threshold="Low")
+        self.assertEqual(AA.APPROVED_THRESHOLD_RE.search(posted["body"]).group(1), "low")
+        self.assertEqual(self.recorded(posted), self.MERGE_BASE)
+
+    def test_a_disagreeing_round_records_nothing_but_still_approves(self):
+        # The round diffed something else (the base was rewritten since, or its
+        # sentinel lies): GitHub's answer alone is not what was reviewed.
+        self.compare_answer["merge_base_commit"]["sha"] = self.OTHER
+        for run in (self.run_decide, self.run_external):
+            with self.subTest(run=run.__name__):
+                self.posted = []
+                posted = run()
+                self.assertEqual((posted["event"], self.recorded(posted)), (AA.APPROVE, ""))
+                self.assertTrue(any("records no merge base" in line for line in self.printed), self.printed)
+
+    def test_a_forged_or_unusable_round_mark_records_nothing(self):
+        # Each round review below agrees with GitHub, but none is the latest
+        # unedited, real round on this head by the poster — or the latest one
+        # disagrees. A sentinel can veto a record; it can never supply one.
+        no_merge_base = self.round_review(11)
+        no_merge_base["body"] = no_merge_base["body"].replace(self.MERGE_BASE, "not-a-sha")
+        cases = {
+            "edited": [self.round_review(10, edited=True)],
+            # The newest round is the one this approval comes from: edited, or
+            # with no usable merge base, the older one behind it is no stand-in.
+            "a newer one edited": [self.round_review(10), self.round_review(11, edited=True)],
+            "the latest names none": [self.round_review(10), no_merge_base],
+            "not a consolidated review": [dict(self.round_review(10),
+                                               body="> quoted\n" + self.round_review(10)["body"])],
+            "another identity": [self.round_review(10, poster="mallory")],
+            "github-actions": [self.round_review(10, poster="github-actions[bot]")],
+            "reviewed nothing": [self.round_review(10, banner=AA.NON_ROUND_BANNERS[0])],
+            "no-findings body": [self.round_review(10, banner=AA.NON_ROUND_BANNERS[1])],
+            "another head": [self.round_review(10, head="c" * 40)],
+            "the latest disagrees": [self.round_review(10), self.round_review(11, merge_base=self.OTHER)],
+            "no round at all": [],
+        }
+        for name, reviews in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                self.reviews = reviews
+                self.assertEqual(self.recorded(self.run_decide()), "")
+        # The latest real round wins, whatever an older one said — or whatever
+        # became of it.
+        for older in (self.round_review(10, merge_base=self.OTHER), self.round_review(10, edited=True)):
+            with self.subTest(older=older):
+                self.setUp()
+                self.reviews = [older, self.round_review(11)]
+                self.assertEqual(self.recorded(self.run_decide()), self.MERGE_BASE)
+
+    def test_a_round_by_github_actions_names_nothing_even_when_asked_for(self):
+        # round_merge_base on its own, without approval_merge_base's early
+        # return in front: any workflow can post as github-actions[bot].
+        reviews = [self.round_review(10, poster="github-actions[bot]")]
+        for poster in ("github-actions[bot]", " GitHub-Actions[bot] "):
+            with self.subTest(poster=poster):
+                self.assertEqual(AA.round_merge_base(reviews, poster, SHA), "")
+        self.assertEqual(AA.round_merge_base([self.round_review(10)], POSTER, SHA), self.MERGE_BASE)
+
+    def test_without_a_trusted_poster_nothing_is_even_read(self):
+        # No round review could confirm one, so not a read is spent on it — nor
+        # a log line on every approval of a caller that never posts as an App.
+        for poster in ("", "github-actions[bot]"):
+            with self.subTest(poster=poster):
+                self.setUp()
+                self.assertEqual(self.recorded(self.run_decide(poster=poster)), "")
+                self.assertEqual(self.compares, [])
+                self.assertFalse(any("merge base" in line for line in self.printed), self.printed)
+
+    def test_a_failed_read_still_approves_without_a_record(self):
+        for field, error in (("compare_answer", RuntimeError("gh api failed: HTTP 403")),
+                             ("compare_answer", {"merge_base_commit": None}), ("compare_answer", []),
+                             ("reviews", RuntimeError("gh api failed: HTTP 502"))):
+            with self.subTest(field=field, error=error):
+                self.setUp()
+                setattr(self, field, error)
+                posted = self.run_decide()
+                self.assertEqual((posted["event"], self.recorded(posted)), (AA.APPROVE, ""))
+
+    def test_a_request_for_changes_records_nothing(self):
+        posted = self.run_decide(findings=[finding("high")])
+        self.assertEqual((posted["event"], self.recorded(posted)), (AA.REQUEST_CHANGES, ""))
+        self.assertEqual(self.compares, [])
+
+    def test_the_record_sits_in_the_leading_markers(self):
+        # Where carry_baseline reads it, and nowhere a reason could put a line.
+        for body in (AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main", merge_base=self.MERGE_BASE),
+                     AA.render_external_body("", SHA, "main", merge_base=self.MERGE_BASE)):
+            self.assertIn(f"<!-- cursor-review-auto-approve-merge-base:{self.MERGE_BASE} -->",
+                          AA.leading_markers(body))
+        self.assertNotIn("merge-base", AA.render_body(AA.REQUEST_CHANGES, ["no"], "low", [], SHA, "main",
+                                                      merge_base=self.MERGE_BASE))
+        for bad in ("", "D" * 40, "d" * 39, "main"):
+            self.assertNotIn("merge-base", AA.render_body(AA.APPROVE, ["ok"], "low", [], SHA, "main", merge_base=bad))

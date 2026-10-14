@@ -345,27 +345,32 @@ on:
           round reviewed (the PR was only rebased or re-merged onto a moved
           base, e.g. a lower PR of a stack changed or landed), re-approve the
           live head instead of dismissing. Identical means the compare-API
-          diff from the reviewed round's merge base to the reviewed commit
-          equals the diff from the live base to the live head, file by file,
-          context lines and hunk headings included (hunk line numbers ignored,
-          the distance between a file's hunks not). File modes are not
-          compared: the compare API does not report them. Fails closed —
-          dismisses as before — on 300+ files, a file with no or an empty
-          patch (binary or too large, except a pure rename), any read error,
-          an edited approval or round review, a newer request for changes by
-          the approver, an `approve_max_severity` stricter than the one the
-          approval was granted under, a draft, a veto or `needs-human-review`
-          label, an author `approve_authors` does not list, an empty
-          `approve_max_severity`, round reviews posted as
+          diff from the merge base the approval recorded to the reviewed
+          commit equals the diff from the live base to the live head, file by
+          file, context lines and hunk headings included (hunk line numbers
+          ignored, the distance between a file's hunks not). File modes are
+          not compared: the compare API does not report them. An approval
+          records its merge base only when the compare API and the round's
+          own sentinel agree on it; one that records none (every approval an
+          earlier version posted) never carries. Fails closed — dismisses as
+          before — on 300+ files, a file with no or an empty patch (binary or
+          too large, except a pure rename), any read error, an edited
+          approval, a recorded merge base that is not an ancestor of the
+          reviewed commit, a newer request for changes by the approver, an
+          `approve_max_severity` stricter than the one the approval was
+          granted under, a draft, a veto or `needs-human-review` label, an
+          author `approve_authors` does not list, an empty
+          `approve_max_severity`, rounds or approvals posted as
           `github-actions[bot]` (set `bot_app_id`), or any event other than
           `pull_request_target`. Only an approval GitHub still shows as
           APPROVED is carried, so after a squash or rebase merge of a lower
-          PR the auto-retarget (whose diff still holds that PR's commits)
-          dismisses it, and the later rebase has nothing left to carry. The
-          new approval records the commit and merge base the round reviewed,
-          and the threshold the approval was granted under, so a chain of such
-          pushes keeps comparing against what a round actually read, and the
-          card keeps its approval (no round is scheduled). Default false.
+          PR, a retarget read before the rebase (its diff still holds that
+          PR's commits) dismisses it, and the rebase has nothing left to
+          carry. The new approval records the commit and merge base the round
+          reviewed, and the threshold the approval was granted under, so a
+          chain of such pushes keeps comparing against what a round actually
+          read, and the card keeps its approval (no round is scheduled).
+          Default false.
         type: boolean
         required: false
         default: false
@@ -6135,7 +6140,10 @@ jobs:
     # With `carry_forward_unchanged_diff` (BE-20585), a stale approval whose
     # PR's own changes are still identical to the ones a round reviewed — a
     # rebase or re-merge onto a moved base, the stacked-PR case — is re-posted
-    # on the live head instead, and then the old one is dismissed. Only under
+    # on the live head instead, and then the old one is dismissed. What a round
+    # reviewed comes only from the approver identity's own records (the merge
+    # base the approval recorded, or what a carried approval copied forward),
+    # never from a review the bot identity posted. Only under
     # `pull_request_target`; it compares compare-API diffs and never reads the
     # PR's tree.
     #
