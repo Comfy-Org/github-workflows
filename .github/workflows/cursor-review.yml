@@ -347,15 +347,23 @@ on:
           live head instead of dismissing. Identical means the compare-API
           diff from the reviewed round's merge base to the reviewed commit
           equals the diff from the live base to the live head, file by file,
-          context lines included (hunk line numbers ignored). Fails closed —
-          dismisses as before — on 300+ files, a file with no patch (binary or
-          too large, except a pure rename), any read error, an edited approval
-          or round review, a newer request for changes by the approver, a
-          draft, a veto or `needs-human-review` label, an author
-          `approve_authors` does not list, an empty `approve_max_severity`,
-          round reviews posted as `github-actions[bot]` (set `bot_app_id`), or
-          any event other than `pull_request_target`. The new approval records
-          the commit and merge base the round reviewed, so a chain of such
+          context lines and hunk headings included (hunk line numbers ignored,
+          the distance between a file's hunks not). File modes are not
+          compared: the compare API does not report them. Fails closed —
+          dismisses as before — on 300+ files, a file with no or an empty
+          patch (binary or too large, except a pure rename), any read error,
+          an edited approval or round review, a newer request for changes by
+          the approver, an `approve_max_severity` stricter than the one the
+          approval was granted under, a draft, a veto or `needs-human-review`
+          label, an author `approve_authors` does not list, an empty
+          `approve_max_severity`, round reviews posted as
+          `github-actions[bot]` (set `bot_app_id`), or any event other than
+          `pull_request_target`. Only an approval GitHub still shows as
+          APPROVED is carried, so after a squash or rebase merge of a lower
+          PR the auto-retarget (whose diff still holds that PR's commits)
+          dismisses it, and the later rebase has nothing left to carry. The
+          new approval records the commit and merge base the round reviewed,
+          and the threshold the approval was granted under, so a chain of such
           pushes keeps comparing against what a round actually read, and the
           card keeps its approval (no round is scheduled). Default false.
         type: boolean

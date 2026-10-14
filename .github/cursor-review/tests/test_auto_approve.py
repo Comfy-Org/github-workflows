@@ -4003,10 +4003,11 @@ class CarryForwardTest(unittest.TestCase):
         self.pr_after_post = None
         self.reviews = [self.round_review(10), self.approval(11)]
         self.after_post_reviews = []
-        # The same change at other line numbers, under another hunk heading:
+        self.after_post_changes = {}
+        # The same change at other line numbers, under the same hunk heading:
         # what a rebase onto a base that grew above it looks like.
         self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10, " func a() {"),
-                         (self.BASE_SHA, self.LIVE): self.files(42, " func b() {")}
+                         (self.BASE_SHA, self.LIVE): self.files(42, " func a() {")}
         self.comments = []
         self.fail_post = False
         self.fail_relist = False
@@ -4030,7 +4031,7 @@ class CarryForwardTest(unittest.TestCase):
         """An approval an earlier run already carried forward to `head`."""
         return {"id": rid, "user": {"login": self.LOGIN}, "state": "APPROVED",
                 "body": AA.render_carried_body("", head or self.LIVE, "main", self.REVIEWED, self.MERGE_BASE,
-                                               from_sha or self.REVIEWED)}
+                                               from_sha or self.REVIEWED, "low")}
 
     def round_review(self, rid, head=None, merge_base=None, poster=None, edited=False):
         sentinel = POST_REVIEW.render_round_sentinel(head or self.REVIEWED, "9" * 40, merge_base or self.MERGE_BASE)
@@ -4063,6 +4064,7 @@ class CarryForwardTest(unittest.TestCase):
                 raise RuntimeError("gh api failed: HTTP 502")
             reviews = list(self.reviews)
             if self.posted:
+                reviews = [dict(r, **self.after_post_changes.get(r["id"], {})) for r in reviews]
                 reviews += [{"id": rid, "user": {"login": self.LOGIN}, "state": "APPROVED", "body": p["body"]}
                             for rid, p in self.posted] + self.after_post_reviews
             return graphql_reviews(reviews)
@@ -4209,7 +4211,71 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.posted_body()
 
+    def test_the_same_change_in_another_function_is_a_changed_diff(self):
+        # Line numbers go, the hunk heading stays: deleting one of several
+        # copy-pasted guards with the same context is not the same change
+        # when it lands in another function.
+        self.compares[(self.BASE_SHA, self.LIVE)] = self.files(42, " func b() {")
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("differ from the ones reviewed")
+
+    def test_hunks_moved_apart_are_a_changed_diff(self):
+        # A base that grew above the file's first hunk shifts every hunk alike
+        # and still carries; the same hunks at another distance from each other
+        # are a change landing somewhere else.
+        two = lambda start, second: self.files(patch=self.patch(start) + "\n" + self.patch(second))
+        for live, carries in ((two(42, 62), True), (two(42, 63), False)):
+            with self.subTest(live=live, carries=carries):
+                self.setUp()
+                self.compares = {(self.MERGE_BASE, self.REVIEWED): two(10, 30), (self.BASE_SHA, self.LIVE): live}
+                rc = self.run_dismiss()
+                if carries:
+                    self.assertEqual(rc, 0, self.printed)
+                    self.posted_body()
+                else:
+                    self.assert_dismissed_as_before(rc)
+
     # -- what it cannot vouch for fails closed --------------------------------
+
+    def test_an_empty_patch_fails_closed(self):
+        # Only a pure rename may come without one: an empty patch on an edit
+        # would compare by name and status alone.
+        for side in ((self.MERGE_BASE, self.REVIEWED), (self.BASE_SHA, self.LIVE)):
+            with self.subTest(side=side):
+                self.setUp()
+                self.compares = {key: self.files(patch="") for key in self.compares}
+                self.assert_dismissed_as_before(self.run_dismiss())
+                self.emitted_line("could not vouch")
+
+    def test_a_tightened_threshold_never_carries(self):
+        # The approval was granted under `low`: a caller now at `nit` wants a
+        # round under the stricter rule; one at `medium` or `low` carries it,
+        # and the carried approval keeps recording `low`, so a chain never
+        # launders it into a looser one.
+        for threshold, carries in (("nit", False), ("low", True), ("medium", True)):
+            with self.subTest(threshold=threshold):
+                self.setUp()
+                rc = self.run_dismiss(threshold=threshold)
+                if carries:
+                    self.assertEqual(rc, 0, self.printed)
+                    self.assertEqual(AA.APPROVED_THRESHOLD_RE.search(self.posted_body()).group(1), "low")
+                else:
+                    self.assert_dismissed_as_before(rc)
+                    self.emitted_line("looser than")
+                    self.assertEqual(self.compare_tokens, [])
+        # approve-external's approval records the threshold it was handed too.
+        self.setUp()
+        self.reviews[1]["body"] = AA.render_external_body("", self.REVIEWED, "main", "low")
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(AA.APPROVED_THRESHOLD_RE.search(self.posted_body()).group(1), "low")
+        # An approval that records no threshold proves none.
+        for body in (AA.render_body(AA.APPROVE, ["ok"], "", [], self.REVIEWED, "main"),
+                     AA.render_external_body("", self.REVIEWED, "main")):
+            with self.subTest(body=body):
+                self.setUp()
+                self.reviews[1]["body"] = body
+                self.assert_dismissed_as_before(self.run_dismiss())
+
 
     def test_a_file_with_no_patch_fails_closed(self):
         # Binary, or too large for the API to return: nothing to compare. Also a
@@ -4292,6 +4358,21 @@ class CarryForwardTest(unittest.TestCase):
                                          (self.REVIEWED, self.MERGE_BASE))
                     else:
                         self.assertEqual((rc, self.posted, self.dismissed), (0, [], {13: AA.STALE_MESSAGE}))
+
+    def test_an_unusable_newest_round_is_no_baseline(self):
+        # The newest round on the approved commit is the one that approved it.
+        # Edited, or with no merge base, it is no baseline — and the older
+        # round behind it (perhaps off another base, perhaps rejecting) is not
+        # one either.
+        newer_edited = self.round_review(12, edited=True)
+        no_merge_base = self.round_review(12)
+        no_merge_base["body"] = no_merge_base["body"].replace(self.MERGE_BASE, "not-a-sha")
+        for newer in (newer_edited, no_merge_base):
+            with self.subTest(newer=newer["body"][-60:]):
+                self.setUp()
+                self.reviews = [self.round_review(10), newer, self.approval(13)]
+                self.assertEqual((self.run_dismiss(), self.posted, self.dismissed), (0, [], {13: AA.STALE_MESSAGE}))
+                self.emitted_line("no unedited round review")
 
     def test_the_baseline_is_the_round_that_approved_not_a_later_one(self):
         # The fake answers only the earlier round's compare, so reading the later
@@ -4427,6 +4508,17 @@ class CarryForwardTest(unittest.TestCase):
         self.after_post_reviews = [self.change_request(98)]
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.assertEqual(self.dismissed, {100: AA.STALE_MESSAGE, 11: AA.STALE_MESSAGE})
+
+    def test_an_approval_withdrawn_during_the_post_is_not_resurrected(self):
+        # Dismissed (by a human, or a round withdrawing it without a block) or
+        # edited in the read → POST window: the carried copy goes too.
+        for change in ({"state": "DISMISSED"}, {"edited": True}):
+            with self.subTest(change=change):
+                self.setUp()
+                self.after_post_changes = {11: change}
+                self.assertEqual(self.run_dismiss(), 0, self.printed)
+                self.assertEqual(self.dismissed[100], AA.STALE_MESSAGE)
+                self.emitted_line("withdrawn again")
 
     def test_a_carried_approval_that_cannot_be_taken_back_goes_red(self):
         self.pr_after_post = dict(self.pr, head={"sha": self.LATER})

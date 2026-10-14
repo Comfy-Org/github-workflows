@@ -416,7 +416,7 @@ class CardMarkersTest(unittest.TestCase):
     def test_both_approval_renderers_match_the_dismissed_approval_test(self):
         for body in (AA.render_body(AA.APPROVE, ["ok"], "low", [], X, "main"),
                      AA.render_external_body("", X, "main"),
-                     AA.render_carried_body("", Y, "main", X, Z, X)):
+                     AA.render_carried_body("", Y, "main", X, Z, X, "low")):
             self.assertTrue(any(line in body for line in AA.APPROVAL_BODY_LINES), body)
         for body in (AA.render_body(AA.REQUEST_CHANGES, ["no"], "low", [], X, "main"),
                      AA.render_standing_body("No decision.", [], "Re-run.", "low", X, "main")):

@@ -144,7 +144,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `auto_retry_delay_minutes` | `0` | How long an automatic retry waits before relabelling, in minutes — provider capacity is the usual cause, and a few minutes is what makes the second attempt different from the first. `0` relabels immediately, which is what every caller had before this input. The wait happens on a runner, so it costs runner-minutes on a private repo; that is the whole cost. Clamped to `30`; anything unparsable waits not at all. No effect without `approve_max_severity`. |
 | `auto_rereview_after_dismissal` | `false` | When a push dismisses the approver's approval, start the next round **automatically** after `auto_rereview_delay_minutes` — but only if the head is still the commit whose push dismissed it (so a burst of pushes costs one round, not one per push), the head has no consolidated review yet, the review label has not been applied since the approval the card reports (no round in flight), the PR is open and not a draft, it carries neither `skip-cursor-review` nor `needs-human-review`, and it is under `max_rounds`. Once per head commit, recorded on the status card, so a head that flips back is never re-run twice. With it off, the dismissal still marks the card stale (`no_decision`/`relabel`, or `capped`/`human` at the round cap) and nothing relabels. Needs `bot_app_id` or `APPROVER_TOKEN`. No effect without `approve_max_severity`, for an author `approve_authors` does not list, or under `run_without_label`, where the push already starts the round. See [cursor-approve's card contract](cursor-approve.md#a-push-that-dismisses-the-approval). |
 | `auto_rereview_delay_minutes` | `10` | The debounce before `auto_rereview_after_dismissal` relabels, in minutes. A newer push during the wait means no relabel; that push's own dismissal schedules its own wait. The wait happens on a runner, inside the push's run, so a later event in the same concurrency slot cancels it: a `pull_request`/`pull_request_target` event schedules a new one, but a `pull_request_review_thread` run (resolving a thread during the wait) does not, and the card's fallback (re-run by hand) applies. Clamped to `30`; anything unparsable waits not at all. |
-| `carry_forward_unchanged_diff` | `false` | Opt-in, for stacked PRs: when a push or a retarget would dismiss the approver's approval but the PR's **own** changes are identical to the ones a round reviewed (a rebase or re-merge onto a moved base, e.g. a lower PR of the stack changed or landed), re-approve the live head, then dismiss the old approval; the card keeps its approval and no round is scheduled. Identical is the compare API's diff from the approving round's merge base to the reviewed commit against the diff from the live base to the live head, file by file, context lines included and hunk line numbers ignored. Anything it cannot vouch for dismisses as before. Only under `pull_request_target`, and only with `approve_max_severity` set and `bot_app_id` posting the rounds. See [Auto-approve](#auto-approve) for every condition and the [trust model](#trust-model) for what it trusts. |
+| `carry_forward_unchanged_diff` | `false` | Opt-in, for stacked PRs: when a push or a retarget would dismiss the approver's approval but the PR's **own** changes are identical to the ones a round reviewed (a rebase or re-merge onto a moved base, e.g. a lower PR of the stack changed or landed), re-approve the live head, then dismiss the old approval; the card keeps its approval and no round is scheduled. Identical is the compare API's diff from the approving round's merge base to the reviewed commit against the diff from the live base to the live head, file by file, context lines and hunk headings included, hunk line numbers ignored. Anything it cannot vouch for dismisses as before. Only under `pull_request_target`, and only with `approve_max_severity` set and `bot_app_id` posting the rounds. See [Auto-approve](#auto-approve) for every condition and the [trust model](#trust-model) for what it trusts. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. A round whose own decision found the PR head had moved (a newer push superseded it) does not count, at most once per reviewed commit and at most `max_rounds` times. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 | `approver_environment` | `''` | The caller-repo environment that holds `APPROVER_TOKEN` (as an environment secret). Declared as `environment:` on the four jobs that read the token, only under `pull_request_target`, and on none that checks out PR code. With a deployment-branch policy of the base branch only, the token is unreachable from `pull_request` runs. Use with a `pull_request_target` caller — see the [trust model](#trust-model). Empty = no environment. |
@@ -1008,7 +1008,8 @@ true` the job first compares, through the compare API, what the approving round
 reviewed (its merge base → the reviewed commit, from the round sentinel in the
 bot's consolidated review) with what the PR changes now (the live base → the
 live head). When the two are identical file by file — names, statuses and
-patches, context lines included, hunk line numbers ignored — it posts a new
+patches, context lines and hunk headings included, hunk line numbers ignored
+(but not the distance between a file's hunks) — it posts a new
 approval on the live head and then dismisses the old one ("Carried forward to
 …"). The new approval records the commit and merge base the round reviewed, so
 a chain of base-only pushes keeps comparing against what a round actually read.
@@ -1018,21 +1019,35 @@ stands.
 It carries only the approver's **latest** verdict, so a newer request for
 changes is never overruled, and nothing while an approval of its own already
 stands on the head. It dismisses as before on anything it cannot vouch for:
-300 or more changed files (the compare API's cap), a file with no patch (binary,
-or too large to return; a pure rename is fine), an empty diff, any read error,
-an edited approval or round review, no round sentinel for the approved commit
-(an error review's never counts), a draft or closed PR, `skip-cursor-review` or `needs-human-review`, an author
+300 or more changed files (the compare API's cap), a file with no or an empty
+patch (binary, or too large to return; a pure rename is fine), an empty diff,
+any read error, an edited approval or round review (the newest round on the
+approved commit is the only candidate; an older one never stands in for it), no
+round sentinel for the approved commit (an error review's never counts), an
+`approve_max_severity` stricter than the one the approval records it was granted
+under (every carry copies that forward), a draft or closed PR, `skip-cursor-review` or `needs-human-review`, an author
 `approve_authors` does not list, an empty `approve_max_severity`, round reviews
 or approvals posted as `github-actions[bot]` (set `bot_app_id`), or any event
 other than `pull_request_target`. After posting, it re-reads the PR and its
-reviews and withdraws the new approval if the head, base, labels or state moved
-or a request for changes landed meanwhile; a withdrawal that fails turns the
+reviews and withdraws the new approval if the head, base, labels or state moved,
+the approval it carries was dismissed or edited, or a request for changes landed
+meanwhile; a withdrawal that fails turns the
 job red. If the post itself fails, the old approval is dismissed as before, and
 since a timed-out post may still have landed, it re-lists the reviews and
 withdraws any carried approval of the live head it finds (red if it cannot). The
 compare reads use the job's own token (`contents: read`), not the approver's. An
 approval GitHub already dismissed (a ruleset with `dismiss_stale_reviews_on_push`
 can, on the push itself) is never carried.
+
+What it does not see: file modes (the compare API reports none, so a `+x`
+riding on an otherwise identical file carries), and what the PR sits on — it
+compares the PR's own changes, so a base that lost code they rely on (a lower
+PR closed unmerged and this one rebased onto the trunk) still carries. And it
+only carries an approval that is still APPROVED: after a lower PR lands by
+squash or rebase merge, GitHub's auto-retarget arrives while this branch still
+holds that PR's original commits, so the diff differs and the approval is
+dismissed; the rebase push that follows has nothing left to carry. A merge-commit
+merge keeps those commits in the base and carries.
 
 **Widened callers: keep `edited` from cancelling a panel.** The label-only
 caller above keys its group on `github.event.label.name`, so `edited` never
