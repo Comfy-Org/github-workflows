@@ -12,7 +12,10 @@ token-usage step EXECUTED against a fake result:
     `--setting-sources ""`, /proc and /sys denied, never `--bare`;
   * the key is referenced by the `axis-direct` job alone, never the Cursor job;
   * usage — `usage-direct-axis-<axis>-<model>`, the cells' script byte for byte
-    but for the result path, best effort and time-boxed.
+    but for the result path, best effort and time-boxed;
+  * the API-error diagnostic — agent-error.py runs on the OUTCOME, not on the
+    exit code alone, so a capped or revoked key is NAMED instead of reading as
+    an axis that answered nothing.
 
 Run: python3 -m unittest discover -s .github/cursor-approve/tests -p 'test_*.py'
 """
@@ -288,6 +291,88 @@ class ReplyGuards(unittest.TestCase):
                 self.assertNotEqual(done.returncode, 0)
                 self.assertIsNone(reply)
                 self.assertFalse(kept)
+
+
+class ApiErrorDiagnostic(unittest.TestCase):
+    """agent-error.py is gated on the OUTCOME, not on the exit code alone.
+
+    Claude Code reports an API-level failure as
+    `{"type":"result","subtype":"success","is_error":true,"result":"API Error:
+    400 ..."}` and EXITS 0. An `rc != 0` gate therefore skipped the one shape
+    `_api_error_cause` exists to name: the axis uploaded no verdict, the card
+    read `no output`, and a spend-capped key was indistinguishable from a model
+    that answered nothing — diagnosable only by opening the job log. The panel's
+    direct cell gates this on `status != ok`; these pin the axis to the subset
+    of that rule that can carry a provider cause: a nonzero exit or `is_error`.
+    """
+
+    # The shape a capped key actually produces, `subtype` included.
+    CAPPED = {"type": "result", "subtype": "success", "is_error": True,
+              "num_turns": 1, "api_error_status": 400,
+              "result": "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":"
+                        "\"invalid_request_error\",\"message\":\"You have reached your "
+                        "specified API usage limits. You will regain access on "
+                        "2026-11-01 at 00:00 UTC.\"}}"}
+
+    def gate(self):
+        """The `if` condition guarding agent-error.py, read out of the workflow."""
+        body = run_block(STEPS["Run the axis (direct)"])
+        lines = body.split("\n")
+        # The INVOCATION, not a comment that merely names the script.
+        at = next(i for i, ln in enumerate(lines)
+                  if '"$CURSOR_REVIEW_ASSETS/agent-error.py"' in ln)
+        cond = next(lines[j] for j in range(at, -1, -1) if lines[j].startswith("if "))
+        return cond[len("if "):].rstrip().removesuffix("; then")
+
+    def fires(self, result, rc="0"):
+        """Does the real condition fire for this result file and exit code?"""
+        work = tempfile.mkdtemp()
+        res = os.path.join(work, "axis-claude-result.json")
+        if result is not None:
+            with open(res, "w", encoding="utf-8") as f:
+                f.write(result if isinstance(result, str) else json.dumps(result))
+        cond = self.gate().replace("/tmp/axis-claude-result.json", res)
+        done = subprocess.run(["bash", "-c", f'rc={rc}; if {cond}; then echo FIRES; fi'],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip() == "FIRES"
+
+    def test_an_api_error_on_a_zero_exit_is_diagnosed(self):
+        # The regression: rc 0, is_error true. An rc-only gate stays silent.
+        self.assertTrue(self.fires(self.CAPPED, rc="0"))
+
+    def test_a_non_zero_exit_is_still_diagnosed(self):
+        self.assertTrue(self.fires({"result": "x", "num_turns": 5}, rc="1"))
+
+    def test_a_clean_run_is_not_diagnosed(self):
+        # No noise on the happy path, which is why this is gated at all.
+        self.assertFalse(self.fires({"result": "ok", "num_turns": 5, "is_error": False}))
+
+    def test_an_unreadable_result_never_breaks_the_gate(self):
+        # Fails closed toward "no extra diagnostic"; the guards below still
+        # report, so a missing or junk file must not abort the step.
+        for result in (None, "not json", "[]", '{"is_error": "true"}', ""):
+            with self.subTest(result=result):
+                self.assertFalse(self.fires(result))
+
+    def test_the_cause_reaches_the_log(self):
+        """End to end: the gate fires AND agent-error.py names the cause."""
+        work = tempfile.mkdtemp()
+        res = os.path.join(work, "result.json")
+        with open(res, "w", encoding="utf-8") as f:
+            json.dump(self.CAPPED, f)
+        script = os.path.join(ROOT, ".github", "cursor-review", "agent-error.py")
+        done = subprocess.run(["python3", "-I", script, "--events", res, "--label", "axis-correctness/m"],
+                              capture_output=True, text=True,
+                              env=dict(os.environ, ANTHROPIC_API_KEY=ReplyGuards.KEY))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("api_error_status=400", done.stdout)
+        self.assertIn("API Error: 400", done.stdout)
+
+    def test_the_terminal_message_points_at_the_printed_cause(self):
+        # The guard's own line must not re-strand the reader after all this.
+        body = run_block(STEPS["Run the axis (direct)"])
+        self.assertIn("claude reported an error result; the cause", body)
 
 
 class VerdictTripwire(unittest.TestCase):
