@@ -34,7 +34,8 @@ the context axes (business, design, completeness) are not available yet.
 3. Each axis runs only when `approve_gate == 'pass'`, after the start phase: a
    read-only checkout of the PR head, one `cursor-agent` call over
    `.github/cursor-approve/`'s prompt, and one `axis-<name>` artifact holding
-   `{"verdict", "confidence", "headline", "summary", "commit_sha"}`. A failed
+   `{"verdict", "confidence", "headline", "summary", "commit_sha"}`, plus
+   `yellow_kind` on a yellow (see below). A failed
    axis uploads nothing, and an axis refuses to run on a fork PR.
 4. `cursor-approve` with `phase: decide` runs `aggregate.py decide` (any
    missing/malformed axis, one not stamped with `commit_sha`, one with no
@@ -63,7 +64,8 @@ heading, fire a mention or forge the card marker.
 | Verdict | Meaning | Effect |
 |---|---|---|
 | 🟢 `green` | the axis checked its remit and found it clean | approves |
-| 🟡 `yellow` | a material concern, or the axis could not reach a judgement | approves only while within `max_yellow_axes` |
+| 🟡 `yellow` · concern | a material concern: the axis judged, and found something short of a blocker | approves only while within `max_yellow_axes` |
+| 🟡 `yellow` · could not judge | the axis could not reach a judgement on a change its remit clearly covers | approves only while within `max_yellow_axes` — counted exactly like a concern |
 | 🔴 `red` | the axis should block this change | never approves |
 | ⚪ `n/a` | nothing on this axis applies to this change | approves; does not count against `max_yellow_axes` |
 | ⚠️ no result | the axis uploaded nothing, or something untrusted | never approves |
@@ -71,10 +73,28 @@ heading, fire a mention or forge the card marker.
 `n/a` is deliberately not a `green`: an axis with no applicable guidance has
 not given this PR a clean bill, and recording that as one would quietly approve
 the gap the day guidance appears. It is also not a `yellow`, because a yellow
-is a *concern* and this is the absence of one — conflating them is what made
-"⚠️ why is this yellow?" the normal reaction to the card. A round where EVERY
-axis reports `n/a` is withheld: nothing was actually judged. An `n/a` must name
-what the axis looked for and where; one that does not is untrusted.
+is a *finding* — a concern, or a change the axis's remit covers that it could
+not judge — and this is the absence of anything to judge; conflating them is
+what made "⚠️ why is this yellow?" the normal reaction to the card. A round
+where EVERY axis reports `n/a` is withheld: nothing was actually judged. An
+`n/a` must name what the axis looked for and where; one that does not is
+untrusted.
+
+A yellow has two meanings with opposite follow-ups, so each one says which in
+`yellow_kind`: `concern` (the axis judged, and found something) or `unjudged`
+(it could not reach a judgement). A yellow that leaves the field out, or gives
+any other value, is recorded as `unjudged` — an axis that did not say is never
+credited with having judged. **The split is reporting only**: both kinds count
+against `max_yellow_axes` exactly as a bare yellow always has, the `reasons`
+are unchanged, and no value of the field can make an axis untrusted or change
+the approval. It is recorded in the `axis-<name>` artifact (`yellow_kind`), in
+`aggregate.py decide`'s output (each axis's `yellow_kind`, and the yellow axes
+grouped by kind in `yellow_kinds`), and on the card and job summary as
+`🟡 yellow · concern` / `🟡 yellow · could not judge`, so the mix can be counted
+before any change to how either kind is gated. Both labels keep the
+`🟡 yellow` prefix and contain none of `red` / `green` / `n/a` / `pending`, so a
+parser that reduces the Verdict cell to a known token by substring reads either
+as a yellow.
 
 The card's table shows each axis's `headline` whole — one sentence, capped at
 240 characters and required, which has to state **what decided the verdict**
@@ -565,7 +585,7 @@ transcript, plus the proxy's call log for the context axes. On a context axis
 each tool call in it is cut to the tool's name: no arguments and no results, so
 no Linear, Notion or Slack content. Only the verdict
 JSON (`verdict`, `confidence`, `headline` capped at 240 characters, `summary`
-capped at 1200) reaches `cursor-approve.yml`; its exact-name `axis-<axis>` downloads never
+capped at 1200, and a yellow's `yellow_kind`) reaches `cursor-approve.yml`; its exact-name `axis-<axis>` downloads never
 match a transcript.
 
 ## Prior rounds

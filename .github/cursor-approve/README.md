@@ -28,9 +28,21 @@ focus:
 on this change — no applicable guidance, nothing in its remit touched — and it
 is NOT a `green`: letting "no applicable standard" claim a clean bill would
 quietly approve the gap the day guidance does appear. It does not count against
-`--max-yellow-axes`, because `yellow` is a *concern* and this is its absence;
-but a round where EVERY axis says `n/a` is withheld, since nothing was judged.
-An `n/a` has to name what the axis looked for and where.
+`--max-yellow-axes`, because a `yellow` is a *finding* and this is the absence
+of anything to judge; but a round where EVERY axis says `n/a` is withheld,
+since nothing was judged. An `n/a` has to name what the axis looked for and
+where.
+
+A `yellow` also carries `yellow_kind`: `concern` (the axis judged, and found a
+material concern) or `unjudged` (it could not reach a judgement on a change its
+remit covers). Anything else — the field left out included — is recorded as
+`unjudged`, so an axis that did not say is never credited with having judged.
+The kind is **reporting only**: `extract` writes it normalised into the
+artifact, `decide` carries it per axis and groups the yellow axes by kind in
+`yellow_kinds`, and the card renders `🟡 yellow · concern` /
+`🟡 yellow · could not judge`; both kinds count against `--max-yellow-axes`
+exactly as a bare yellow does, and no value of it changes the event or the
+reasons.
 
 Each verdict carries two strings, with different jobs and different audiences:
 
@@ -75,7 +87,7 @@ aggregate.py decide --outputs-dir out/ [--axes design,correctness] [--max-yellow
 ```
 
 `decide` reads `<axis>.json` for each expected axis and prints
-`{"event", "verdicts", "axes", "reasons"}`. In order:
+`{"event", "verdicts", "axes", "yellow_kinds", "reasons"}`. In order:
 
 1. any expected axis missing, unparsable, with a verdict outside
    red/yellow/green/n-a, a confidence outside 0..1, or a missing or empty
@@ -84,7 +96,8 @@ aggregate.py decide --outputs-dir out/ [--axes design,correctness] [--max-yellow
 2. any `red` → `NONE`, naming the red axes;
 3. more `yellow` axes than `--max-yellow-axes` (0–3, default 0, and always
    strictly below the number of expected axes — a limit that every axis could
-   reach would approve a round with no green axis at all) → `NONE`;
+   reach would approve a round with no green axis at all) → `NONE`; a
+   `concern` and an `unjudged` yellow count alike;
 4. every axis `n/a` → `NONE`: nothing was judged, so there is nothing to
    approve on;
 5. otherwise `APPROVE`.

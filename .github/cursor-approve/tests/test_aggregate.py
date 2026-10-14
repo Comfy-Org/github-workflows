@@ -229,6 +229,88 @@ class YellowTest(DecideCase):
                 self.assertEqual(out, "")
 
 
+class YellowKindTest(DecideCase):
+    """`yellow_kind` splits a yellow into a material concern and a could-not-
+    judge, for REPORTING only: the gate must decide exactly as it did before the
+    field existed, whatever the field says or whether it is there at all."""
+
+    # What an axis may write in `yellow_kind`, and what decide records for it.
+    # Anything but an exact `concern` is `unjudged`: an axis that did not say
+    # must not be credited with having judged.
+    KINDS = (
+        ("concern", "concern"),
+        ("unjudged", "unjudged"),
+        (None, "unjudged"),          # absent: the field is left out entirely
+        ("", "unjudged"),
+        ("Concern", "unjudged"),
+        ("could not judge", "unjudged"),
+        (1, "unjudged"),
+        (["concern"], "unjudged"),
+        ({"kind": "concern"}, "unjudged"),
+    )
+
+    def yellow(self, axis, kind):
+        out = {"verdict": "yellow", "confidence": 0.4, "summary": "s"}
+        return out if kind is None else {**out, "yellow_kind": kind}
+
+    def test_each_kind_is_recorded_normalised(self):
+        for given, recorded in self.KINDS:
+            with self.subTest(given=given):
+                self.write_all(correctness=self.yellow("correctness", given))
+                result = self.decide("--max-yellow-axes", "1")
+                self.assertEqual(result["axes"]["correctness"]["yellow_kind"], recorded)
+                self.assertEqual(result["yellow_kinds"][recorded], ["correctness"])
+                other = "concern" if recorded == "unjudged" else "unjudged"
+                self.assertEqual(result["yellow_kinds"][other], [])
+
+    def test_a_kind_on_any_other_verdict_is_dropped(self):
+        for verdict in ("green", "red", "n/a"):
+            with self.subTest(verdict):
+                self.write_all(correctness={"verdict": verdict, "confidence": 0.9, "summary": "s",
+                                            "yellow_kind": "concern"})
+                result = self.decide()
+                self.assertIsNone(result["axes"]["correctness"]["yellow_kind"])
+                self.assertEqual(result["yellow_kinds"], {"concern": [], "unjudged": []})
+
+    def test_an_untrusted_axis_has_no_kind(self):
+        self.write_all(correctness="{not json")
+        result = self.decide()
+        self.assertEqual(result["event"], AG.NONE)
+        self.assertIsNone(result["axes"]["correctness"]["yellow_kind"])
+
+    def test_the_kind_never_makes_an_axis_untrusted(self):
+        for given, _ in self.KINDS:
+            with self.subTest(given=given):
+                self.write_all(correctness=self.yellow("correctness", given))
+                result = self.decide("--max-yellow-axes", "1")
+                self.assertEqual(result["event"], AG.APPROVE)
+                self.assertNotIn("error", result["axes"]["correctness"])
+
+    def test_the_gate_is_identical_whatever_the_kind_says(self):
+        """The property that makes this safe to ship without a flag. For every
+        limit and every yellow count, the event, the reasons and the verdicts
+        are exactly those of the same round written with NO `yellow_kind` —
+        the input every axis produced before the field existed — and both
+        kinds count against the limit exactly as a bare yellow does."""
+        for limit in range(0, AG.MAX_YELLOW_LIMIT + 1):
+            for count in range(0, len(AG.AXES)):
+                yellow_axes = AG.AXES[:count]
+                self.write_all(**{a: self.yellow(a, None) for a in yellow_axes})
+                baseline = self.decide("--max-yellow-axes", str(limit))
+                self.assertEqual(baseline["event"], AG.APPROVE if count <= limit else AG.NONE)
+                # Every kind on every yellow axis, then the two kinds mixed.
+                variants = [[given] * count for given, _ in self.KINDS]
+                variants.append([("concern", "unjudged")[i % 2] for i in range(count)])
+                for kinds in variants:
+                    with self.subTest(limit=limit, count=count, kinds=kinds):
+                        self.write_all(**{a: self.yellow(a, k) for a, k in zip(yellow_axes, kinds)})
+                        result = self.decide("--max-yellow-axes", str(limit))
+                        for key in ("event", "reasons", "verdicts"):
+                            self.assertEqual(result[key], baseline[key], key)
+                        self.assertEqual(sorted(result["yellow_kinds"]["concern"]
+                                                + result["yellow_kinds"]["unjudged"]), sorted(yellow_axes))
+
+
 class AxesSubsetTest(DecideCase):
     def test_subset_ignores_unexpected_axes(self):
         # Only the expected axes count: a red or garbage axis outside the list is not read.
@@ -558,6 +640,32 @@ class ExtractCli(unittest.TestCase):
             headline = json.load(f)["headline"]
         self.assertEqual(headline, AG.clamp_headline(long))
         self.assertLessEqual(len(headline), AG.HEADLINE_MAX)
+
+    def artifact(self, obj):
+        code, _, err = self.extract(json.dumps(obj))
+        self.assertEqual(code, 0, err)
+        with open(self.out, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_a_yellow_kind_reaches_the_artifact(self):
+        """The artifact is where the yellow mix is counted after the fact."""
+        base = {"verdict": "yellow", "confidence": 0.5, "headline": "h", "summary": "s"}
+        self.assertEqual(self.artifact({**base, "yellow_kind": "concern"})["yellow_kind"], "concern")
+        self.assertEqual(self.artifact({**base, "yellow_kind": "unjudged"})["yellow_kind"], "unjudged")
+
+    def test_an_unsaid_or_unparseable_yellow_kind_is_written_as_unjudged(self):
+        base = {"verdict": "yellow", "confidence": 0.5, "headline": "h", "summary": "s"}
+        self.assertEqual(self.artifact(base)["yellow_kind"], "unjudged")
+        for bad in ("", "CONCERN", "a concern", 0, None, ["concern"]):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.artifact({**base, "yellow_kind": bad})["yellow_kind"], "unjudged")
+
+    def test_no_yellow_kind_on_any_other_verdict(self):
+        for verdict in ("green", "red", "n/a"):
+            with self.subTest(verdict):
+                obj = self.artifact({"verdict": verdict, "confidence": 0.5, "headline": "h", "summary": "s",
+                                     "yellow_kind": "concern"})
+                self.assertNotIn("yellow_kind", obj)
 
     def test_rejects_a_bad_commit_sha(self):
         code, _, err = self.extract('{"verdict": "green", "confidence": 1, "summary": "ok"}', sha="main")

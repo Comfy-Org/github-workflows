@@ -587,11 +587,13 @@ class ApproveExternal(unittest.TestCase):
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
         axes = AXES.split(",")
-        kinds = ("green", "yellow", "red", agg.NA)
+        # (verdict, yellow_kind): both kinds of yellow, since the kind is
+        # aggregate.py's to report and must never move approve-external either.
+        kinds = (("green", None), ("yellow", "concern"), ("yellow", "unjudged"), ("red", None), (agg.NA, None))
         for max_yellow in range(len(axes)):
             for a in kinds:
                 for b in kinds:
-                    outputs = {axes[0]: (a, 0.9, "s", "h"), axes[1]: (b, 0.9, "s", "h")}
+                    outputs = {axes[0]: (a[0], 0.9, "s", "h", a[1]), axes[1]: (b[0], 0.9, "s", "h", b[1])}
                     decision = agg.decide(outputs, axes, max_yellow=max_yellow)
                     with self.subTest(verdicts=(a, b), max_yellow=max_yellow):
                         self.assertEqual(aa.external_decision_approves(decision, axes),

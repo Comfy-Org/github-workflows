@@ -91,6 +91,14 @@ AXES = ("business", "design", "correctness", "completeness", "conformance")
 VERDICT_ICONS = {"green": "🟢 green", "yellow": "🟡 yellow", "red": "🔴 red",
                  "n/a": "⚪ n/a"}
 NO_RESULT = "⚠️ no result"
+# A yellow's two meanings (aggregate.py's YELLOW_KINDS), told apart on the card
+# so a reader sees which kind gated a round. Both keep the `🟡 yellow` prefix
+# and contain no `red`/`green`/`n/a`/`pending`: a consumer that reduces a
+# verdict cell to a known token by substring still reads either one as a yellow.
+# Anything but an exact `concern` renders as could-not-judge, as aggregate.py
+# records it. Reporting only — the rule line counts both kinds alike.
+YELLOW_KIND_ICONS = {"concern": "🟡 yellow · concern", "unjudged": "🟡 yellow · could not judge"}
+YELLOW_RULE = "at most {} yellow (a concern and a could-not-judge count alike)"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 # Outcomes auto-approve.py `approve-external` reports; anything else renders as
@@ -334,6 +342,16 @@ def sanitize(text, limit: int = SUMMARY_LIMIT) -> str:
     return _ESCAPE_RE.sub(r"\\\1", text)
 
 
+def verdict_icon(entry) -> str:
+    """One axis's Verdict cell: its icon and verdict, a yellow's kind included,
+    or NO_RESULT for an entry with no known verdict."""
+    verdict = entry.get("verdict") if isinstance(entry, dict) else None
+    if verdict == "yellow":
+        kind = entry.get("yellow_kind")
+        return YELLOW_KIND_ICONS[kind if isinstance(kind, str) and kind in YELLOW_KIND_ICONS else "unjudged"]
+    return VERDICT_ICONS.get(verdict, NO_RESULT)
+
+
 def why_text(entry: dict) -> str:
     """One axis's Why cell: its whole headline, sanitised.
 
@@ -467,8 +485,7 @@ def render_job_summary(round_no, max_rounds, sha: str, axes: list, decision, out
     for axis in axes:
         entry = detail.get(axis)
         entry = entry if isinstance(entry, dict) else {}
-        verdict = entry.get("verdict")
-        icon = VERDICT_ICONS.get(verdict, NO_RESULT)
+        icon = verdict_icon(entry)
         confidence = _confidence(entry.get("confidence"))
         lines += ["", f"#### {axis} — {icon}" + (f" (confidence {confidence})" if confidence else "")]
         # The card's Why cell, word for word: the same clamp and fallback, so
@@ -479,7 +496,7 @@ def render_job_summary(round_no, max_rounds, sha: str, axes: list, decision, out
         summary = sanitize(entry.get("summary"), SUMMARY_DETAIL_LIMIT)
         lines += ["", summary or "_No summary was reported._"]
     limit = _int_or_q(max_yellow)
-    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report "
+    lines += ["", f"_Rule: no red, {YELLOW_RULE.format(limit)}; every axis must report "
               "(⚪ n/a counts as reporting and does not block, but all-n/a withholds)._"]
     return "\n".join(lines) + "\n"
 
@@ -510,7 +527,7 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
         if verdict not in VERDICT_ICONS:
             lines.append(f"| {axis} | {NO_RESULT} | |")
             continue
-        lines.append(f"| {axis} | {VERDICT_ICONS[verdict]} | {why_text(entry)} |")
+        lines.append(f"| {axis} | {verdict_icon(entry)} | {why_text(entry)} |")
     lines.append("")
     if outcome == OUTCOME_APPROVED:
         lines.append("**Result: ✅ Approved.**")
@@ -523,7 +540,7 @@ def render_decide(round_no, max_rounds, sha: str, axes: list, decision, outcome:
     # The run link sits on the reviewed-commit line, as on every other card;
     # it used to close the rule line instead, leaving this line's "workflow
     # run" as unlinked text right under a linked one.
-    lines += ["", f"_Rule: no red, at most {limit} yellow; every axis must report "
+    lines += ["", f"_Rule: no red, {YELLOW_RULE.format(limit)}; every axis must report "
               f"(⚪ n/a counts as reporting and does not block, but all-n/a withholds)._",
               "", _reviewed_line(sha, run_url)]
     return "\n".join(lines) + "\n"
