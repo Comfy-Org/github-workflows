@@ -3972,3 +3972,482 @@ class AutoRetryTest(unittest.TestCase):
 
     def test_the_default_label_matches_card_py(self):
         self.assertEqual(AA.DEFAULT_REVIEW_LABEL, CARD.DEFAULT_REVIEW_LABEL)
+
+
+POST_REVIEW = AA._load_post_review()
+
+
+class CarryForwardTest(unittest.TestCase):
+    """dismiss-stale's carry-forward (BE-20585).
+
+    On a stack, a change to a lower PR re-merges or rebases every PR above it,
+    so their approvals go stale while their own changes stay the same. With
+    `--carry-forward true` the approval moves to the live head when the compare
+    API says the PR's own changes are still the ones a round reviewed. A wrong
+    carry is an approval no round produced, so every case that cannot vouch for
+    the comparison must keep the old behaviour: dismiss, and post nothing.
+
+    The PR, unless a case says otherwise: a round (review 10) reviewed REVIEWED,
+    diffed from MERGE_BASE, and review 11 approved it. The PR now sits on LIVE
+    over BASE_SHA. Reviews this run posts get ids from 100.
+    """
+
+    REVIEWED, LIVE, LATER = "a" * 40, "b" * 40, "c" * 40
+    MERGE_BASE, BASE_SHA, BASE_SHA2 = "d" * 40, "e" * 40, "f" * 40
+    POSTER = "cloud-code-bot[bot]"
+    LOGIN = "cursor-approver"
+
+    def setUp(self):
+        self.pr = {"state": "open", "draft": False, "user": {"login": "dev"},
+                   "head": {"sha": self.LIVE}, "base": {"ref": "main", "sha": self.BASE_SHA}, "labels": []}
+        self.pr_after_post = None
+        self.reviews = [self.round_review(10), self.approval(11)]
+        self.after_post_reviews = []
+        # The same change at other line numbers, under another hunk heading:
+        # what a rebase onto a base that grew above it looks like.
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10, " func a() {"),
+                         (self.BASE_SHA, self.LIVE): self.files(42, " func b() {")}
+        self.comments = []
+        self.fail_post = False
+        self.fail_dismiss = set()
+        self.posted, self.writes, self.patches = [], [], []
+        self.dismissed = {}
+        self.compare_tokens, self.post_tokens = [], []
+        self.printed, self.emitted = [], []
+        out = tempfile.NamedTemporaryFile("w+", delete=False)
+        out.close()
+        self.addCleanup(os.unlink, out.name)
+        self.output_path = out.name
+
+    # -- the PR ------------------------------------------------------------
+
+    def approval(self, rid, sha=None, base="main", edited=False, state="APPROVED", login=None):
+        return {"id": rid, "user": {"login": login or self.LOGIN}, "state": state, "edited": edited,
+                "body": AA.render_body(AA.APPROVE, ["ok"], "low", [], sha or self.REVIEWED, base)}
+
+    def carried(self, rid, head=None, from_sha=None):
+        """An approval an earlier run already carried forward to `head`."""
+        return {"id": rid, "user": {"login": self.LOGIN}, "state": "APPROVED",
+                "body": AA.render_carried_body("", head or self.LIVE, "main", self.REVIEWED, self.MERGE_BASE,
+                                               from_sha or self.REVIEWED)}
+
+    def round_review(self, rid, head=None, merge_base=None, poster=None, edited=False):
+        sentinel = POST_REVIEW.render_round_sentinel(head or self.REVIEWED, "9" * 40, merge_base or self.MERGE_BASE)
+        return {"id": rid, "user": {"login": poster or self.POSTER}, "state": "COMMENTED", "edited": edited,
+                "body": f"{POST_REVIEW.CONSOLIDATED_MARKER}\n{sentinel}\n\nfindings"}
+
+    def change_request(self, rid):
+        return {"id": rid, "user": {"login": self.LOGIN}, "state": "CHANGES_REQUESTED",
+                "body": AA.render_body(AA.REQUEST_CHANGES, ["bad"], "low", [], self.LIVE, "main")}
+
+    @staticmethod
+    def patch(start, heading="", added="+new", context=" keep"):
+        return f"@@ -{start},3 +{start},3 @@{heading}\n{context}\n-old\n{added}\n keep"
+
+    def files(self, start=10, heading="", **entry):
+        f = {"filename": "svc/a.go", "status": "modified", "changes": 2, "patch": self.patch(start, heading)}
+        f.update(entry)
+        return {"files": [f]}
+
+    def pass_card(self):
+        body = CARD.render_round(2, 5, self.REVIEWED, "pass", "none", "Approved: no finding above `low`.", [], "", "")
+        return {"id": 77, "user": {"login": self.LOGIN}, "body": body,
+                "html_url": "https://github.com/o/r/pull/1#issuecomment-77"}
+
+    # -- GitHub ------------------------------------------------------------
+
+    def gh(self, args, payload=None):
+        if args[:2] == ["api", "graphql"]:
+            reviews = list(self.reviews)
+            if self.posted:
+                reviews += [{"id": rid, "user": {"login": self.LOGIN}, "state": "APPROVED", "body": p["body"]}
+                            for rid, p in self.posted] + self.after_post_reviews
+            return graphql_reviews(reviews)
+        if args == ["api", "repos/o/r/pulls/1"]:
+            return json.dumps(self.pr_after_post if self.posted and self.pr_after_post else self.pr)
+        if args[:3] == ["api", "--paginate", "--slurp"]:
+            return json.dumps([self.comments] if "/comments" in args[3] else [[]])
+        if len(args) == 2 and args[1].startswith("repos/o/r/compare/"):
+            self.compare_tokens.append(os.environ.get("GH_TOKEN"))
+            got = self.compares.get(tuple(args[1].rsplit("/", 1)[1].split("...")))
+            if isinstance(got, Exception):
+                raise got
+            if got is None:
+                raise RuntimeError(f"gh api failed: HTTP 404 (no compare {args[1]})")
+            return json.dumps(got)
+        if args[:4] == ["api", "-X", "POST", "repos/o/r/pulls/1/reviews"]:
+            self.post_tokens.append(os.environ.get("GH_TOKEN"))
+            self.writes.append(("POST", payload["commit_id"]))
+            if self.fail_post:
+                raise RuntimeError("gh api failed: HTTP 422 Unprocessable Entity")
+            rid = 100 + len(self.posted)
+            self.posted.append((rid, payload))
+            return json.dumps({"id": rid})
+        if args[:3] == ["api", "-X", "PUT"]:
+            rid = int(args[3].split("/")[-2])
+            if rid in self.fail_dismiss:
+                raise RuntimeError("gh api failed: HTTP 403")
+            self.writes.append(("PUT", rid, payload["message"]))
+            self.dismissed[rid] = payload["message"]
+            return "{}"
+        if args[:3] == ["api", "-X", "PATCH"]:
+            self.patches.append(payload["body"])
+            self.comments[0]["body"] = payload["body"]
+            return json.dumps(self.comments[0])
+        raise AssertionError(f"unexpected gh call {args}")
+
+    def run_dismiss(self, carry="true", event="pull_request_target", threshold="low", authors="",
+                    all_approvals=False, poster=None, login=None, auto="false", env=None):
+        args = argparse.Namespace(
+            repo="o/r", pr_number="1", head_sha=self.pr["head"]["sha"], approver_login=login or self.LOGIN,
+            all_approvals=all_approvals, threshold=threshold, approve_authors=authors, max_rounds="5",
+            poster_login=poster or self.POSTER, review_label="cursor-review", auto_rereview=auto,
+            auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false",
+            carry_forward=carry, event_name=event)
+        environ = dict({"GITHUB_OUTPUT": self.output_path}, **(env or {}))
+        with mock.patch.object(AA, "gh", self.gh), mock.patch.object(AA, "emit", self.emitted.append), \
+                mock.patch.dict(os.environ, environ), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+            if "FALLBACK_TOKEN" not in environ:
+                os.environ.pop("FALLBACK_TOKEN", None)
+            rc = AA.cmd_dismiss_stale(args)
+            self.token_after = os.environ.get("GH_TOKEN")
+        return rc
+
+    def outputs(self):
+        with open(self.output_path, encoding="utf-8") as f:
+            return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+
+    def posted_body(self):
+        self.assertEqual(len(self.posted), 1, self.emitted)
+        return self.posted[0][1]["body"]
+
+    def emitted_line(self, text):
+        self.assertTrue(any(text in line for line in self.emitted), self.emitted)
+
+    def assert_dismissed_as_before(self, rc, message=AA.STALE_MESSAGE):
+        self.assertEqual(rc, 0, self.printed)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.dismissed, {11: message})
+
+    # -- the carry ---------------------------------------------------------
+
+    def test_an_unchanged_own_diff_moves_the_approval_to_the_live_head(self):
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual((self.posted[0][1]["commit_id"], self.posted[0][1]["event"]), (self.LIVE, AA.APPROVE))
+        self.assertIn(AA.APPROVE_MARKER, body)
+        self.assertEqual(AA.REVIEWED_SHA_RE.search(body).group(1), self.LIVE)
+        self.assertEqual(AA.recorded_base(body), "main")
+        self.assertEqual(AA.CARRIED_MARKER_RE.search(body).groups(), (self.REVIEWED, self.MERGE_BASE))
+        self.assertIn(f"Carried forward from `{self.REVIEWED[:7]}`", body)
+        # Posted BEFORE the stale one goes, so the PR is never left without it.
+        self.assertEqual(self.writes, [("POST", self.LIVE), ("PUT", 11, AA.carried_message(self.LIVE))])
+        self.emitted_line("carried the approval")
+        # Every reader takes it for what it is: a current approval of the live
+        # head and base, which a later dismissal still recognises as one.
+        posted = {"id": 100, "user": {"login": self.LOGIN}, "state": "APPROVED", "body": body}
+        self.assertEqual(AA.stale_reviews_to_dismiss([posted], self.LOGIN, self.LIVE, "main"), [])
+        self.assertTrue(any(line in body for line in AA.APPROVAL_BODY_LINES), body)
+
+    def test_a_changed_own_diff_is_dismissed_as_before(self):
+        self.compares[(self.BASE_SHA, self.LIVE)] = self.files(42, patch=self.patch(42, added="+newer"))
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("differ from the ones reviewed")
+
+    def test_a_changed_context_line_is_a_changed_diff(self):
+        # Context is compared on purpose: the lines around a change are part of
+        # what a round read, and a base that rewrote them changed what it does.
+        self.compares[(self.BASE_SHA, self.LIVE)] = self.files(42, patch=self.patch(42, context=" kept"))
+        self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_an_extra_changed_file_is_a_changed_diff(self):
+        extra = dict(self.files(42)["files"][0], filename="svc/b.go")
+        self.compares[(self.BASE_SHA, self.LIVE)]["files"].append(extra)
+        self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_a_retarget_with_an_identical_own_diff_carries(self):
+        # A lower stacked PR landed and this one was retargeted: same head, a
+        # new base, and against it the same own changes.
+        self.pr["head"]["sha"] = self.REVIEWED
+        self.pr["base"] = {"ref": "release", "sha": self.BASE_SHA2}
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
+                         (self.BASE_SHA2, self.REVIEWED): self.files(77)}
+        self.assertEqual(self.run_dismiss(all_approvals=True), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual(self.posted[0][1]["commit_id"], self.REVIEWED)
+        self.assertEqual(AA.recorded_base(body), "release")
+        self.assertEqual(self.dismissed, {11: AA.carried_message(self.REVIEWED)})
+
+    def test_a_chained_carry_compares_against_the_recorded_baseline(self):
+        # Carried once already (to LIVE), then the base moved again. No round ever
+        # reviewed LIVE: the comparison reaches back to what one did read. The
+        # fake answers no other compare, so any other baseline fails closed.
+        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.pr["head"]["sha"] = self.LATER
+        self.pr["base"]["sha"] = self.BASE_SHA2
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.files(10),
+                         (self.BASE_SHA2, self.LATER): self.files(90)}
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual(AA.CARRIED_MARKER_RE.search(body).groups(), (self.REVIEWED, self.MERGE_BASE))
+        self.assertEqual(AA.REVIEWED_SHA_RE.search(body).group(1), self.LATER)
+        self.assertIn(f"Carried forward from `{self.LIVE[:7]}`", body)
+        self.assertEqual(self.dismissed, {50: AA.carried_message(self.LATER)})
+
+    def test_a_pure_rename_needs_no_patch(self):
+        rename = {"filename": "svc/new.go", "previous_filename": "svc/old.go", "status": "renamed", "changes": 0}
+        for files in self.compares.values():
+            files["files"].append(dict(rename))
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.posted_body()
+
+    # -- what it cannot vouch for fails closed --------------------------------
+
+    def test_a_file_with_no_patch_fails_closed(self):
+        # Binary, or too large for the API to return: nothing to compare. Also a
+        # rename that changed content, which needs its patch like any edit.
+        cases = [{"patch": None},
+                 {"patch": None, "status": "renamed", "previous_filename": "svc/old.go", "changes": 4}]
+        for entry in cases:
+            for side in ((self.MERGE_BASE, self.REVIEWED), (self.BASE_SHA, self.LIVE)):
+                with self.subTest(entry=entry, side=side):
+                    self.setUp()
+                    self.compares[side] = self.files(**entry)
+                    self.assert_dismissed_as_before(self.run_dismiss())
+                    self.emitted_line("could not vouch")
+
+    def test_300_files_fail_closed(self):
+        # The compare API lists at most 300 files: past that, a change could hide
+        # in one the comparison never saw. One fewer still compares.
+        for count, carries in ((AA.COMPARE_FILE_CAP, False), (AA.COMPARE_FILE_CAP - 1, True)):
+            with self.subTest(count=count):
+                self.setUp()
+                many = {"files": [dict(self.files()["files"][0], filename=f"f{i}.go") for i in range(count)]}
+                self.compares = {key: many for key in self.compares}
+                rc = self.run_dismiss()
+                if carries:
+                    self.assertEqual(rc, 0, self.printed)
+                    self.posted_body()
+                else:
+                    self.assert_dismissed_as_before(rc)
+
+    def test_an_empty_or_shapeless_compare_fails_closed(self):
+        # An empty diff is not "identical", even on both sides: a compare that
+        # lists nothing proves nothing about what the PR changes.
+        for got in ({"files": []}, {}, {"files": "x"}, [], {"files": [{"status": "modified", "patch": ""}]},
+                    RuntimeError("gh api failed: HTTP 502")):
+            for both in (False, True):
+                with self.subTest(got=got, both=both):
+                    self.setUp()
+                    for key in self.compares if both else [(self.BASE_SHA, self.LIVE)]:
+                        self.compares[key] = got
+                    self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_an_edited_round_review_is_no_baseline(self):
+        self.reviews = [self.round_review(10, edited=True), self.approval(11)]
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("no unedited round review")
+
+    def test_an_edited_approval_is_never_carried(self):
+        self.reviews = [self.round_review(10), self.approval(11, edited=True)]
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.assertEqual(self.compare_tokens, [])
+
+    def test_no_round_review_is_no_baseline(self):
+        for reviews in ([self.approval(11)],
+                        [self.round_review(10, head=self.LATER), self.approval(11)],
+                        [self.round_review(10, poster="someone-else"), self.approval(11)],
+                        # Posted after the approval: not the round that produced it.
+                        [self.approval(11), self.round_review(12)]):
+            with self.subTest(reviews=[r["id"] for r in reviews]):
+                self.setUp()
+                self.reviews = reviews
+                self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_a_round_that_reviewed_nothing_is_no_baseline(self):
+        # The error review fences imported CLI/judge text at column 0, so a line
+        # in it can pass for a sentinel; neither it nor the all-cells-failed body
+        # reviewed anything. Between the round and the approval, it must not
+        # displace the round that did; alone, it is no baseline at all.
+        for banner in AA.NON_ROUND_BANNERS:
+            forged = self.round_review(12, merge_base=self.BASE_SHA2)
+            forged["body"] = forged["body"].replace("\n\nfindings", banner + "\nfindings")
+            for reviews, carries in (([self.round_review(10), forged, self.approval(13)], True),
+                                     ([forged, self.approval(13)], False)):
+                with self.subTest(banner=banner, ids=[r["id"] for r in reviews]):
+                    self.setUp()
+                    self.reviews = reviews
+                    rc = self.run_dismiss()
+                    if carries:
+                        self.assertEqual(rc, 0, self.printed)
+                        self.assertEqual(AA.CARRIED_MARKER_RE.search(self.posted_body()).groups(),
+                                         (self.REVIEWED, self.MERGE_BASE))
+                    else:
+                        self.assertEqual((rc, self.posted, self.dismissed), (0, [], {13: AA.STALE_MESSAGE}))
+
+    def test_the_baseline_is_the_round_that_approved_not_a_later_one(self):
+        # The fake answers only the earlier round's compare, so reading the later
+        # round's merge base would fail closed instead of carrying.
+        self.reviews = [self.round_review(10), self.approval(11), self.round_review(12, merge_base=self.BASE_SHA2)]
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(AA.CARRIED_MARKER_RE.search(self.posted_body()).groups(), (self.REVIEWED, self.MERGE_BASE))
+
+    def test_github_actions_never_vouches_for_a_round_or_an_approval(self):
+        # Every workflow's GITHUB_TOKEN posts as that login, a PR's own included.
+        self.reviews = [self.round_review(10, poster="github-actions[bot]"), self.approval(11)]
+        self.assert_dismissed_as_before(self.run_dismiss(poster="github-actions[bot]"))
+        self.emitted_line("set `bot_app_id`")
+        self.setUp()
+        self.reviews = [self.round_review(10), self.approval(11, login="github-actions[bot]")]
+        rc = self.run_dismiss(login="github-actions[bot]")
+        self.assertEqual((rc, self.posted, self.dismissed), (0, [], {11: AA.STALE_MESSAGE}))
+        self.emitted_line("cannot vouch for what a round approved")
+
+    # -- when it must not post at all -----------------------------------------
+
+    def test_a_veto_or_the_hand_off_never_carries(self):
+        for label, message in (("skip-cursor-review", AA.SKIP_REVIEW_WITHDRAWN_MESSAGE),
+                               (AA.HUMAN_REVIEW_LABEL, AA.HUMAN_REVIEW_MESSAGE)):
+            with self.subTest(label=label):
+                self.setUp()
+                self.pr["labels"] = [{"name": label}]
+                self.assert_dismissed_as_before(self.run_dismiss(), message)
+                self.assertEqual(self.compare_tokens, [])
+
+    def test_unreadable_labels_never_carry(self):
+        self.pr["labels"] = None
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("could not be read")
+
+    def test_outside_the_approval_lane_it_never_carries(self):
+        for kwargs, why in (({"threshold": ""}, "`approve_max_severity`"),
+                            ({"authors": "someone-else"}, "`approve_authors` does not list"),
+                            ({"event": "pull_request"}, "only under `pull_request_target`"),
+                            ({"carry": "false"}, None)):
+            with self.subTest(kwargs=kwargs):
+                self.setUp()
+                self.assert_dismissed_as_before(self.run_dismiss(**kwargs))
+                self.assertEqual(self.compare_tokens, [])
+                if why:
+                    self.emitted_line(why)
+                else:  # switched off: not a word about it either
+                    self.assertFalse(any("carry" in line for line in self.emitted), self.emitted)
+
+    def test_a_draft_or_closed_pr_never_carries(self):
+        for change in ({"draft": True}, {"state": "closed"}):
+            with self.subTest(change=change):
+                self.setUp()
+                self.pr.update(change)
+                self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_a_newer_request_for_changes_is_never_overruled(self):
+        # GitHub counts a reviewer's newest review: carrying the older approval
+        # past this block would overrule the round that left it.
+        self.reviews.append(self.change_request(12))
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.emitted_line("request for changes")
+        self.assertEqual(self.compare_tokens, [])
+
+    def test_an_older_request_for_changes_does_not_stop_the_carry(self):
+        # The approval already outranks it, and so does the one carried forward.
+        self.reviews.insert(0, self.change_request(5))
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.posted_body()
+
+    def test_an_approval_already_on_the_live_head_is_not_doubled(self):
+        # Newer or older than the stale one: either way one already stands.
+        for reviews in (self.reviews + [self.approval(12, sha=self.LIVE)],
+                        [self.approval(9, sha=self.LIVE)] + self.reviews):
+            with self.subTest(reviews=[r["id"] for r in reviews]):
+                self.setUp()
+                self.reviews = reviews
+                self.assert_dismissed_as_before(self.run_dismiss())
+
+    def test_only_the_latest_verdict_is_offered(self):
+        # Review 13 is the newest approval and no round stands behind it, so
+        # nothing is carried — not even review 11, which would compare equal.
+        self.reviews.append(self.approval(13, sha=self.LATER))
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.dismissed, {11: AA.STALE_MESSAGE, 13: AA.STALE_MESSAGE})
+
+    # -- the write and its races -----------------------------------------------
+
+    def test_a_failed_post_falls_back_to_the_dismissal(self):
+        self.fail_post = True
+        self.assert_dismissed_as_before(self.run_dismiss())
+        self.assertEqual(self.writes[0], ("POST", self.LIVE))
+        self.assertTrue(any(line.startswith("::warning::Could not carry") for line in self.printed), self.printed)
+
+    def test_a_pr_that_moves_during_the_post_takes_the_carried_approval_back(self):
+        for change in ({"head": {"sha": self.LATER}}, {"base": {"ref": "release", "sha": self.BASE_SHA}},
+                       {"labels": [{"name": "skip-cursor-review"}]}, {"labels": [{"name": AA.HUMAN_REVIEW_LABEL}]},
+                       {"labels": None}, {"draft": True}, {"state": "closed"}):
+            with self.subTest(change=change):
+                self.setUp()
+                self.pr_after_post = dict(self.pr, **change)
+                self.assertEqual(self.run_dismiss(), 0, self.printed)
+                self.assertEqual(self.dismissed, {100: AA.STALE_MESSAGE, 11: AA.STALE_MESSAGE})
+                self.emitted_line("withdrawn again")
+
+    def test_a_request_for_changes_landing_during_the_post_takes_it_back(self):
+        # A round deciding in the read → POST window: its block is newer than
+        # the stale approval, and the carried one would overrule it.
+        self.after_post_reviews = [self.change_request(98)]
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(self.dismissed, {100: AA.STALE_MESSAGE, 11: AA.STALE_MESSAGE})
+
+    def test_a_carried_approval_that_cannot_be_taken_back_goes_red(self):
+        self.pr_after_post = dict(self.pr, head={"sha": self.LATER})
+        self.fail_dismiss = {100}
+        self.assertEqual(self.run_dismiss(), 1)
+        self.assertTrue(any(line.startswith("::error::The PR changed while the carried-forward approval")
+                            for line in self.printed), self.printed)
+        self.assertEqual(self.dismissed, {11: AA.STALE_MESSAGE})
+
+    def test_compare_reads_use_the_job_token(self):
+        # The approver token may be scoped to reviews; the job's has contents:
+        # read. The swap is undone before the approval is posted.
+        rc = self.run_dismiss(env={"GH_TOKEN": "approver-token", "FALLBACK_TOKEN": "job-token"})
+        self.assertEqual(rc, 0, self.printed)
+        self.assertEqual(self.compare_tokens, ["job-token", "job-token"])
+        self.assertEqual((self.post_tokens, self.token_after), (["approver-token"], "approver-token"))
+        self.setUp()
+        self.run_dismiss(env={"GH_TOKEN": "approver-token"})
+        self.assertEqual(self.compare_tokens, ["approver-token", "approver-token"])
+
+    # -- the card ---------------------------------------------------------------
+
+    def test_a_carried_approval_keeps_the_card_and_starts_no_round(self):
+        self.comments = [self.pass_card()]
+        self.assertEqual(self.run_dismiss(auto="true"), 0, self.printed)
+        self.assertIn("[cursor-approve card](https://github.com/o/r/pull/1#issuecomment-77)", self.posted_body())
+        self.assertEqual(self.patches, [])
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
+    def test_the_card_stays_on_the_next_event_too(self):
+        # A label or an edit later: the carried approval stands on the head.
+        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.comments = [self.pass_card()]
+        self.assertEqual(self.run_dismiss(auto="true"), 0, self.printed)
+        self.assertEqual((self.posted, self.dismissed, self.patches), ([], {}, []))
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
+    def test_without_a_carry_the_card_is_still_marked_stale(self):
+        # The guard is for a carried approval only: a dismissal still rewrites
+        # the card and schedules the round.
+        self.comments = [self.pass_card()]
+        self.compares[(self.BASE_SHA, self.LIVE)] = self.files(42, patch=self.patch(42, added="+newer"))
+        self.assertEqual(self.run_dismiss(auto="true"), 0, self.printed)
+        self.assertEqual(len(self.patches), 1)
+        self.assertEqual(CARD.stale_head(self.patches[0]), self.LIVE)
+        self.assertEqual(self.outputs().get("auto_rereview"), "true")
+
+    def test_a_carried_approval_this_run_withdrew_no_longer_keeps_the_card(self):
+        self.reviews = [self.round_review(10), self.approval(11, state="DISMISSED"), self.carried(50)]
+        self.pr["labels"] = [{"name": "skip-cursor-review"}]
+        self.comments = [self.pass_card()]
+        self.assertEqual(self.run_dismiss(), 0, self.printed)
+        self.assertEqual(self.dismissed, {50: AA.SKIP_REVIEW_WITHDRAWN_MESSAGE})
+        self.assertEqual(len(self.patches), 1)
