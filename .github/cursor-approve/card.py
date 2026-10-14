@@ -672,6 +672,16 @@ _STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-appro
 #                   whose heading names another round reads as no re-checks, so
 #                   a new panel round resets the count without anyone clearing
 #                   the line.
+# PANEL_BLOCKED_MARKER  written only by cursor-review's own round card when its
+#                   decide requested changes on the round's findings (or an
+#                   earlier round's open thread above the threshold): the PANEL
+#                   blocked, not the axes. With `approve_only_on_push` and
+#                   `auto_rereview_after_dismissal` both on, the next push starts
+#                   a full round itself (cursor-review's `dismiss-stale`). A
+#                   card without it — an untrusted round, a capped one, or any
+#                   card written before the marker existed — never does.
+PANEL_BLOCKED_MARKER = "<!-- cursor-approve-panel: blocked -->"
+_PANEL_BLOCKED_RE = re.compile(r"^<!-- cursor-approve-panel: blocked -->[ \t\r]*$", re.MULTILINE)
 LANE_MARKER = "<!-- cursor-approve-lane: axes -->"
 _LANE_RE = re.compile(r"^<!-- cursor-approve-lane: axes -->[ \t\r]*$", re.MULTILINE)
 RECHECK_SENTINEL_OPENER = "<!-- cursor-approve:recheck v1 "
@@ -735,6 +745,40 @@ def next_auto_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=Non
     when = retry_delay_phrase(delay_minutes, "the latest push", now)
     return (f"Nothing — a new round starts automatically{when} if no further "
             f"commit lands ({relabel(label)}). If none starts, re-run it by hand.")
+
+
+def panel_blocked(body) -> bool:
+    """Whether the card is cursor-review's own round card for a round whose
+    panel requested changes (PANEL_BLOCKED_MARKER)."""
+    return bool(_PANEL_BLOCKED_RE.search(body or ""))
+
+
+def next_panel_rereview_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=None) -> str:
+    """The next step once a push lands on a panel-blocked round and the
+    workflow schedules the full round itself."""
+    when = retry_delay_phrase(delay_minutes, "the latest push", now)
+    return (f"Nothing — the panel blocked the last round, so a new full round starts automatically{when} if no "
+            f"further commit lands ({relabel(label)}). If none starts, re-run it by hand.")
+
+
+_NEXT_LINE_RE = re.compile(r"^\*\*Next step:\*\* [^\n]*$", re.MULTILINE)
+_NEXT_MARKER_RE = re.compile(r"^<!-- cursor-approve-next: [a-z_]+ -->$", re.MULTILINE)
+
+
+def render_panel_blocked_stale(body: str, head_sha: str, next_text: str) -> str:
+    """A panel-blocked round card once a push moved the head and a full round
+    is scheduled: same state, gating rows and heading; `next` becomes `relabel`
+    (the workflow is relabelling), the next step says so, and the stale-head
+    marker names the head the round is scheduled for (`auto-rereview` checks
+    it is still that head)."""
+    body = _NEXT_MARKER_RE.sub(NEXT_MARKER.format(NEXT_RELABEL), body, count=1)
+    line = f"**Next step:** {reason_text(next_text)}"
+    if _NEXT_LINE_RE.search(body):
+        body = _NEXT_LINE_RE.sub(lambda _: line, body, count=1)
+    else:
+        body = _append_line(body, line)
+    body = _STALE_HEAD_RE.sub("", body).rstrip("\n") + "\n"
+    return _append_line(body, STALE_HEAD_MARKER.format(head_sha))
 
 
 def in_axes_lane(body) -> bool:
@@ -933,6 +977,8 @@ def render_round(round_no, max_rounds, sha: str, state: str, next_step: str, hea
     if threshold in ("medium", "low", "nit"):
         lines += ["", f"_Threshold: `{threshold}` (this repo's `approve_max_severity`)._"]
     lines += ["", _reviewed_line(sha, run_url)]
+    if state == STATE_CHANGES:
+        lines += ["", PANEL_BLOCKED_MARKER]
     return "\n".join(lines) + "\n"
 
 

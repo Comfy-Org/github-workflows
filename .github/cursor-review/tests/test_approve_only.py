@@ -310,6 +310,128 @@ class DismissalTextTest(Base):
         self.assertEqual(self.outputs().get("auto_rereview"), "true")
 
 
+def panel_blocked_card(sha=X, round_no=2):
+    """cursor-review's own round card for a round its PANEL blocked."""
+    return CARD.render_round(round_no, 5, sha, "changes_requested", "resolve_then_relabel",
+                             "Not approved: 1 finding(s) above `medium`.", ["1 finding(s) above `medium`"],
+                             CARD.next_resolve_text(), "", [], "medium")
+
+
+class PanelBlockedRereviewTest(Base):
+    """A push on a round the PANEL blocked starts a full round itself — only
+    with both `approve_only_on_push` and `auto_rereview_after_dismissal`."""
+
+    def dismiss(self, fake, approve_only="true", auto="true", can_relabel="true", run_without_label="false",
+                max_rounds="5"):
+        args = argparse.Namespace(
+            repo="o/r", pr_number="1", head_sha=fake.pr["head"]["sha"], approver_login=LOGIN, all_approvals=False,
+            threshold="medium", approve_authors="", max_rounds=max_rounds, poster_login=POSTER,
+            review_label="cursor-review", auto_rereview=auto, auto_rereview_delay_minutes="10",
+            can_relabel=can_relabel, run_without_label=run_without_label, carry_forward="false",
+            event_name="pull_request_target", approve_only=approve_only, approve_only_delay_minutes="10")
+        with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+            return AA.cmd_dismiss_stale(args)
+
+    def rereview(self, fake, head=Y):
+        args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=head, approver_login=LOGIN,
+                                  poster_login=POSTER, review_label="cursor-review", max_rounds="5")
+        with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+            return AA.cmd_auto_rereview(args)
+
+    def blocked_fake(self, **kw):
+        return FakeGitHub(card=panel_blocked_card(), reviews=[block(), REREVIEW.round_review(1, X)],
+                          labels=("cursor-review",), **kw)
+
+    def test_only_cursor_reviews_changes_requested_round_card_is_panel_blocked(self):
+        self.assertTrue(CARD.panel_blocked(panel_blocked_card()))
+        for body in (CARD.render_round(2, 5, X, "no_decision", "push_then_relabel", "No decision.", [], "x", ""),
+                     CARD.render_round(2, 5, X, "capped", "human", "Capped.", [], "x", ""),
+                     CARD.render_round(2, 5, X, "pass", "none", "Approved.", [], "", ""),
+                     red_card()):
+            self.assertFalse(CARD.panel_blocked(body))
+        forged = CARD.render_round(2, 5, X, "no_decision", "relabel", CARD.PANEL_BLOCKED_MARKER,
+                                   [CARD.PANEL_BLOCKED_MARKER], CARD.PANEL_BLOCKED_MARKER, "")
+        self.assertFalse(CARD.panel_blocked(forged), "model text cannot forge the marker")
+
+    def test_a_push_schedules_the_full_round_and_says_so(self):
+        fake = self.blocked_fake()
+        self.dismiss(fake)
+        out = self.outputs()
+        self.assertEqual((out.get("auto_rereview"), out.get("rereview_head")), ("true", Y))
+        body = fake.card["body"]
+        self.assertIn("the panel blocked the last round, so a new full round starts automatically", body)
+        self.assertIn("<!-- cursor-approve-next: relabel -->", body)
+        self.assertEqual(CARD.card_state(body), "changes_requested")
+        self.assertEqual(CARD.stale_head(body), Y)
+        self.assertTrue(CARD.panel_blocked(body))
+        # …and the auto-rereview job relabels once, from the request for
+        # changes (there is no approval to date it by).
+        self.assertEqual(self.rereview(fake), 0)
+        self.assertEqual(fake.labels, ["DELETE", "POST"])
+        self.assertIn(Y, CARD.rereview_heads(fake.card["body"]))
+
+    def test_either_flag_off_changes_nothing(self):
+        for approve_only, auto in (("false", "true"), ("true", "false")):
+            with self.subTest(approve_only=approve_only, auto=auto):
+                fake = self.blocked_fake()
+                self.dismiss(fake, approve_only=approve_only, auto=auto)
+                self.assertEqual(fake.patches, [])
+                self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
+    def test_no_round_for_a_hand_off_veto_draft_cap_or_label_free_caller(self):
+        cases = {
+            "hand-off": (dict(labels=("cursor-review", "needs-human-review")), {}),
+            "veto": (dict(labels=("cursor-review", "skip-cursor-review")), {}),
+            "draft": (dict(draft=True), {}),
+            "no relabel token": ({}, dict(can_relabel="false")),
+            "run_without_label": ({}, dict(run_without_label="true")),
+            "at the cap": ({}, dict(max_rounds="1")),
+        }
+        for name, (fake_kw, kw) in cases.items():
+            with self.subTest(name):
+                labels = fake_kw.pop("labels", ("cursor-review",))
+                fake = FakeGitHub(card=panel_blocked_card(), reviews=[block(), REREVIEW.round_review(1, X)],
+                                  labels=labels, **fake_kw)
+                self.dismiss(fake, **kw)
+                self.assertNotEqual(self.outputs().get("auto_rereview"), "true", name)
+
+    def test_the_head_must_have_moved_and_have_no_round_of_its_own(self):
+        fake = FakeGitHub(head=X, card=panel_blocked_card(), reviews=[block()], labels=("cursor-review",))
+        self.dismiss(fake)
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+        fake = FakeGitHub(card=panel_blocked_card(), reviews=[block(), REREVIEW.round_review(5, Y)],
+                          labels=("cursor-review",))
+        self.dismiss(fake)
+        self.assertEqual(self.outputs().get("auto_rereview"), "false")
+
+    def test_an_untrusted_or_capped_round_never_restarts(self):
+        for state, nxt in (("no_decision", "push_then_relabel"), ("capped", "human")):
+            with self.subTest(state):
+                card = CARD.render_round(2, 5, X, state, nxt, "x", [], "y", "")
+                fake = FakeGitHub(card=card, reviews=[block()], labels=("cursor-review",))
+                self.dismiss(fake)
+                self.assertEqual(self.outputs().get("auto_rereview"), "false")
+                self.assertEqual(fake.patches, [])
+
+    def test_a_panel_blocked_card_is_never_re_checked_by_the_axes_alone(self):
+        # The two paths are exclusive by state: no lane marker, no approve-only.
+        self.run_stage(self.blocked_fake(), "check")
+        self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_no_readable_decision_means_no_relabel(self):
+        fake = self.blocked_fake()
+        self.dismiss(fake)
+        fake.reviews = [REREVIEW.round_review(1, X)]
+        self.rereview(fake)
+        self.assertEqual(fake.labels, [])
+
+
 class WorkflowWiringTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -3402,6 +3402,9 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     approved, stale_for = card.reviewed_sha(body), card.stale_head(body)
     if not approved:
         return
+    if card.panel_blocked(body):
+        schedule_panel_rereview(args, pr, reviews, live_head, vetoed, human_review, found, body, approved)
+        return
     standing = [r for r in reviews if isinstance(r, dict) and r.get("id") not in withdrawn]
     if not stale_for and carried_approval_stands(standing, login, live_head, live_base, approved):
         # BE-20585: the approval moved to the live head with the PR's own
@@ -3478,6 +3481,53 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     if auto:
         set_output("auto_rereview", "true")
         set_output("rereview_head", live_head)
+
+
+def schedule_panel_rereview(args, pr: dict, reviews: list, live_head: str, vetoed, human_review: bool,
+                            found: dict, body: str, reviewed: str) -> None:
+    """A push on a round whose PANEL blocked: schedule the full round itself.
+
+    Only with `approve_only_on_push` AND `auto_rereview_after_dismissal` on,
+    and only for the card cursor-review's own decide wrote for a round it
+    requested changes on (card.PANEL_BLOCKED_MARKER — never an untrusted or
+    capped round, never a card the axes wrote, which `approve-only` handles).
+    Everything `mark_card_stale`'s own scheduling requires holds here too: the
+    head moved off the reviewed commit and has no round of its own yet, no
+    automatic round ran for it, the PR is not a draft and carries neither veto
+    nor hand-off, the caller is label-gated and can relabel, and the round
+    count is readable and under `max_rounds`. Anything else leaves the card's
+    "fix, resolve, relabel" as it is — today's behaviour. Then the same
+    `auto-rereview` job relabels after the debounce, re-reading it all.
+    """
+    card = _load_card()
+    login = (args.approver_login or "").strip()
+    if not (_true(getattr(args, "approve_only", "")) and _true(getattr(args, "auto_rereview", ""))):
+        return
+    if (not SHA_HEX_RE.fullmatch(live_head or "") or live_head == reviewed or vetoed or human_review
+            or pr.get("draft") or not _true(getattr(args, "can_relabel", ""))
+            or _true(getattr(args, "run_without_label", ""))):
+        return
+    if live_head in card.rereview_heads(body) or head_already_reviewed(reviews, live_head):
+        return
+    max_rounds = _max_rounds(args)
+    rounds = rounds_so_far(args, reviews) if max_rounds else 0
+    if rounds is None or (max_rounds and rounds >= max_rounds):
+        return
+    label = getattr(args, "review_label", "") or ""
+    new = card.render_panel_blocked_stale(
+        body, live_head, card.next_panel_rereview_text(label, getattr(args, "auto_rereview_delay_minutes", 0)))
+    if card.stale_head(body) != live_head and new.strip() != body.strip():
+        try:
+            card.upsert(args.repo, args.pr_number, login, new, card=found)
+        except (RuntimeError, ValueError) as e:
+            # Nothing announced the round, so nothing starts one either.
+            print(f"::warning::Could not mark the cursor-approve card for a new round: "
+                  f"{annotation_cause(e, 'unknown error')}")
+            return
+        emit(f"Auto-approve: the panel blocked `{reviewed[:7]}` and the head moved to `{live_head[:7]}` — "
+             "a full round is scheduled.")
+    set_output("auto_rereview", "true")
+    set_output("rereview_head", live_head)
 
 
 def relabel_review_label(repo: str, pr_number, label: str):
@@ -3582,6 +3632,10 @@ def cmd_auto_rereview(args) -> int:
         return skip("this head already had a review round, so a relabel would be skipped as a duplicate")
     approval = approval_of(reviews, args.approver_login, card.reviewed_sha(body) or "")
     since = (approval or {}).get("submitted_at")
+    if approval is None and card.panel_blocked(body):
+        # A panel-blocked round approved nothing: its decision is the
+        # approver's request for changes (`schedule_panel_rereview`).
+        since = _last_decision_at(reviews, args.approver_login)
     if not isinstance(since, str) or not since:
         return skip("the approval the card reports could not be read, so a round in flight cannot be ruled out")
     if labeled_after(timeline, label, since):

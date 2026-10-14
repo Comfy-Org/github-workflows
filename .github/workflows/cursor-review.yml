@@ -326,6 +326,9 @@ on:
           `bot_app_id` or APPROVER_TOKEN to relabel. No effect without
           `approve_max_severity`, for an author `approve_authors` does not
           list, or under `run_without_label` (the push starts that round).
+          With `approve_only_on_push` on too, a push on a round whose panel
+          blocked (its card carries the panel-blocked marker) is scheduled the
+          same way, though no approval was dismissed.
         type: boolean
         required: false
         default: false
@@ -395,7 +398,11 @@ on:
           relabelled. Relabelling still runs a full round. Needs
           APPROVER_TOKEN, `approve_max_severity` and `pull_request_target`
           (the caller's cursor-approve jobs need all three anyway); no effect
-          under `run_without_label` (the push starts that round). Default false.
+          under `run_without_label` (the push starts that round). With
+          `auto_rereview_after_dismissal` on as well, a push on a round whose
+          PANEL blocked (cursor-review's own decide requested changes — never an
+          untrusted or capped round) starts a full round itself instead, through
+          the same debounced `auto-rereview` relabel. Default false.
         type: boolean
         required: false
         default: false

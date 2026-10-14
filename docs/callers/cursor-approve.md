@@ -244,6 +244,22 @@ automatically if it can. The `state` / `next` markers keep their meanings.
 With `prior_rounds`, a re-check's axes see this round's verdict on the commit
 before the push as their prior.
 
+The other state a push can land on is a round the **panel** blocked —
+cursor-review's own decide requested changes on its findings, or on an earlier
+round's open thread above the threshold. Only that card carries
+`<!-- cursor-approve-panel: blocked -->` (an untrusted `no_decision` round and
+a `capped` one never do, and model text cannot forge it). With
+`approve_only_on_push` and `auto_rereview_after_dismissal` both on, a push there
+schedules a **full** round: the card keeps `changes_requested`, `next` becomes
+`relabel`, the next step reads "the panel blocked the last round, so a new full
+round starts automatically at HH:MM UTC…", and it gains the stale-head marker.
+The `auto-rereview` job then relabels exactly as after a dismissal — same
+debounce, once per head, under `max_rounds`, never on a draft, a veto or the
+hand-off — dating "a round in flight" from the approver's last decision (its
+request for changes), since no approval exists. The two paths are exclusive by
+state: a lane card goes to the approver-only re-check, a panel-blocked card to
+the full round.
+
 ### Why a relabel alone is not always enough (BE-19527)
 
 The gate's `dup` step skips any head that already carries a bot-posted
