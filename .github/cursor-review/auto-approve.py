@@ -16,7 +16,10 @@ Five subcommands, each run from a job that checks out NO PR code:
     that card (BE-20246). On a PR's first round there is no card yet, so it
     creates a pending one just before the review (``review_card_url``): a
     review edited afterwards to add the link would read as stale, or never be
-    withdrawn.
+    withdrawn. An APPROVE (here or in ``approve-external``) also records the
+    merge base its round diffed against, once GitHub's compare API and the
+    round's sentinel agree on it (``approval_merge_base``, BE-20585): the only
+    baseline ``dismiss-stale`` will carry it forward from.
 
 ``dismiss-stale`` (in `dismiss-stale-approval`, on every same-repo
 `pull_request` event of an open PR; ``--all-approvals`` on a base retarget)
@@ -42,6 +45,15 @@ Five subcommands, each run from a job that checks out NO PR code:
     ``needs-human-review``, or with ``--threshold ''`` (the caller's
     ``approve_max_severity`` is empty), this identity's own marked, unedited
     REQUEST_CHANGES are dismissed too (``withdraw_handed_off_blocks``).
+    With ``--carry-forward true`` (the workflow's `carry_forward_unchanged_diff`,
+    BE-20585) this identity's latest verdict, when it is a stale approval, is
+    first offered to ``try_carry_forward``: when the PR's own changes are
+    identical to the ones a round reviewed (from the merge base that approval
+    recorded) — a rebase or re-merge onto a moved base, or a retarget once a
+    lower stacked PR landed — the approval is re-posted on the live head, and
+    only then is the stale one dismissed. Only under ``--event-name
+    pull_request_target``; the carry-forward section below lists every
+    condition.
 
 ``round-cap`` (in `round-cap`, before the panel starts)
     Count the consolidated reviews the posting identity has already left on
@@ -212,6 +224,17 @@ REVIEWED_SHA_RE = re.compile(r"<!-- cursor-review-auto-approve:sha=([0-9a-f]{40}
 # close the HTML comment early. dismiss-stale withdraws an approval whose
 # recorded base is no longer the PR's base.
 BASE_MARKER_RE = re.compile(r"<!-- cursor-review-auto-approve-base:([0-9a-f]*) -->")
+# The merge base the approving round diffed against (BE-20585), written by the
+# approver identity at approval time and only once GitHub's compare API and that
+# round's own sentinel agree on it (approval_merge_base). With the carried
+# record below, the only baseline carry-forward will compare against; read from
+# the body's leading marker lines alone (leading_markers).
+MERGE_BASE_MARKER_RE = re.compile(r"<!-- cursor-review-auto-approve-merge-base:([0-9a-f]{40}) -->")
+# A carried-forward approval (BE-20585) copies the commit a round actually
+# reviewed and that round's merge base from the approval it carries, so the next
+# carry compares against what a reviewer read — never against the previous
+# carry's head.
+CARRIED_MARKER_RE = re.compile(r"<!-- cursor-review-auto-approve-carried:([0-9a-f]{40}):([0-9a-f]{40}) -->")
 # post-review.py prefixes every inline comment with `<emoji> **<Label>** — `.
 BADGE_RE = re.compile(r"^\S+\s+\*\*(Critical|High|Medium|Low|Nit)\*\*\s+—")
 
@@ -1603,12 +1626,14 @@ def discard_pending_card(args) -> None:
 
 
 def render_body(event: str, reasons: list, threshold: str, blocking: list, reviewed_sha: str = "",
-                base_ref: str = "", card_url: str = "") -> str:
+                base_ref: str = "", card_url: str = "", merge_base: str = "") -> str:
     lines = [APPROVE_MARKER]
     if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
         lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
     if base_ref:
         lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    if event == APPROVE and SHA_HEX_RE.fullmatch(merge_base or ""):
+        lines.append(f"<!-- cursor-review-auto-approve-merge-base:{merge_base} -->")
     lines.append("### 🤖 Cursor Review — auto-approve")
     if event == APPROVE:
         lines.append(f"✅ Approved: {reasons[0]}. A new push or a base retarget dismisses this approval.")
@@ -2002,13 +2027,19 @@ def cmd_decide(args) -> int:
                              why, next_text, threshold)
         return rc
 
+    # BE-20585: an APPROVE records the merge base its round diffed against —
+    # once GitHub and the round's sentinel agree on it — as the only baseline a
+    # later carry-forward compares against. Never fatal: without it, the
+    # approval simply never carries.
+    merge_base = approval_merge_base(args, pr) if event == APPROVE else ""
     # Rendered once before the card is looked up: a body that cannot be
     # rendered posts no review, and a first round's pending card created for
     # it would never be replaced by this round's.
-    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref)
+    body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, merge_base=merge_base)
     card_url = review_card_url(args)
     if card_url:
-        body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, card_url)
+        body = render_body(event, reasons, threshold, blocking, args.commit_sha, args.base_ref, card_url,
+                           merge_base=merge_base)
     if event == APPROVE and not REVIEWED_SHA_RE.search(body):
         # The recorded SHA is the only staleness anchor an approval has (see
         # REVIEWED_SHA_RE), and render_body drops the marker for anything that is
@@ -2569,6 +2600,532 @@ def annotation_cause(error, fallback: str) -> str:
     return text if len(text) <= ANNOTATION_CAUSE_MAX else text[:ANNOTATION_CAUSE_MAX - 1] + "…"
 
 
+# --- carry-forward (BE-20585): an approval outlives a push that left the PR's
+# own changes alone --------------------------------------------------------------
+#
+# On a stack, a change to a lower PR reaches the PRs above it as a re-merge or
+# a rebase, and a partial stack merge retargets and rebases the rest. Each one
+# moves the head or the base, so the approval above goes stale although the
+# changes it approved are the same, and a full round re-reads them. With
+# `--carry-forward true`, dismiss-stale compares what a round reviewed with
+# what the PR changes now and, when they are identical, re-posts the approval
+# on the live head before dismissing the stale one.
+#
+# What it trusts, and nothing else — no record the bot identity posted:
+# * the approval: this identity's, marked, unedited, recording the commit it
+#   approved — the same reading `_stale_approvals` takes — and this identity's
+#   LATEST verdict on the PR. GitHub counts a reviewer's newest review, so an
+#   approval carried past a newer request for changes (a later round's, or a
+#   standing block) would overrule it;
+# * the baseline, i.e. what a round actually diffed, from records this identity
+#   signed and nobody else can write: the merge base the approval recorded
+#   (MERGE_BASE_MARKER_RE), or — for an approval that was itself carried — the
+#   commit and merge base it copied forward (CARRIED_MARKER_RE). Read from the
+#   body's leading marker lines only. An approval that records neither (every
+#   one posted before this, and any whose merge base could not be confirmed)
+#   never carries. The merge base is recorded at approval time
+#   (approval_merge_base) only when GitHub's compare API computes it and the
+#   round's own sentinel names the same commit: the bot-posted sentinel can
+#   veto a record, never supply one;
+# * the compare API, read with the job's own token, which must also show that
+#   baseline is an ancestor of the reviewed commit (`status` "ahead",
+#   `behind_by` 0), file by file: name, previous name, status, and the patch
+#   with each hunk header's line numbers dropped — but the heading after them
+#   kept, and each later hunk's distance from the one before it — context
+#   lines kept. Anything it cannot vouch for fails closed: 300+ files (the
+#   API's cap), a file with no or an empty patch (binary, or too large) other
+#   than a pure rename, an empty diff, a read error. The compare API reports
+#   no file modes, so a mode flip riding on an otherwise identical file is not
+#   seen;
+# * the threshold the approval was granted under (`_Threshold:`, copied into
+#   every carry): a caller that tightened `approve_max_severity` since gets a
+#   round, not a carry, and an approval that records none is never carried.
+# It compares the PR's own changes, not what they sit on: a base that lost
+# code the PR relied on (a lower PR closed unmerged, the PR rebased onto the
+# trunk) still carries.
+# It posts only under `pull_request_target`, only for an author the approval
+# lane admits and with a threshold set, only on an open, non-draft PR whose
+# labels it read and found neither a veto nor the hand-off on, never as
+# `github-actions[bot]` (any workflow's GITHUB_TOKEN posts as that login), and
+# only while no approval by this identity already stands on the live head.
+# After the POST it re-reads the PR and its reviews, and withdraws the new
+# approval if the head, base, labels or state moved, the approval it carries
+# was dismissed or edited, or a newer request for changes by this identity
+# landed. A POST that failed ambiguously (a timeout, no review id) re-lists the
+# reviews and withdraws any carried approval of the live head it may have
+# landed anyway. A withdrawal that fails turns the job red.
+
+COMPARE_FILE_CAP = 300
+COMPARE_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@(.*)$")
+# Identities whose reviews prove nothing: any workflow's GITHUB_TOKEN posts as it.
+UNTRUSTED_POSTERS = ("github-actions[bot]",)
+# The `approve_max_severity` an approval was granted under, as render_body (and
+# render_carried_body, which copies it forward) writes it.
+APPROVED_THRESHOLD_RE = re.compile(r"^_Threshold: `(" + "|".join(ALLOWED_THRESHOLDS) + r")` ", re.M)
+CARRIED_MESSAGE = ("Carried forward to `{head}`: this PR's own changes are identical to the ones reviewed, so the "
+                   "approval moved to the live head.")
+
+
+def carried_message(head: str) -> str:
+    return CARRIED_MESSAGE.format(head=(head or "?")[:7])
+
+
+def leading_markers(body) -> str:
+    """The HTML-comment lines a review body opens with, where every marker this
+    module writes sits. Read from here alone, a record cannot be supplied by text
+    further down the body — a reason, a quoted path."""
+    lines = []
+    for line in _lf(body).split("\n"):
+        if not (line.startswith("<!-- ") and line.endswith(" -->")):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def gh_read(args: list) -> str:
+    """`gh` as the job's own token (``FALLBACK_TOKEN``) when the step provides one.
+
+    The compare API needs `contents: read`, which the job token has and an
+    approver token scoped to reviews may not. Without one, the ambient token."""
+    token = os.environ.get("FALLBACK_TOKEN", "")
+    if not token:
+        return gh(args)
+    saved = os.environ.get("GH_TOKEN")
+    os.environ["GH_TOKEN"] = token
+    try:
+        return gh(args)
+    finally:
+        if saved is None:
+            os.environ.pop("GH_TOKEN", None)
+        else:
+            os.environ["GH_TOKEN"] = saved
+
+
+def compare(repo: str, base: str, head: str):
+    """GitHub's three-dot compare of `head` against `base` (gh_read), or None."""
+    try:
+        data = json.loads(gh_read(["api", f"repos/{repo}/compare/{base}...{head}"]))
+    except (RuntimeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def is_ancestor_compare(data) -> bool:
+    """Whether a compare shows its base as an ancestor of its head: `status`
+    "ahead" with `behind_by` 0 (an equal pair has nothing to compare)."""
+    behind = data.get("behind_by") if isinstance(data, dict) else None
+    return (isinstance(data, dict) and data.get("status") == "ahead"
+            and isinstance(behind, int) and not isinstance(behind, bool) and behind == 0)
+
+
+def own_changes(data):
+    """The changes a compare lists (`head` over its merge base with `base`),
+    normalized for comparison — or None when it cannot vouch for every file."""
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list) or not files or len(files) >= COMPARE_FILE_CAP:
+        return None
+    out = []
+    for f in files:
+        if not isinstance(f, dict) or not isinstance(f.get("filename"), str):
+            return None
+        status = f.get("status") if isinstance(f.get("status"), str) else ""
+        previous = f.get("previous_filename") if isinstance(f.get("previous_filename"), str) else ""
+        patch = f.get("patch")
+        if not isinstance(patch, str) or not patch:
+            # Binary, or a patch too large to return: nothing to compare. A pure
+            # rename has no patch and nothing in it to differ.
+            if status == "renamed" and f.get("changes") == 0:
+                patch = ""
+            else:
+                return None
+        out.append((f["filename"], previous, status, normalize_patch(patch)))
+    return sorted(out)
+
+
+def normalize_patch(patch: str) -> str:
+    """`patch` with each hunk header's line numbers dropped — a moved base shifts
+    them — but its heading (the enclosing function) kept, and each later hunk's
+    distance from the one before it: the same lines changed at another spot
+    with the same context are a different change."""
+    lines, prev_end = [], None
+    for line in patch.split("\n"):
+        hunk = COMPARE_HUNK_RE.match(line)
+        if not hunk:
+            lines.append(line)
+            continue
+        start = int(hunk.group(1))
+        length = 1 if hunk.group(2) is None else int(hunk.group(2))
+        gap = "" if prev_end is None else str(start - prev_end)
+        lines.append(f"@@ {gap} @@{hunk.group(3)}")
+        prev_end = start + length
+    return "\n".join(lines)
+
+
+def round_merge_base(reviews: list, poster_login: str, head: str) -> str:
+    """The merge base the latest round on `head` says it diffed against, or "".
+
+    The sentinel of the latest consolidated review `poster_login` left whose
+    sentinel names `head` — never `github-actions[bot]`'s, never a body that
+    reviewed nothing (NON_ROUND_BANNERS: the error review fences imported
+    CLI/judge text at column 0, where a line can pass for a sentinel, and
+    build-ledger.py refuses that shape for the same reason), and none at all
+    when an edited review by `poster_login` is newer. Bot-posted, so only ever
+    a cross-check on GitHub's own answer (approval_merge_base)."""
+    poster = (poster_login or "").strip().lower()
+    if not poster or poster in UNTRUSTED_POSTERS or not SHA_HEX_RE.fullmatch(head or ""):
+        return ""
+    marker = _load_post_review().CONSOLIDATED_MARKER
+    latest, edited = None, []
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        if ((r.get("user") or {}).get("login") or "").lower() != poster:
+            continue
+        rid, body = _review_id(r), _lf(r.get("body"))
+        if rid is None:
+            continue
+        # An edited body's sentinel says nothing, not even which commit it
+        # reviewed — perhaps this one: it rules out every older round.
+        if r.get("edited"):
+            edited.append(rid)
+            continue
+        if not body.startswith(marker) or any(b in body for b in NON_ROUND_BANNERS):
+            continue
+        match = ROUND_SENTINEL_RE.search(body)
+        try:
+            payload = json.loads(match.group(1)) if match else None
+        except (ValueError, RecursionError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("head") == head and (latest is None or rid > latest[0]):
+            latest = (rid, payload.get("merge_base"))
+    # The LATEST round's record or none: an older round's says nothing about
+    # what the newest one diffed.
+    if latest is None or any(rid > latest[0] for rid in edited):
+        return ""
+    merge_base = latest[1]
+    return merge_base if isinstance(merge_base, str) and SHA_HEX_RE.fullmatch(merge_base) else ""
+
+
+def approval_merge_base(args, pr) -> str:
+    """The merge base an approval of `args.commit_sha` records (BE-20585), or "".
+
+    GitHub computes it — `compare/{live base sha}...{commit}`, its
+    `merge_base_commit` — and the round's own sentinel must name the same
+    commit (round_merge_base). Only then does this identity record it in the
+    approval it signs, as the one baseline a later carry-forward compares
+    against. Anything missing, unreadable or in disagreement records nothing:
+    the approval is posted all the same, and simply never carries."""
+    poster = (getattr(args, "poster_login", "") or "").strip()
+    if not poster or poster.lower() in UNTRUSTED_POSTERS:
+        return ""  # no round review can confirm one: not even worth a read
+    try:
+        merge_base, why = _approval_merge_base(args, pr, poster)
+    except Exception as e:  # noqa: BLE001 — the record is optional; it must never cost the approval
+        merge_base, why = "", f"it could not be read ({annotation_cause(e, 'unknown error')})"
+    if merge_base:
+        print(f"Auto-approve: this approval records merge base {merge_base[:7]}, which GitHub's compare API and "
+              "the round's sentinel agree on.")
+    else:
+        print(f"Auto-approve: this approval records no merge base, so it will not carry forward: {why}.")
+    return merge_base
+
+
+def _approval_merge_base(args, pr, poster: str):
+    head = (getattr(args, "commit_sha", "") or "").lower()
+    base_sha = _str_field(pr, "base", "sha") if isinstance(pr, dict) else ""
+    if not SHA_HEX_RE.fullmatch(head) or not SHA_HEX_RE.fullmatch(base_sha):
+        return "", "the live base or head could not be read"
+    recorded = round_merge_base(list_reviews(args.repo, args.pr_number), poster, head)
+    if not recorded:
+        return "", f"the latest round review by {poster} on {head[:7]} names none, or a newer one was edited"
+    data = compare(args.repo, base_sha, head)
+    commit = data.get("merge_base_commit") if isinstance(data, dict) else None
+    computed = commit.get("sha") if isinstance(commit, dict) else None
+    if not isinstance(computed, str) or not SHA_HEX_RE.fullmatch(computed):
+        return "", "GitHub's compare API did not answer with one"
+    if computed != recorded:
+        return "", f"GitHub computes {computed[:7]} but the round's sentinel names {recorded[:7]}"
+    return computed, ""
+
+
+def carry_baseline(approval: dict):
+    """(reviewed commit, merge base) for `approval`, read only from what this
+    identity signed in its leading marker lines: the record of an approval that
+    was itself carried, else the merge base the approval recorded with the
+    commit it approved. None when it records neither, so it never carries."""
+    markers = leading_markers(approval.get("body"))
+    carried = CARRIED_MARKER_RE.search(markers)
+    if carried:
+        return carried.group(1), carried.group(2)
+    approved, recorded = REVIEWED_SHA_RE.search(markers), MERGE_BASE_MARKER_RE.search(markers)
+    if approved and recorded:
+        return approved.group(1), recorded.group(1)
+    return None
+
+
+def latest_verdict(reviews: list, login: str):
+    """`login`'s newest APPROVED or CHANGES_REQUESTED review — the one GitHub
+    counts for that reviewer — or None."""
+    login = (login or "").strip().lower()
+    found = None
+    for r in reviews:
+        if not isinstance(r, dict) or r.get("state") not in ("APPROVED", "CHANGES_REQUESTED"):
+            continue
+        if not login or ((r.get("user") or {}).get("login") or "").lower() != login:
+            continue
+        rid = _review_id(r)
+        if rid is not None and (found is None or rid > found[0]):
+            found = (rid, r)
+    return None if found is None else found[1]
+
+
+def carry_forward_context(args, pr, handed_off):
+    """(what a carry needs from the live PR, None) — or (None, why not) when this
+    run must not carry; (None, "") when the switch is off. Head and base come
+    from the live read itself: the event's head never stands in for it here."""
+    if not _true(getattr(args, "carry_forward", "")):
+        return None, ""
+    login = (getattr(args, "approver_login", "") or "").strip()
+    threshold = (getattr(args, "threshold", "") or "").strip()
+    event = getattr(args, "event_name", "") or ""
+    if event != "pull_request_target":
+        return None, f"it approves only under `pull_request_target`, and this run is `{event or '?'}`"
+    if not isinstance(pr, dict) or not live_labels_readable(pr):
+        return None, "the live PR, or its labels, could not be read"
+    if handed_off:
+        return None, f"the PR carries `{handed_off}`"
+    if pr.get("state") != "open" or pr.get("draft"):
+        return None, "the PR is not open and ready for review"
+    # Any workflow's GITHUB_TOKEN posts as `github-actions[bot]`, so an approval
+    # under it — and what it records — could be anyone's.
+    if not login or login.lower() in UNTRUSTED_POSTERS:
+        return None, f"approvals by `{login or '?'}` cannot vouch for what a round approved"
+    try:
+        threshold = validate_threshold(threshold)
+    except ValueError:
+        return None, "auto-approve is off or misconfigured (`approve_max_severity`)"
+    user = pr.get("user")
+    author = (user.get("login") or "") if isinstance(user, dict) else ""
+    if not author_opted_in(getattr(args, "approve_authors", ""), author):
+        return None, "`approve_authors` does not list this PR's author"
+    head, base = pr_head_base(pr)
+    base_sha = _str_field(pr, "base", "sha")
+    if not SHA_HEX_RE.fullmatch(head) or not base or not SHA_HEX_RE.fullmatch(base_sha):
+        return None, "the live head or base could not be read"
+    return {"head": head, "base": base, "base_sha": base_sha, "threshold": threshold}, ""
+
+
+def carry_card_url(args) -> str:
+    """The status card's URL for the carried approval's link, or "" (never fatal)."""
+    try:
+        card = _load_card()
+        found = card.find_card(card.list_comments(args.repo, args.pr_number), args.approver_login)
+        return safe_card_url((found or {}).get("html_url") or "")
+    except Exception:  # noqa: BLE001 — a link is a convenience; it must never cost the approval
+        return ""
+
+
+def render_carried_body(card_url: str, head: str, base_ref: str, reviewed: str, merge_base: str, from_sha: str,
+                        threshold: str) -> str:
+    """A marked approval of `head` carried forward from `from_sha`, whose own
+    changes a round reviewed at `reviewed` (diffed from `merge_base`) and
+    approved under `threshold` — the original's, never loosened by a chain."""
+    url = safe_card_url(card_url)
+    lines = [
+        APPROVE_MARKER,
+        f"<!-- cursor-review-auto-approve:sha={head} -->",
+        f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->",
+        f"<!-- cursor-review-auto-approve-carried:{reviewed}:{merge_base} -->",
+        f"Approved, see the [cursor-approve card]({url})." if url else "Approved, see the cursor-approve card.",
+        f"Carried forward from `{from_sha[:7]}`: only what this PR is based on changed; its own changes are "
+        f"identical to the ones reviewed at `{reviewed[:7]}`.",
+    ]
+    # Guarded as in render_body: this body is parsed back for its markers.
+    if threshold in ALLOWED_THRESHOLDS:
+        lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
+    return "\n".join(lines)
+
+
+def try_carry_forward(args, ctx: dict, approval):
+    """Re-post `approval` on the live head when the PR's own changes are still the
+    ones a round reviewed. (the new review, None) on success; (None, None) when
+    nothing was carried; (None, failure) when an approval posted here moved, or
+    an ambiguous POST may have landed one, and it could not be withdrawn again."""
+    if not isinstance(approval, dict) or approval.get("state") != "APPROVED" or approval.get("edited"):
+        return None, None
+    body = _lf(approval.get("body"))
+    approved = REVIEWED_SHA_RE.search(body)
+    if APPROVE_MARKER not in body or not approved:
+        return None, None
+    from_sha = approved.group(1)
+    # A round approves under the threshold of its day: once the caller tightens
+    # it, an approval granted under the looser one must face a round again.
+    granted = APPROVED_THRESHOLD_RE.search(body)
+    current = ctx.get("threshold")
+    if (not granted or current not in ALLOWED_THRESHOLDS
+            or SEVERITY_ORDER.index(current) > SEVERITY_ORDER.index(granted.group(1))):
+        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — it was granted under "
+             f"`approve_max_severity: {granted.group(1) if granted else '?'}`, looser than (or not provably as "
+             f"strict as) the current `{current}`.")
+        return None, None
+    baseline = carry_baseline(approval)
+    if baseline is None:
+        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — it records no merge base "
+             "its round was confirmed to have diffed against.")
+        return None, None
+    reviewed, merge_base = baseline
+    reviewed_read = compare(args.repo, merge_base, reviewed)
+    if reviewed_read is not None and not is_ancestor_compare(reviewed_read):
+        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the merge base it records, "
+             f"`{merge_base[:7]}`, is not an ancestor of the reviewed commit `{reviewed[:7]}`.")
+        return None, None
+    before = own_changes(reviewed_read)
+    after = own_changes(compare(args.repo, ctx["base_sha"], ctx["head"]))
+    if before is None or after is None:
+        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the compare API could not "
+             "vouch for every changed file (300+ files, a binary or oversized patch, or a read error).")
+        return None, None
+    if before != after:
+        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the PR's own changes differ "
+             f"from the ones reviewed at `{reviewed[:7]}`.")
+        return None, None
+    new_body = render_carried_body(carry_card_url(args), ctx["head"], ctx["base"], reviewed, merge_base, from_sha,
+                                   granted.group(1))
+    try:
+        posted = json.loads(gh(
+            ["api", "-X", "POST", f"repos/{args.repo}/pulls/{args.pr_number}/reviews", "--input", "-"],
+            {"commit_id": ctx["head"], "event": APPROVE, "body": new_body},
+        ))
+        # As approve-external: the id is what a late move dismisses by, so a
+        # `gh` that exits 0 without one is an ambiguous POST, not a success.
+        if not isinstance(posted, dict) or posted.get("id") is None:
+            raise ValueError(f"the review POST returned no review id ({type(posted).__name__})")
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Could not carry the approval of `{from_sha[:7]}` forward, so it is dismissed instead: "
+              f"{annotation_cause(e, 'unknown error')}")
+        # Ambiguous, as decide's failed POST: a timeout, or a reply with no id,
+        # may still have landed an approval that skipped the re-check below.
+        return None, withdraw_unconfirmed_carries(args, ctx["head"], _review_id(approval))
+    # The read → POST race approve-external closes: re-read after the write.
+    # The reviews too: a round deciding in that window may have requested
+    # changes, which this approval, being newer, would overrule.
+    login = (args.approver_login or "").strip()
+    try:
+        pr_now = read_pr(args.repo, args.pr_number)
+        head_now, base_now = pr_head_base(pr_now)
+        still = (head_now == ctx["head"] and base_now == ctx["base"] and live_labels_readable(pr_now)
+                 and not any(has_label(pr_now, label) for label in (*VETO_LABELS, HUMAN_REVIEW_LABEL))
+                 and pr_now.get("state") == "open" and not pr_now.get("draft"))
+        if still:
+            stale_id = _review_id(approval)
+            listed = list_reviews(args.repo, args.pr_number)
+            # The approval it carries must still stand: one dismissed (by a
+            # human, or a round withdrawing it without a block) in the read →
+            # POST window is not to be resurrected on the live head.
+            still = stale_id is not None and any(
+                _review_id(r) == stale_id and r.get("state") == "APPROVED" and not r.get("edited")
+                for r in listed) and not any(
+                r.get("state") == "CHANGES_REQUESTED" and _review_id(r) is not None and _review_id(r) > stale_id
+                and ((r.get("user") or {}).get("login") or "").lower() == login.lower()
+                for r in listed)
+    except (RuntimeError, ValueError):
+        still = False
+    if not still:
+        try:
+            dismiss(args.repo, args.pr_number, posted["id"], STALE_MESSAGE)
+        except RuntimeError as e:
+            cause = annotation_cause(e, "unknown error")
+            print(f"::error::The PR changed while the carried-forward approval was being posted, and withdrawing "
+                  f"it failed: {cause}. {DISMISS_PERMISSION_HINT}")
+            return None, f"{posted['id']}: {cause}"
+        emit("Auto-approve: the PR changed while the carried-forward approval was being posted — withdrawn again.")
+        return None, None
+    emit(f"Auto-approve: carried the approval of `{from_sha[:7]}` forward to `{ctx['head'][:7]}` — the PR's own "
+         f"changes are identical to the ones reviewed at `{reviewed[:7]}`.")
+    return {"id": posted["id"], "user": {"login": login}, "state": "APPROVED", "body": new_body, "edited": False,
+            "commit_id": ctx["head"]}, None
+
+
+def withdraw_unconfirmed_carries(args, head: str, stale_id):
+    """After an ambiguous carry POST: dismiss this identity's carried approvals
+    of `head` newer than the stale approval `stale_id`. None when none is left
+    standing, else the failure (the job goes red)."""
+    login = (args.approver_login or "").strip().lower()
+    try:
+        stray = []
+        for r in list_reviews(args.repo, args.pr_number):
+            rid, body = _review_id(r), _lf(r.get("body"))
+            sha = REVIEWED_SHA_RE.search(body)
+            if (r.get("state") == "APPROVED" and rid is not None and stale_id is not None and rid > stale_id
+                    and ((r.get("user") or {}).get("login") or "").lower() == login
+                    and CARRIED_MARKER_RE.search(body) and sha and sha.group(1) == head):
+                stray.append(rid)
+    except (RuntimeError, ValueError) as e:
+        cause = annotation_cause(e, "unknown error")
+        print(f"::error::Could not re-list reviews after an ambiguous carried-forward approval POST: {cause}.")
+        return f"re-list after an ambiguous carry POST: {cause}"
+    for rid in stray:
+        try:
+            dismiss(args.repo, args.pr_number, rid, STALE_MESSAGE)
+        except RuntimeError as e:
+            cause = annotation_cause(e, "unknown error")
+            print(f"::error::A carried-forward approval landed despite a failed POST, and withdrawing it failed: "
+                  f"{cause}. {DISMISS_PERMISSION_HINT}")
+            return f"{rid}: {cause}"
+    if stray:
+        emit(f"Auto-approve: withdrew {len(stray)} carried-forward approval(s) an ambiguous POST had landed.")
+    return None
+
+
+def carry_stale_approval(args, pr, reviews: list, ids: list, handed_off):
+    """({stale id: carried review}, [failure]) for this dismiss-stale run.
+
+    Only this identity's latest verdict is carried, and only when it is one of
+    the stale approvals: a newer request for changes (a later round's, or a
+    standing block) must not be overruled by an older approval, and one
+    approval on the live head is enough — every stale one is dismissed by the
+    caller either way. Nothing is tried while an approval by this identity
+    already stands on the head and base."""
+    if not ids:
+        return {}, []
+    ctx, why_not = carry_forward_context(args, pr, handed_off)
+    if ctx is None:
+        if why_not:
+            emit(f"Auto-approve: not carrying a stale approval forward — {why_not}.")
+        return {}, []
+    if any(rid not in ids for rid in own_approvals(reviews, args.approver_login)):
+        return {}, []
+    latest = latest_verdict(reviews, args.approver_login)
+    if latest is None or latest.get("id") not in ids:
+        newer = "a request for changes" if (latest or {}).get("state") == "CHANGES_REQUESTED" else "a review"
+        emit(f"Auto-approve: not carrying a stale approval forward — {newer} by {args.approver_login} is newer "
+             "than it.")
+        return {}, []
+    new, failure = try_carry_forward(args, ctx, latest)
+    if failure:
+        return {}, [failure]
+    return ({latest["id"]: new} if new is not None else {}), []
+
+
+def carried_approval_stands(reviews: list, login: str, head: str, base, reviewed: str) -> bool:
+    """Whether `login` has a standing, unedited approval of `head` (recorded
+    against `base`, when known) carried forward from the round that reviewed
+    `reviewed`."""
+    for r in reviews:
+        if not isinstance(r, dict) or r.get("state") != "APPROVED" or r.get("edited"):
+            continue
+        if ((r.get("user") or {}).get("login") or "").lower() != (login or "").lower():
+            continue
+        body = _lf(r.get("body"))
+        sha, carried = REVIEWED_SHA_RE.search(body), CARRIED_MARKER_RE.search(body)
+        if APPROVE_MARKER not in body or not sha or not carried:
+            continue
+        recorded = recorded_base(body)
+        if sha.group(1) == head and carried.group(1) == reviewed and (base is None or recorded == base):
+            return True
+    return False
+
+
 def cmd_dismiss_stale(args) -> int:
     # On a retarget the head is unchanged, so an approval pinned to it is
     # exactly as stale as an off-head one: select every marked approval. That
@@ -2688,9 +3245,15 @@ def cmd_dismiss_stale(args) -> int:
     others = unactionable_stale_approvals(reviews, args.approver_login, head, live_base)
     failed = []
     withdrawn = set()
+    # BE-20585: offer carry-forward the stale approvals before any is
+    # dismissed. At most one is re-posted on the live head (this identity's
+    # latest verdict, when it is one of them); every stale one is still
+    # dismissed below, as before.
+    carried, carry_failed = carry_stale_approval(args, pr if read_error is None else None, reviews, ids,
+                                                 handed_off)
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid, message)
+            dismiss(args.repo, args.pr_number, rid, carried_message(live_head) if rid in carried else message)
         except RuntimeError as e:
             # Collapsed per id: these are joined into an ::error:: annotation, and
             # each carries `gh`'s multi-line stderr.
@@ -2707,17 +3270,22 @@ def cmd_dismiss_stale(args) -> int:
         # Red, not a warning: a stale approval that stays valid is the exact
         # failure this job exists to prevent.
         print(f"::error::Could not dismiss {len(failed)} stale auto-approve review(s) ({'; '.join(failed)}). {DISMISS_PERMISSION_HINT}")
-    approval_stands = any(rid not in withdrawn for rid in own_approvals(reviews, args.approver_login))
+    approval_stands = (any(rid not in withdrawn for rid in own_approvals(reviews, args.approver_login))
+                       or bool(carried))
     blocks_failed = withdraw_handed_off_blocks(args, reviews, vetoed, human_review, approval_stands)
     # Only once every stale approval is actually withdrawn: a card that says
     # "withdrawn" over an approval still counting (and a round scheduled on
     # top of it) is worse than the old "Approved" card the red run reports.
-    if read_error is None and SHA_HEX_RE.fullmatch(live_head or "") and not failed and not others:
+    # A carried approval joins the reviews it reads, so the card keeps its
+    # approval (and schedules no round) when one stands on the live head.
+    if read_error is None and SHA_HEX_RE.fullmatch(live_head or "") and not failed and not others \
+            and not carry_failed:
         try:
-            mark_card_stale(args, pr, reviews, live_head, live_base, vetoed, human_review, withdrawn)
+            mark_card_stale(args, pr, reviews + list(carried.values()), live_head, live_base, vetoed, human_review,
+                            withdrawn)
         except Exception as e:  # noqa: BLE001 — the card is a report; never fail the dismissal for it
             print(f"::warning::Could not mark the cursor-approve card stale: {annotation_cause(e, 'unknown error')}")
-    return 1 if failed or others or blocks_failed else 0
+    return 1 if failed or others or blocks_failed or carry_failed else 0
 
 
 # --- the card after a dismissal, and the round it can start (BE-20262) -------
@@ -2833,6 +3401,13 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     body = _lf(found.get("body"))
     approved, stale_for = card.reviewed_sha(body), card.stale_head(body)
     if not approved:
+        return
+    standing = [r for r in reviews if isinstance(r, dict) and r.get("id") not in withdrawn]
+    if not stale_for and carried_approval_stands(standing, login, live_head, live_base, approved):
+        # BE-20585: the approval moved to the live head with the PR's own
+        # changes unchanged, so the card's approval of the commit the round
+        # reviewed still counts, and no round is wanted. (Not when this run
+        # withdrew that carried approval too — a veto, the hand-off.)
         return
     if not stale_for:
         approval = approval_of(reviews, login, approved) if card.card_state(body) == CARD_PASS else None
@@ -3463,16 +4038,23 @@ def external_decision_approves(decision, axes: list) -> bool:
     return all(v in ("green", "yellow", "n/a") for v in reported) and any(v != "n/a" for v in reported)
 
 
-def render_external_body(card_url: str, reviewed_sha: str, base_ref: str) -> str:
+def render_external_body(card_url: str, reviewed_sha: str, base_ref: str, threshold: str = "",
+                         merge_base: str = "") -> str:
     lines = [APPROVE_MARKER]
     if re.fullmatch(r"[0-9a-f]{40}", (reviewed_sha or "").lower()):
         lines.append(f"<!-- cursor-review-auto-approve:sha={reviewed_sha.lower()} -->")
     if base_ref:
         lines.append(f"<!-- cursor-review-auto-approve-base:{base_ref.encode('utf-8').hex()} -->")
+    if SHA_HEX_RE.fullmatch(merge_base or ""):
+        lines.append(f"<!-- cursor-review-auto-approve-merge-base:{merge_base} -->")
     if safe_card_url(card_url):
         lines.append(f"Approved, see the [cursor-approve card]({card_url}).")
     else:
         lines.append("Approved, see the cursor-approve card.")
+    # What carry-forward reads back (APPROVED_THRESHOLD_RE): an approval that
+    # records none is never carried.
+    if threshold in ALLOWED_THRESHOLDS:
+        lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
 
 
@@ -3620,7 +4202,10 @@ def cmd_approve_external(args) -> int:
             rc = 1
         return rc
 
-    body = render_external_body(args.card_url, args.commit_sha, args.base_ref)
+    # BE-20585: as cmd_decide, the merge base this approval's round diffed against.
+    body = render_external_body(args.card_url, args.commit_sha, args.base_ref,
+                                (getattr(args, "threshold", "") or "").strip().lower(),
+                                merge_base=approval_merge_base(args, pr))
     try:
         posted = json.loads(
             gh(
@@ -3848,6 +4433,10 @@ def main() -> int:
     s.add_argument("--auto-rereview-delay-minutes", default="0")
     s.add_argument("--can-relabel", default="false")
     s.add_argument("--run-without-label", default="false")
+    # BE-20585: re-approve instead of dismissing when the push left the PR's
+    # own changes identical; posts only when --event-name is pull_request_target.
+    s.add_argument("--carry-forward", default="false")
+    s.add_argument("--event-name", default="")
     q = sub.add_parser("auto-rereview")
     q.add_argument("--repo", required=True)
     q.add_argument("--pr-number", required=True)
