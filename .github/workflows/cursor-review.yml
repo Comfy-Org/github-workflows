@@ -757,7 +757,8 @@ on:
         description: >-
           The caller-repo environment that holds APPROVER_TOKEN, declared as
           `environment:` on exactly the jobs that read it (`post-review`,
-          `dismiss-stale-approval`, `auto-retry`, `auto-rereview`), on
+          `dismiss-stale-approval`, `auto-retry`, `auto-rereview`,
+          `approve-only`), on
           `pull_request_target` runs only. Give the environment a
           deployment-branch policy of the base branch only and store
           APPROVER_TOKEN as an ENVIRONMENT secret there (not a repo secret):
@@ -7638,12 +7639,15 @@ jobs:
     # starts. The card's "If none starts, re-run it by hand" covers that.
     #
     # Under `approve_only_on_push` it waits on `approve-only` and stands down
-    # when that job took the push (`eligible`): the axes re-check the head, so
-    # no full round is relabelled for it. `approve-only` is skipped (empty
-    # output) for every caller that did not opt in.
+    # only when that job actually started the re-check (`go`): the axes judge
+    # the head, so no full round is relabelled for it. Gating on `go`, not
+    # `eligible`, keeps the round when `start` stands down after the debounce
+    # (the live PR turned ineligible, or the card could not record it) —
+    # `approve_gate` is then `untrusted` and no axes run either. `approve-only`
+    # is skipped (empty output) for every caller that did not opt in.
     name: Start the next round after a dismissal
     needs: [dismiss-stale-approval, approve-only]
-    if: ${{ !cancelled() && needs.dismiss-stale-approval.outputs.auto_rereview == 'true' && needs.approve-only.outputs.eligible != 'true' }}
+    if: ${{ !cancelled() && needs.dismiss-stale-approval.outputs.auto_rereview == 'true' && needs.approve-only.outputs.go != 'true' }}
     # Every later PR event re-schedules a waiter from the stale card, so
     # waiters for one head are serialised, never run side by side: the next
     # one starts after the first has recorded its round on the card, reads

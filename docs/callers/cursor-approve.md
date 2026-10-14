@@ -238,8 +238,9 @@ card alone:
 A re-check keeps its panel round's number, so the heading still says "round N
 of M"; the line under it says "Approver-only re-check K of C for `<sha7>`".
 Before the debounce the card announces it ("Approver-only re-check of `<sha7>`
-starts at HH:MM UTC…"), and a dismissed card's next step says the new head is
-re-checked automatically. The `state` / `next` markers keep their meanings.
+starts at HH:MM UTC…"), and a dismissed card's next step leads with the
+relabel to use if the re-check cannot run, then says the new head is re-checked
+automatically if it can. The `state` / `next` markers keep their meanings.
 With `prior_rounds`, a re-check's axes see this round's verdict on the commit
 before the push as their prior.
 

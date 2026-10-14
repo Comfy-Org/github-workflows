@@ -301,6 +301,9 @@ class DismissalTextTest(Base):
             AA.cmd_dismiss_stale(args)
         body = fake.card["body"]
         self.assertIn("cursor-approve re-checks the new head automatically", body)
+        # The fallback leads: the re-check is decided after this card is written.
+        self.assertIn("If cursor-approve cannot re-check this push, remove and re-add the `cursor-review` label. "
+                      "If it can,", body)
         self.assertTrue(CARD.in_axes_lane(body))
         # The round is still asked for: the workflow stands it down only when
         # `approve-only` actually takes the push.

@@ -828,8 +828,9 @@ def next_recheck_text(label=DEFAULT_REVIEW_LABEL, delay_minutes=0, now=None) -> 
     """The dismissed card's next step when the push is re-checked by the axes
     alone (`approve_only_on_push`) rather than by a new round."""
     when = retry_delay_phrase(delay_minutes, "the latest push", now)
-    return (f"Nothing — cursor-approve re-checks the new head automatically{when} if no further commit lands "
-            f"(the axes only; the panel does not re-run). For the full panel instead, {relabel(label)}.")
+    return (f"If cursor-approve cannot re-check this push, {relabel(label)}. If it can, cursor-approve "
+            f"re-checks the new head automatically{when} if no further commit lands (the axes only; the panel "
+            f"does not re-run).")
 
 
 def next_capped_unlabelled_text() -> str:
