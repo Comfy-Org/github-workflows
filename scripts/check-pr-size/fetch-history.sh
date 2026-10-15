@@ -53,13 +53,18 @@ export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${B64}"
 # Extras reach `git fetch` as positional refspecs, so anything that is not a
 # full lower-case SHA is dropped here — a value starting with `-` would
 # otherwise be parsed as an option. They come from the ledger, which already
-# validates the shape; this is the second lock, not the first.
+# validates the shape; this is the second lock, not the first. A whole-string
+# `=~`, not a line-oriented grep, so a multi-line value cannot pass on one
+# 40-hex line; and the rejected value is never echoed, so a newline in it cannot
+# smuggle a ::workflow command:: into the log.
 EXTRAS=()
+pos=0
 for sha in "$@"; do
-  if printf '%s' "$sha" | grep -Eqx '[0-9a-f]{40}'; then
+  pos=$((pos + 1))
+  if [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
     EXTRAS+=("$sha")
   elif [ -n "$sha" ]; then
-    echo "Ignoring extra commit '${sha}': not a full 40-hex SHA." >&2
+    echo "Ignoring extra commit argument #${pos}: not a full 40-hex SHA." >&2
   fi
 done
 
@@ -99,7 +104,11 @@ fetch() {
 # Extras are fetched ONE AT A TIME and apart from BASE/HEAD: a single
 # unfetchable SHA fails a whole multi-SHA `git fetch`, and an extra must never
 # take the mandatory pair down with it. An extra already in the object store
-# (an ancestor of HEAD, the common case) is not fetched again.
+# (an ancestor of HEAD, the common case) is not fetched again. One that is
+# missing is fetched with an ABSOLUTE depth, and the boundaries that registers
+# can land inside BASE/HEAD history; that is why this runs BEFORE the
+# BASE/HEAD ladder below, which re-checks the merge base and deepens past any
+# such graft.
 FETCHED_EXTRAS=()
 fetch_extras() {
   local sha out
@@ -114,11 +123,11 @@ fetch_extras() {
     fi
   done
 }
+# `--deepen` only ever moves boundaries DEEPER, so unlike the absolute-depth
+# fetch above it cannot cut into the history the merge base was proven on.
 deepen_extras() {
-  local sha
-  for sha in "${FETCHED_EXTRAS[@]+"${FETCHED_EXTRAS[@]}"}"; do
-    git_fetch "$@" origin "$sha" >/dev/null || true
-  done
+  [ "${#FETCHED_EXTRAS[@]}" -gt 0 ] || return 0
+  git_fetch "$@" origin "${FETCHED_EXTRAS[@]}" >/dev/null || true
 }
 is_shallow() { [ "$(git rev-parse --is-shallow-repository)" = "true" ]; }
 # True when no shallow boundary is among the commits `rev-list "$@"` walks:
@@ -132,10 +141,14 @@ walk_is_complete() {
   # anyway, but the early return keeps the intent explicit.
   [ -s "$shallow_file" ] || return 0
   walked="$(git rev-list "$@" 2>/dev/null)" || return 1
-  if printf '%s\n' "$walked" | grep -qxF -f "$shallow_file"; then
-    return 1
-  fi
-  return 0
+  # A here-string, not `printf | grep -q`: under pipefail, grep -q exiting on
+  # its first match SIGPIPEs a writer still holding more than a pipe buffer of
+  # the walk, and the pipeline's non-zero status would read as "no boundary" —
+  # vouching for exactly the walk this exists to reject. Only exit 1 means "no
+  # boundary"; a grep error (2) is not proof of anything.
+  local rc=0
+  grep -qxF -f "$shallow_file" <<<"$walked" || rc=$?
+  [ "$rc" -eq 1 ]
 }
 
 # A merge base read off a SHALLOW graph can be WRONG, not merely missing:
@@ -164,8 +177,8 @@ have_merge_base() {
 # it is an ancestor of the one before it, the first of HEAD (HEAD <- last
 # reviewed head <- its recorded merge base). A YES from a shallow graph is
 # always right (a graft only removes parents); a NO is right only once no
-# boundary on the descendant's side hides a path, so an unvouched NO asks the
-# ladder for more depth. These are for PARITY with a full clone, not for
+# boundary on the descendant's side hides a path, so an unvouched NO earns one
+# bounded deepen at the end. These are for PARITY with a full clone, not for
 # safety: the step that reads the answer fails closed to "no incremental block"
 # on a NO either way. A link whose extra did not fetch is not asked.
 have_extras() {
@@ -182,7 +195,6 @@ have_extras() {
   done
   return 0
 }
-trusted() { have_merge_base && have_extras; }
 
 # The first rung is mandatory, but no more fatal than the deepen rungs below
 # it: under `set -e` a transient network or 5xx failure here would exit and
@@ -191,31 +203,31 @@ trusted() { have_merge_base && have_extras; }
 fetch --depth=100 || { sleep 3; fetch --depth=100; } || true
 fetch_extras
 
-# Deepen until the answers above are trustworthy. The distance to the fork
+# Deepen until the merge base is trustworthy. Only the BASE/HEAD pair drives
+# this ladder and the fallback below: the extras are advisory, and letting an
+# unvouched NO about them (the answer after every rebase) climb every rung and
+# unshallow the repo would put the full-history cost back on the critical path
+# for an answer its reader treats the same either way. The distance to the fork
 # point is unknown — a monorepo's base branch can be far ahead of it — and a
 # shallow graft hides the ancestry `merge-base` walks, so guessing one depth is
 # not an option. Each rung is incremental, so the cost is the depth actually
 # needed rather than the sum of the rungs, and the loop stops the moment the
 # repo stops being shallow (deepening past the root cannot help).
 for extra in 400 1600 6400; do
-  trusted && break
+  have_merge_base && break
   is_shallow || break
   # A rung that errors is NOT fatal — and must not skip the rest of the ladder
   # either. `continue` retries at the next depth; only a genuinely exhausted
   # ladder should reach the fallback below, which is the most expensive git
   # operation here.
-  deepen_extras "--deepen=${extra}"
   fetch "--deepen=${extra}" || continue
 done
 
 # Last resort: complete history — but still only for the named commits, which is
 # the part `fetch-depth: 0` got wrong. `--unshallow` refuses to run on an
 # already-complete repo, hence the guard.
-if ! trusted && is_shallow; then
-  deepen_extras --unshallow
-  if is_shallow; then
-    fetch --unshallow || fetch --depth=2147483647 || true
-  fi
+if ! have_merge_base && is_shallow; then
+  fetch --unshallow || fetch --depth=2147483647 || true
 fi
 
 # Hard-fail rather than let the tool report `could not resolve merge base` from
@@ -230,6 +242,11 @@ if ! have_merge_base; then
     echo "::error::could not resolve a trustworthy merge base of ${BASE_SHA} and ${HEAD_SHA} after fetching both commits' history"
   fi
   exit 1
+fi
+# The extras get ONE bounded deepen, after the merge base is settled and only
+# when their own answer is the one still unvouched.
+if ! have_extras && is_shallow; then
+  deepen_extras --deepen=400
 fi
 if ! have_extras; then
   echo "::warning::the ancestry of the last-reviewed commit(s) could not be fully resolved — the incremental block may be skipped this round."

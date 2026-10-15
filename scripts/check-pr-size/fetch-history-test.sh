@@ -65,7 +65,16 @@ if run "$BASE_SHA" "$HEAD_SHA" "0123456789abcdef0123456789abcdef01234567" "--upl
 else
   not_ok "unfetchable / malformed / empty extras are not fatal: $(cat "$T/out")"
 fi
-grep -q "Ignoring extra commit '--upload-pack=evil'" "$T/out" && ok "a non-SHA extra never reaches git" || not_ok "a non-SHA extra never reaches git"
+grep -q "Ignoring extra commit argument #2: not a full 40-hex SHA" "$T/out" && ok "a non-SHA extra never reaches git" || not_ok "a non-SHA extra never reaches git"
+grep -q -- '--upload-pack=evil' "$T/out" && not_ok "a rejected extra is not echoed" || ok "a rejected extra is not echoed"
+
+fresh
+if run "$BASE_SHA" "$HEAD_SHA" "$(printf '%s\n::error::x' "$LAST")" >"$T/out" 2>&1; then
+  ok "a multi-line extra is not fatal"
+else
+  not_ok "a multi-line extra is not fatal: $(cat "$T/out")"
+fi
+grep -q '^::error::x' "$T/out" && not_ok "a multi-line extra is rejected whole, never echoed" || ok "a multi-line extra is rejected whole, never echoed"
 
 fresh
 if run "$BASE_SHA" "0123456789abcdef0123456789abcdef01234567" >"$T/out" 2>&1; then

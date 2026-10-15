@@ -2652,13 +2652,8 @@ jobs:
     # matrix model list (emitted as an output the `review` matrix consumes), so
     # the validated list and the reviewed list can never drift apart.
     name: Preflight — validate model catalog
-    # Gated like `diff-size` (gate + round cap), NOT on its `within_cap`, so the
-    # two run side by side instead of this ~20 s job queueing behind the size
-    # check. It therefore also runs on an over-cap PR, where nothing consumes
-    # its outputs; the panel cells still `needs:` both, and each repeats the
-    # `within_cap` condition itself.
-    needs: [gate, round-cap]
-    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.round-cap.outputs.capped != 'true'
+    needs: [gate, diff-size]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 10
     permissions:
