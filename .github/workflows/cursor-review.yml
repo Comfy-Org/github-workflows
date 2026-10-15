@@ -490,7 +490,12 @@ on:
           changes; requires the `ANTHROPIC_API_KEY` secret and a plain id
           (`[A-Za-z0-9._-]`) other than `openai_direct_model`'s, and set
           without any of those, preflight warns, the cells stay off and the
-          panel is unchanged. Unlike the OpenAI cells,
+          panel is unchanged. The same holds for a key that is present but
+          UNUSABLE: `gate` probes it with one 1-token call each round, and a
+          usage-limit, billing or 401/403 refusal, or 429/529/5xx after
+          retries, keeps the Cursor `claude-*` cells for that run, with a
+          warning, a job summary line and a note under the review header; an
+          unknown model id fails the run instead. Unlike the OpenAI cells,
           which see the diff only, the agent also reads a read-only checkout of
           the PR with Read, Grep and Glob alone — no Bash or other
           code-running tool — and `--restricted` confines those file tools to
@@ -531,7 +536,8 @@ on:
           instead of `judge_model` through Cursor. Empty (default) = the judge
           stays on Cursor and nothing changes. Requires a plain id
           (`[A-Za-z0-9._-]`, at most 100) and the key; set without either,
-          preflight warns and the Cursor judge runs. Same prompt, same
+          preflight warns and the Cursor judge runs — as it does when `gate`'s
+          probe finds the key unusable (see `anthropic_direct_model`). Same prompt, same
           structured-output tool, same timeout and same degraded panel-union
           fallback as the Cursor judge. The agent reads the PR checkout with
           Read, Grep and Glob alone — no Bash or other code-running tool —
@@ -798,8 +804,10 @@ on:
           Anthropic API key for the optional direct-API Anthropic review cells
           and direct judge. Required only when the `anthropic_direct_model` or
           `judge_direct_model` input is set; ignored otherwise. Only the gate
-          (a presence check), the direct cells and the `judge-direct` job read
-          it, all on GitHub-hosted `ubuntu-latest`. Use a key scoped to its
+          (a presence check and a 1-token usability probe), the direct cells
+          and the `judge-direct` job read it, all on GitHub-hosted
+          `ubuntu-latest`. A key the probe finds capped or refused puts those
+          lanes on Cursor for that run. Use a key scoped to its
           own Anthropic workspace with a spend limit, never a personal key —
           the cells and judge bill per call against it directly rather than
           against a pooled seat.
@@ -968,6 +976,13 @@ jobs:
       approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
       openai_key_present: ${{ steps.openai_key.outputs.present }}
       anthropic_key_present: ${{ steps.anthropic_key.outputs.present }}
+      # Whether the key is USABLE, per lane: usable / unusable / invalid, or
+      # empty when not probed. See `Probe the direct Anthropic key`.
+      anthropic_cells_probe: ${{ steps.anthropic_probe.outputs.cells_probe }}
+      anthropic_cells_probe_reason: ${{ steps.anthropic_probe.outputs.cells_probe_reason }}
+      anthropic_judge_probe: ${{ steps.anthropic_probe.outputs.judge_probe }}
+      anthropic_judge_probe_reason: ${{ steps.anthropic_probe.outputs.judge_probe_reason }}
+      anthropic_fallback_note: ${{ steps.anthropic_probe.outputs.fallback_note }}
     steps:
       - name: Resolve OPENAI_API_KEY presence
         # A boolean for `preflight`, which cannot read the secret itself: it
@@ -1321,6 +1336,127 @@ jobs:
             echo "No prior review for $HEAD_SHA — proceeding."
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Probe the direct Anthropic key
+        # Presence is not usability: a key whose organization hit its usage
+        # limit (an HTTP 400 naming the reset time), ran out of credit, or was
+        # revoked fails every direct cell and the direct judge, and the round
+        # ends with no decision. One 1-token Messages call per configured model
+        # tells, so `preflight` can treat an UNUSABLE key exactly like an absent
+        # one (the Cursor cells and the Cursor judge run). An unknown model id
+        # is `invalid` — preflight fails the run on it, never falls back on a
+        # typo. 429 / 529 / 5xx / no answer are retried, then read as unusable.
+        # Here, not in `preflight`, for the reason the presence steps above
+        # give: this job is GitHub-hosted and checks out nothing. Only for a
+        # round that will run. The script is byte-identical to
+        # cursor-axis-base.yml's `Probe the direct Anthropic key` (a test pins
+        # it); it never prints the key or any header. Best effort: a crash
+        # here leaves the outputs empty, which preflight reads as "not probed".
+        id: anthropic_probe
+        if: steps.check.outputs.should_run == 'true' && steps.dup.outputs.already_reviewed != 'true' && steps.anthropic_key.outputs.present == 'true'
+        continue-on-error: true
+        # Two models at worst: 2 x (3 x 20 s + 60 s) = 4 minutes.
+        timeout-minutes: 5
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_PROBE_URL: https://api.anthropic.com/v1/messages
+          PROBE_RETRY_DELAYS: '15 45'
+          PROBE_LANES: cells judge
+          PROBE_MODEL_CELLS: ${{ inputs.anthropic_direct_model }}
+          PROBE_MODEL_JUDGE: ${{ inputs.judge_direct_model }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, time, urllib.error, urllib.request
+
+          KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+          DELAYS = [int(d) for d in os.environ.get("PROBE_RETRY_DELAYS", "").split()]
+
+
+          def clean(text):
+              """One printable line of API text, the key redacted, bounded."""
+              text = str(text)
+              if KEY:
+                  text = text.replace(KEY, "***")
+              return re.sub(r"[^\x20-\x7e]+", " ", text).strip()[:300]
+
+
+          def call(model):
+              """(status or None, error type, error message) for one request."""
+              body = json.dumps({"model": model, "max_tokens": 1,
+                                 "messages": [{"role": "user", "content": "ping"}]}).encode()
+              request = urllib.request.Request(
+                  os.environ["ANTHROPIC_PROBE_URL"], data=body, method="POST",
+                  headers={"x-api-key": KEY, "anthropic-version": "2023-06-01",
+                           "content-type": "application/json"})
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return response.status, "", ""
+              except urllib.error.HTTPError as e:
+                  # Only the JSON body is read: never the headers, never str(e).
+                  try:
+                      error = json.loads(e.read(65536).decode("utf-8", "replace")).get("error") or {}
+                  except (ValueError, AttributeError, OSError):
+                      error = {}
+                  if not isinstance(error, dict):
+                      error = {}
+                  return e.code, clean(error.get("type", "")), clean(error.get("message", ""))
+              except (urllib.error.URLError, OSError, ValueError) as e:
+                  return None, "", clean(f"no answer ({type(e).__name__})")
+
+
+          def classify(status, etype, message):
+              """usable / unusable / invalid / retry, and the reason class."""
+              lowered = message.lower()
+              if status is not None and 200 <= status < 300:
+                  return "usable", "ok"
+              if status == 402 or etype == "billing_error" or "credit balance" in lowered:
+                  return "unusable", "billing"
+              if status == 400 and "usage limit" in lowered:
+                  return "unusable", "usage-limit"
+              # An unknown id is a 404; a 400 counts only when it says the
+              # model is unknown. Any other 400 is unusable, not a config error.
+              if status == 404 or (status == 400 and re.search(r"\bmodel\b", lowered) and any(
+                      word in lowered for word in ("not found", "invalid", "unknown", "does not exist"))):
+                  return "invalid", "unknown-model"
+              if status in (401, 403):
+                  return "unusable", "unauthorized"
+              if status is None or status in (408, 429) or status >= 500:
+                  return "retry", "unavailable"
+              return "unusable", f"http-{status}"
+
+
+          def probe(model):
+              for attempt in range(len(DELAYS) + 1):
+                  status, etype, message = call(model)
+                  verdict, reason = classify(status, etype, message)
+                  print(f"probe {model}: attempt {attempt + 1} -> HTTP {status or '-'} ({reason})")
+                  if verdict != "retry":
+                      break
+                  if attempt < len(DELAYS):
+                      time.sleep(DELAYS[attempt])
+              else:
+                  verdict = "unusable"
+              detail = f"{reason}: {message}" if message else reason
+              return verdict, detail
+
+
+          results, fallen = {}, []
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for lane in os.environ.get("PROBE_LANES", "").split():
+                  model = os.environ.get(f"PROBE_MODEL_{lane.upper()}", "")
+                  if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+                      continue  # unset, or not a plain id: the consumer warns
+                  if model not in results:
+                      results[model] = probe(model)
+                  verdict, detail = results[model]
+                  out.write(f"{lane}_probe={verdict}\n{lane}_probe_reason={detail}\n")
+                  if verdict == "unusable":
+                      fallen.append((lane, detail))
+              if fallen:
+                  lanes = ", ".join(lane for lane, _ in fallen)
+                  out.write(f"fallback_note=The direct Anthropic key was unusable this run "
+                            f"({fallen[0][1]}), so these lanes ran on Cursor: {lanes}.\n")
+          PY
 
   ledger:
     # Prior-review ledger: what earlier rounds already raised on THIS PR, and how
@@ -2641,9 +2777,15 @@ jobs:
           ANTHROPIC_DIRECT_REPLACES: ${{ inputs.anthropic_direct_replaces_cursor_anthropic }}
           ANTHROPIC_DIRECT_EFFORT: ${{ inputs.anthropic_direct_effort }}
           ANTHROPIC_KEY_PRESENT: ${{ needs.gate.outputs.anthropic_key_present }}
+          # `gate`'s usability probe, per lane: unusable reads as an absent
+          # key, invalid fails the run, empty (not probed) changes nothing.
+          ANTHROPIC_CELLS_PROBE: ${{ needs.gate.outputs.anthropic_cells_probe }}
+          ANTHROPIC_CELLS_PROBE_REASON: ${{ needs.gate.outputs.anthropic_cells_probe_reason }}
           # The direct judge (touches no panel list).
           JUDGE_DIRECT_MODEL: ${{ inputs.judge_direct_model }}
           JUDGE_DIRECT_EFFORT: ${{ inputs.judge_direct_effort }}
+          JUDGE_PROBE: ${{ needs.gate.outputs.anthropic_judge_probe }}
+          JUDGE_PROBE_REASON: ${{ needs.gate.outputs.anthropic_judge_probe_reason }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
@@ -2756,6 +2898,12 @@ jobs:
               echo "::warning::anthropic_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API Anthropic cells are off for this run and the panel is unchanged."
             elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
               echo "::warning::anthropic_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
+            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "invalid" ]; then
+              echo "::error::the Anthropic API does not know anthropic_direct_model '$ANTHROPIC_DIRECT_MODEL' ($ANTHROPIC_CELLS_PROBE_REASON). Fix the id; an unknown model never falls back to Cursor."
+              exit 1
+            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "unusable" ]; then
+              echo "::warning::the ANTHROPIC_API_KEY secret is unusable for anthropic_direct_model this run ($ANTHROPIC_CELLS_PROBE_REASON), so the direct-API Anthropic cells are off and the Cursor Anthropic cells run: the review cells fell back to Cursor."
+              echo "Direct Anthropic review cells: fell back to Cursor, the key is unusable ($ANTHROPIC_CELLS_PROBE_REASON)." >> "$GITHUB_STEP_SUMMARY"
             elif [ "$openai_direct" = "true" ] \
                  && [ "$(printf '%s' "$ANTHROPIC_DIRECT_MODEL" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$OPENAI_DIRECT_MODEL" | tr 'A-Z' 'a-z')" ]; then
               # Both direct jobs name their artifact findings-direct-<type>-<id>,
@@ -2806,6 +2954,12 @@ jobs:
               echo "::warning::judge_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the judge runs on Cursor (judge_model) for this run."
             elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
               echo "::warning::judge_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the judge runs on Cursor (judge_model) for this run. Pass the secret through from the caller to enable it."
+            elif [ "${JUDGE_PROBE:-}" = "invalid" ]; then
+              echo "::error::the Anthropic API does not know judge_direct_model '$JUDGE_DIRECT_MODEL' ($JUDGE_PROBE_REASON). Fix the id; an unknown model never falls back to Cursor."
+              exit 1
+            elif [ "${JUDGE_PROBE:-}" = "unusable" ]; then
+              echo "::warning::the ANTHROPIC_API_KEY secret is unusable for judge_direct_model this run ($JUDGE_PROBE_REASON), so the judge fell back to Cursor (judge_model)."
+              echo "Direct judge: fell back to Cursor, the key is unusable ($JUDGE_PROBE_REASON)." >> "$GITHUB_STEP_SUMMARY"
             else
               judge_direct=true
               echo "The judge runs direct through the Anthropic API ($JUDGE_DIRECT_MODEL)."
@@ -5900,6 +6054,9 @@ jobs:
           APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}
           APPROVE_SCOPE: ${{ inputs.approve_scope }}
           INCREMENTAL_STATE: ${{ needs.diff-size.outputs.incremental_state }}
+          # Set only when `gate` found the direct Anthropic key unusable and
+          # the direct lanes fell back to Cursor: says so under the header.
+          RUNNER_NOTE: ${{ needs.gate.outputs.anthropic_fallback_note }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
@@ -5993,7 +6150,8 @@ jobs:
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
               "${SCOPE_FLAGS[@]}" \
-              --ledger-note "$LEDGER_NOTE"
+              --ledger-note "$LEDGER_NOTE" \
+              --runner-note "$RUNNER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             # No JUDGE_ERROR is read here on purpose: this branch passes --notice with
             # $JUDGE_STATUS and never --error-message, so the message had nowhere to go
@@ -6015,6 +6173,7 @@ jobs:
               "${LEDGER_FLAGS[@]}" \
               "${SCOPE_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE" \
+              --runner-note "$RUNNER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
             # Bound the message HERE, before it becomes a single argv element: Linux
@@ -6041,6 +6200,7 @@ jobs:
               --triggered-by "$TRIGGERED_BY" \
               "${LEDGER_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE" \
+              --runner-note "$RUNNER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
 

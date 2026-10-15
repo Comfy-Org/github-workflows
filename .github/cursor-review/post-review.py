@@ -3006,6 +3006,14 @@ def main():
             "or the 'context unavailable' banner. Empty/absent renders nothing."
         ),
     )
+    parser.add_argument(
+        "--runner-note",
+        default=None,
+        help=(
+            "Which runner a lane fell back to, e.g. the direct Anthropic lanes on "
+            "Cursor after the key probed unusable. Empty/absent renders nothing."
+        ),
+    )
     args = parser.parse_args()
 
     attribution = f"\n\n_Triggered by @{args.triggered_by}._" if args.triggered_by else ""
@@ -3035,6 +3043,10 @@ def main():
         # banner case matters most: a re-review that ran WITHOUT prior context
         # must never look identical to a genuine first-round review.
         banners += f"\n\n_{neutralize_mentions(args.ledger_note.strip())}_"
+    if args.runner_note and args.runner_note.strip():
+        # A fallback is a different panel than the caller configured: say so,
+        # or a Cursor-judged round reads as a direct-judged one.
+        banners += f"\n\n_{neutralize_mentions(args.runner_note.strip())}_"
     header += banners
     review_header += banners
 
