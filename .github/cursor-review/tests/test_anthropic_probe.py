@@ -209,6 +209,16 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertEqual((outputs["cells_probe"], outputs["judge_probe"]), ("unusable", "unusable"))
         self.assertIn("ran on Cursor: cells, judge", outputs["fallback_note"])
 
+    def test_two_models_failing_differently_each_keep_their_reason(self):
+        done, outputs, requests, _ = probe(gate_probe_step(), [USAGE_LIMIT, BILLING], {
+            "inputs.anthropic_direct_model": MODEL, "inputs.judge_direct_model": f"{MODEL}-judge"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(requests), 2)
+        note = outputs["fallback_note"]
+        self.assertIn("ran on Cursor: cells (usage-limit: ", note)
+        self.assertIn("; judge (billing: ", note)
+        self.assertNotIn("this run (usage-limit", note)
+
     def test_a_non_plain_id_is_not_probed(self):
         done, outputs, requests, _ = probe(gate_probe_step(), [OK], {
             "inputs.anthropic_direct_model": "claude opus", "inputs.judge_direct_model": ""})

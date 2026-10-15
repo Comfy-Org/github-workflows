@@ -1453,9 +1453,15 @@ jobs:
                   if verdict == "unusable":
                       fallen.append((lane, detail))
               if fallen:
-                  lanes = ", ".join(lane for lane, _ in fallen)
-                  out.write(f"fallback_note=The direct Anthropic key was unusable this run "
-                            f"({fallen[0][1]}), so these lanes ran on Cursor: {lanes}.\n")
+                  # One shared reason reads once; lanes that failed differently
+                  # (two models: billing vs. unavailable) each carry their own.
+                  if len({detail for _, detail in fallen}) == 1:
+                      lanes = ", ".join(lane for lane, _ in fallen)
+                      note = f"({fallen[0][1]}), so these lanes ran on Cursor: {lanes}."
+                  else:
+                      note = "so these lanes ran on Cursor: " + "; ".join(
+                          f"{lane} ({detail})" for lane, detail in fallen) + "."
+                  out.write(f"fallback_note=The direct Anthropic key was unusable this run {note}\n")
           PY
 
   ledger:
