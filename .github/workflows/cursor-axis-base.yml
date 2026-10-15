@@ -145,10 +145,11 @@ jobs:
     # for a usage limit, billing, 401/403, or one that stays 429/529/5xx after
     # retries (or any other refusal: an unrecognised 4xx, a redirect, never
     # followed), runs the Cursor `axis` job instead, for this run only, with a
-    # warning naming the API's message. A dash-free CLI model alias (`opus`)
-    # the raw API 404s is not probed, so it runs direct. Everything else still
-    # fails the axis here, before either runner: a non-plain or unknown model id, a direct
-    # model combined with context_sources, a non-checkout axis, an absent key.
+    # warning naming the reason (and a usage limit's reset time). A dash-free
+    # CLI model alias (`opus`) the raw API 404s is not probed, so it runs
+    # direct. Everything else still fails the axis here, before either runner:
+    # a non-plain or unknown model id, a direct model combined with
+    # context_sources, a non-checkout axis, an absent key.
     # GitHub-hosted, no checkout of anything: the key meets no PR code here.
     name: 'axis: ${{ inputs.axis }} (probe)'
     if: inputs.axis_direct_model != ''
@@ -288,7 +289,14 @@ jobs:
                       verdict = "unusable"  # still unavailable, out of retries or time
                       break
                   time.sleep(DELAYS[attempt])
-              detail = f"{reason}: {message}" if message else reason
+              # Only the reason class, and a usage limit's reset time, leave this
+              # step: the review, annotations and summaries are world-readable on a
+              # public repo, and an API message can name the organization (a 429)
+              # or its credit state.
+              detail = reason
+              reset = re.search(r"\d{4}-\d{2}-\d{2}(?:T| at )\d{2}:\d{2}(?::\d{2})?(?: ?UTC|Z)?", message)
+              if reset:
+                  detail = f"{reason}: access returns {reset.group(0)}"
               if verdict == "invalid" and "-" not in model:
                   # A CLI model alias (`opus`, `sonnet`, `opusplan`): the lanes'
                   # `--model` resolves it, the raw API does not. Not probed.

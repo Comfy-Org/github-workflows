@@ -8,13 +8,14 @@ classifies the answer. EXECUTED against a local HTTP stub replaying recorded
 responses:
 
   * 200 → usable; the usage-limit 400 / a billing error / 401 → unusable, with
-    the API's message kept; 429 then 200 → usable after a retry; 529 on every
+    the usage limit's reset time kept; 429 then 200 → usable after a retry; 529 on every
     attempt → unusable; 404 → invalid (a typo never falls back), except a
     dash-free Claude Code alias, which is not probed; a 400 is never invalid;
     a redirect is refused, never followed with the key; a truncated body is
     an answer to retry, not a crash; retries stop at the budget;
-  * the key never reaches the step's output or log, and the request is the
-    1-token call the ticket allows;
+  * the key never reaches the step's output or log, nor does the API's raw
+    message (it can name the organization): only the reason class and a
+    usage limit's reset time; the request is the 1-token call the ticket allows;
   * preflight reads unusable exactly like an absent key (the Cursor `claude-*`
     cells and the Cursor judge run, one warning per lane) and fails on invalid,
     but only after the openai/anthropic id collision check; a panel with no
@@ -167,11 +168,10 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertEqual(requests[0]["body"]["model"], MODEL)
         self.assertEqual(requests[0]["headers"].get("x-api-key"), KEY)
 
-    def test_the_usage_limit_400_is_unusable_and_keeps_the_message(self):
+    def test_the_usage_limit_400_is_unusable_and_keeps_the_reset_time(self):
         outputs, requests = self.run_probe(USAGE_LIMIT)
         self.assertEqual(outputs["cells_probe"], "unusable")
-        self.assertTrue(outputs["cells_probe_reason"].startswith("usage-limit: "))
-        self.assertIn("2026-11-01 at 00:00 UTC", outputs["cells_probe_reason"])
+        self.assertEqual(outputs["cells_probe_reason"], "usage-limit: access returns 2026-11-01 at 00:00 UTC")
         self.assertIn("ran on Cursor: cells", outputs["fallback_note"])
         self.assertEqual(len(requests), 1)  # a refusal is not retried
 
@@ -239,9 +239,19 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertEqual((outputs["cells_probe"], outputs["cells_probe_reason"].split(":")[0]),
                          ("unusable", "http-400"))
 
-    def test_a_message_echoing_the_key_is_redacted(self):
+    def test_a_message_echoing_the_key_is_never_published(self):
         outputs, _ = self.run_probe(LEAKY)
-        self.assertIn("***", outputs["cells_probe_reason"])
+        self.assertEqual(outputs["cells_probe_reason"], "unauthorized")
+
+    def test_only_the_reason_class_leaves_the_step_never_the_raw_message(self):
+        # A 429 can name the organization; a billing error its credit state.
+        org_429 = (429, {"type": "error", "error": {"type": "rate_limit_error", "message":
+                   "This request would exceed the rate limit for your organization (org-0123abcd) of 50 rpm"}})
+        for response, reason in ((org_429, "unavailable"), (BILLING, "billing"), (OTHER_400, "http-400")):
+            with self.subTest(reason=reason):
+                outputs, _ = self.run_probe(response)
+                self.assertEqual(outputs["cells_probe_reason"], reason)
+                self.assertNotIn("org-0123abcd", outputs.get("fallback_note", ""))
 
     def test_one_call_serves_both_lanes_on_one_model(self):
         done, outputs, requests, _ = probe(gate_probe_step(), [USAGE_LIMIT], {
@@ -258,7 +268,7 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         note = outputs["fallback_note"]
         self.assertIn("ran on Cursor: cells (usage-limit: ", note)
-        self.assertIn("; judge (billing: ", note)
+        self.assertIn("; judge (billing).", note)
         self.assertNotIn("this run (usage-limit", note)
 
     def test_every_output_is_written_at_once_at_the_end(self):

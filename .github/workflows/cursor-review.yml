@@ -1456,7 +1456,14 @@ jobs:
                       verdict = "unusable"  # still unavailable, out of retries or time
                       break
                   time.sleep(DELAYS[attempt])
-              detail = f"{reason}: {message}" if message else reason
+              # Only the reason class, and a usage limit's reset time, leave this
+              # step: the review, annotations and summaries are world-readable on a
+              # public repo, and an API message can name the organization (a 429)
+              # or its credit state.
+              detail = reason
+              reset = re.search(r"\d{4}-\d{2}-\d{2}(?:T| at )\d{2}:\d{2}(?::\d{2})?(?: ?UTC|Z)?", message)
+              if reset:
+                  detail = f"{reason}: access returns {reset.group(0)}"
               if verdict == "invalid" and "-" not in model:
                   # A CLI model alias (`opus`, `sonnet`, `opusplan`): the lanes'
                   # `--model` resolves it, the raw API does not. Not probed.
