@@ -1886,10 +1886,16 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Full history so the BASE...HEAD three-dot diff resolves and the
-          # tool's base-ref reads (linguist-generated via `check-attr --source`,
-          # deleted-file blob fallbacks) work without a separate fetch.
-          fetch-depth: 0
+          # The head commit and its tree, nothing else. This used to be
+          # a full-history clone — every branch and tag of the consumer, ~2 min per
+          # round on a large monorepo, on the review's critical path. The
+          # BASE...HEAD three-dot diff, the tool's base-ref reads
+          # (linguist-generated via `check-attr --source`, deleted-file blob
+          # fallbacks) and the incremental block need only BASE, HEAD, their
+          # merge base, and the last-reviewed commits; "Fetch the base commit
+          # and the merge-base history" below fetches exactly that, with the
+          # same shared script pr-size.yml uses.
+          fetch-depth: 1
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -1950,6 +1956,40 @@ jobs:
             exit 1
           fi
 
+      - name: Load check-pr-size tool
+        # The SAME classifier the PR-size cap uses — the single source of truth
+        # for "what is codegen". Comes from THIS repo (public, pinned via
+        # workflows_ref), never the PR checkout, so a malicious PR can't rewrite
+        # the logic that decides which of its files skip review.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_size_tool
+          persist-credentials: false
+
+      - name: Fetch the base commit and the merge-base history
+        # The other half of the narrowed checkout above (pr-size.yml's BE-8940
+        # fetch, from the ONE script both workflows call). Fails this job — fail
+        # closed, no review — when BASE/HEAD cannot be fetched or no trustworthy
+        # merge base exists, with an error naming which. The last-reviewed head
+        # and its recorded merge base ride along best-effort so the incremental
+        # block's ancestry checks are answered from a graph that can vouch for
+        # them; neither is ever fatal here. The script comes from the pinned
+        # checkout of THIS repo, never the PR's.
+        env:
+          # The job's own read-only token (`permissions: contents: read`),
+          # handed to git through GIT_CONFIG_* env for this step only — never
+          # written to `.git/config`.
+          FETCH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
+          LAST_REVIEWED_MERGE_BASE: ${{ needs.ledger.outputs.last_reviewed_merge_base }}
+        run: |
+          bash _pr_size_tool/scripts/check-pr-size/fetch-history.sh \
+            "$LAST_REVIEWED_SHA" "$LAST_REVIEWED_MERGE_BASE"
+
       - name: Resolve this round's merge base
         # Recorded in the consolidated review by `post-review`, and read back by the
         # NEXT round to pin the OLD side of its incremental block (BE-15598). Plain
@@ -1960,7 +2000,7 @@ jobs:
         #
         # Best-effort by construction — it must never fail the job. `git merge-base`
         # exits non-zero when the two commits share no history (an unrelated-histories
-        # base, a base ref the fetch-depth:0 checkout still cannot see), and there is
+        # base), and there is
         # nothing to do about that except record nothing and say so.
         id: merge_base
         env:
@@ -1982,18 +2022,6 @@ jobs:
             echo "::warning::Could not resolve the merge base of ${BASE_SHA} and ${HEAD_SHA} — this round records none, so the next round will skip its incremental diff block rather than diff against the wrong tree."
           fi
           echo "merge_base_sha=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
-
-      - name: Load check-pr-size tool
-        # The SAME classifier the PR-size cap uses — the single source of truth
-        # for "what is codegen". Comes from THIS repo (public, pinned via
-        # workflows_ref), never the PR checkout, so a malicious PR can't rewrite
-        # the logic that decides which of its files skip review.
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
-          path: _pr_size_tool
-          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
@@ -2144,7 +2172,7 @@ jobs:
         # The subset of the reviewed diff that changed since the last reviewed
         # round — PRIORITIZATION, not narrowing, the full diff above stays the
         # primary input; this just tells the panel where to spend budget. Built
-        # here (this job already holds the fetch-depth:0 checkout) so it can
+        # here (this job already holds the fetched history) so it can
         # ride the same shared artifact instead of every consumer re-deriving it.
         # Best-effort: an unresolvable SHA (force-push, base-branch rewrite)
         # simply produces no incremental block.
@@ -2254,8 +2282,15 @@ jobs:
           if [ -z "$LAST_REVIEWED_SHA" ] || [ "$LAST_REVIEWED_SHA" = "$HEAD_SHA" ]; then
             echo "No usable last-reviewed SHA — skipping the incremental diff block."
             echo "incremental_state=none" >> "$GITHUB_OUTPUT"
-          elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
-            echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
+          elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null \
+               || ! git merge-base --is-ancestor "$LAST_REVIEWED_SHA" "$HEAD_SHA" 2>/dev/null; then
+            # The ancestor test keeps the block's old reach. Under the former
+            # full-history clone a force-pushed-away head was simply absent; the
+            # narrowed fetch asks for it BY SHA, and GitHub can still serve it, so
+            # presence alone would now build a block (and widen approve_scope's
+            # `delta`) on exactly the rounds that used to get none. "An ancestor
+            # of this head" is what an un-rewritten branch's last round always is.
+            echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable or no longer in this head's history (force-push or base-branch rewrite) — skipping the incremental diff block."
           elif [ -z "$LAST_REVIEWED_MERGE_BASE" ]; then
             # Fail CLOSED, and do NOT fall back to ${BASE_SHA}: that fallback IS the bug
             # (BE-15598). Every live PR sees this once after rollout — the round it is
@@ -2617,8 +2652,13 @@ jobs:
     # matrix model list (emitted as an output the `review` matrix consumes), so
     # the validated list and the reviewed list can never drift apart.
     name: Preflight — validate model catalog
-    needs: [gate, diff-size]
-    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
+    # Gated like `diff-size` (gate + round cap), NOT on its `within_cap`, so the
+    # two run side by side instead of this ~20 s job queueing behind the size
+    # check. It therefore also runs on an over-cap PR, where nothing consumes
+    # its outputs; the panel cells still `needs:` both, and each repeats the
+    # `within_cap` condition itself.
+    needs: [gate, round-cap]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.round-cap.outputs.capped != 'true'
     runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 10
     permissions:
@@ -3233,7 +3273,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          # The head tree only, as `review-anthropic-direct` takes it. No step
+          # here reads history — the reviewed diff, the incremental diff and the
+          # ledger arrive as artifacts — and a full clone of a large consumer
+          # cost ~2 min of this round's critical path.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require a pinned workflows_ref
@@ -4696,7 +4740,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          # The head tree only, as `review-anthropic-direct` takes it. No step
+          # here reads history — the reviewed diff, the incremental diff and the
+          # ledger arrive as artifacts — and a full clone of a large consumer
+          # cost ~2 min of this round's critical path.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require a pinned workflows_ref
@@ -5249,7 +5297,7 @@ jobs:
     # payload upload with it and is the one failure mode that can never reach
     # the degraded panel-union fallback. The step trips first and is absorbed,
     # so a hung judge costs the adjudication, not the panel. The slack over
-    # the step (10m) covers this job's own overhead — a `fetch-depth: 0`
+    # the step (10m) covers this job's own overhead — a PR-head
     # checkout, the CLI install, three artifact downloads and the upload —
     # which a panel cell does not all pay, so the judge's effective MODEL
     # budget is the step cap, not this one.
@@ -5296,7 +5344,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          # The head tree only, as `review-anthropic-direct` takes it. No step
+          # here reads history — the reviewed diff, the incremental diff and the
+          # ledger arrive as artifacts — and a full clone of a large consumer
+          # cost ~2 min of this round's critical path.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require a pinned workflows_ref
