@@ -72,15 +72,19 @@ class Base(unittest.TestCase):
         with open(self.out.name, encoding="utf-8") as f:
             return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
 
-    def run_stage(self, fake, stage, head=Y, threshold="medium", authors="", max_runs="10", threads=()):
+    def run_stage(self, fake, stage, head=Y, threshold="medium", authors="", max_runs="10", threads=(),
+                  max_rounds="5", editors=()):
         args = argparse.Namespace(stage=stage, repo="o/r", pr_number="1", head_sha=head, approver_login=LOGIN,
                                   review_label="", threshold=threshold, approve_authors=authors,
-                                  max_runs=max_runs, delay_minutes="10")
+                                  max_runs=max_runs, max_rounds=max_rounds, delay_minutes="10")
         reader = (mock.Mock(side_effect=RuntimeError("graphql 502")) if threads is None
                   else mock.Mock(return_value=list(threads)))
+        history = (mock.Mock(side_effect=RuntimeError("graphql 502")) if editors is None
+                   else mock.Mock(return_value=list(editors)))
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
                 mock.patch.object(AA, "_load_card", lambda: CARD), \
                 mock.patch.object(AA, "open_thread_severities", reader), \
+                mock.patch.object(AA, "card_foreign_editors", history), \
                 mock.patch.object(AA, "emit", lambda *a: None), \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
@@ -120,6 +124,24 @@ class EligibilityTest(Base):
         self.assertNotIn(CARD.LANE_MARKER, capped)
         self.run_stage(self.fake(card=capped), "check")
         self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_a_card_anyone_else_edited_or_whose_history_is_unreadable_is_out_of_the_lane(self):
+        # Write access can edit the card and plant LANE_MARKER after a failed
+        # panel; only its edit history says who touched it.
+        self.run_stage(self.fake(), "check", editors=["dev"])
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.run_stage(self.fake(), "check", editors=None)
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.run_stage(self.fake(), "start", editors=["dev"])
+        self.assertEqual(self.outputs()["go"], "false")
+
+    def test_the_last_round_of_max_rounds_or_an_unnumbered_round_is_not_re_checked(self):
+        self.run_stage(self.fake(card=red_card(round_no=5)), "check")
+        self.assertEqual(self.outputs()["eligible"], "false", "round 5 of 5 is the human's")
+        self.run_stage(self.fake(card=red_card(round_no=4)), "check")
+        self.assertEqual(self.outputs()["eligible"], "true")
+        self.run_stage(self.fake(card=red_card(round_no="")), "check", max_rounds="0")
+        self.assertEqual(self.outputs()["eligible"], "false", "`max_rounds: 0` writes `round ?`")
 
     def test_the_live_pr_must_still_want_it(self):
         cases = {
@@ -193,6 +215,20 @@ class CapTest(Base):
         self.run_stage(fake, "start", head=Z, max_runs="2")
         self.assertEqual(self.outputs()["go"], "true")
         self.assertEqual(CARD.rechecks_this_round(fake.card["body"]), [Y, Z])
+
+    def test_the_cap_is_clamped_to_the_heads_the_record_keeps(self):
+        # Above RECHECK_HEADS_KEPT the record stops growing, so the cap could
+        # never be reached and re-checks would be unbounded.
+        with mock.patch.object(AA, "_load_card", lambda: CARD):
+            self.assertEqual(AA._approve_only_cap(argparse.Namespace(max_runs="999")), CARD.RECHECK_HEADS_KEPT)
+            self.assertEqual(AA._approve_only_cap(argparse.Namespace(max_runs="7")), 7)
+        heads = [f"{i:040x}" for i in range(CARD.RECHECK_HEADS_KEPT)]
+        body = red_card()
+        for h in heads:
+            body = CARD.mark_recheck_started(body, "2", 999, h)
+        fake = self.fake(card=body)
+        self.run_stage(fake, "check", max_runs="999")
+        self.assertEqual(self.outputs()["eligible"], "false")
 
     def test_an_unparsable_cap_re_checks_nothing(self):
         self.run_stage(self.fake(), "check", max_runs="ten")
@@ -308,6 +344,58 @@ class DismissalTextTest(Base):
         # The round is still asked for: the workflow stands it down only when
         # `approve-only` actually takes the push.
         self.assertEqual(self.outputs().get("auto_rereview"), "true")
+
+    def test_an_unnumbered_round_promises_no_re_check(self):
+        # `max_rounds: 0` writes `round ?`, which approve-only never re-checks.
+        start = CARD.render_start("", "", X, AXES, "pass", "")
+        self.assertTrue(CARD.in_axes_lane(start))
+        fake = FakeGitHub(card=start, reviews=[REREVIEW.approval(10, X)], labels=("cursor-review",))
+        args = argparse.Namespace(
+            repo="o/r", pr_number="1", head_sha=Y, approver_login=LOGIN, all_approvals=False, threshold="low",
+            approve_authors="", max_rounds="0", poster_login=POSTER, review_label="", auto_rereview="false",
+            auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false", carry_forward="false",
+            event_name="pull_request_target", approve_only="true", approve_only_delay_minutes="10")
+        with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
+                mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+            AA.cmd_dismiss_stale(args)
+        self.assertNotIn("re-checks the new head automatically", fake.card["body"])
+
+
+class CardEditHistoryTest(unittest.TestCase):
+    @staticmethod
+    def page(logins, more=False, cursor=""):
+        nodes = [{"editor": None if n is None else {"__typename": "User", "login": n}} for n in logins]
+        return {"data": {"node": {"userContentEdits": {
+            "pageInfo": {"hasNextPage": more, "endCursor": cursor}, "nodes": nodes}}}}
+
+    def editors(self, pages, comment=None):
+        calls = []
+
+        def graphql(query, **variables):
+            calls.append(variables)
+            return pages[len(calls) - 1]
+        with mock.patch.object(AA, "_graphql", graphql):
+            return AA.card_foreign_editors({"node_id": "IC_x"} if comment is None else comment, LOGIN), calls
+
+    def test_only_the_approver_ever_edited_it(self):
+        self.assertEqual(self.editors([self.page([LOGIN, LOGIN.upper()])])[0], [])
+
+    def test_a_bot_login_matches_with_or_without_its_suffix(self):
+        with mock.patch.object(AA, "_graphql", lambda q, **v: self.page(["approver"])):
+            self.assertEqual(AA.card_foreign_editors({"node_id": "IC_x"}, "approver[bot]"), [])
+
+    def test_every_page_is_read_and_any_other_editor_or_a_ghost_is_reported(self):
+        found, calls = self.editors([self.page([LOGIN], more=True, cursor="c1"), self.page(["Dev", None])])
+        self.assertEqual(found, ["(unknown)", "dev"])
+        self.assertEqual(calls[1].get("cursor"), "c1")
+
+    def test_an_unreadable_history_raises(self):
+        with self.assertRaises(ValueError):
+            self.editors([], comment={})
+        with self.assertRaises(ValueError):
+            self.editors([{"data": {"node": None}}])
 
 
 def panel_blocked_card(sha=X, round_no=2):

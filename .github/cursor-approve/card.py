@@ -657,7 +657,9 @@ _STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-appro
 # A push after a round whose PANEL passed re-runs only the axes on the new head,
 # not the panel. Two more line-start markers, read back only from the card
 # `find_card` trusts (model text is `sanitize`d or `reason_text`ed, which
-# escapes `<`, so neither can be forged from it):
+# escapes `<`, so neither can be forged from it). Write access can still edit
+# the card by hand, so cursor-review reads the lane only from a card whose edit
+# history names no other editor (auto-approve.py `card_foreign_editors`):
 #
 # LANE_MARKER       written by every card that sits past a passing panel: the
 #                   start card (not at the cap) and the decide card (not handed

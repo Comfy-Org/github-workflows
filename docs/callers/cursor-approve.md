@@ -229,7 +229,10 @@ card alone:
 - `<!-- cursor-approve-lane: axes -->` — written by the start card (not at the
   cap) and every decide card except the hand-off, and kept by the dismissed
   card. cursor-review's own round card never carries it, so a panel round that
-  did not pass takes the PR out of the lane until its axes run again.
+  did not pass takes the PR out of the lane until its axes run again. Anyone
+  with write access can edit the card, so cursor-review trusts the marker only
+  on a card whose edit history names no editor but the approver identity; a
+  card someone else ever edited is out of the lane for good (relabel instead).
 - `<!-- cursor-approve:recheck v1 <round> <cap> <sha>,… -->` — the heads
   already re-checked under panel round `<round>`, carried through every
   rewrite. A card whose heading names another round reads as none, so a new

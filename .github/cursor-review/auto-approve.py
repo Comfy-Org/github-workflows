@@ -3451,8 +3451,8 @@ def mark_card_stale(args, pr: dict, reviews: list, live_head: str, live_base, ve
     # Only the sentence differs: `auto` still asks for the round, and the
     # workflow skips that relabel when `approve-only` takes the push.
     recheck = (head_moved and not capped and not vetoed and _true(getattr(args, "approve_only", ""))
-               and card.in_axes_lane(body) and not _true(getattr(args, "run_without_label", ""))
-               and not pr.get("draft"))
+               and card.in_axes_lane(body) and card.card_round(body).isdigit()
+               and not _true(getattr(args, "run_without_label", "")) and not pr.get("draft"))
     if recheck:
         next_text = card.next_recheck_text(label, getattr(args, "approve_only_delay_minutes", 0))
     elif auto:
@@ -3680,11 +3680,64 @@ def cmd_auto_rereview(args) -> int:
 #            of the same head) and writes `go` and `round`.
 #
 # Eligibility is read only from the approver identity's own card (LANE_MARKER:
-# the last panel round passed and its axes ran) and the live PR, never from PR
-# content. Anything unreadable is "not eligible", which leaves today's
+# the last panel round passed and its axes ran) — trusted only while its edit
+# history names no other editor (card_foreign_editors) — and the live PR,
+# never from PR content. Anything unreadable is "not eligible", which leaves today's
 # behaviour: the card asks for a relabel, or `auto-rereview` starts a round.
 
 APPROVE_ONLY_STAGES = ("check", "start")
+
+CARD_EDITS_QUERY = """
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on IssueComment {
+      userContentEdits(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { editor { __typename login } }
+      }
+    }
+  }
+}
+"""
+
+
+def card_foreign_editors(comment: dict, login: str) -> list:
+    """Every login other than `login` that ever edited the card comment.
+
+    LANE_MARKER and the re-check record are read from the card, and
+    `find_card` proves only who CREATED it: anyone with write access — any
+    same-repo PR author — can edit it, and a later rewrite by `login` carries
+    a planted marker through (`render_dismissed`). The edit history is the one
+    record of the card those authors cannot write, so a card anyone else ever
+    touched is out of the lane for good. Raises on an unreadable history.
+    """
+    node_id = (comment or {}).get("node_id")
+    if not isinstance(node_id, str) or not node_id:
+        raise ValueError("the card has no node id, so its edit history cannot be read")
+    own = (login or "").strip().lower().removesuffix("[bot]")
+    others, cursor = set(), ""
+    for _page in range(50):
+        variables = {"id": node_id}
+        if cursor:
+            variables["cursor"] = cursor
+        node = (_graphql(CARD_EDITS_QUERY, **variables).get("data") or {}).get("node")
+        edits = node.get("userContentEdits") if isinstance(node, dict) else None
+        if not isinstance(edits, dict) or not isinstance(edits.get("nodes"), list):
+            raise ValueError("the card's edit history came back in an unexpected shape")
+        for edit in edits["nodes"]:
+            editor = (edit or {}).get("editor") if isinstance(edit, dict) else None
+            # A deleted account reads as no editor: not provably the approver.
+            name = editor.get("login") if isinstance(editor, dict) else None
+            name = name.lower() if isinstance(name, str) and name else "(unknown)"
+            if name.removesuffix("[bot]") != own:
+                others.add(name)
+        info = edits.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return sorted(others)
+        cursor = info.get("endCursor") or ""
+        if not cursor:
+            break
+    raise ValueError("the card's edit history could not be read to the end")
 
 
 def _last_decision_at(reviews: list, login: str):
@@ -3699,11 +3752,13 @@ def _last_decision_at(reviews: list, login: str):
     return max(stamps) if stamps else None
 
 
-def approve_only_blocker(args, pr: dict, reviews: list, timeline: list, body: str, head: str, threads=None):
+def approve_only_blocker(args, pr: dict, reviews: list, timeline: list, body: str, head: str, threads=None,
+                         foreign_editors=None):
     """Why this push may NOT be re-checked by the axes alone, or None.
 
     `threads` is open_thread_severities' list, or None when it could not be
-    read. Order matters only for the reason reported.
+    read; `foreign_editors` is card_foreign_editors' list, or None likewise.
+    Order matters only for the reason reported.
     """
     card = _load_card()
     label = (getattr(args, "review_label", "") or "").strip() or DEFAULT_REVIEW_LABEL
@@ -3730,11 +3785,21 @@ def approve_only_blocker(args, pr: dict, reviews: list, timeline: list, body: st
         return "there is no cursor-approve card, so no round has run its axes"
     if not card.in_axes_lane(body):
         return "the last round's panel did not pass (or its axes never ran), so the push needs a full round"
+    if foreign_editors is None:
+        return "the card's edit history could not be read, so its lane marker cannot be trusted"
+    if foreign_editors:
+        return (f"the card was edited by someone other than the approver identity "
+                f"({', '.join(f'`{n}`' for n in foreign_editors[:3])}), so its lane marker cannot be trusted")
     if card.card_state(body) == CARD_CAPPED:
         return "the card hands the PR to a human"
     round_no = card.card_round(body)
     if not round_no.isdigit():
-        return "the card names no round"
+        return "the card names no round (`max_rounds` is 0)"
+    max_rounds = _max_rounds(args)
+    if max_rounds and int(round_no) >= max_rounds:
+        # As an approved round at the cap, whose stale card leaves the lane:
+        # the last round is the human's, whatever its axes said.
+        return f"round {round_no} was the last of `max_rounds: {max_rounds}`, so a human decides this PR"
     heads = card.rechecks_this_round(body)
     if head in heads:
         return "this head was already re-checked"
@@ -3764,9 +3829,11 @@ def approve_only_blocker(args, pr: dict, reviews: list, timeline: list, body: st
 
 
 def _approve_only_cap(args) -> int:
+    """`approve_only_max_runs`, clamped to the heads the card's record keeps:
+    a cap above that could never be reached (the count stops growing)."""
     raw = str(getattr(args, "max_runs", "") or "").strip()
     match = re.fullmatch(r"([0-9]+)(?:\.0+)?", raw)
-    return min(int(match.group(1)), 999) if match else 0
+    return min(int(match.group(1)), _load_card().RECHECK_HEADS_KEPT) if match else 0
 
 
 def cmd_approve_only(args) -> int:
@@ -3800,7 +3867,12 @@ def cmd_approve_only(args) -> int:
     except Exception as e:  # noqa: BLE001 — unreadable threads are "not eligible", never a traceback
         print(f"::warning::Could not read the open review threads: {annotation_cause(e, 'unknown error')}")
         threads = None
-    why = approve_only_blocker(args, pr, reviews, timeline, body, head, threads)
+    try:
+        editors = card_foreign_editors(found, args.approver_login) if body else []
+    except Exception as e:  # noqa: BLE001 — an unreadable history is "not eligible", never a traceback
+        print(f"::warning::Could not read the card's edit history: {annotation_cause(e, 'unknown error')}")
+        editors = None
+    why = approve_only_blocker(args, pr, reviews, timeline, body, head, threads, editors)
     if why:
         return skip(why)
     if args.stage == "check":
@@ -4688,6 +4760,8 @@ def main() -> int:
     o.add_argument("--approve-authors", default="")
     # `approve_only_max_runs`: re-checks per panel round.
     o.add_argument("--max-runs", default="0")
+    # The last round of `max_rounds` is the human's: no re-check after it.
+    o.add_argument("--max-rounds", default="0")
     # Announced on the card at `check`, not waited for here — the job waits.
     o.add_argument("--delay-minutes", default="0")
     r = sub.add_parser("auto-retry")
