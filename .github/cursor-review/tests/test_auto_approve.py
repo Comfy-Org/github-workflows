@@ -2605,7 +2605,7 @@ class ApproveAuthorsTest(unittest.TestCase):
         self.assertIn("AUTHOR_ENABLED: ${{ needs.gate.outputs.approve_author_ok }}", step)
         self.assertIn('--author-enabled "$AUTHOR_ENABLED"', step)
         self.assertIn('--pr-author "$PR_AUTHOR"', step)
-        self.assertIn("needs: [gate, consolidate, ledger, diff-size, round-cap]", src)
+        self.assertIn("needs: [gate, consolidate, ledger, diff-size, round-cap, preflight]", src)
         # No "not blocking auto-approve" marks for an author no decision is taken for.
         self.assertIn("APPROVE_THRESHOLD: ${{ needs.gate.outputs.approve_author_ok != 'false' && inputs.approve_max_severity || '' }}", src)
 

@@ -9,11 +9,16 @@ responses:
 
   * 200 → usable; the usage-limit 400 / a billing error / 401 → unusable, with
     the API's message kept; 429 then 200 → usable after a retry; 529 on every
-    attempt → unusable; 404 → invalid (a typo never falls back);
+    attempt → unusable; 404 → invalid (a typo never falls back), except a
+    dash-free Claude Code alias, which is not probed; a 400 is never invalid;
+    a redirect is refused, never followed with the key; a truncated body is
+    an answer to retry, not a crash; retries stop at the budget;
   * the key never reaches the step's output or log, and the request is the
     1-token call the ticket allows;
   * preflight reads unusable exactly like an absent key (the Cursor `claude-*`
-    cells and the Cursor judge run, one warning per lane) and fails on invalid;
+    cells and the Cursor judge run, one warning per lane) and fails on invalid,
+    but only after the openai/anthropic id collision check; a panel with no
+    Cursor claude-* id says no Anthropic cell ran;
   * the axis base picks its runner from the same result.
 
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
@@ -57,6 +62,10 @@ OVERLOADED = (529, {"type": "error", "error": {"type": "overloaded_error", "mess
 NOT_FOUND = (404, {"type": "error", "error": {"type": "not_found_error", "message": f"model: {MODEL}-typo"}})
 INVALID_400 = (400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"model: invalid model id {MODEL}-typo"}})
 OTHER_400 = (400, {"type": "error", "error": {"type": "invalid_request_error", "message": "max_tokens: too small for this model"}})
+MODEL_WORDED_400 = (400, {"type": "error", "error": {"type": "invalid_request_error", "message": "invalid max_tokens for this model"}})
+ALIAS_404 = (404, {"type": "error", "error": {"type": "not_found_error", "message": "model: opus"}})
+# A response whose body ends early: e.read() raises IncompleteRead.
+TRUNCATED = (500, {"type": "error", "error": {"type": "api_error", "message": "x" * 200}}, {"truncate": True})
 OK = (200, {"id": "msg_1", "type": "message", "content": [{"type": "text", "text": "p"}]})
 # An error message echoing the key must never reach the output or the log.
 LEAKY = (401, {"type": "error", "error": {"type": "authentication_error", "message": f"bad key {KEY}"}})
@@ -74,13 +83,18 @@ class Stub:
                 length = int(self.headers.get("content-length", 0))
                 stub.requests.append({"headers": {k.lower(): v for k, v in self.headers.items()},
                                       "body": json.loads(self.rfile.read(length))})
-                status, body = stub.responses[min(len(stub.requests), len(stub.responses)) - 1]
+                status, body, *extra = stub.responses[min(len(stub.requests), len(stub.responses)) - 1]
+                extra = extra[0] if extra else {}
                 data = json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(data)))
+                if "location" in extra:
+                    self.send_header("location", extra["location"])
                 self.end_headers()
-                self.wfile.write(data)
+                self.wfile.write(data[:20] if extra.get("truncate") else data)
+                if extra.get("truncate"):
+                    self.close_connection = True
 
             def log_message(self, *args):
                 pass
@@ -188,9 +202,37 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertEqual(outputs["cells_probe"], "invalid")
         self.assertNotIn("fallback_note", outputs)
 
-    def test_a_400_naming_an_unknown_model_is_invalid(self):
-        outputs, _ = self.run_probe(INVALID_400)
-        self.assertEqual(outputs["cells_probe"], "invalid")
+    def test_a_400_is_never_invalid_whatever_it_says_about_the_model(self):
+        # Only a 404 / not_found_error is an unknown id: a 400's wording is a
+        # guess that would fail a valid config ("invalid max_tokens for this model").
+        for response in (INVALID_400, MODEL_WORDED_400):
+            with self.subTest(message=response[1]["error"]["message"]):
+                outputs, _ = self.run_probe(response)
+                self.assertEqual((outputs["cells_probe"], outputs["cells_probe_reason"].split(":")[0]),
+                                 ("unusable", "http-400"))
+
+    def test_a_404_on_a_claude_code_alias_is_not_probed(self):
+        done, outputs, requests, _ = probe(gate_probe_step(), [ALIAS_404], {
+            "inputs.anthropic_direct_model": "opus", "inputs.judge_direct_model": ""})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(outputs["cells_probe"], "")
+        self.assertNotIn("fallback_note", outputs)
+
+    def test_a_redirect_is_refused_never_followed_with_the_key(self):
+        target = Stub([OK])
+        try:
+            outputs, requests = self.run_probe((302, {}, {"location": target.url}))
+        finally:
+            target.close()
+        self.assertEqual(target.requests, [])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual((outputs["cells_probe"], outputs["cells_probe_reason"]), ("unusable", "http-302"))
+
+    def test_a_truncated_error_body_is_retried_not_a_crash(self):
+        outputs, requests = self.run_probe(TRUNCATED, OK)
+        self.assertEqual(outputs["cells_probe"], "usable")
+        self.assertEqual(len(requests), 2)
 
     def test_any_other_400_is_unusable_not_invalid(self):
         outputs, _ = self.run_probe(OTHER_400)
@@ -219,6 +261,38 @@ class ProbeClassifiesRecordedResponses(unittest.TestCase):
         self.assertIn("; judge (billing: ", note)
         self.assertNotIn("this run (usage-limit", note)
 
+    def test_every_output_is_written_at_once_at_the_end(self):
+        # A probe that dies on the second lane must not leave the first
+        # decided and the note missing: one write, after both lanes.
+        script = run_block(gate_probe_step())
+        self.assertEqual(script.count('open(os.environ["GITHUB_OUTPUT"]'), 1)
+        self.assertLess(script.index("for lane in"), script.index('open(os.environ["GITHUB_OUTPUT"]'))
+
+    def test_the_retries_stop_at_the_budget(self):
+        stub = Stub([OVERLOADED])
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                output = os.path.join(workdir, "github-output")
+                open(output, "w").close()
+                env = {"PATH": os.environ.get("PATH", ""), "GITHUB_OUTPUT": output, "ANTHROPIC_API_KEY": KEY,
+                       "ANTHROPIC_PROBE_URL": stub.url, "PROBE_RETRY_DELAYS": "30 30",
+                       "PROBE_BUDGET_SECONDS": "5", "PROBE_LANES": "cells", "PROBE_MODEL_CELLS": MODEL}
+                done = subprocess.run([shutil.which("bash"), "-e", "-c", run_block(gate_probe_step())],
+                                      env=env, capture_output=True, text=True, timeout=20)
+                with open(output, encoding="utf-8") as f:
+                    text = f.read()
+        finally:
+            stub.close()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(stub.requests), 1)  # the 30 s retry would overrun 5 s
+        self.assertIn("cells_probe=unusable\n", text)
+
+    def test_both_steps_bound_the_retries_inside_their_timeout(self):
+        for step, minutes in ((gate_probe_step(), 5), (axis_step(PROBE_STEP), 3)):
+            env = block_mapping(step, "        env:", 10)
+            self.assertLess(int(env["PROBE_BUDGET_SECONDS"].strip("'")), minutes * 60 - 20)
+            self.assertIn(f"timeout-minutes: {minutes}", "\n".join(step))
+
     def test_a_non_plain_id_is_not_probed(self):
         done, outputs, requests, _ = probe(gate_probe_step(), [OK], {
             "inputs.anthropic_direct_model": "claude opus", "inputs.judge_direct_model": ""})
@@ -246,7 +320,7 @@ class ProbeWiring(unittest.TestCase):
 
 
 class PreflightFallsBackOnAnUnusableKey(unittest.TestCase):
-    def resolve(self, cells, judge):
+    def resolve(self, cells, judge, **extra):
         step = step_named(split_jobs(read_workflow())["preflight"], PANEL_MODELS_STEP)
         with tempfile.TemporaryDirectory() as workdir:
             summary = os.path.join(workdir, "summary")
@@ -259,6 +333,7 @@ class PreflightFallsBackOnAnUnusableKey(unittest.TestCase):
                 "needs.gate.outputs.anthropic_cells_probe_reason": "usage-limit: You have reached your specified API usage limits.",
                 "needs.gate.outputs.anthropic_judge_probe": judge,
                 "needs.gate.outputs.anthropic_judge_probe_reason": "usage-limit: You have reached your specified API usage limits.",
+                **extra,
             }
             # run_step sets no GITHUB_STEP_SUMMARY; the fallback branch writes
             # one. Relative to the step's cwd, as run_step re-roots /tmp/.
@@ -297,6 +372,37 @@ class PreflightFallsBackOnAnUnusableKey(unittest.TestCase):
                 done, _, _ = self.resolve(cells, judge)
                 self.assertNotEqual(done.returncode, 0)
                 self.assertIn("::error::", done.stdout)
+
+
+    def test_the_id_collision_warns_before_a_probe_verdict_can_fail_the_run(self):
+        # An OpenAI id in both direct inputs: the gate probes it against the
+        # Anthropic API (a 404), but this is the documented collision warning.
+        done, outputs, _ = self.resolve("invalid", "usable", **{
+            "inputs.anthropic_direct_model": "gpt-5.6", "inputs.openai_direct_model": "gpt-5.6",
+            "needs.gate.outputs.openai_key_present": "true"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(outputs["anthropic_direct"], "false")
+        self.assertIn("same id as openai_direct_model", done.stdout)
+        self.assertNotIn("::error::", done.stdout)
+
+    def test_a_panel_with_no_cursor_claude_cell_says_no_anthropic_cell_ran(self):
+        done, outputs, summary = self.resolve("unusable", "usable", **{
+            "inputs.panel_models": '["gpt-5.6-sol-xhigh", "kimi-k3-max"]'})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual((outputs["anthropic_direct"], outputs["anthropic_cells_no_cursor"]), ("false", "true"))
+        self.assertIn("no Anthropic review cell runs this round", done.stdout)
+        self.assertNotIn("Cursor Anthropic cells run", done.stdout)
+        self.assertIn("no Anthropic review cell ran", summary)
+        done, outputs, _ = self.resolve("unusable", "usable")
+        self.assertEqual(outputs["anthropic_cells_no_cursor"], "false")
+
+    def test_the_post_step_corrects_the_note_for_a_panel_with_no_claude_cell(self):
+        jobs = split_jobs(read_workflow())
+        post = "\n".join(step_named(jobs["post-review"], "Post review"))
+        self.assertIn("NO_CURSOR_ANTHROPIC: ${{ needs.preflight.outputs.anthropic_cells_no_cursor }}", post)
+        self.assertIn("preflight", "\n".join(l for l in jobs["post-review"] if l.startswith("    needs:")))
+        self.assertIn("anthropic_cells_no_cursor: ${{ steps.models.outputs.anthropic_cells_no_cursor }}",
+                      "\n".join(jobs["preflight"]))
 
 
 class AxisPicksItsRunner(unittest.TestCase):

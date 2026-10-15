@@ -1344,8 +1344,11 @@ jobs:
         # ends with no decision. One 1-token Messages call per configured model
         # tells, so `preflight` can treat an UNUSABLE key exactly like an absent
         # one (the Cursor cells and the Cursor judge run). An unknown model id
-        # is `invalid` — preflight fails the run on it, never falls back on a
-        # typo. 429 / 529 / 5xx / no answer are retried, then read as unusable.
+        # (a 404) is `invalid` — preflight fails the run on it, never falls
+        # back on a typo — except a dash-free Claude Code alias (`opus`), which
+        # the CLI resolves and the raw API does not: that one is not probed.
+        # 429 / 529 / 5xx / no answer are retried, then read as unusable, as is
+        # any other refusal (an unrecognised 4xx; a redirect, never followed).
         # Here, not in `preflight`, for the reason the presence steps above
         # give: this job is GitHub-hosted and checks out nothing. Only for a
         # round that will run. The script is byte-identical to
@@ -1355,12 +1358,15 @@ jobs:
         id: anthropic_probe
         if: steps.check.outputs.should_run == 'true' && steps.dup.outputs.already_reviewed != 'true' && steps.anthropic_key.outputs.present == 'true'
         continue-on-error: true
-        # Two models at worst: 2 x (3 x 20 s + 60 s) = 4 minutes.
+        # Two models at worst: 2 x (3 x 20 s + 60 s) = 4 minutes; the script
+        # stops retrying at PROBE_BUDGET_SECONDS, and writes every output in
+        # one go at the end, so a timeout here still leaves none.
         timeout-minutes: 5
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_PROBE_URL: https://api.anthropic.com/v1/messages
           PROBE_RETRY_DELAYS: '15 45'
+          PROBE_BUDGET_SECONDS: '240'
           PROBE_LANES: cells judge
           PROBE_MODEL_CELLS: ${{ inputs.anthropic_direct_model }}
           PROBE_MODEL_JUDGE: ${{ inputs.judge_direct_model }}
@@ -1370,6 +1376,19 @@ jobs:
 
           KEY = os.environ.get("ANTHROPIC_API_KEY", "")
           DELAYS = [int(d) for d in os.environ.get("PROBE_RETRY_DELAYS", "").split()]
+          # `timeout=` bounds each socket operation, not a request, so the retries
+          # also stop at this wall-clock budget, inside the step's timeout-minutes.
+          DEADLINE = time.monotonic() + float(os.environ.get("PROBE_BUDGET_SECONDS") or "inf")
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              """A redirect would carry x-api-key to another URL: refuse it (a 3xx)."""
+
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          OPENER = urllib.request.build_opener(NoRedirect)
 
 
           def clean(text):
@@ -1389,18 +1408,18 @@ jobs:
                   headers={"x-api-key": KEY, "anthropic-version": "2023-06-01",
                            "content-type": "application/json"})
               try:
-                  with urllib.request.urlopen(request, timeout=20) as response:
+                  with OPENER.open(request, timeout=20) as response:
                       return response.status, "", ""
               except urllib.error.HTTPError as e:
                   # Only the JSON body is read: never the headers, never str(e).
                   try:
                       error = json.loads(e.read(65536).decode("utf-8", "replace")).get("error") or {}
-                  except (ValueError, AttributeError, OSError):
+                  except Exception:  # a truncated body (IncompleteRead) included
                       error = {}
                   if not isinstance(error, dict):
                       error = {}
                   return e.code, clean(error.get("type", "")), clean(error.get("message", ""))
-              except (urllib.error.URLError, OSError, ValueError) as e:
+              except Exception as e:  # no answer, or a broken one: never a crash mid-loop
                   return None, "", clean(f"no answer ({type(e).__name__})")
 
 
@@ -1413,15 +1432,16 @@ jobs:
                   return "unusable", "billing"
               if status == 400 and "usage limit" in lowered:
                   return "unusable", "usage-limit"
-              # An unknown id is a 404; a 400 counts only when it says the
-              # model is unknown. Any other 400 is unusable, not a config error.
-              if status == 404 or (status == 400 and re.search(r"\bmodel\b", lowered) and any(
-                      word in lowered for word in ("not found", "invalid", "unknown", "does not exist"))):
+              # An unknown id is a 404 `not_found_error`. A 400 is never read as
+              # one: its text is a guess ("invalid max_tokens for this model").
+              if status == 404 or etype == "not_found_error":
                   return "invalid", "unknown-model"
               if status in (401, 403):
                   return "unusable", "unauthorized"
               if status is None or status in (408, 429) or status >= 500:
                   return "retry", "unavailable"
+              # Any other refusal (an unrecognised 4xx, a refused redirect) is
+              # unusable too: the direct lane would get the same answer.
               return "unusable", f"http-{status}"
 
 
@@ -1432,36 +1452,43 @@ jobs:
                   print(f"probe {model}: attempt {attempt + 1} -> HTTP {status or '-'} ({reason})")
                   if verdict != "retry":
                       break
-                  if attempt < len(DELAYS):
-                      time.sleep(DELAYS[attempt])
-              else:
-                  verdict = "unusable"
+                  if attempt == len(DELAYS) or time.monotonic() + DELAYS[attempt] > DEADLINE:
+                      verdict = "unusable"  # still unavailable, out of retries or time
+                      break
+                  time.sleep(DELAYS[attempt])
               detail = f"{reason}: {message}" if message else reason
+              if verdict == "invalid" and "-" not in model:
+                  # A CLI model alias (`opus`, `sonnet`, `opusplan`): the lanes'
+                  # `--model` resolves it, the raw API does not. Not probed.
+                  return "", f"{reason}: an alias, not probed"
               return verdict, detail
 
 
-          results, fallen = {}, []
+          results, fallen, lines = {}, [], []
+          for lane in os.environ.get("PROBE_LANES", "").split():
+              model = os.environ.get(f"PROBE_MODEL_{lane.upper()}", "")
+              if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+                  continue  # unset, or not a plain id: the consumer warns
+              if model not in results:
+                  results[model] = probe(model)
+              verdict, detail = results[model]
+              lines.append(f"{lane}_probe={verdict}\n{lane}_probe_reason={detail}\n")
+              if verdict == "unusable":
+                  fallen.append((lane, detail))
+          if fallen:
+              # One shared reason reads once; lanes that failed differently
+              # (two models: billing vs. unavailable) each carry their own.
+              if len({detail for _, detail in fallen}) == 1:
+                  lanes = ", ".join(lane for lane, _ in fallen)
+                  note = f"({fallen[0][1]}), so these lanes ran on Cursor: {lanes}."
+              else:
+                  note = "so these lanes ran on Cursor: " + "; ".join(
+                      f"{lane} ({detail})" for lane, detail in fallen) + "."
+              lines.append(f"fallback_note=The direct Anthropic key was unusable this run {note}\n")
+          # One write, at the end: a probe that dies midway leaves every lane
+          # unprobed, never one lane decided and the other (or the note) missing.
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              for lane in os.environ.get("PROBE_LANES", "").split():
-                  model = os.environ.get(f"PROBE_MODEL_{lane.upper()}", "")
-                  if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
-                      continue  # unset, or not a plain id: the consumer warns
-                  if model not in results:
-                      results[model] = probe(model)
-                  verdict, detail = results[model]
-                  out.write(f"{lane}_probe={verdict}\n{lane}_probe_reason={detail}\n")
-                  if verdict == "unusable":
-                      fallen.append((lane, detail))
-              if fallen:
-                  # One shared reason reads once; lanes that failed differently
-                  # (two models: billing vs. unavailable) each carry their own.
-                  if len({detail for _, detail in fallen}) == 1:
-                      lanes = ", ".join(lane for lane, _ in fallen)
-                      note = f"({fallen[0][1]}), so these lanes ran on Cursor: {lanes}."
-                  else:
-                      note = "so these lanes ran on Cursor: " + "; ".join(
-                          f"{lane} ({detail})" for lane, detail in fallen) + "."
-                  out.write(f"fallback_note=The direct Anthropic key was unusable this run {note}\n")
+              out.write("".join(lines))
           PY
 
   ledger:
@@ -2605,6 +2632,9 @@ jobs:
       # The same pair for the direct Anthropic cells (`review-anthropic-direct`).
       anthropic_direct: ${{ steps.models.outputs.anthropic_direct }}
       anthropic_direct_counts: ${{ steps.models.outputs.anthropic_direct_counts }}
+      # 'true' only when an unusable key turned the direct cells off and the
+      # panel list had no Cursor claude-* cell to run instead (post-review says so).
+      anthropic_cells_no_cursor: ${{ steps.models.outputs.anthropic_cells_no_cursor }}
       # `anthropic_direct_effort`, validated: always one of the allowed levels.
       anthropic_direct_effort: ${{ steps.models.outputs.anthropic_direct_effort }}
       # 'true' only when the judge can actually run direct: `judge_direct_model`
@@ -2894,6 +2924,7 @@ jobs:
           # left, so the empty-panel check sees both drops. `judge_model` is
           # never touched — the judge stays on Cursor.
           anthropic_direct=false
+          anthropic_no_cursor=false
           if [ -n "$(printf '%s' "${ANTHROPIC_DIRECT_MODEL:-}" | tr -d '[:space:]')" ]; then
             # `grep -x` matches line by line, so a multi-line value would pass
             # on any one clean line; refuse every whitespace character (a
@@ -2904,12 +2935,6 @@ jobs:
               echo "::warning::anthropic_direct_model is not a plain model id (letters, digits, '.', '_', '-'; at most 100), so the direct-API Anthropic cells are off for this run and the panel is unchanged."
             elif [ "${ANTHROPIC_KEY_PRESENT:-false}" != "true" ]; then
               echo "::warning::anthropic_direct_model is set but the ANTHROPIC_API_KEY secret did not reach this workflow, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Pass the secret through from the caller to enable it."
-            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "invalid" ]; then
-              echo "::error::the Anthropic API does not know anthropic_direct_model '$ANTHROPIC_DIRECT_MODEL' ($ANTHROPIC_CELLS_PROBE_REASON). Fix the id; an unknown model never falls back to Cursor."
-              exit 1
-            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "unusable" ]; then
-              echo "::warning::the ANTHROPIC_API_KEY secret is unusable for anthropic_direct_model this run ($ANTHROPIC_CELLS_PROBE_REASON), so the direct-API Anthropic cells are off and the Cursor Anthropic cells run: the review cells fell back to Cursor."
-              echo "Direct Anthropic review cells: fell back to Cursor, the key is unusable ($ANTHROPIC_CELLS_PROBE_REASON)." >> "$GITHUB_STEP_SUMMARY"
             elif [ "$openai_direct" = "true" ] \
                  && [ "$(printf '%s' "$ANTHROPIC_DIRECT_MODEL" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$OPENAI_DIRECT_MODEL" | tr 'A-Z' 'a-z')" ]; then
               # Both direct jobs name their artifact findings-direct-<type>-<id>,
@@ -2917,11 +2942,28 @@ jobs:
               # aggregator, which assigns by model id, credits every record to
               # the OpenAI lab.
               echo "::warning::anthropic_direct_model is the same id as openai_direct_model, so the direct-API Anthropic cells are off for this run and the panel is unchanged. Give each lane its own lab's model id."
+            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "invalid" ]; then
+              # After the collision check: an OpenAI id the Anthropic API
+              # rejects is that documented warning, not a failed run.
+              echo "::error::the Anthropic API does not know anthropic_direct_model '$ANTHROPIC_DIRECT_MODEL' ($ANTHROPIC_CELLS_PROBE_REASON). Fix the id; an unknown model never falls back to Cursor."
+              exit 1
+            elif [ "${ANTHROPIC_CELLS_PROBE:-}" = "unusable" ]; then
+              if jq -e 'any(.[]; ascii_downcase | startswith("claude-"))' /tmp/models.json > /dev/null; then
+                echo "::warning::the ANTHROPIC_API_KEY secret is unusable for anthropic_direct_model this run ($ANTHROPIC_CELLS_PROBE_REASON), so the direct-API Anthropic cells are off and the Cursor Anthropic cells run: the review cells fell back to Cursor."
+                echo "Direct Anthropic review cells: fell back to Cursor, the key is unusable ($ANTHROPIC_CELLS_PROBE_REASON)." >> "$GITHUB_STEP_SUMMARY"
+              else
+                # Exactly an absent key's panel, said as it is: a panel_models
+                # list with no claude-* id has no Cursor cell to fall back to.
+                anthropic_no_cursor=true
+                echo "::warning::the ANTHROPIC_API_KEY secret is unusable for anthropic_direct_model this run ($ANTHROPIC_CELLS_PROBE_REASON), so the direct-API Anthropic cells are off, and the panel list carries no Cursor Anthropic (claude-*) id to fall back to: no Anthropic review cell runs this round."
+                echo "Direct Anthropic review cells: off, the key is unusable ($ANTHROPIC_CELLS_PROBE_REASON) and the panel list has no Cursor claude-* id, so no Anthropic review cell ran." >> "$GITHUB_STEP_SUMMARY"
+              fi
             else
               anthropic_direct=true
             fi
           fi
           echo "anthropic_direct=${anthropic_direct}" >> "$GITHUB_OUTPUT"
+          echo "anthropic_cells_no_cursor=${anthropic_no_cursor}" >> "$GITHUB_OUTPUT"
           case "${ANTHROPIC_DIRECT_EFFORT:-}" in
             low|medium|high|xhigh|max) anthropic_direct_effort="$ANTHROPIC_DIRECT_EFFORT" ;;
             *)
@@ -5761,7 +5803,9 @@ jobs:
     # this adds no ordering, only the outputs. `round-cap` likewise (diff-size
     # already `needs:` it), for the round number on the status card decide
     # writes (BE-19489).
-    needs: [gate, consolidate, ledger, diff-size, round-cap]
+    # `preflight` (already transitive through consolidate) for whether a cells
+    # fallback found any Cursor claude-* cell to run.
+    needs: [gate, consolidate, ledger, diff-size, round-cap, preflight]
     # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
     # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
     # checks out PR code — and only under `pull_request_target`: any other
@@ -6063,7 +6107,13 @@ jobs:
           # Set only when `gate` found the direct Anthropic key unusable and
           # the direct lanes fell back to Cursor: says so under the header.
           RUNNER_NOTE: ${{ needs.gate.outputs.anthropic_fallback_note }}
+          NO_CURSOR_ANTHROPIC: ${{ needs.preflight.outputs.anthropic_cells_no_cursor }}
         run: |
+          # The gate wrote its note before the panel was known: when the cells
+          # fell back to a panel with no Cursor claude-* cell, say none ran.
+          if [ -n "$RUNNER_NOTE" ] && [ "$NO_CURSOR_ANTHROPIC" = "true" ]; then
+            RUNNER_NOTE="$RUNNER_NOTE The panel list has no Cursor claude-* id, though, so no Anthropic review cell ran this round."
+          fi
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
           # failed call. A guard that could not read its input SAYS SO — a
