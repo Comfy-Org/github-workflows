@@ -140,9 +140,10 @@ Read them from the start of the comment body. A released value is not renamed (t
 
 | State | Written by | Card says | `next` | Next-step line |
 |---|---|---|---|---|
-| `pass` | cursor-review decide, then this workflow's start phase | Approved (or passed the severity gate, axes pending), then the axes table; or, for a few seconds on a first round, "Deciding this round" (the pending card, below) | `none` | none |
+| `pass` | cursor-review decide, then this workflow's start phase | Approved (or passed the severity gate, axes pending), then the axes table; or, for a few seconds on a first round, "Deciding this round" (the pending card, below); or the early start card (no lane marker) while the panel runs, under [`axes_alongside_panel`](#axes-alongside-the-panel) | `none` | none |
 | `changes_requested` | cursor-review decide | "Not approved: N finding(s) above `<threshold>` gate this round", one line per gating finding (severity, `file:line`, thread link, why it gated: inside this round's changes, a live re-raise, High/Critical anywhere, or `full` scope), or the earlier open threads that held it | `resolve_then_relabel` | Fix or reply to the gating threads, resolve them, then start a new round: remove and re-add the `cursor-review` label. |
 | `no_decision` | cursor-review decide | "No decision this round", with `decide_gate`'s reasons verbatim (e.g. "2/6 panel reviewers did not complete") | `relabel` when the head moved (the one transient cause a relabel alone clears); `push_then_relabel` for a transient cause that left the head where it was (a reviewer or the judge errored, the PR could not be read, the base alone was retargeted); `human` for a structural one (the findings did not land as threads, the reviewed diff is empty) | Re-run the round: remove and re-add the `cursor-review` label. / Nothing — the round is being re-run automatically (see below). / Push a commit so the head moves, then re-run the round. / A human is needed: <cause>. |
+| `no_decision` | cursor-review's `axes-closeout` ([`axes_alongside_panel`](#axes-alongside-the-panel)) | "No decision this round: the review panel did not pass (`<gate>`), so the axes' verdicts for this commit were discarded" — the close-out of an early start card whose panel did not pass | `push_then_relabel` | Push a commit so the head moves, then re-run the round. |
 | `capped` | cursor-review decide, or this workflow's start phase | Needs a human (`needs-human-review`, or the round limit) | `human` | A human is needed: the bot withdraws its own request for changes on this hand-off, so a human's review decides this PR — if one still shows, its withdrawal failed (see the run log) and it needs dismissing by hand. Removing the `needs-human-review` label resets the round count. |
 
 **The pending card (BE-20246).** Every auto-approve review links the card, so
@@ -227,7 +228,8 @@ pushed head as usual. Two more line-start markers make that decidable from the
 card alone:
 
 - `<!-- cursor-approve-lane: axes -->` — written by the start card (not at the
-  cap) and every decide card except the hand-off, and kept by the dismissed
+  cap, and not the early card [`axes_alongside_panel`](#axes-alongside-the-panel)
+  writes while the panel runs) and every decide card except the hand-off, and kept by the dismissed
   card. cursor-review's own round card never carries it, so a panel round that
   did not pass takes the PR out of the lane until its axes run again. Anyone
   with write access can edit the card, so cursor-review trusts the marker only
@@ -558,6 +560,76 @@ A forger able to delete the honest upload and re-upload under its name leaves
 no red leg at all. In those cases the count stays tamper-evident only in the
 rollup, if at all; telling which leg failed needs per-job conclusions
 (`actions: read`), which the consolidate job does not have.
+
+## Axes alongside the panel
+
+By default the axes start only after cursor-review's whole run finishes, so an
+approved round waits for the panel (14–25 minutes) and THEN for the axes
+(about 5). cursor-review's `axes_alongside_panel: true` starts this workflow's
+`start` phase and the correctness and conformance axes **inside** the
+cursor-review run, as soon as its round cap has run, on the same head the
+panel reviews. When the panel passes, the axes are usually done, and the tail
+is your decide job alone.
+
+What changes, and what does not:
+
+- **Your decide job stays exactly where it is**, on
+  `needs.cursor-review.outputs.approve_gate == 'pass'`. That `if:` is the ONLY
+  panel-pass guard in this design: the axes have run whatever the panel
+  decides, so a decide that ran on anything else would approve on the axes
+  alone. decide downloads the `axis-*` artifacts of the whole run, which
+  includes the ones cursor-review's nested axes uploaded.
+- **Your own start and axes jobs skip** when cursor-review's `axes_started`
+  output is `success`: add `&& needs.cursor-review.outputs.axes_started !=
+  'success'` to their `if:`. Any other value (`skipped` when the input is off
+  or the run was not eligible, `failure`, `cancelled`) leaves them running as
+  before. A `failure` there is a start phase that did not withdraw; the axes
+  inside cursor-review were skipped, and your own run them after the panel.
+- **The start card is written while the panel runs.** It is the usual
+  `pass`/`none` card with every axis pending, plus a line saying the panel is
+  still running, and **without** the axes-lane marker:
+  [`approve_only_on_push`](#a-push-re-checked-by-the-axes-alone) reads that
+  marker as "the last panel round passed", which an undecided round has not.
+  cursor-review's own decide then writes its round card as usual, and on a
+  `pass` your decide writes the verdicts.
+- **When the panel does not pass**, cursor-review's `axes-closeout` job
+  rewrites a card that still lists a pending axis — for this commit and this
+  round only — to `no_decision` / `push_then_relabel` ("the axes' verdicts for
+  this commit were discarded"). A card any decide already wrote is left alone.
+- **At the round cap** (or with `needs-human-review` on the PR) the start phase
+  writes the capped card and withdraws the standing request for changes, as
+  your own start would; no axis runs.
+
+Requirements are your own start's: a `pull_request_target` caller,
+`approve_max_severity` set, `APPROVER_TOKEN` (with `approver_environment`),
+and an author `approve_authors` lets through. Pass cursor-review the axis
+settings through `axes` (default `correctness,conformance`, the start card's
+list — only those two axes run inside cursor-review), `axis_prior_rounds`
+(this workflow's `prior_rounds`) and `axis_direct_model`, and give your decide
+job the same `axes` and `prior_rounds`. cursor-review hands each axis
+`CURSOR_API_KEY` and `ANTHROPIC_API_KEY` explicitly, never `inherit`.
+
+```yaml
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with:
+      workflows_ref: <sha>
+      approve_max_severity: low
+      defer_approval: true
+      approver_environment: cursor-approver
+      axes_alongside_panel: true
+    secrets: inherit
+```
+
+and `&& needs.cursor-review.outputs.axes_started != 'success'` appended to
+the `if:` of `approve-start`, `axis-correctness` and `axis-conformance` in the
+caller above, with `cursor-approve` (decide) left exactly as it is.
+
+The nesting is four levels deep — your caller → cursor-review →
+cursor-approve / axis-`<name>` → cursor-axis-base — inside GitHub's limit of
+ten. None of the nested jobs is part of cursor-review's `Panel integrity` or
+`Blocking gate`, so a red axis never turns those checks red; it reaches the
+PR only through decide.
 
 ## Inputs
 

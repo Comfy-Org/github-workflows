@@ -44,7 +44,10 @@ name: Cursor approve
 #   max_yellow_axes  0..3 (default 0), strictly below the number of axes
 #   round            cursor-review's `round` output
 #   max_rounds       cursor-review's `max_rounds` output
-#   approve_gate     cursor-review's `approve_gate` output (start phase)
+#   approve_gate     cursor-review's `approve_gate` output (start phase), or
+#                    `pending` when cursor-review itself runs this phase beside
+#                    its panel (`axes_alongside_panel`): treated as `pass`, but
+#                    the card carries no axes-lane marker
 #   approve_max_severity  cursor-review's threshold (decide phase); with
 #                    poster_login, an approval auto-resolves cursor-review's
 #                    own at-or-below-threshold threads, as cursor-review does
@@ -142,9 +145,14 @@ jobs:
     # `pull_request_target`: any other event runs on `refs/pull/<n>/merge`,
     # which a base-branch-only deployment policy rejects before a step runs.
     environment: ${{ github.event_name == 'pull_request_target' && inputs.approver_environment || '' }}
+    # `contents: read` only. Nothing here calls the Actions API: the artifact
+    # steps read and write THIS run's artifacts, which needs no `actions:`
+    # scope. And a nested job cannot exceed its caller's grant, so asking for
+    # more would fail cursor-review's `axes_alongside_panel` call — which
+    # nests this inside a caller granting `contents` + `pull-requests` only —
+    # at startup for every caller, whether or not it set that input.
     permissions:
       contents: read
-      actions: read
     steps:
       - name: Check the approver token
         id: token

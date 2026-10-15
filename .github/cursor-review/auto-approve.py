@@ -79,10 +79,17 @@ Five subcommands, each run from a job that checks out NO PR code:
     standing REQUEST_CHANGES a no-decision ``decide`` does (BE-19489); one that
     hands the PR to a human (``needs_human``, ``vetoed``) withdraws it instead.
     The approval and that block both link the card ``--card-url`` names.
+    Nothing here knows whether the round's PANEL passed: the caller's
+    ``approve_gate == 'pass'`` ``if:`` on its decide job is the ONLY
+    panel-pass guard, and it must stay on that job in every mode — under
+    cursor-review's ``axes_alongside_panel`` the axes (and their artifacts)
+    exist before the panel has decided, so a decide that ran on any other
+    gate would approve on the axes alone.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
-    ``cmd_withdraw``.
+    ``cmd_withdraw``. ``--approve-gate pending`` (cursor-review's
+    ``axes_alongside_panel`` start, its panel still running) is ``pass``.
 
 ``decide`` also emits ``approve_gate`` (one of ``APPROVE_GATE_VALUES``) as a
 step output, for a downstream workflow that should run only after a round
@@ -249,6 +256,9 @@ GATE_CAPPED = "capped"
 GATE_OFF = "off"
 
 APPROVE_GATE_VALUES = (GATE_PASS, GATE_FAIL, GATE_UNTRUSTED, GATE_CAPPED, GATE_OFF)
+# Never an `approve_gate` output: what cursor-review's `axes_alongside_panel`
+# hands cursor-approve's start phase while its panel is still running.
+GATE_PENDING = "pending"
 
 # The panel matrix's review types (cursor-review.yml's `matrix.review_type`, pinned
 # by test_auto_approve.py). With `--max-failed-reviewers` > 0, a round where one of
@@ -4623,12 +4633,20 @@ def cmd_withdraw(args) -> int:
     REQUEST_CHANGES (BE-19492): when the round cap is what labelled the PR, no
     `decide` ran to do it, and no round will approve a PR handed to a human.
     The gate is the caller's word, so the label is re-read off the live PR
-    first. A failure is red, but the start card still runs (its `if:`)."""
+    first. A failure is red, but the start card still runs (its `if:`).
+
+    ``--approve-gate pending`` is cursor-review's `axes_alongside_panel` start,
+    run while its panel still is: treated as ``pass``. Only this identity's own
+    approvals are withdrawn; a standing REQUEST_CHANGES stays, for the panel's
+    decide to dismiss when the round passes."""
     if not (args.approver_login or "").strip():
         print("::error::--approver-login is empty; refusing to run without an identity to withdraw approvals for")
         return 2
+    gate = (getattr(args, "approve_gate", "") or "").strip()
+    if gate == GATE_PENDING:
+        gate = GATE_PASS
     rc = withdraw_own_approvals(args, AXES_PENDING_MESSAGE)
-    if (getattr(args, "approve_gate", "") or "").strip() == GATE_CAPPED:
+    if gate == GATE_CAPPED:
         if withdraw_handed_off_change_requests(args, HUMAN_REVIEW_MESSAGE, HUMAN_REVIEW_LABEL):
             rc = 1
     return rc
