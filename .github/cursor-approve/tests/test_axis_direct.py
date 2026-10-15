@@ -5,12 +5,14 @@ token-usage step EXECUTED against a fake result:
 
   * plumbing — the wrappers declare the input (default '') and the optional
     ANTHROPIC_API_KEY, and pass both to the base unchanged;
-  * exactly one runner — the Cursor job is gated on the input being empty, the
-    separate `axis-direct` job (hard-pinned to `ubuntu-latest`) on it being
-    set, and nothing falls back;
+  * exactly one runner — the Cursor job runs when the input is empty or
+    `axis-probe` found the direct key unusable, the separate `axis-direct` job
+    (hard-pinned to `ubuntu-latest`) when the probe picked direct; nothing
+    falls back once the direct runner runs;
   * confinement — the cells' flags: Read/Grep/Glob, `--restricted`,
     `--setting-sources ""`, /proc and /sys denied, never `--bare`;
-  * the key is referenced by the `axis-direct` job alone, never the Cursor job;
+  * the key is referenced by the `axis-direct` and `axis-probe` jobs alone,
+    never the Cursor job;
   * usage — `usage-direct-axis-<axis>-<model>`, the cells' script byte for byte
     but for the result path, best effort and time-boxed;
   * the API-error diagnostic — agent-error.py runs on the OUTCOME, not on the
@@ -30,8 +32,10 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
-DIRECT_IF = "inputs.axis_direct_model != ''"
-CURSOR_IF = "inputs.axis_direct_model == ''"
+PROBE_IF = "inputs.axis_direct_model != ''"
+DIRECT_IF = "${{ !cancelled() && needs.axis-probe.outputs.runner == 'direct' }}"
+CURSOR_IF = ("${{ !cancelled() && (inputs.axis_direct_model == '' "
+             "|| needs.axis-probe.outputs.runner == 'cursor') }}")
 
 
 def read(name):
@@ -68,6 +72,7 @@ def run_block(step_text):
 BASE = read("cursor-axis-base.yml")
 CURSOR_JOB = job(BASE, "axis")
 DIRECT_JOB = job(BASE, "axis-direct")
+PROBE_JOB = job(BASE, "axis-probe")
 # Without comment lines, for the "never mentioned" checks below.
 CURSOR_CODE = "\n".join(ln for ln in CURSOR_JOB.split("\n") if not ln.lstrip().startswith("#"))
 DIRECT_CODE = "\n".join(ln for ln in DIRECT_JOB.split("\n") if not ln.lstrip().startswith("#"))
@@ -100,7 +105,8 @@ class Plumbing(unittest.TestCase):
         # The run names its runner, on both paths.
         self.assertIn("::notice::", check)
         self.assertEqual(check.count("GITHUB_STEP_SUMMARY"), 1)
-        self.assertEqual(CURSOR["Check inputs"].count("GITHUB_STEP_SUMMARY"), 1)
+        # Once on each branch: the plain line, or the one naming a fallback.
+        self.assertEqual(CURSOR["Check inputs"].count("GITHUB_STEP_SUMMARY"), 2)
         # The direct job reads neither, so it does not gate on them.
         self.assertNotIn("inputs.model", DIRECT_JOB)
         self.assertNotIn("inputs.runs_on", DIRECT_JOB)
@@ -128,10 +134,13 @@ class Plumbing(unittest.TestCase):
 
 class ExactlyOneRunner(unittest.TestCase):
     def test_each_job_is_gated_on_the_input(self):
+        self.assertIn(f"\n    if: {PROBE_IF}\n", PROBE_JOB)
         self.assertIn(f"\n    if: {CURSOR_IF}\n", CURSOR_JOB)
         self.assertIn(f"\n    if: {DIRECT_IF}\n", DIRECT_JOB)
+        for body in (CURSOR_JOB, DIRECT_JOB):
+            self.assertIn("\n    needs: axis-probe\n", body)
         self.assertEqual(re.findall(r"^  ([A-Za-z0-9_-]+):$", BASE[BASE.index("\njobs:\n"):], re.MULTILINE),
-                         ["axis", "axis-direct"])
+                         ["axis-probe", "axis", "axis-direct"])
 
     def test_the_direct_job_is_hosted_and_named_apart(self):
         # Never the caller's `runs_on` pool, as cursor-review's direct cells.
@@ -144,6 +153,9 @@ class ExactlyOneRunner(unittest.TestCase):
         self.assertNotIn("cursor-agent", DIRECT_CODE)
         self.assertNotIn("install-cursor-cli", DIRECT_CODE)
         self.assertNotIn("axis_direct_model", CURSOR_CODE.replace(f"if: {CURSOR_IF}", ""))
+        # The probe runs no reviewer and checks nothing out.
+        for word in ("claude", "cursor-agent", "actions/checkout", "uses:"):
+            self.assertNotIn(word, PROBE_JOB.replace("claude-", ""), word)
 
     def test_no_fallback_a_missing_key_fails_the_axis(self):
         body = run_block(STEPS["Check the Anthropic API key"])
@@ -181,7 +193,11 @@ class Confinement(unittest.TestCase):
             if "secrets.ANTHROPIC_API_KEY" in body:
                 self.assertIn(name, ("Check the Anthropic API key", "Run the axis (direct)",
                                      "Extract the verdict"), name)
-        self.assertEqual(BASE.count("secrets.ANTHROPIC_API_KEY"), DIRECT_JOB.count("secrets.ANTHROPIC_API_KEY"))
+        self.assertEqual(BASE.count("secrets.ANTHROPIC_API_KEY"),
+                         DIRECT_JOB.count("secrets.ANTHROPIC_API_KEY") + PROBE_JOB.count("secrets.ANTHROPIC_API_KEY"))
+        # The probe job is hosted and checks nothing out (asserted above).
+        self.assertIn("\n    runs-on: ubuntu-latest\n", PROBE_JOB)
+        self.assertNotIn("CURSOR_API_KEY", PROBE_JOB)
         self.assertNotIn("CURSOR_API_KEY", DIRECT_JOB)
 
     def test_every_stdin_python_with_the_key_is_isolated(self):

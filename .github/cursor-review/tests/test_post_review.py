@@ -1703,6 +1703,16 @@ class FirstReviewConfirmationTest(unittest.TestCase):
             True,
         )
 
+    def test_a_runner_note_is_rendered_under_the_header(self):
+        """`--runner-note`: the direct Anthropic lanes fell back to Cursor."""
+        driver = EndToEndPostTest()
+        note = "The direct Anthropic key was unusable this run (usage-limit), so these lanes ran on Cursor: cells, judge."
+        posted = driver.run_main(self.ANCHORED, existing_reviews=[], extra_argv=["--runner-note", note])
+        self.assertTrue(posted[0]["body"].startswith(PR.CONSOLIDATED_MARKER))
+        self.assertIn(f"_{note}_", posted[0]["body"])
+        bare = driver.run_main(self.ANCHORED, existing_reviews=[], extra_argv=["--runner-note", ""])
+        self.assertNotIn("ran on Cursor", bare[0]["body"])
+
     def confirm(self, raw_stdout, posted_body="body"):
         """`review_already_posted` over a literal `gh` stdout, so the answer is the
         payload's doing and nothing else's."""
