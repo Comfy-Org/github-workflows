@@ -40,7 +40,10 @@ name: Cursor approve
 #                    (checked against job.workflow_sha).
 #   phase            start | decide
 #   commit_sha       the PR head the axes judged (cursor-review's reviewed head)
-#   axes             comma-separated axes the caller ran, e.g. correctness,conformance
+#   axes             comma-separated axes the caller ran, e.g. correctness,conformance;
+#                    output `axes` is it normalized. Under approve_gate `pending`
+#                    it must be a non-empty subset of correctness,conformance
+#                    (the axes cursor-review runs), or the phase fails
 #   max_yellow_axes  0..3 (default 0), strictly below the number of axes
 #   round            cursor-review's `round` output
 #   max_rounds       cursor-review's `max_rounds` output
@@ -127,6 +130,13 @@ on:
     secrets:
       APPROVER_TOKEN:
         required: false
+    outputs:
+      axes:
+        description: >-
+          `axes` normalized: comma-joined, lower-cased, whitespace and empty
+          entries dropped, first occurrence kept. cursor-review's
+          `axes_alongside_panel` drives its axis jobs' `if:` from this.
+        value: ${{ jobs.approve.outputs.axes }}
 
 permissions:
   contents: read
@@ -153,7 +163,40 @@ jobs:
     # at startup for every caller, whether or not it set that input.
     permissions:
       contents: read
+    outputs:
+      axes: ${{ steps.axes.outputs.axes }}
     steps:
+      - name: Check the axes
+        id: axes
+        env:
+          AXES: ${{ inputs.axes }}
+          APPROVE_GATE: ${{ inputs.approve_gate }}
+        run: |
+          # Normalized the way card.py's parse_axes reads the list, so the axes
+          # a caller runs and the card's pending rows agree. Under `pending`
+          # (cursor-review's `axes_alongside_panel` start) the axes beside the
+          # panel are driven from this output, and only correctness and
+          # conformance run there: anything else would sit pending on the card
+          # with no job to judge it, and an empty list starts no axis at all,
+          # so fail loudly instead.
+          python3 - <<'PY'
+          import os, sys
+          axes = []
+          for name in os.environ["AXES"].split(","):
+              name = name.strip().lower()
+              if name and name not in axes:
+                  axes.append(name)
+          if os.environ["APPROVE_GATE"].strip() == "pending":
+              bad = [a for a in axes if a not in ("correctness", "conformance")]
+              if bad or not axes:
+                  sys.exit(f"::error::with axes_alongside_panel, axes must be a non-empty comma-separated subset of "
+                           f"correctness,conformance (the only axes cursor-review runs beside its panel); got {os.environ['AXES']!r}")
+          # A name that is not plain letters (a newline-separated list, say)
+          # names no axis, and must not reach $GITHUB_OUTPUT as a second line.
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"axes={','.join(a for a in axes if a.isascii() and a.isalpha())}\n")
+          PY
+
       - name: Check the approver token
         id: token
         env:

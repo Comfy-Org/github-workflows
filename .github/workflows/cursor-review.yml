@@ -41,7 +41,8 @@ name: Cursor Review (reusable)
 # `panel-integrity`'s or `blocking-gate`'s `needs:` — an axis never gates the
 # panel's own checks. The caller's decide stays where it was, on
 # `approve_gate == 'pass'`, reading this run's `axis-*` artifacts; the
-# `axes_started` output tells it to skip its own start and axes. Nesting is
+# `axes_started` output tells it to skip its own start and axes, and
+# `axes_ok` (false when an axis job here failed) to skip its decide. Nesting is
 # four levels — caller → cursor-review → cursor-approve / axis-<name> →
 # cursor-axis-base — inside GitHub's limit of ten. Every such job is
 # `if: inputs.axes_alongside_panel && …`, so with the input off it is skipped
@@ -814,25 +815,29 @@ on:
           so a passing round's tail after the panel is the caller's decide
           job alone. Same requirements as the caller-side axes:
           `pull_request_target`, `approve_max_severity`, APPROVER_TOKEN, and
-          an author `approve_authors` lets through. The start card is written
+          an author `approve_authors` lets through — plus `defer_approval`
+          (without it the start is skipped). A round over the diff-size cap,
+          or with a failed preflight, runs no axis. The start card is written
           with `approve_gate` `pending` (no axes-lane marker, so
           `approve_only_on_push` never reads an undecided round as a passed
           one); a round the cap hands to a human writes the capped card and
           runs no axis. When the panel then does NOT pass, `axes-closeout`
-          rewrites that still-pending card to "No decision this round"; on
-          `pass` the caller's decide downloads this run's `axis-*` artifacts
-          as usual. The caller keeps its decide job, still gated on
-          `approve_gate == 'pass'` — the only panel-pass guard — and gates its
-          own start and axes on the `axes_started` output so they do not run
-          twice. Default false: every job it adds is skipped.
+          rewrites that still-pending card to "No decision this round" (and
+          on a `pass` whose axis job failed); on `pass` the caller's decide
+          downloads this run's `axis-*` artifacts as usual. The caller keeps
+          its decide job, still gated on `approve_gate == 'pass'` — the only
+          panel-pass guard — and on `axes_ok` when `axes_started` is
+          `success`, and gates its own start and axes on `axes_started` so
+          they do not run twice. Default false: every job it adds is skipped.
         type: boolean
         required: false
         default: false
       axes:
         description: >-
           With `axes_alongside_panel`: the comma-separated axes the start card
-          lists, as cursor-approve's `axes`. Only `correctness` and
-          `conformance` are run here; pass the same list to the caller's
+          lists, as cursor-approve's `axes`: a non-empty subset of
+          `correctness` and `conformance`, the only axes run here (anything
+          else fails the start phase). Pass the same list to the caller's
           decide. Default `correctness,conformance`.
         type: string
         required: false
@@ -954,6 +959,16 @@ on:
           or not eligible this run: the caller's own start and axes run as
           before). Empty or `skipped` whenever `axes_alongside_panel` is false.
         value: ${{ jobs.approve-start-early.result }}
+      axes_ok:
+        description: >-
+          Under `axes_alongside_panel`: `true` when every axis job this run
+          started succeeded (or was not listed in `axes`), else `false`. A
+          caller's decide must not run when `axes_started` is `success` and
+          this is `false`: a failed axis job may mean its genuine verdict
+          upload lost to a forged `axis-<name>` artifact another job in the run
+          claimed first, and decide reads the artifact by name.
+          `axes-closeout` writes "No decision this round" on that path.
+        value: ${{ contains(fromJSON('["success","skipped"]'), jobs.axis-correctness.result) && contains(fromJSON('["success","skipped"]'), jobs.axis-conformance.result) }}
 
 concurrency:
   # Owned by the REUSABLE so every caller gets it at its next pin bump — the
@@ -5887,7 +5902,14 @@ jobs:
     # writes (BE-19489).
     # `preflight` (already transitive through consolidate) for whether a cells
     # fallback found any Cursor claude-* cell to run.
-    needs: [gate, consolidate, ledger, diff-size, round-cap, preflight]
+    # `approve-start-early` (`axes_alongside_panel`; skipped otherwise) for
+    # ORDER only: it writes the pending start card, and a start delayed past
+    # this job (an environment wait, queueing) would overwrite the round card
+    # decide writes here with that pending one. It adds no wait on the axes;
+    # with the input off it only orders this job after `dismiss-stale-approval`
+    # (its one need not already upstream here), a short job that starts with
+    # the run and has long finished by the time the panel has.
+    needs: [gate, consolidate, ledger, diff-size, round-cap, preflight, approve-start-early]
     # The caller environment holding APPROVER_TOKEN (docs/callers/cursor-review.md#trust-model);
     # '' = none. Only the APPROVER_TOKEN jobs declare it — never a job that
     # checks out PR code — and only under `pull_request_target`: any other
@@ -8123,13 +8145,27 @@ jobs:
     # and the documented caller grants `contents` + `pull-requests`, so
     # anything more here (or in cursor-approve.yml) fails every caller at
     # startup, whether or not it set this input.
+    #
+    # `defer_approval` is required: without it `post-review` approves on
+    # severity alone, and nothing withdraws that approval while the axes run
+    # (the caller's own start, which would, is skipped on `axes_started`).
+    # A round the panel itself will not review — over the diff-size cap, or a
+    # preflight that failed — starts no axis either (two billable agents for a
+    # verdict nobody reads); only the capped/labelled hand-off runs without
+    # them, since `diff-size` is skipped there. After `dismiss-stale-approval`
+    # (as `approve-only` is): both withdraw approvals and write the card, and
+    # unordered they race. `!cancelled()` because those jobs can be skipped.
     name: Axes alongside the panel (start)
-    needs: [gate, round-cap]
+    needs: [gate, round-cap, diff-size, preflight, dismiss-stale-approval]
     if: >-
-      ${{ inputs.axes_alongside_panel && github.event_name == 'pull_request_target' &&
+      ${{ !cancelled() && inputs.axes_alongside_panel && github.event_name == 'pull_request_target' &&
+      inputs.defer_approval &&
       needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' &&
       needs.round-cap.result == 'success' && inputs.approve_max_severity != '' &&
-      needs.gate.outputs.approve_author_ok != 'false' }}
+      needs.gate.outputs.approve_author_ok != 'false' &&
+      needs.dismiss-stale-approval.result != 'failure' && needs.dismiss-stale-approval.result != 'cancelled' &&
+      (needs.round-cap.outputs.capped == 'true' || needs.round-cap.outputs.labelled == 'true' ||
+      (needs.diff-size.outputs.within_cap == 'true' && needs.preflight.result == 'success')) }}
     permissions:
       contents: read
     uses: ./.github/workflows/cursor-approve.yml
@@ -8151,14 +8187,17 @@ jobs:
     # an explicit `result == 'success'`: a start phase that failed to withdraw
     # an approval skips the axes, which the caller's decide reads as "no
     # result". Deliberately NOT in `panel-integrity`'s or `blocking-gate`'s
-    # `needs:`. Secrets are passed explicitly, never inherited. The ` correctness,`
-    # disjunct takes a list written with a space after the comma.
+    # `needs:`. Secrets are passed explicitly, never inherited. The axis list
+    # is the start phase's `axes` output: `axes` normalized (whitespace and
+    # case) and validated there, which fails the start on anything but a
+    # non-empty subset of correctness,conformance — an axis no job here runs
+    # would otherwise sit pending on the card with nothing to judge it.
     name: Axes alongside the panel (correctness)
     needs: [round-cap, approve-start-early]
     if: >-
       ${{ !cancelled() && inputs.axes_alongside_panel && needs.approve-start-early.result == 'success' &&
       needs.round-cap.outputs.capped != 'true' && needs.round-cap.outputs.labelled != 'true' &&
-      (contains(format(',{0},', inputs.axes), ',correctness,') || contains(format(',{0},', inputs.axes), ' correctness,')) }}
+      contains(format(',{0},', needs.approve-start-early.outputs.axes), ',correctness,') }}
     permissions:
       contents: read
     uses: ./.github/workflows/axis-correctness.yml
@@ -8177,7 +8216,7 @@ jobs:
     if: >-
       ${{ !cancelled() && inputs.axes_alongside_panel && needs.approve-start-early.result == 'success' &&
       needs.round-cap.outputs.capped != 'true' && needs.round-cap.outputs.labelled != 'true' &&
-      (contains(format(',{0},', inputs.axes), ',conformance,') || contains(format(',{0},', inputs.axes), ' conformance,')) }}
+      contains(format(',{0},', needs.approve-start-early.outputs.axes), ',conformance,') }}
     permissions:
       contents: read
     uses: ./.github/workflows/axis-conformance.yml
@@ -8196,14 +8235,22 @@ jobs:
     # this run's decide writes its round card only on the paths it decides),
     # so this rewrites it to "No decision this round" — only a `pass` card for
     # this commit and round with an axis still pending (`card.py closeout`).
-    # `always()`: a failed or cancelled panel is exactly the case. The gate is
-    # the workflow-level `approve_gate` output, computed from `needs` (a test
-    # pins the two equal). Checks out only this repo's assets; writes as
-    # APPROVER_TOKEN, so GITHUB_TOKEN needs nothing past `contents: read`.
+    # It also rewrites it on `pass` when an axis job this run started did not
+    # succeed (`axes_ok` false): the caller's decide is documented to skip
+    # then, because artifact names are run-global and a panel cell running
+    # beside the axes can claim `axis-<name>` first — the genuine upload then
+    # fails, and a decide that read the artifact by name would read the forgery.
+    # `!cancelled()`, not `always()`: a failed panel is the case, but a run a
+    # newer one superseded must not touch the card that newer run now owns
+    # (`closeout` also leaves a card another run's link is on alone). The gate
+    # is the workflow-level `approve_gate` output, computed from `needs` (a
+    # test pins the two equal). `!= 'skipped'`: the start phase writes its card
+    # even when its withdrawal failed. Checks out only this repo's assets;
+    # writes as APPROVER_TOKEN, so GITHUB_TOKEN needs nothing past `contents: read`.
     name: Axes alongside the panel (close-out)
-    needs: [gate, round-cap, approve-start-early, post-review, approve-only]
+    needs: [gate, round-cap, approve-start-early, axis-correctness, axis-conformance, post-review, approve-only]
     if: >-
-      ${{ always() && inputs.axes_alongside_panel && needs.approve-start-early.result == 'success' &&
+      ${{ !cancelled() && inputs.axes_alongside_panel && needs.approve-start-early.result != 'skipped' &&
       needs.round-cap.outputs.capped != 'true' && needs.round-cap.outputs.labelled != 'true' }}
     environment: ${{ github.event_name == 'pull_request_target' && inputs.approver_environment || '' }}
     runs-on: ubuntu-latest
@@ -8285,6 +8332,8 @@ jobs:
           ROUND: ${{ needs.round-cap.outputs.next_round }}
           MAX_ROUNDS: ${{ needs.round-cap.outputs.max_rounds }}
           APPROVE_GATE: ${{ (needs.round-cap.outputs.capped == 'true' || needs.round-cap.outputs.labelled == 'true') && 'capped' || (inputs.approve_max_severity == '' || needs.gate.outputs.approve_author_ok == 'false') && 'off' || needs.approve-only.outputs.go == 'true' && 'pass' || needs.post-review.outputs.approve_gate || 'untrusted' }}
+          AXES_OK: ${{ contains(fromJSON('["success","skipped"]'), needs.axis-correctness.result) && contains(fromJSON('["success","skipped"]'), needs.axis-conformance.result) }}
+          AXIS_RESULTS: correctness ${{ needs.axis-correctness.result }}, conformance ${{ needs.axis-conformance.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "$APPROVER_TOKEN" ]; then
@@ -8301,4 +8350,4 @@ jobs:
           python3 "$CURSOR_REVIEW_ASSETS/../cursor-approve/card.py" closeout --repo "$REPO" \
             --pr-number "$PR_NUMBER" --login "$LOGIN" --commit-sha "$COMMIT_SHA" --round "$ROUND" \
             --max-rounds "$MAX_ROUNDS" --approve-gate "$APPROVE_GATE" --review-label "$REVIEW_LABEL" \
-            --run-url "$RUN_URL"
+            --run-url "$RUN_URL" --axes-ok "$AXES_OK" --axis-results "$AXIS_RESULTS"

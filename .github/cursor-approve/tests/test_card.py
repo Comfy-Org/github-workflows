@@ -945,15 +945,30 @@ class AxesAlongsidePanel(unittest.TestCase):
                      card.render_round("2", "5", SHA, card.STATE_CHANGES, card.NEXT_RESOLVE, "x", [], "y", ""),
                      card.render_round("2", "5", SHA, card.STATE_PASS, card.NEXT_NONE, "Approved", [], "", "")):
             for gate in ("fail", "untrusted", "off"):
-                new, _ = card.closeout_body(body, SHA, "2", gate)
+                new, _ = card.closeout_body(body, SHA, "2", gate, run_url=self.RUN_URL, axes_ok=False)
                 self.assertIsNone(new)
 
     def test_closeout_leaves_a_card_for_another_commit_or_round_alone(self):
-        self.assertIsNone(card.closeout_body(self.early(sha="b" * 40), SHA, "2", "fail")[0])
-        self.assertIsNone(card.closeout_body(self.early(round_no="1"), SHA, "2", "fail")[0])
+        self.assertIsNone(card.closeout_body(self.early(sha="b" * 40), SHA, "2", "fail", run_url=self.RUN_URL)[0])
+        self.assertIsNone(card.closeout_body(self.early(round_no="1"), SHA, "2", "fail", run_url=self.RUN_URL)[0])
+
+    def test_closeout_leaves_a_card_another_run_wrote_alone(self):
+        # A run a newer one superseded (same commit, same uncounted round) must
+        # not close out the card that newer run's start wrote.
+        other = card.render_start("2", "5", SHA, self.AXES, "pending", "https://github.com/o/r/actions/runs/10")
+        self.assertIsNone(card.closeout_body(other, SHA, "2", "fail", "5", run_url=self.RUN_URL)[0])
+        self.assertIsNone(card.closeout_body(self.early(), SHA, "2", "fail", "5", run_url="")[0])
 
     def test_closeout_leaves_the_card_alone_when_the_panel_passed(self):
-        self.assertIsNone(card.closeout_body(self.early(), SHA, "2", "pass")[0])
+        self.assertIsNone(card.closeout_body(self.early(), SHA, "2", "pass", run_url=self.RUN_URL)[0])
+
+    def test_closeout_rewrites_a_passing_round_whose_axis_job_did_not_complete(self):
+        new, why = card.closeout_body(self.early(), SHA, "2", "pass", "5", run_url=self.RUN_URL, axes_ok=False,
+                                      axis_results="correctness failure, conformance success")
+        self.assertEqual(why, "rewritten")
+        self.assertEqual(markers(new), ("no_decision", "push_then_relabel"))
+        self.assertIn("an axis job did not complete (correctness failure, conformance success)", new)
+        self.assertNotIn("⏳ pending", new)
 
     def test_closeout_rewrites_a_pending_card_when_the_panel_did_not_pass(self):
         for gate in ("untrusted", "fail", "off"):
@@ -967,8 +982,9 @@ class AxesAlongsidePanel(unittest.TestCase):
             self.assertEqual(card.card_round(new), "2")
 
     def test_closeout_is_idempotent(self):
-        new, _ = card.closeout_body(self.early(), SHA, "2", "fail")
-        self.assertIsNone(card.closeout_body(new, SHA, "2", "fail")[0])
+        new, _ = card.closeout_body(self.early(), SHA, "2", "fail", run_url=self.RUN_URL)
+        self.assertIsNotNone(new)
+        self.assertIsNone(card.closeout_body(new, SHA, "2", "fail", run_url=self.RUN_URL)[0])
 
     def test_closeout_command_edits_only_the_approvers_card_and_never_fails(self):
         planted = {"id": 3, "user": {"login": "someone"}, "body": self.early()}
@@ -984,7 +1000,7 @@ class AxesAlongsidePanel(unittest.TestCase):
             return json.dumps({"id": 7})
 
         argv = ["closeout", "--repo", "o/r", "--pr-number", "1", "--login", LOGIN, "--commit-sha", SHA,
-                "--round", "2", "--max-rounds", "5", "--approve-gate", "untrusted"]
+                "--round", "2", "--max-rounds", "5", "--approve-gate", "untrusted", "--run-url", self.RUN_URL]
         with mock.patch.object(card, "gh", fake_gh), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(card.main(argv), 0)
             self.assertEqual(card.main(argv), 0)  # a second run finds nothing pending

@@ -5,8 +5,10 @@ With the input off NOTHING may change: every job it adds must be skipped, which
 holds only while `inputs.axes_alongside_panel` is a top-level conjunct of each
 such job's `if:` — an `||` beside it would run the job anyway. Nothing fails
 when that slips, so it is pinned here, along with the wiring the design rests
-on: the start phase never says `pass`, the axes need a SUCCESSFUL start, none
-of them gates the panel's own checks, the close-out reads the same gate the
+on: the start phase never says `pass` and needs `defer_approval`, a round the
+panel itself will review and the stale-approval dismissal ahead of it, the axes
+need a SUCCESSFUL start and take its validated axis list, none of them gates the
+panel's own checks, the close-out reads the same gate and axis results the
 workflow reports, and no nested job asks for a scope the documented caller
 does not grant (that fails every caller at startup, input on or off).
 
@@ -136,10 +138,26 @@ class AxesAlongsidePanel(unittest.TestCase):
         # The real next round: `card.py prior` keeps only rounds below it.
         self.assertIn("needs.round-cap.outputs.next_round", with_value(body, "round"))
         expr = top_level(unwrap(job_key(body, "if")), "&&")
+        # `!cancelled()`: diff-size and preflight are skipped on the capped path.
+        self.assertEqual(expr[0], "!cancelled()")
         for term in ("github.event_name == 'pull_request_target'", "needs.round-cap.result == 'success'",
                      "inputs.approve_max_severity != ''", "needs.gate.outputs.approve_author_ok != 'false'",
-                     "needs.gate.outputs.should_run == 'true'", "needs.gate.outputs.already_reviewed != 'true'"):
+                     "needs.gate.outputs.should_run == 'true'", "needs.gate.outputs.already_reviewed != 'true'",
+                     # Without it post-review approves on severity alone and nothing withdraws it.
+                     "inputs.defer_approval",
+                     "needs.dismiss-stale-approval.result != 'failure'",
+                     "needs.dismiss-stale-approval.result != 'cancelled'"):
             self.assertIn(term, expr)
+        # Axes only for a round the panel itself reviews; the hand-off card without them.
+        self.assertIn("(needs.round-cap.outputs.capped == 'true' || needs.round-cap.outputs.labelled == 'true' || "
+                      "(needs.diff-size.outputs.within_cap == 'true' && needs.preflight.result == 'success'))", expr)
+        needs = job_key(body, "needs")
+        for job in ("gate", "round-cap", "diff-size", "preflight", "dismiss-stale-approval"):
+            self.assertRegex(needs, r"\b%s\b" % re.escape(job))
+
+    def test_post_review_waits_for_the_early_start_card(self):
+        # Otherwise a late start overwrites decide's round card with a pending one.
+        self.assertRegex(job_key(self.jobs["post-review"], "needs"), r"\bapprove-start-early\b")
 
     def test_the_axes_need_a_successful_start_and_get_explicit_secrets(self):
         for axis in ("correctness", "conformance"):
@@ -150,7 +168,7 @@ class AxesAlongsidePanel(unittest.TestCase):
             for term in ("needs.approve-start-early.result == 'success'",
                          "needs.round-cap.outputs.capped != 'true'", "needs.round-cap.outputs.labelled != 'true'"):
                 self.assertIn(term, expr, axis)
-            self.assertIn(f"',{axis},'", expr[-1])
+            self.assertEqual(expr[-1], f"contains(format(',{{0}},', needs.approve-start-early.outputs.axes), ',{axis},')")
             lines = iso.code_lines(body)
             self.assertNotIn("    secrets: inherit", lines)
             self.assertIn("      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}", lines)
@@ -164,11 +182,35 @@ class AxesAlongsidePanel(unittest.TestCase):
         needs = job_key(self.jobs["axes-closeout"], "needs")
         for job in re.findall(r"needs\.([a-z-]+)\.", closeout):
             self.assertIn(job, needs)
-        self.assertEqual(top_level(unwrap(job_key(self.jobs["axes-closeout"], "if")), "&&")[0], "always()")
+        expr = top_level(unwrap(job_key(self.jobs["axes-closeout"], "if")), "&&")
+        # Not `always()`: a superseded run must not close out the newer run's card.
+        self.assertEqual(expr[0], "!cancelled()")
+        self.assertIn("needs.approve-start-early.result != 'skipped'", expr)
+        axes_ok = with_value(self.jobs["axes-closeout"], "AXES_OK")
+        self.assertEqual(axes_ok, output_value(self.text, "axes_ok").replace("jobs.", "needs."))
+        for job in ("axis-correctness", "axis-conformance"):
+            self.assertIn(f"needs.{job}.result", axes_ok)
+            self.assertRegex(needs, r"\b%s\b" % re.escape(job))
+        self.assertIn('--axes-ok "$AXES_OK"', "\n".join(self.jobs["axes-closeout"]))
         self.assertIn('if [ -z "$APPROVER_TOKEN" ]', "\n".join(self.jobs["axes-closeout"]))
 
     def test_axes_started_reports_the_start_jobs_result(self):
         self.assertEqual(output_value(self.text, "axes_started"), "${{ jobs.approve-start-early.result }}")
+
+    def test_axes_ok_counts_an_unlisted_axis_but_not_a_failed_one(self):
+        value = output_value(self.text, "axes_ok")
+        for axis in ("correctness", "conformance"):
+            self.assertIn(f"""contains(fromJSON('["success","skipped"]'), jobs.axis-{axis}.result)""", value)
+
+    def test_cursor_approve_validates_and_exports_the_axes(self):
+        text = read("cursor-approve.yml")
+        self.assertRegex(text, r"\n    outputs:\n      axes:\n(?:        .*\n)*?        value: \$\{\{ jobs\.approve\.outputs\.axes \}\}\n")
+        approve = iso.split_jobs(text.split("\n"))["approve"]
+        self.assertIn("      axes: ${{ steps.axes.outputs.axes }}", iso.code_lines(approve))
+        step = "\n".join(approve)
+        step = step[step.index("- name: Check the axes"):step.index("- name: Check the approver token")]
+        self.assertIn('== "pending"', step)
+        self.assertIn('("correctness", "conformance")', step)
 
     def test_no_nested_job_asks_more_than_the_documented_caller_grants(self):
         # A nested job cannot exceed its caller's grant, and GitHub checks
