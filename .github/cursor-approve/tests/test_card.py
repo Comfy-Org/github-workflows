@@ -914,5 +914,108 @@ class EmptyLogin(unittest.TestCase):
         self.assertEqual(card._int_or_q("1.5"), "?")
 
 
+class AxesAlongsidePanel(unittest.TestCase):
+    """cursor-review's `axes_alongside_panel`: the early start card and its close-out."""
+
+    AXES = ["correctness", "conformance"]
+    RUN_URL = "https://github.com/o/r/actions/runs/9"
+
+    def early(self, sha=SHA, round_no="2"):
+        return card.render_start(round_no, "5", sha, self.AXES, "pending", self.RUN_URL)
+
+    def test_a_pending_start_card_carries_no_lane_marker(self):
+        # Load-bearing (approve_only_on_push): the lane marker says the panel
+        # passed, and the panel of this round is still running.
+        body = self.early()
+        self.assertNotIn(card.LANE_MARKER, body)
+        self.assertFalse(card.in_axes_lane(body))
+        self.assertTrue(card.in_axes_lane(card.render_start("2", "5", SHA, self.AXES, "pass", self.RUN_URL)))
+
+    def test_a_pending_start_card_is_pass_none_with_the_table_and_the_panel_line(self):
+        body = self.early()
+        self.assertEqual(markers(body), ("pass", "none"))
+        self.assertIn("| correctness | ⏳ pending |", body)
+        self.assertIn("| conformance | ⏳ pending |", body)
+        self.assertIn(card.PANEL_RUNNING_TEXT, body)
+        self.assertNotIn(card.PANEL_RUNNING_TEXT, card.render_start("2", "5", SHA, self.AXES, "pass", ""))
+
+    def test_closeout_leaves_a_decided_card_alone(self):
+        for body in (card.render_decide("2", "5", SHA, self.AXES, decision(correctness="green", conformance="green"),
+                                        "approved", "0", ""),
+                     card.render_round("2", "5", SHA, card.STATE_CHANGES, card.NEXT_RESOLVE, "x", [], "y", ""),
+                     card.render_round("2", "5", SHA, card.STATE_PASS, card.NEXT_NONE, "Approved", [], "", "")):
+            for gate in ("fail", "untrusted", "off"):
+                new, _ = card.closeout_body(body, SHA, "2", gate, run_url=self.RUN_URL, axes_ok=False)
+                self.assertIsNone(new)
+
+    def test_closeout_leaves_a_card_for_another_commit_or_round_alone(self):
+        self.assertIsNone(card.closeout_body(self.early(sha="b" * 40), SHA, "2", "fail", run_url=self.RUN_URL)[0])
+        self.assertIsNone(card.closeout_body(self.early(round_no="1"), SHA, "2", "fail", run_url=self.RUN_URL)[0])
+
+    def test_closeout_leaves_a_card_another_run_wrote_alone(self):
+        # A run a newer one superseded (same commit, same uncounted round) must
+        # not close out the card that newer run's start wrote.
+        other = card.render_start("2", "5", SHA, self.AXES, "pending", "https://github.com/o/r/actions/runs/10")
+        self.assertIsNone(card.closeout_body(other, SHA, "2", "fail", "5", run_url=self.RUN_URL)[0])
+        self.assertIsNone(card.closeout_body(self.early(), SHA, "2", "fail", "5", run_url="")[0])
+
+    def test_closeout_leaves_the_card_alone_when_the_panel_passed(self):
+        self.assertIsNone(card.closeout_body(self.early(), SHA, "2", "pass", run_url=self.RUN_URL)[0])
+
+    def test_closeout_rewrites_a_passing_round_whose_axis_job_did_not_complete(self):
+        new, why = card.closeout_body(self.early(), SHA, "2", "pass", "5", run_url=self.RUN_URL, axes_ok=False,
+                                      axis_results="correctness failure, conformance success")
+        self.assertEqual(why, "rewritten")
+        self.assertEqual(markers(new), ("no_decision", "push_then_relabel"))
+        self.assertIn("an axis job did not complete (correctness failure, conformance success)", new)
+        self.assertNotIn("⏳ pending", new)
+
+    def test_closeout_rewrites_a_pending_card_when_the_panel_did_not_pass(self):
+        for gate in ("untrusted", "fail", "off"):
+            new, why = card.closeout_body(self.early(), SHA, "2", gate, "5", run_url=self.RUN_URL)
+            self.assertEqual(why, "rewritten")
+            self.assertEqual(markers(new), ("no_decision", "push_then_relabel"))
+            self.assertIn(f"the review panel did not pass ({gate})", new)
+            self.assertNotIn("⏳ pending", new)
+            self.assertFalse(card.in_axes_lane(new))
+            self.assertEqual(card.reviewed_sha(new), SHA)
+            self.assertEqual(card.card_round(new), "2")
+
+    def test_closeout_is_idempotent(self):
+        new, _ = card.closeout_body(self.early(), SHA, "2", "fail", run_url=self.RUN_URL)
+        self.assertIsNotNone(new)
+        self.assertIsNone(card.closeout_body(new, SHA, "2", "fail", run_url=self.RUN_URL)[0])
+
+    def test_closeout_command_edits_only_the_approvers_card_and_never_fails(self):
+        planted = {"id": 3, "user": {"login": "someone"}, "body": self.early()}
+        mine = {"id": 7, "user": {"login": LOGIN}, "body": self.early()}
+        comments = [planted, mine]
+        patched = []
+
+        def fake_gh(args, payload=None):
+            if "--paginate" in args:
+                return json.dumps([comments])
+            patched.append(args[3])
+            mine["body"] = payload["body"]
+            return json.dumps({"id": 7})
+
+        argv = ["closeout", "--repo", "o/r", "--pr-number", "1", "--login", LOGIN, "--commit-sha", SHA,
+                "--round", "2", "--max-rounds", "5", "--approve-gate", "untrusted", "--run-url", self.RUN_URL]
+        with mock.patch.object(card, "gh", fake_gh), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(card.main(argv), 0)
+            self.assertEqual(card.main(argv), 0)  # a second run finds nothing pending
+        self.assertEqual(patched, ["repos/o/r/issues/comments/7"])
+        self.assertEqual(markers(mine["body"]), ("no_decision", "push_then_relabel"))
+        self.assertEqual(planted["body"], self.early())
+
+        def broken_gh(args, payload=None):
+            raise RuntimeError("boom")
+
+        out = io.StringIO()
+        with mock.patch.object(card, "gh", broken_gh), contextlib.redirect_stdout(out):
+            self.assertEqual(card.main(argv), 0)
+        self.assertIn("::warning::Could not close out", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

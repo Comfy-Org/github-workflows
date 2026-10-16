@@ -476,6 +476,17 @@ class ApproveExternal(unittest.TestCase):
                     self.assertEqual(aa.cmd_withdraw(args), 0)
                 self.assertEqual(fake.dismissed, dismissed)
 
+    def test_withdraw_on_a_pending_gate_is_a_pass(self):
+        # cursor-review's `axes_alongside_panel` start, its panel still
+        # running: withdraw this identity's own approvals, never the standing
+        # block (the panel's decide dismisses that when the round passes).
+        fake = FakeGitHub(reviews=[prior_approval(SHA)] + handoff_reviews(), labels=[aa.HUMAN_REVIEW_LABEL])
+        args = argparse.Namespace(repo="o/r", pr_number="1", approver_login=LOGIN, approve_gate="pending")
+        with mock.patch.object(aa, "gh", fake), mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+            self.assertEqual(aa.cmd_withdraw(args), 0)
+        self.assertEqual(fake.dismissed, ["42"])
+        self.assertNotIn(aa.GATE_PENDING, aa.APPROVE_GATE_VALUES)
+
     def test_withdraw_is_red_when_the_block_cannot_be_withdrawn(self):
         class Refuses(FakeGitHub):
             def __call__(self, args, payload=None):

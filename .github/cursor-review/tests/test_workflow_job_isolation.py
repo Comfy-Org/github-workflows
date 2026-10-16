@@ -161,6 +161,11 @@ def checks_out_pr_repo(job_lines):
     return False
 
 
+def calls_a_workflow(job_lines):
+    """True for a job that is a reusable-workflow call (`uses:` at job level)."""
+    return any(re.match(r"^    uses:\s", line) for line in code_lines(job_lines))
+
+
 def references_bot_key(job_lines):
     return any("BOT_APP_PRIVATE_KEY" in line for line in code_lines(job_lines))
 
@@ -313,10 +318,17 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             name for name, body in self.jobs.items()
             if any("secrets.ANTHROPIC_API_KEY" in l for l in code_lines(body))
         }
-        self.assertEqual(holders, {"gate", "review-anthropic-direct", "judge-direct"})
+        # `axis-correctness` / `axis-conformance` (`axes_alongside_panel`) hand
+        # it on to cursor-axis-base.yml, whose only readers (`axis-probe`,
+        # `axis-direct`) are hard-pinned to ubuntu-latest there; they pass no
+        # `runs_on` (asserted in the runs_on test).
+        self.assertEqual(holders, {"gate", "review-anthropic-direct", "judge-direct",
+                                   "axis-correctness", "axis-conformance"})
         for name in ("review-anthropic-direct", "judge-direct"):
             runs_on = [l.strip() for l in self.jobs[name] if l.startswith("    runs-on:")]
             self.assertEqual(runs_on, ["runs-on: ubuntu-latest"], name)
+        for name in ("axis-correctness", "axis-conformance"):
+            self.assertTrue(calls_a_workflow(self.jobs[name]), name)
 
     def test_the_anthropic_cells_load_no_pr_authored_claude_config(self):
         # `claude` runs with the PR checkout as cwd, so PR-authored
@@ -379,6 +391,11 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         # ubuntu-latest, so a pool never meets a credential worth stealing.
         routed, hosted = set(), set()
         for name, body in self.jobs.items():
+            if calls_a_workflow(body):
+                # A called workflow's jobs pick their own runner; this one
+                # must not hand it the pool (axis-<name>'s `runs_on`).
+                self.assertFalse(any("inputs.runs_on" in l for l in code_lines(body)), name)
+                continue
             runs_on = [l.strip() for l in body if l.startswith("    runs-on:")]
             self.assertEqual(len(runs_on), 1, f"job `{name}` has no single runs-on")
             if "inputs.runs_on" in runs_on[0]:
@@ -452,14 +469,21 @@ class WorkflowJobIsolationTest(unittest.TestCase):
             if any("secrets.APPROVER_TOKEN" in line for line in code_lines(body))
         )
         self.assertEqual(
-            token_jobs, ["approve-only", "auto-rereview", "auto-retry", "dismiss-stale-approval", "post-review"]
+            token_jobs, ["approve-only", "approve-start-early", "auto-rereview", "auto-retry", "axes-closeout",
+                         "dismiss-stale-approval", "post-review"]
         )
         env_jobs = sorted(
             name
             for name, body in self.jobs.items()
             if any(re.match(r"^    environment:", line) for line in code_lines(body))
         )
-        self.assertEqual(env_jobs, token_jobs)
+        # A job that calls a workflow cannot declare `environment:`; it passes
+        # `approver_environment` on, and cursor-approve.yml declares it (below).
+        called = [name for name in token_jobs if calls_a_workflow(self.jobs[name])]
+        self.assertEqual(called, ["approve-start-early"])
+        self.assertIn("      approver_environment: ${{ inputs.approver_environment }}",
+                      code_lines(self.jobs["approve-start-early"]))
+        self.assertEqual(env_jobs, [name for name in token_jobs if name not in called])
         for name in env_jobs:
             body = code_lines(self.jobs[name])
             self.assertIn(ENVIRONMENT_LINE, body, name)

@@ -9,7 +9,16 @@ round:
 ``start`` (before the axis jobs)
     The round heading, every enabled axis as pending, and a link to the run.
     When cursor-review reported ``approve_gate == capped`` it writes
-    "Round limit reached, needs a human" and no table instead.
+    "Round limit reached, needs a human" and no table instead. Under
+    cursor-review's ``axes_alongside_panel`` it runs while the panel still
+    does (``approve_gate == pending``): the same table, a line saying the
+    panel is still running, and no ``LANE_MARKER``.
+
+``closeout`` (cursor-review's ``axes-closeout``, after its panel decided)
+    Rewrite that early card to "No decision this round" when the panel did
+    not pass, or an axis job did not complete — only a ``pass`` card for the
+    same commit, round and workflow run with an axis still pending, so a card
+    any decide (or a newer run) already wrote is left alone.
 
 ``ensure`` (decide phase, before the review is posted)
     Print the card's URL, creating it first when the start phase never ran,
@@ -91,6 +100,7 @@ AXES = ("business", "design", "correctness", "completeness", "conformance")
 VERDICT_ICONS = {"green": "🟢 green", "yellow": "🟡 yellow", "red": "🔴 red",
                  "n/a": "⚪ n/a"}
 NO_RESULT = "⚠️ no result"
+PENDING_ROW = "⏳ pending"
 # A yellow's two meanings (aggregate.py's YELLOW_KINDS), told apart on the card
 # so a reader sees which kind gated a round. Both keep the `🟡 yellow` prefix
 # and contain no `red`/`green`/`n/a`/`pending`: a consumer that reduces a
@@ -443,8 +453,21 @@ def _reviewed_line(sha: str, run_url: str) -> str:
     return f"_Reviewed commit: {reviewed} · {_run_link(run_url)}_"
 
 
+PANEL_RUNNING_TEXT = "*The review panel is still running; the axes judge the same commit in parallel.*"
+
+
 def render_start(round_no, max_rounds, sha: str, axes: list, approve_gate: str, run_url: str) -> str:
+    """The start phase's card: every axis pending, or the capped hand-off.
+
+    `approve_gate == "pending"` is cursor-review's `axes_alongside_panel`
+    start, written while its panel is still running: the same `pass`/`none`
+    head and table, a line saying so, and NO `LANE_MARKER`. The lane marker
+    means "the last panel round passed", which `auto-approve.py
+    approve_only_blocker` trusts to let a push skip the panel; an early card
+    carrying it would put a round whose panel has not passed into that lane.
+    """
     capped = approve_gate == "capped"
+    early = approve_gate == "pending"
     lines = card_head(STATE_CAPPED if capped else STATE_PASS, NEXT_HUMAN if capped else NEXT_NONE)
     lines += [heading(round_no, max_rounds, sha), ""]
     if capped:
@@ -452,9 +475,11 @@ def render_start(round_no, max_rounds, sha: str, axes: list, approve_gate: str, 
         lines += ["", f"**Next step:** {NEXT_HUMAN_CAPPED_TEXT}"]
     else:
         lines += ["| Axis | Verdict | Why |", "|---|---|---|"]
-        lines += [f"| {axis} | ⏳ pending | |" for axis in axes]
+        lines += [f"| {axis} | {PENDING_ROW} | |" for axis in axes]
+        if early:
+            lines += ["", PANEL_RUNNING_TEXT]
     lines += ["", _reviewed_line(sha, run_url)]
-    if not capped:
+    if not capped and not early:
         lines += ["", LANE_MARKER]
     return "\n".join(lines) + "\n"
 
@@ -650,6 +675,7 @@ _REREVIEW_SENTINEL_RE = re.compile(r"^<!-- cursor-approve:auto-rereview v1 ([0-9
 REREVIEW_HEADS_KEPT = 20
 _HEADING_RE = re.compile(r"^### Cursor approve · round ([0-9?]+) of ([0-9?]+) · ", re.MULTILINE)
 _REVIEWED_RE = re.compile(r"^_Reviewed commit: `([0-9a-f]{40})`", re.MULTILINE)
+_REVIEWED_RUN_RE = re.compile(r"^_Reviewed commit: .*\[workflow run\]\(([^)\s]+)\)", re.MULTILINE)
 _STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-approve-state: ([a-z_]+) -->")
 
 # --- approver-only re-checks (cursor-review's `approve_only_on_push`) --------
@@ -662,7 +688,9 @@ _STATE_RE = re.compile(r"\A" + re.escape(CARD_MARKER) + r"\r?\n<!-- cursor-appro
 # history names no other editor (auto-approve.py `card_foreign_editors`):
 #
 # LANE_MARKER       written by every card that sits past a passing panel: the
-#                   start card (not at the cap) and the decide card (not handed
+#                   start card (not at the cap, nor `pending`: an
+#                   `axes_alongside_panel` start runs before the panel has
+#                   passed) and the decide card (not handed
 #                   to a human), and carried by `render_dismissed`. Absent from
 #                   cursor-review's own round card, so the moment a panel round
 #                   decides — whatever it decided — the PR is out of the lane
@@ -702,6 +730,12 @@ def card_state(body) -> str:
 def reviewed_sha(body) -> str:
     """The full commit SHA on the card's "Reviewed commit" line, or ""."""
     match = _REVIEWED_RE.search(body or "")
+    return match.group(1) if match else ""
+
+
+def reviewed_run_url(body) -> str:
+    """The workflow-run link on the card's "Reviewed commit" line, or ""."""
+    match = _REVIEWED_RUN_RE.search(body or "")
     return match.group(1) if match else ""
 
 
@@ -1279,6 +1313,18 @@ def main(argv=None) -> int:
     # The commit this round's axes judge: an approver-only re-check shares its
     # panel round's number, so a same-round entry for ANOTHER commit is prior.
     p.add_argument("--commit-sha", default="")
+    p = sub.add_parser("closeout")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--pr-number", required=True)
+    p.add_argument("--login", required=True)
+    p.add_argument("--commit-sha", required=True)
+    p.add_argument("--round", default="")
+    p.add_argument("--approve-gate", default="")
+    p.add_argument("--max-rounds", default="")
+    p.add_argument("--review-label", default=DEFAULT_REVIEW_LABEL)
+    p.add_argument("--run-url", default="")
+    p.add_argument("--axes-ok", default="true")
+    p.add_argument("--axis-results", default="")
     for name in ("start", "ensure", "decide"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
@@ -1303,6 +1349,8 @@ def main(argv=None) -> int:
         return 2
     if args.cmd == "prior":
         return cmd_prior(args)
+    if args.cmd == "closeout":
+        return cmd_closeout(args)
     axes = parse_axes(args.axes)
     entry, keep = None, None
     if args.cmd == "start":
@@ -1400,6 +1448,75 @@ def cmd_prior(args) -> int:
         print(f"::warning::Could not write the prior-axes history to {args.out}: {e.__class__.__name__}")
         return 0
     print(f"prior rounds read from the card: {len(rounds)}")
+    return 0
+
+
+_PENDING_ROW_RE = re.compile(r"^\| [a-z]+ \| " + re.escape(PENDING_ROW) + r" \|", re.MULTILINE)
+
+
+def closeout_body(body, commit_sha: str, round_no, approve_gate: str, max_rounds="",
+                  label=DEFAULT_REVIEW_LABEL, run_url: str = "", axes_ok: bool = True,
+                  axis_results: str = ""):
+    """(new body or None, why): the close-out of an `axes_alongside_panel` round.
+
+    cursor-review's early start card says every axis is pending while its panel
+    runs. When that panel then did NOT pass, nothing else rewrites the card on
+    every path (the caller's decide runs only on `pass`), so it would keep
+    saying "pending" for a round whose axes' verdicts nobody will read. On
+    `pass` the same holds when an axis job did not succeed (`axes_ok` false):
+    the caller's decide skips then, since a failed axis upload may mean another
+    job claimed its artifact name. Only THAT card is rewritten: state `pass`,
+    this commit, this round, written by THIS run (a run a newer one superseded
+    must not close out the newer run's card), at least one pending axis row.
+    Anything else — a card a decide already wrote, one for another commit,
+    round or run — is left alone, and so is every card on a clean `pass`.
+    """
+    gate = (approve_gate or "").strip()
+    if gate == "pass" and axes_ok:
+        return None, "the panel passed; the caller's decide writes the verdicts"
+    if card_state(body) != STATE_PASS:
+        return None, f"the card's state is {card_state(body) or 'unreadable'!r}, not 'pass'"
+    if reviewed_sha(body) != (commit_sha or "").strip().lower():
+        return None, "the card is for another commit"
+    if card_round(body) != _int_or_q(round_no):
+        return None, "the card is for another round"
+    if reviewed_run_url(body) != (run_url or "").strip():
+        return None, "the card was written by another workflow run"
+    if not _PENDING_ROW_RE.search(body or ""):
+        return None, "the card has no pending axis"
+    if gate == "pass":
+        detail = f" ({axis_results.strip()})" if axis_results.strip() else ""
+        headline = (f"No decision this round: an axis job did not complete{detail}, "
+                    "so no axis verdict for this commit is trusted.")
+    else:
+        headline = (f"No decision this round: the review panel did not pass ({gate or 'no verdict'}), "
+                    "so the axes' verdicts for this commit were discarded.")
+    return render_round(round_no, max_rounds, commit_sha, STATE_NO_DECISION, NEXT_PUSH, headline, [],
+                        next_push_text(label), run_url), "rewritten"
+
+
+def cmd_closeout(args) -> int:
+    """Rewrite the early start card when its round's panel did not pass.
+
+    Never an error past the arguments, like `prior`: a card that cannot be read
+    or written is a warning, and the round's outcome is already decided.
+    """
+    try:
+        found = find_card(list_comments(args.repo, args.pr_number), args.login)
+        if found is None:
+            print("No cursor-approve card on this PR; nothing to close out.")
+            return 0
+        body, why = closeout_body(found.get("body") or "", args.commit_sha, args.round, args.approve_gate,
+                                  args.max_rounds, args.review_label, args.run_url,
+                                  axes_ok=(args.axes_ok or "").strip().lower() != "false",
+                                  axis_results=args.axis_results)
+        if body is None:
+            print(f"Leaving the cursor-approve card alone: {why}.")
+            return 0
+        upsert(args.repo, args.pr_number, args.login, body, card=found)
+        print("Closed out the early cursor-approve card: the panel did not pass, or an axis job did not complete.")
+    except Exception as e:  # noqa: BLE001 — a report; the round is already decided
+        print(f"::warning::Could not close out the cursor-approve card ({e.__class__.__name__}: {e})")
     return 0
 
 
