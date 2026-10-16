@@ -53,3 +53,8 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+      - name: fetch-history.sh (shellcheck + local-upstream test)
+        run: |
+          shellcheck -x fetch-history.sh fetch-history-test.sh
+          bash fetch-history-test.sh
