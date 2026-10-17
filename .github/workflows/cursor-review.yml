@@ -7810,9 +7810,9 @@ jobs:
     # hand the new head to the caller's cursor-approve jobs (the `approve_gate`
     # output reads `go`). `auto-approve.py approve-only` decides; see its block
     # comment for every condition. Two stages either side of the debounce:
-    # `check` (eligible? announce it on the card; `auto-rereview` stands down
-    # on `eligible`) and `start` (re-read everything live, record the head on
-    # the card's re-check sentinel, write `go` and `round`).
+    # `check` (eligible? announce it on the card) and `start` (re-read
+    # everything live, record the head on the card's re-check sentinel, write
+    # `go` and `round`; `auto-rereview` stands down on `go`, not `eligible`).
     #
     # After `Dismiss stale auto-approval`, so its stale-card write lands first
     # and this job's announcement replaces that card's next step; and only

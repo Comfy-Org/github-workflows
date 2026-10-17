@@ -102,10 +102,12 @@ Eight subcommands, each run from a job that checks out NO PR code:
     `approve_only_on_push`: on a push past a round whose panel passed, hand the
     new head to the axes alone — see ``cmd_approve_only`` and the block comment
     above it. ``check`` answers only whether the push is eligible (the
-    `eligible` output, which also stands ``auto-rereview`` down) and announces
+    `eligible` output, which gates the debounce and ``start``) and announces
     the re-check on the card; ``start`` re-reads everything live and writes
     `go`, which sets cursor-review's ``approve_gate`` to ``pass`` with no panel,
-    so the caller's existing cursor-approve jobs judge the pushed commit. It
+    so the caller's existing cursor-approve jobs judge the pushed commit, and
+    which alone stands ``auto-rereview`` down — not `eligible`, so a ``start``
+    that stands down after the debounce still leaves the full round. It
     records the head on the card's re-check sentinel first — the record that
     stops a second re-check of the same head. No consolidated review is posted,
     so such a push never consumes `max_rounds`. Eligibility is read from the
@@ -113,15 +115,17 @@ Eight subcommands, each run from a job that checks out NO PR code:
     and anything unreadable is "not eligible".
 
 ``auto-retry`` (in `auto-retry`, last, after every job that reports on the round)
-    Re-run a round the head outran: take the review label off the PR and put it
-    back — see ``cmd_auto_retry``. Only ``decide`` asks for it (`auto_retry`),
+    Re-run a round the head outran, or (with ``--retry-errored-rounds true``)
+    a same-head round whose reviewers ERRORED: take the review label off the
+    PR and put it back — see ``cmd_auto_retry`` and ``auto_retry_eligible``. Only ``decide`` asks for it (`auto_retry`),
     and only once its marked standing block is on the PR. The relabel fires
     ``unlabeled``/``labeled`` events that land in the caller's
     ``cancel-in-progress`` group, cancelling whatever of this run is still
     going, which is why the job runs last. The write must come from
     APPROVER_TOKEN or the bot App token — a GITHUB_TOKEN-applied label fires no
     run — and the PR is re-read first, so one closed, merged or handed to a
-    human during the wait gets no new round.
+    human during the wait gets no new round. That guard is best-effort: if the
+    re-read fails, it warns and relabels anyway.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
