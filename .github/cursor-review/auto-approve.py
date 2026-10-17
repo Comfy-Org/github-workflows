@@ -3,7 +3,7 @@
 
 Used by cursor-review.yml when the caller sets `approve_max_severity` (and,
 for ``round-cap``, `max_rounds`), and by cursor-approve.yml (``approve-external``).
-Five subcommands, each run from a job that checks out NO PR code:
+Eight subcommands, each run from a job that checks out NO PR code:
 
 ``decide`` (in `post-review`, after the consolidated review is posted)
     APPROVE when every finding of this round is at or below the threshold and
@@ -85,6 +85,43 @@ Five subcommands, each run from a job that checks out NO PR code:
     cursor-review's ``axes_alongside_panel`` the axes (and their artifacts)
     exist before the panel has decided, so a decide that ran on any other
     gate would approve on the axes alone.
+
+``auto-rereview`` (in `auto-rereview`, after the dismissal's debounce)
+    Start the round a dismissal left wanting, once per head — see
+    ``cmd_auto_rereview``. Everything is re-read live after the wait, and
+    anything unreadable stands down: the head must still be the dismissed one,
+    the PR open, not a draft, carrying no veto label and under `max_rounds`,
+    the approver's card must still be the stale card for that head with no
+    automatic round recorded against it, and no round may have started since
+    the approval that card reports. The head goes on the card BEFORE the
+    relabel, so a later waiter reads that record and never starts a second
+    round for the same head.
+
+``approve-only`` (in `approve-only`, stage ``check`` before the debounce,
+``start`` after it)
+    `approve_only_on_push`: on a push past a round whose panel passed, hand the
+    new head to the axes alone — see ``cmd_approve_only`` and the block comment
+    above it. ``check`` answers only whether the push is eligible (the
+    `eligible` output, which also stands ``auto-rereview`` down) and announces
+    the re-check on the card; ``start`` re-reads everything live and writes
+    `go`, which sets cursor-review's ``approve_gate`` to ``pass`` with no panel,
+    so the caller's existing cursor-approve jobs judge the pushed commit. It
+    records the head on the card's re-check sentinel first — the record that
+    stops a second re-check of the same head. No consolidated review is posted,
+    so such a push never consumes `max_rounds`. Eligibility is read from the
+    approver identity's own card and the live PR only, never from PR content,
+    and anything unreadable is "not eligible".
+
+``auto-retry`` (in `auto-retry`, last, after every job that reports on the round)
+    Re-run a round the head outran: take the review label off the PR and put it
+    back — see ``cmd_auto_retry``. Only ``decide`` asks for it (`auto_retry`),
+    and only once its marked standing block is on the PR. The relabel fires
+    ``unlabeled``/``labeled`` events that land in the caller's
+    ``cancel-in-progress`` group, cancelling whatever of this run is still
+    going, which is why the job runs last. The write must come from
+    APPROVER_TOKEN or the bot App token — a GITHUB_TOKEN-applied label fires no
+    run — and the PR is re-read first, so one closed, merged or handed to a
+    human during the wait gets no new round.
 
 ``withdraw`` (in cursor-approve.yml's start phase)
     Withdraw this identity's own marked approvals while the axes run — see
