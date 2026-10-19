@@ -879,6 +879,38 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(pins("cursor-axis-base.yml"), pins("cursor-review.yml"))
         self.assertEqual(len(pins("cursor-review.yml")), 2)
 
+    def test_cli_pin_bumper_edits_every_file_carrying_the_pin(self):
+        pin_re = re.compile(r"^  CURSOR_CLI_VERSION: ", re.MULTILINE)
+        carrying = []
+        for name in sorted(os.listdir(WORKFLOWS)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as fh:
+                if pin_re.search(fh.read()):
+                    carrying.append(f".github/workflows/{name}")
+        self.assertIn(".github/workflows/cursor-review.yml", carrying)
+        with open(os.path.join(WORKFLOWS, "bump-cursor-cli-pin.yml"), encoding="utf-8") as fh:
+            bumper = fh.read()
+        hint = ("every workflow carrying the Cursor CLI pin must be listed in bump-cursor-cli-pin.yml's "
+                "WORKFLOW_FILES (both the Discover and Move-the-pin steps) and its `git add` line")
+        listed = re.findall(r"^\s+WORKFLOW_FILES: (.+)$", bumper, re.MULTILINE)
+        self.assertEqual(len(listed), 2, "both the Discover and Move-the-pin steps declare WORKFLOW_FILES")
+        for value in listed:
+            self.assertEqual(sorted(value.split()), carrying, hint)
+        added = re.findall(r"^\s+git add (.+)$", bumper, re.MULTILINE)
+        self.assertEqual(len(added), 1, "the bumper stages the pin files in one `git add`")
+        for value in added:
+            self.assertEqual(sorted(value.split()), carrying, hint)
+        # And every carrier holds the SAME (version, sha256) pair, not just the
+        # two test_cli_pin_matches_cursor_review names.
+        pin_pair = re.compile(r"^  (CURSOR_CLI_(?:VERSION|SHA256)): (\S+)$", re.MULTILINE)
+        pairs = set()
+        for path in carrying:
+            with open(os.path.join(WORKFLOWS, os.path.basename(path)), encoding="utf-8") as fh:
+                pairs.add(tuple(pin_pair.findall(fh.read())))
+        self.assertEqual(len(pairs), 1, f"Cursor CLI pins diverge across {carrying}: {pairs}")
+        self.assertEqual(len(next(iter(pairs))), 2)
+
 
 
 class GuardParity(unittest.TestCase):
