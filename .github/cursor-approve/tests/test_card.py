@@ -897,9 +897,19 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(len(listed), 2, "both the Discover and Move-the-pin steps declare WORKFLOW_FILES")
         for value in listed:
             self.assertEqual(sorted(value.split()), carrying, hint)
-        added = re.search(r"^\s+git add (.+)$", bumper, re.MULTILINE)
-        self.assertIsNotNone(added)
-        self.assertEqual(sorted(added.group(1).split()), carrying, hint)
+        added = re.findall(r"^\s+git add (.+)$", bumper, re.MULTILINE)
+        self.assertEqual(len(added), 1, "the bumper stages the pin files in one `git add`")
+        for value in added:
+            self.assertEqual(sorted(value.split()), carrying, hint)
+        # And every carrier holds the SAME (version, sha256) pair, not just the
+        # two test_cli_pin_matches_cursor_review names.
+        pin_pair = re.compile(r"^  (CURSOR_CLI_(?:VERSION|SHA256)): (\S+)$", re.MULTILINE)
+        pairs = set()
+        for path in carrying:
+            with open(os.path.join(WORKFLOWS, os.path.basename(path)), encoding="utf-8") as fh:
+                pairs.add(tuple(pin_pair.findall(fh.read())))
+        self.assertEqual(len(pairs), 1, f"Cursor CLI pins diverge across {carrying}: {pairs}")
+        self.assertEqual(len(next(iter(pairs))), 2)
 
 
 

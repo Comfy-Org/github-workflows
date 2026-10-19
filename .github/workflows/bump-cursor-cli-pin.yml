@@ -122,21 +122,28 @@ jobs:
           # Anchored read of the pin: `^  CURSOR_CLI_VERSION: ` matches the
           # top-level env key and nothing else (the in-job references to
           # $CURSOR_CLI_VERSION are indented far deeper). Every file carrying the
-          # pin must agree: a divergence means someone hand-moved one of them,
-          # and the bumper fails loud rather than papering over it.
+          # pin must agree on BOTH the version and the digest: a divergence means
+          # someone hand-moved one of them, and the bumper fails loud rather than
+          # papering over it. A digest mismatch on an equal version is checked
+          # here, before the no-change exit, because it is otherwise invisible
+          # to a run whose version is already current. Never auto-reconciled:
+          # which digest is right is the reviewer's call (see the trust anchor).
           read -ra files <<<"$WORKFLOW_FILES"
           old_version=""
+          old_sha256=""
           for f in "${files[@]}"; do
             v=$(sed -nE 's/^  CURSOR_CLI_VERSION: (.*)$/\1/p' "$f" | head -1 || true)
-            if [ -z "$v" ]; then
-              echo "::error::No '  CURSOR_CLI_VERSION: ' line in ${f} — the pin moved or was removed; this workflow needs updating."
+            d=$(sed -nE 's/^  CURSOR_CLI_SHA256: (.*)$/\1/p' "$f" | head -1 || true)
+            if [ -z "$v" ] || [ -z "$d" ]; then
+              echo "::error::No '  CURSOR_CLI_VERSION: ' / '  CURSOR_CLI_SHA256: ' line in ${f} — the pin moved or was removed; this workflow needs updating."
               exit 1
             fi
-            echo "pinned in ${f}: ${v}"
+            echo "pinned in ${f}: ${v} (sha256 ${d})"
             if [ -z "$old_version" ]; then
               old_version="$v"
-            elif [ "$v" != "$old_version" ]; then
-              echo "::error::Pinned versions disagree across ${WORKFLOW_FILES} ('${old_version}' vs '${v}' in ${f}) — reconcile by hand before the bumper can move them."
+              old_sha256="$d"
+            elif [ "$v" != "$old_version" ] || [ "$d" != "$old_sha256" ]; then
+              echo "::error::Pins disagree across ${WORKFLOW_FILES} ('${old_version}' / ${old_sha256} vs '${v}' / ${d} in ${f}) — reconcile by hand before the bumper can move them."
               exit 1
             fi
           done
