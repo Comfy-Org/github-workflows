@@ -287,6 +287,11 @@
 					"description": "Post review status messages (e.g., when a review is skipped) in the walkthrough summary comment.",
 					"type": "boolean"
 				},
+				"review_info": {
+					"default": true,
+					"description": "Post review information such as the configuration used, reviewed commits, and skipped files.",
+					"type": "boolean"
+				},
 				"review_details": {
 					"default": false,
 					"description": "Post review details (ignored files, extra context used, suppressed comments, etc.).",
@@ -619,13 +624,13 @@
 							}
 						},
 						"autofix": {
-							"description": "Autofix | Configure autofix behavior.",
+							"description": "Fix comments | Configure the Fix comments finishing touch.",
 							"default": {},
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Autofix | Enable the autofix finishing touch (trigger via the 🪄 Autofix checkboxes under review comments or the `@coderabbitai autofix` command). When disabled, the autofix checkboxes are hidden, the command is removed from help, and CodeRabbit declines `@coderabbitai autofix` requests.",
+									"description": "Fix comments | Enable the Fix comments finishing touch (trigger via the 🪄 Fix comments checkbox under review comments or the `@coderabbitai fix comments` command). When disabled, the Fix comments checkboxes are hidden, the command is removed from help, and CodeRabbit declines one-off repair requests using `@coderabbitai fix comments` or the compatibility aliases `fix-comments`, `fix`, `autofix`, `auto-fix`, and `auto fix`, with or without `stacked pr`.",
 									"type": "boolean"
 								}
 							}
@@ -886,7 +891,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.8",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.9",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1021,7 +1026,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.14",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.16",
 									"type": "boolean"
 								},
 								"level": {
@@ -1076,7 +1081,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.13.2",
+									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.14.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1104,7 +1109,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.8.1",
+									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.9.0",
 									"type": "boolean"
 								}
 							}
@@ -1128,7 +1133,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.19",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.20",
 									"type": "boolean"
 								}
 							}
@@ -1261,7 +1266,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Regal | Regal is a linter and language server for Rego. | v0.42.0",
+									"description": "Enable Regal | Regal is a linter and language server for Rego. | v0.43.0",
 									"type": "boolean"
 								}
 							}
@@ -1297,7 +1302,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.27.0",
+									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.28.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1337,7 +1342,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.22.0",
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.23.0",
 									"type": "boolean"
 								}
 							}
@@ -1373,7 +1378,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.177.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.179.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1389,7 +1394,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.50961",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.51648",
 									"type": "boolean"
 								}
 							}
@@ -1429,7 +1434,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.65.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.66.0",
 									"type": "boolean"
 								}
 							}
@@ -1465,7 +1470,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.8",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.1.1",
 									"type": "boolean"
 								}
 							}
@@ -1477,7 +1482,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.85.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.86.0",
 									"type": "boolean"
 								}
 							}
@@ -1489,7 +1494,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.8.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.8.3 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1659,7 +1664,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.11.2",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.12.0",
 									"type": "boolean"
 								}
 							}
@@ -1771,7 +1776,7 @@
 						},
 						"filePatterns": {
 							"default": [],
-							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. An entry may also reference a same-organization repository the CodeRabbit installation can read, as repo:path or owner/repo:path (e.g. engineering-standards:frontend/react.md, globs supported); such files are read at that repository's default branch. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
+							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. An entry may also reference a same-organization repository the CodeRabbit installation can read, as repo:path or owner/repo:path (e.g. engineering-standards:frontend/react.md, globs supported); such files are read at that repository's default branch. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/.claude/rules/**/*.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
 							"type": "array",
 							"items": {
 								"anyOf": [
