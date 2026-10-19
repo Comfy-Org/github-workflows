@@ -40,6 +40,9 @@ on:
       # (secret isolation, the guard byte-copy, the CLI pin).
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
+      # The cursor-approve suite asserts the bumper lists every file carrying
+      # the CLI pin.
+      - '.github/workflows/bump-cursor-cli-pin.yml'
       - '.github/workflows/axis-*.yml'
       # test_caller_doc_pattern.py reads the caller snippets out of these
       # pages and pins their `if:` guards; the regression it guards is a
@@ -58,6 +61,9 @@ on:
       # (secret isolation, the guard byte-copy, the CLI pin).
       - '.github/workflows/cursor-approve.yml'
       - '.github/workflows/cursor-axis-base.yml'
+      # The cursor-approve suite asserts the bumper lists every file carrying
+      # the CLI pin.
+      - '.github/workflows/bump-cursor-cli-pin.yml'
       - '.github/workflows/axis-*.yml'
       # test_caller_doc_pattern.py reads the caller snippets out of these
       # pages and pins their `if:` guards; the regression it guards is a

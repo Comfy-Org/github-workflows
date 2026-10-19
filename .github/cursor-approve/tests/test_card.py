@@ -879,6 +879,28 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(pins("cursor-axis-base.yml"), pins("cursor-review.yml"))
         self.assertEqual(len(pins("cursor-review.yml")), 2)
 
+    def test_cli_pin_bumper_edits_every_file_carrying_the_pin(self):
+        pin_re = re.compile(r"^  CURSOR_CLI_VERSION: ", re.MULTILINE)
+        carrying = []
+        for name in sorted(os.listdir(WORKFLOWS)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as fh:
+                if pin_re.search(fh.read()):
+                    carrying.append(f".github/workflows/{name}")
+        self.assertIn(".github/workflows/cursor-review.yml", carrying)
+        with open(os.path.join(WORKFLOWS, "bump-cursor-cli-pin.yml"), encoding="utf-8") as fh:
+            bumper = fh.read()
+        hint = ("every workflow carrying the Cursor CLI pin must be listed in bump-cursor-cli-pin.yml's "
+                "WORKFLOW_FILES (both the Discover and Move-the-pin steps) and its `git add` line")
+        listed = re.findall(r"^\s+WORKFLOW_FILES: (.+)$", bumper, re.MULTILINE)
+        self.assertEqual(len(listed), 2, "both the Discover and Move-the-pin steps declare WORKFLOW_FILES")
+        for value in listed:
+            self.assertEqual(sorted(value.split()), carrying, hint)
+        added = re.search(r"^\s+git add (.+)$", bumper, re.MULTILINE)
+        self.assertIsNotNone(added)
+        self.assertEqual(sorted(added.group(1).split()), carrying, hint)
+
 
 
 class GuardParity(unittest.TestCase):

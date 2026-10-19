@@ -1,6 +1,7 @@
 name: Bump Cursor CLI pin
 
-# Keep the Cursor CLI pin in cursor-review.yml from going stale silently.
+# Keep the Cursor CLI pin in cursor-review.yml and cursor-axis-base.yml from
+# going stale silently.
 #
 # BE-5869 replaced `curl https://cursor.com/install | bash` with a versioned,
 # sha256-pinned artifact (see .github/cursor-review/install-cursor-cli.sh). That
@@ -8,13 +9,21 @@ name: Bump Cursor CLI pin
 # one: nothing moves the pin, so the panel would run an ever-older CLI until
 # someone noticed. This job notices instead — weekly it reads the version Cursor
 # currently ships, and when it differs from the pin it downloads that version's
-# linux/x64 artifact, computes its digest, and opens a two-line PR moving
-# CURSOR_CLI_VERSION + CURSOR_CLI_SHA256. Nothing auto-merges: a human reviews
+# linux/x64 artifact, computes its digest, and opens a PR moving
+# CURSOR_CLI_VERSION + CURSOR_CLI_SHA256 in BOTH files that carry the pin
+# (cursor-review.yml, and cursor-axis-base.yml since the cursor-approve axes
+# install the same CLI). Nothing auto-merges: a human reviews
 # the digest, which is the whole point (see the trust-anchor note below).
 #
-# Merging that PR touches .github/workflows/cursor-review.yml, which is exactly
-# the path filter bump-cursor-review-callers.yml watches — so the SHA-pinned
-# caller fleet rolls forward on its own. No new fleet plumbing here.
+# Merging that PR touches .github/workflows/cursor-review.yml and
+# .github/workflows/cursor-axis-base.yml, both already in
+# bump-cursor-review-callers.yml's single `push.paths` filter — so the one
+# SHA-pinned caller fleet rolls forward on its own, exactly as before (there is
+# deliberately no separate cursor-approve fleet; see that file's header). No new
+# fleet plumbing here. The two pins must stay equal (cursor-approve's
+# test_card.py asserts it), so the bumper reads and moves them together; the
+# same suite asserts WORKFLOW_FILES and the `git add` below list every file
+# carrying the pin.
 #
 # Modelled on bump-cursor-review-callers.yml: same main-only job guard, same
 # non-cancelling concurrency around a stable shared branch, same App-token
@@ -73,7 +82,7 @@ jobs:
       - name: Discover the version Cursor currently ships
         id: discover
         env:
-          WORKFLOW_FILE: .github/workflows/cursor-review.yml
+          WORKFLOW_FILES: .github/workflows/cursor-review.yml .github/workflows/cursor-axis-base.yml
         run: |
           set -euo pipefail
 
@@ -112,10 +121,27 @@ jobs:
 
           # Anchored read of the pin: `^  CURSOR_CLI_VERSION: ` matches the
           # top-level env key and nothing else (the in-job references to
-          # $CURSOR_CLI_VERSION are indented far deeper).
-          old_version=$(sed -nE 's/^  CURSOR_CLI_VERSION: (.*)$/\1/p' "$WORKFLOW_FILE" | head -1 || true)
+          # $CURSOR_CLI_VERSION are indented far deeper). Every file carrying the
+          # pin must agree: a divergence means someone hand-moved one of them,
+          # and the bumper fails loud rather than papering over it.
+          read -ra files <<<"$WORKFLOW_FILES"
+          old_version=""
+          for f in "${files[@]}"; do
+            v=$(sed -nE 's/^  CURSOR_CLI_VERSION: (.*)$/\1/p' "$f" | head -1 || true)
+            if [ -z "$v" ]; then
+              echo "::error::No '  CURSOR_CLI_VERSION: ' line in ${f} — the pin moved or was removed; this workflow needs updating."
+              exit 1
+            fi
+            echo "pinned in ${f}: ${v}"
+            if [ -z "$old_version" ]; then
+              old_version="$v"
+            elif [ "$v" != "$old_version" ]; then
+              echo "::error::Pinned versions disagree across ${WORKFLOW_FILES} ('${old_version}' vs '${v}' in ${f}) — reconcile by hand before the bumper can move them."
+              exit 1
+            fi
+          done
           if [ -z "$old_version" ]; then
-            echo "::error::No '  CURSOR_CLI_VERSION: ' line in ${WORKFLOW_FILE} — the pin moved or was removed; this workflow needs updating."
+            echo "::error::WORKFLOW_FILES is empty — nothing to read the pin from."
             exit 1
           fi
 
@@ -250,40 +276,43 @@ jobs:
       - name: Move the pin
         if: steps.discover.outputs.changed == 'true'
         env:
-          WORKFLOW_FILE: .github/workflows/cursor-review.yml
+          WORKFLOW_FILES: .github/workflows/cursor-review.yml .github/workflows/cursor-axis-base.yml
           NEW_VERSION: ${{ steps.discover.outputs.new_version }}
           NEW_SHA256: ${{ steps.digest.outputs.new_sha256 }}
         run: |
           set -euo pipefail
 
           # Both substitutions are anchored to the top-level env keys, and each
-          # must match EXACTLY one line — anything else means cursor-review.yml
+          # must match EXACTLY one line per file — anything else means that file
           # was restructured and a blind sed could corrupt it.
-          for key in CURSOR_CLI_VERSION CURSOR_CLI_SHA256; do
-            n=$(grep -cE "^  ${key}: " "$WORKFLOW_FILE" || true)
-            if [ "$n" != "1" ]; then
-              echo "::error::Expected exactly one '  ${key}: ' line in ${WORKFLOW_FILE}, found ${n}."
+          read -ra files <<<"$WORKFLOW_FILES"
+          for f in "${files[@]}"; do
+            for key in CURSOR_CLI_VERSION CURSOR_CLI_SHA256; do
+              n=$(grep -cE "^  ${key}: " "$f" || true)
+              if [ "$n" != "1" ]; then
+                echo "::error::Expected exactly one '  ${key}: ' line in ${f}, found ${n}."
+                exit 1
+              fi
+            done
+
+            before="${RUNNER_TEMP}/$(basename "$f").before"
+
+            cp "$f" "$before"
+            sed -i -E "s|^  CURSOR_CLI_VERSION: .*\$|  CURSOR_CLI_VERSION: ${NEW_VERSION}|" "$f"
+            if cmp -s "$before" "$f"; then
+              echo "::error::The CURSOR_CLI_VERSION substitution changed nothing in ${f}."
+              exit 1
+            fi
+
+            cp "$f" "$before"
+            sed -i -E "s|^  CURSOR_CLI_SHA256: .*\$|  CURSOR_CLI_SHA256: ${NEW_SHA256}|" "$f"
+            if cmp -s "$before" "$f"; then
+              echo "::error::The CURSOR_CLI_SHA256 substitution changed nothing in ${f}."
               exit 1
             fi
           done
 
-          before="${RUNNER_TEMP}/cursor-review.before.yml"
-
-          cp "$WORKFLOW_FILE" "$before"
-          sed -i -E "s|^  CURSOR_CLI_VERSION: .*\$|  CURSOR_CLI_VERSION: ${NEW_VERSION}|" "$WORKFLOW_FILE"
-          if cmp -s "$before" "$WORKFLOW_FILE"; then
-            echo "::error::The CURSOR_CLI_VERSION substitution changed nothing."
-            exit 1
-          fi
-
-          cp "$WORKFLOW_FILE" "$before"
-          sed -i -E "s|^  CURSOR_CLI_SHA256: .*\$|  CURSOR_CLI_SHA256: ${NEW_SHA256}|" "$WORKFLOW_FILE"
-          if cmp -s "$before" "$WORKFLOW_FILE"; then
-            echo "::error::The CURSOR_CLI_SHA256 substitution changed nothing."
-            exit 1
-          fi
-
-          git --no-pager diff -- "$WORKFLOW_FILE"
+          git --no-pager diff -- "${files[@]}"
 
       - name: Generate Cloud Code Bot token
         id: token
@@ -320,7 +349,7 @@ jobs:
           git config user.name 'cursor-cli-pin bumper'
           git config user.email 'cursor-cli-pin-bumper@users.noreply.github.com'
           git checkout -B "$BRANCH"
-          git add .github/workflows/cursor-review.yml
+          git add .github/workflows/cursor-review.yml .github/workflows/cursor-axis-base.yml
           git commit -m "ci(cursor-review): bump Cursor CLI pin to ${NEW_VERSION}"
 
           # Force-reset the stable branch so its diff is rebuilt from the current
@@ -338,14 +367,14 @@ jobs:
           # command substitutions — that is exactly why they are single-quoted.
           # shellcheck disable=SC2016
           {
-            printf '%s\n\n' 'Moves the Cursor CLI pin `cursor-review.yml` installs from (BE-5869).'
+            printf '%s\n\n' 'Moves the Cursor CLI pin that `cursor-review.yml` and `cursor-axis-base.yml` install from (BE-5869).'
             printf '| | |\n|---|---|\n'
             printf '| Version | `%s` → `%s` |\n' "$OLD_VERSION" "$NEW_VERSION"
             printf '| sha256 (linux/x64 `agent-cli-package.tar.gz`) | `%s` |\n' "$NEW_SHA256"
             printf '| nixpkgs cross-check | %s |\n' "$NIXPKGS_STATUS"
             printf '| smoke test | passed — `install-cursor-cli.sh` installed this artifact and the binary self-reported `%s` |\n\n' "$NEW_VERSION"
             printf '**You are the trust anchor for this digest.** Cursor publishes no checksums for these artifacts, so the sha256 above is simply what the CDN served during [this run](%s) — trust-on-first-use. Corroborate it before merging (the nixpkgs row above, or a second independent download); nothing downstream can.\n\n' "$RUN_URL"
-            printf '%s\n\n' 'Merging this bumps `cursor-review.yml`, which triggers `bump-cursor-review-callers.yml` and rolls the SHA-pinned caller fleet forward.'
+            printf '%s\n\n' 'Merging this bumps `cursor-review.yml` and `cursor-axis-base.yml`; both are in the path filter of `bump-cursor-review-callers.yml`, so the single SHA-pinned caller fleet rolls forward once, as before.'
             printf '%s\n' '_Opened by the `bump-cursor-cli-pin` workflow._'
           } > "$body"
 
