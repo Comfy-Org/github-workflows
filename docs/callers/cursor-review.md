@@ -1086,9 +1086,10 @@ GitHub runs the caller workflow from the PR's head, so a commit can remove
 `pull_request_target` the caller comes from the BASE branch, so a PR cannot
 drop its own dismissal — another reason to use the shape in the trust model below.
 
-**Pair it with `detect-unreviewed-merge`'s `ignore-approvers`.** Pass the
-approver identity there, or the bot's approval satisfies that SOC 2 audit and a
-PR merged with no human review files nothing. See
+**An approver's `APPROVED` review satisfies `detect-unreviewed-merge`.** That
+includes the account this lane approves as. List that login in
+`ignore-approvers` only when the approval must not count; a caller that
+already lists it keeps dropping the review until the login is removed. See
 [`detect-unreviewed-merge.md`](detect-unreviewed-merge.md#automated-approvers-ignore-approvers).
 
 ### Trust model

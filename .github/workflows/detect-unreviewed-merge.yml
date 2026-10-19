@@ -24,8 +24,9 @@ name: Detect Unreviewed Merge (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<full-commit-sha>  # v1 — substitute a real 40-char SHA
 #       with:
 #         approval-mode: latest-per-reviewer  # or 'any-approval' for private repos
-#         # Logins whose APPROVED reviews do not count — e.g. the identity a
-#         # cursor-review `approve_max_severity` caller approves as.
+#         # Optional opt-out. An APPROVED review counts, including one from an
+#         # automated approver. List a login only when that approval must not
+#         # satisfy the check. The match is exact (`name` != `name[bot]`).
 #         ignore-approvers: ''
 #       secrets:
 #         UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
@@ -45,12 +46,11 @@ on:
         default: latest-per-reviewer
       ignore-approvers:
         description: >-
-          Logins (whitespace- or comma-separated, case-insensitive, `[bot]`
-          suffix included) whose reviews are ignored by the approval check in
-          BOTH modes. Pass any automated approver — e.g. the identity a
-          cursor-review caller with `approve_max_severity` approves as — so a
-          PR whose only approval is the bot's is still reported as unreviewed.
-          Default '' ignores no one.
+          Logins (whitespace- or comma-separated, case-insensitive; the
+          `[bot]` suffix is part of the login and is not stripped) whose
+          reviews are ignored in BOTH modes. An APPROVED review counts,
+          including one from an automated approver, unless that exact login
+          is listed. Default '' ignores no one.
         type: string
         required: false
         default: ''
@@ -142,9 +142,11 @@ jobs:
               pull_number: pr.number,
             });
 
-            // An automated approver (ignore-approvers) is not a reviewer: drop
-            // its reviews before EITHER mode looks, so its APPROVED can neither
-            // count itself nor shadow anything in latest-per-reviewer.
+            // ignore-approvers is an opt-out, matched on the exact login
+            // (`name` does not match `name[bot]`). Drop those reviews before
+            // EITHER mode looks, so a listed APPROVED can neither count nor
+            // shadow another reviewer. Every other APPROVED counts, including
+            // a machine-user approver (type User, no `[bot]` suffix).
             const ignored = new Set(
               (process.env.IGNORE_APPROVERS || '')
                 .split(/[\s,]+/)
@@ -189,10 +191,10 @@ jobs:
             const hasApproval = counted.length > 0;
 
             if (hasApproval) {
-              // ignore-approvers fails open on a typo or a rotated identity, so
-              // say when the only approvals that counted are from Bot accounts.
+              // ignore-approvers fails open on a typo or a rotated identity.
+              // A Bot-typed approval still counts; say so when it was the only one.
               if (counted.every(r => r.user?.type === 'Bot')) {
-                core.warning(`PR #${pr.number}'s approval came only from bot account(s) (${[...new Set(counted.map(r => r.user?.login))].join(', ')}) — if this repo auto-approves, list that identity in ignore-approvers.`);
+                core.warning(`PR #${pr.number}'s approval came only from bot account(s) (${[...new Set(counted.map(r => r.user?.login))].join(', ')}). That APPROVED review counts; list the login in ignore-approvers only when it must not.`);
               }
               core.info('PR has an approving review — no action needed.');
               return;

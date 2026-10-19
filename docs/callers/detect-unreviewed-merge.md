@@ -44,9 +44,10 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<full-commit-sha>
     with:
       approval-mode: latest-per-reviewer   # 'any-approval' for private repos
-      # Only if this repo auto-approves (cursor-review `approve_max_severity`):
-      # the identity that approves, so its approval is not counted as a review.
-      # ignore-approvers: my-review-app[bot]
+      # Optional. An APPROVED review counts, including from an automated
+      # approver. List a login only when that approval must not count.
+      # The match is exact: `name` does not match `name[bot]`.
+      # ignore-approvers: some-bot[bot]
     secrets:
       UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
 ```
@@ -69,7 +70,7 @@ Read-only on your repo. The issue write happens on the tracking repo via the PAT
 | Input | Default | Notes |
 |---|---|---|
 | `approval-mode` | `latest-per-reviewer` | Which historical approvals count. Pick deliberately — see below. |
-| `ignore-approvers` | `''` | Logins (whitespace- or comma-separated, case-insensitive, `[bot]` suffix included) whose reviews the check ignores in both modes. **Required in practice for any repo that auto-approves** — see below. |
+| `ignore-approvers` | `''` | Opt-out. Logins (whitespace- or comma-separated, case-insensitive; the `[bot]` suffix is part of the login and is not stripped) whose reviews the check ignores in both modes. Empty counts every `APPROVED` review, including an automated approver's. |
 
 ### Choosing `approval-mode`
 
@@ -84,12 +85,26 @@ in the other. Check the repo's branch-protection settings, then pick.
 
 ### Automated approvers: `ignore-approvers`
 
-An approval by a bot is not a human review. If the repo enables cursor-review's
-`approve_max_severity`, the bot's `APPROVED` would otherwise satisfy this check
-in either mode — a PR could be labelled, auto-approved and merged with nobody
-looking, and no tracking issue filed. Pass the identity that approves: the
-`APPROVER_TOKEN` account's login, else your `bot_app_id` App's `<slug>[bot]`,
-else `github-actions[bot]`. A human approval alongside the bot's still counts.
+An `APPROVED` review satisfies the check in either mode, including one from an
+automated approver. That is a machine user (the `APPROVER_TOKEN` account; login
+has no `[bot]` suffix and `user.type` is `User`) or a GitHub App (`<slug>[bot]`,
+`user.type` `Bot`). `user.type` is not a filter, and a `[bot]` suffix is not
+inferred: listing `name` does not ignore `name[bot]`, or the reverse.
+
+`ignore-approvers` is the opt-out for a login that must not satisfy the check.
+The match is that exact login, case-insensitive. A listed review is dropped
+before either mode runs, so it cannot count and cannot shadow another
+reviewer's latest decision. Leave the input empty for an approver whose
+approval should count. A human approval alongside a listed login still counts.
+
+A review GitHub has dismissed is state `DISMISSED` and does not count in either
+mode — dismissal replaces `APPROVED` on that review, so `any-approval` does not
+keep a hidden earlier approval. `latest-per-reviewer` also drops an approval
+that the same login later superseded with a non-comment review. A later
+`COMMENTED` review does not.
+
+Callers that already pass an approver's login here keep dropping that approval
+until they remove the login. A pin bump does not edit the input.
 
 ## Gotchas
 
