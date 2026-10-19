@@ -42,8 +42,10 @@ on:
       - '.github/workflows/cursor-axis-base.yml'
       # The cursor-approve suite asserts bump-cursor-cli-pin.yml lists EVERY
       # workflow carrying the CLI pin, so any workflow gaining (or losing) the
-      # pin must trigger it — hence all of them, not just the bumper.
+      # pin must trigger it — hence all of them (both extensions the suite
+      # scans), not just the bumper.
       - '.github/workflows/*.yml'
+      - '.github/workflows/*.yaml'
       - '.github/workflows/axis-*.yml'
       # test_caller_doc_pattern.py reads the caller snippets out of these
       # pages and pins their `if:` guards; the regression it guards is a
@@ -64,8 +66,10 @@ on:
       - '.github/workflows/cursor-axis-base.yml'
       # The cursor-approve suite asserts bump-cursor-cli-pin.yml lists EVERY
       # workflow carrying the CLI pin, so any workflow gaining (or losing) the
-      # pin must trigger it — hence all of them, not just the bumper.
+      # pin must trigger it — hence all of them (both extensions the suite
+      # scans), not just the bumper.
       - '.github/workflows/*.yml'
+      - '.github/workflows/*.yaml'
       - '.github/workflows/axis-*.yml'
       # test_caller_doc_pattern.py reads the caller snippets out of these
       # pages and pins their `if:` guards; the regression it guards is a
