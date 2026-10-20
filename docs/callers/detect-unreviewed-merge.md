@@ -96,6 +96,8 @@ The match is that exact login, case-insensitive. A listed review is dropped
 before either mode runs, so it cannot count and cannot shadow another
 reviewer's latest decision. Leave the input empty for an approver whose
 approval should count. A human approval alongside a listed login still counts.
+When `ignore-approvers` is nonempty, an `APPROVED` review without a usable
+`user.login` is not eligible and does not satisfy the check.
 
 A review GitHub has dismissed is state `DISMISSED` and does not count in either
 mode — dismissal replaces `APPROVED` on that review, so `any-approval` does not
