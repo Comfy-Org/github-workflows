@@ -84,6 +84,27 @@ for (const approvalMode of ['any-approval', 'latest-per-reviewer']) {
     }
   });
 
+  test(`${approvalMode}: comfy-cursor-approver APPROVED counts (User, no [bot] suffix)`, async () => {
+    assert.equal(await run({approvalMode, reviews: [review('comfy-cursor-approver')]}), 0);
+  });
+
+  test(`${approvalMode}: that approval is dropped only when the exact login is ignored`, async () => {
+    const reviews = [review('comfy-cursor-approver')];
+    assert.equal(await run({approvalMode, reviews, ignore: 'comfy-cursor-approver'}), 1);
+    assert.equal(await run({approvalMode, reviews, ignore: 'Comfy-Cursor-Approver'}), 1);
+  });
+
+  test(`${approvalMode}: a [bot] suffix is not implied in either direction`, async () => {
+    const app = [review('comfy-cursor-approver[bot]', 'APPROVED', undefined, 'Bot')];
+    assert.equal(await run({approvalMode, reviews: app, ignore: 'comfy-cursor-approver'}), 0);
+    assert.equal(await run({approvalMode, reviews: [review('comfy-cursor-approver')], ignore: 'comfy-cursor-approver[bot]'}), 0);
+  });
+
+  test(`${approvalMode}: comfy-cursor-approver still counts when a different login is ignored`, async () => {
+    const reviews = [review('other-bot[bot]', 'APPROVED', undefined, 'Bot'), review('comfy-cursor-approver')];
+    assert.equal(await run({approvalMode, reviews, ignore: 'other-bot[bot]'}), 0);
+  });
+
   test(`${approvalMode}: warns when the only counted approval is a Bot's`, async () => {
     const warnings = [];
     const reviews = [review('typo-app[bot]', 'APPROVED', undefined, 'Bot')];
@@ -99,4 +120,29 @@ for (const approvalMode of ['any-approval', 'latest-per-reviewer']) {
 test('latest-per-reviewer: a dismissed human approval still does not count', async () => {
   const reviews = [review('human', 'APPROVED', '2026-10-01T00:00:00Z'), review('human', 'DISMISSED', '2026-10-01T01:00:00Z')];
   assert.equal(await run({reviews}), 1);
+});
+
+test('latest-per-reviewer: a later DISMISSED from comfy-cursor-approver does not count', async () => {
+  const reviews = [
+    review('comfy-cursor-approver', 'APPROVED', '2026-10-01T00:00:00Z'),
+    review('comfy-cursor-approver', 'DISMISSED', '2026-10-01T01:00:00Z'),
+  ];
+  assert.equal(await run({reviews}), 1);
+});
+
+test('latest-per-reviewer: a later COMMENTED review does not knock out comfy-cursor-approver', async () => {
+  const reviews = [
+    review('comfy-cursor-approver', 'APPROVED', '2026-10-01T00:00:00Z'),
+    review('comfy-cursor-approver', 'COMMENTED', '2026-10-01T02:00:00Z'),
+  ];
+  assert.equal(await run({reviews}), 0);
+});
+
+test('any-approval: a DISMISSED comfy-cursor-approver review does not count', async () => {
+  // GitHub replaces APPROVED with DISMISSED on that review object. any-approval
+  // does not reconstruct a historical approval the API no longer reports.
+  assert.equal(await run({
+    approvalMode: 'any-approval',
+    reviews: [review('comfy-cursor-approver', 'DISMISSED')],
+  }), 1);
 });
