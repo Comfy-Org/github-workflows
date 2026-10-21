@@ -365,15 +365,23 @@ class PanelIntegrityJobTest(unittest.TestCase):
                 "evaluate to the empty string, which every cause treats as a pass",
             )
 
-    def test_it_reports_on_cancellation(self):
-        # `always()`, not `!cancelled()`: GitHub counts a SKIPPED required check
-        # as PASSING, so a cancelled run that skipped this job would mint a green
-        # context over a panel that never finished — the same fail-open the
-        # blocking gate documents at its own `if:`.
+    def test_a_cancelled_run_skips_this_job(self):
+        # `!cancelled()`, not `always()`. `always()` runs the job even when
+        # cancel-in-progress has cancelled the RUN, the decision jobs come back
+        # `cancelled`, and the guard then fails the check ("re-run the failed
+        # job") on a run that was torn down before it decided anything. That is
+        # the false red. `post-review` and `over-cap-comment` use `!cancelled()`
+        # for the same interaction.
+        #
+        # A job result of `cancelled` on a run that was NOT cancelled — a
+        # `timeout-minutes`, which GitHub reports as `cancelled` without
+        # cancelling the workflow — still matches `!= 'success'` and still
+        # fails closed. `cancelled()` is the workflow flag, not that result.
+        # The Blocking gate keeps `always()`; this check does not.
         condition = job_scalar(self.panel, "if")
         self.assertIsNotNone(condition)
-        self.assertIn("always()", condition)
-        self.assertNotIn("!cancelled()", condition)
+        self.assertIn("!cancelled()", condition)
+        self.assertNotIn("always()", condition)
 
     def test_it_is_gated_exactly_like_consolidate(self):
         # Reporting on a run where the panel was never supposed to happen — no
@@ -529,7 +537,8 @@ class PanelIntegrityJobTest(unittest.TestCase):
 
 
 class UndecidedRunFailsClosedTest(unittest.TestCase):
-    """The job must go RED, not skipped, when the decision jobs did not finish.
+    """The job must go RED, not skipped, when a decision job did not succeed
+    and the run itself was not cancelled.
 
     Every gate condition on `panel-integrity` reads a job OUTPUT, and a job that
     FAILED has empty outputs. Gating the job on those outputs alone therefore
@@ -539,6 +548,12 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
     integrity` would get a green merge gate over a run that never decided
     whether to review the PR at all. `Blocking gate` closes the same hole with
     the same two guards; this suite pins that they stay closed here too.
+
+    A run cancelled by concurrency is the exception, pinned in
+    `RoundCapIsADecisionJobTest`: every decision job then comes back
+    `cancelled` because the run was torn down, and this check skips rather
+    than failing on a supersede. A `cancelled` job result while the workflow
+    is still running (`timeout-minutes`) is not that exception.
     """
 
     def setUp(self):
@@ -684,9 +699,9 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
 CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github|secrets)(?:\.[A-Za-z0-9_-]+)+")
 
 
-def evaluate(expression, context):
+def evaluate(expression, context, workflow_cancelled=False):
     """Evaluate an expression built only from context reads, string literals,
-    `always()`, `==`/`!=`, `&&`/`||` and parentheses.
+    `always()`, `cancelled()`, `==`/`!=`, `&&`/`||` and parentheses.
 
     `context` maps a dotted read (`needs.gate.result`, `inputs.<name>`,
     `steps.<id>.outputs.<name>`, `matrix.<key>`) to its value. A read it does
@@ -695,28 +710,39 @@ def evaluate(expression, context):
     `a == 'true' && inputs.b || ''` yields a string. Anything outside that
     small grammar fails the translation loudly rather than evaluating to a
     guess.
+
+    `workflow_cancelled` is GitHub's `cancelled()` — the workflow was
+    cancelled — and is distinct from a job result of `cancelled` (a
+    `timeout-minutes`, which does not cancel the workflow). It defaults to
+    false: the suites that build a `needs` map are describing a run that was
+    not itself cancelled.
     """
     expr = expression.strip()
     if expr.startswith("${{") and expr.endswith("}}"):
         expr = expr[3:-2].strip()
     py = CONTEXT_REF.sub(lambda match: repr(context.get(match.group(0), "")), expr)
+    # `!cancelled()` before `cancelled()`, or the negation is left as a `!`.
+    flag = "True" if workflow_cancelled else "False"
+    py = py.replace("!cancelled()", "not " + flag)
+    py = py.replace("cancelled()", flag)
     py = py.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
-    leftover = re.sub(r"'[^']*'|\b(True|False|and|or)\b|==|!=|[()\s]", "", py)
+    leftover = re.sub(r"'[^']*'|\b(True|False|and|or|not)\b|==|!=|[()\s]", "", py)
     if leftover:  # pragma: no cover - only on a grammar this helper does not know
         raise AssertionError("cannot evaluate expression remainder %r" % leftover)
     return eval(py, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
 
 
-def evaluate_if(condition, needs):
+def evaluate_if(condition, needs, workflow_cancelled=False):
     """Evaluate a job `if:` against `needs`, which maps a job to
     `{"result": ..., "outputs": {...}}`. A job absent from it, or an output it
-    does not declare, reads as '' (see `evaluate`)."""
+    does not declare, reads as '' (see `evaluate`). `workflow_cancelled` is
+    GitHub's `cancelled()` and defaults to false."""
     context = {}
     for job, entry in needs.items():
         context["needs.%s.result" % job] = entry.get("result", "")
         for name, value in entry.get("outputs", {}).items():
             context["needs.%s.outputs.%s" % (job, name)] = value
-    return evaluate(condition, context)
+    return evaluate(condition, context, workflow_cancelled=workflow_cancelled)
 
 
 class RoundCapIsADecisionJobTest(unittest.TestCase):
@@ -786,6 +812,9 @@ class RoundCapIsADecisionJobTest(unittest.TestCase):
         self.assertFalse(evaluate_if(self.guard_if, needs))
 
     def test_a_failed_round_cap_is_red_not_skipped(self):
+        # `cancelled` here is a job result (timeout-minutes), not a cancelled
+        # workflow. The run is still going, so the check must run and the
+        # guard must fire. A workflow-level cancel is the next test.
         for result in ("failure", "cancelled"):
             needs = self.fresh(**{
                 "round-cap": {"result": result},
@@ -797,6 +826,51 @@ class RoundCapIsADecisionJobTest(unittest.TestCase):
             })
             self.assertTrue(evaluate_if(self.condition, needs), result)
             self.assertTrue(evaluate_if(self.guard_if, needs), result)
+
+    def test_a_superseded_run_skips_rather_than_failing(self):
+        # cancel-in-progress: the RUN was cancelled, so every decision job's
+        # result is `cancelled` even though none of them failed. The job must
+        # not run — a skip, not the guard's red "re-run the failed job".
+        # Same needs with the workflow still going (the previous test's
+        # `cancelled` result) must keep running; only `cancelled()` changes.
+        needs = self.fresh(**{
+            "gate": {"result": "cancelled"},
+            "round-cap": {"result": "cancelled"},
+            "diff-size": {"result": "cancelled"},
+            "preflight": {"result": "cancelled"},
+            "ledger": {"result": "cancelled"},
+            "review": {"result": "cancelled"},
+            "consolidate": {"result": "cancelled"},
+            "post-review": {"result": "cancelled"},
+        })
+        self.assertFalse(
+            evaluate_if(self.condition, needs, workflow_cancelled=True),
+            "a concurrency-cancelled run still runs Panel integrity",
+        )
+        self.assertTrue(
+            evaluate_if(self.condition, needs, workflow_cancelled=False),
+            "the same all-cancelled results on a live run must still fail closed "
+            "(a timeout reports `cancelled` without cancelling the workflow)",
+        )
+        self.assertTrue(evaluate_if(self.guard_if, needs, workflow_cancelled=False))
+
+    def test_a_cancel_mid_panel_skips_too(self):
+        # The decision jobs finished and the panel was in flight when the run
+        # was superseded. `review` / `consolidate` come back `cancelled`, which
+        # is not `skipped`, so the old `always()` condition ran the report step
+        # and failed the check. The workflow flag skips it; the replacement run
+        # reports. The same shape on a live run — a matrix cancelled without
+        # the workflow being cancelled — still runs the check.
+        needs = self.fresh(**{
+            "review": {"result": "cancelled"},
+            "consolidate": {"result": "cancelled"},
+            "post-review": {"result": "skipped"},
+        })
+        self.assertFalse(evaluate_if(self.condition, needs, workflow_cancelled=True))
+        self.assertTrue(evaluate_if(self.condition, needs, workflow_cancelled=False))
+        # Decision jobs succeeded, so the guard stays quiet; the report step
+        # owns the red on the live-run path.
+        self.assertFalse(evaluate_if(self.guard_if, needs, workflow_cancelled=False))
 
     def test_the_other_deliberate_stops_still_skip(self):
         unlabelled = self.fresh(**{
