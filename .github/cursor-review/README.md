@@ -68,13 +68,13 @@ The jobs, in the order they report:
 | Job / check run | Runs when | Red means |
 |---|---|---|
 | `Gate` | always | The trigger decision itself failed (a label read or the dedupe API call), so whether the PR should be reviewed is unknown. |
-| `Prior-review ledger` | reviewing | Designed never to fail the run: the review matrix `needs:` it, so it degrades to an empty ledger rather than erroring. Rare is not never — if it does go red (a job timeout or a lost runner, both a `cancelled` job result while the run is still going), the matrix skips and `Panel integrity` reports that rather than passing. A run cancelled by `cancel-in-progress` skips `Panel integrity` instead; that run was superseded, and the replacement reports. |
+| `Prior-review ledger` | reviewing | Designed never to fail the run: the review matrix `needs:` it, so it degrades to an empty ledger rather than erroring. Rare is not never — if it does go red (a job timeout or a lost runner, both a `cancelled` job result while the run is still going), the matrix skips and `Panel integrity` reports that rather than passing. A run cancelled after a newer push passes `Panel integrity` without judging it — that head was superseded; any other cancel stays red. |
 | `Diff size check` | reviewing | The `BASE...HEAD` diff could not be built at all. An over-cap PR is not a failure — it is a skip plus a PR comment. |
 | `Preflight — validate model catalog` | reviewing | A pinned panel model is delisted. The panel is skipped rather than quietly running a lab short. |
 | `<review type> (<model>)` — one per cell | reviewing | **That cell did not submit a review.** Its artifact is still uploaded and the panel still consolidates; the leg is red so the gap reaches `statusCheckRollup`. Never require one of these: the context name carries the model id and changes whenever the panel list does. |
 | `Consolidate panel` | reviewing | The judge job failed outright (a hung judge is absorbed and falls back to the panel union instead). |
 | `Post review` | Consolidate panel succeeded | The POST failed, or succeeded without the run being able to confirm it. The findings are written to the job summary in that case — see [Delivery, the body-only fallback, and a throttled POST](#delivery-the-body-only-fallback-and-a-throttled-post). |
-| `Panel integrity` | reviewing, **or** the decision to review failed, and the run was not cancelled | The panel was short, findings went unanchored, nothing was delivered, the judge never adjudicated — or `Gate`/`Round cap`/`Diff size check`/`Preflight`/`Prior-review ledger` failed, leaving whether the PR was reviewed unknown. Skipped, not green-by-verdict, when no review was warranted (including a head stopped by the `max_rounds` cap) and when `cancel-in-progress` cancelled the run. Advisory unless a caller marks it required. |
+| `Panel integrity` | reviewing, **or** the decision to review failed | The panel was short, findings went unanchored, nothing was delivered, the judge never adjudicated — or `Gate`/`Round cap`/`Diff size check`/`Preflight`/`Prior-review ledger` failed, leaving whether the PR was reviewed unknown. Skipped, not green-by-verdict, when no review was warranted (including a head stopped by the `max_rounds` cap). On a cancelled run it passes only when the PR head has since moved; a cancel on an unmoved head is red. Advisory unless a caller marks it required. |
 | `Blocking gate` | `blocking: true` | Unresolved, non-outdated finding threads — or a round that should have produced them and did not. Opt-in. |
 
 **Post review is its own job, and that is a security boundary.** No job both
@@ -117,11 +117,15 @@ read a job output (empty when the job producing it failed) and the fourth reads
 the matrix result, which is `skipped` whenever ANY job the matrix `needs:`
 (`gate`, `diff-size`, `preflight`, `ledger`) did not succeed, while a skipped
 required check passes: the same fail-closed guard the Blocking gate carries.
-A workflow cancelled by `cancel-in-progress` is not that failure. The job's
-`if:` is `!cancelled()`, so a superseded run skips this check instead of
-failing it, and the run that replaced it is the one that reports. A decision
-job that failed — or whose own `timeout-minutes` GitHub reports as a
-`cancelled` job result without cancelling the workflow — still fails the check.
+A cancelled run is told apart inside the job, not by skipping it: the `if:`
+stays `always()`, because `cancelled()` is true for a manual cancel too, and a
+same-SHA replacement can decline to review, so a skip there would be a green
+required check with nothing behind it. On a cancelled run the first step,
+`Judge a cancelled run`, re-reads the PR's live head: if it moved past the SHA
+the run was reviewing, the run was superseded by a push and the job passes
+without judging (a required check is read on the new head, not this one); otherwise — head unmoved, or
+unreadable — the job fails closed. A decision job that failed or timed out on
+a live run still fails the check through the guard.
 
 The invariant is *every* job the matrix depends on, not the four that happen to
 be on that list today — it was re-opened twice by a dependency being added to

@@ -595,20 +595,22 @@ supersession shape below before you reach for either to clear one.
 
 The remaining shapes to expect before you require it:
 
-* **A superseded run skips this check.** `cancel-in-progress` cancels the
-  earlier run while its decision jobs are still going; their results are
-  `cancelled`, not `failure`. The job used to run anyway (`always()`) and fail
-  with "re-run the failed job", which painted that superseded run red. Its
-  `if:` is now `!cancelled()`, the same choice `Post review` makes so a
-  cancelled run does not keep working, so the superseded run skips Panel
-  integrity instead of failing it. The run that replaced it is the one that
-  reports. A skipped required check passes, and that pass means "this run has
-  no verdict", the same reading as the deliberate no-panel branches below — it
-  does not say the panel was whole. This is only the workflow-cancelled path.
-  A decision job that **failed**, or that hit its own `timeout-minutes`
-  (GitHub reports that job result as `cancelled` without cancelling the
-  workflow), still runs this check and fails it. The Blocking gate is separate
-  and still goes red on cancellation.
+* **A cancelled run passes only if the PR head has moved.** The job still
+  runs on a cancelled run (`always()`): GitHub counts a *skipped* required
+  check as passing, and a cancel is not always a supersede — a manual cancel
+  from the UI, the API or `gh run cancel` has no replacement run, and a
+  same-SHA replacement can decline to review (the label removed,
+  `skip-cursor-review` added). So on a cancelled run it first re-reads the
+  PR's live head. If a newer push moved it past the SHA this run was
+  reviewing, the check passes without judging: it sits on a head nobody can
+  merge, and required checks are read on the new head. If the head did **not** move, or
+  cannot be read, the check fails — re-run the workflow or re-apply the
+  review label. That includes a same-SHA re-trigger under `cancel-in-progress`
+  (re-applying the label while a panel is running): the cancelled run goes
+  red on that SHA, and the replacement run's later Panel integrity result is
+  the one to read. A decision job that **failed** or timed out on a run that
+  was not cancelled still fails the check through the guard. The Blocking gate
+  is separate and still goes red on cancellation.
 * **Do not require a leg check instead.** A panel cell's context name carries
   the model id (`edge-case (kimi-k3-max)`), so it changes whenever the panel
   list does — and a required check whose name no longer exists blocks every PR
@@ -628,8 +630,8 @@ The remaining shapes to expect before you require it:
   never to fail — every step in it is `continue-on-error` — but a job timeout
   or a lost runner is not a step outcome. GitHub reports both as a `cancelled`
   job result while the workflow itself is still running, and "rare" is the wrong
-  bar for something that would otherwise hand you a green merge gate. A workflow
-  cancelled by `cancel-in-progress` is the previous bullet, not this one.)
+  bar for something that would otherwise hand you a green merge gate. A
+  cancelled workflow is the previous bullet, not this one.)
 * **It still skips when no review was warranted, and a skip is green.** The
   deliberate no-panel branches — no trigger label, an already-reviewed commit, a
   PR that hit its `max_rounds` cap, a PR over the diff-size cap, a fork the panel

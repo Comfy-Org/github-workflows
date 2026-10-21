@@ -6828,34 +6828,30 @@ jobs:
     # and gated on `approve_gate`, which already fails closed; see
     # docs/callers/cursor-approve.md ("A red panel cell must not skip the axes").
     #
-    # `!cancelled()`, and the same four gate conditions `consolidate` uses, so
-    # this reports on exactly the runs where a panel was supposed to happen and
-    # stays skipped on the ones where nothing was (no trigger label, already
-    # reviewed, capped by `max_rounds`, over the diff-size cap, panel skipped).
+    # `always()`, and the same four gate conditions `consolidate` uses, so this
+    # reports on exactly the runs where a panel was supposed to happen and stays
+    # skipped on the ones where nothing was (no trigger label, already reviewed,
+    # capped by `max_rounds`, over the diff-size cap, panel skipped).
     #
-    # `!cancelled()` rather than `always()`, for the same reason `post-review`
-    # documents at its own `if:` (and `over-cap-comment` before it): the
-    # documented caller sets `cancel-in-progress: true`, and `always()` runs a
-    # job even when the RUN is cancelled. A superseded run's decision jobs come
-    # back `cancelled`, not `failure`, and the guard below then fails this
-    # check — "re-run the failed job" — on a run that was torn down before it
-    # decided anything. That is a false failure: nothing failed, and the run
-    # that replaced this one is the one that reports. Skipping leaves the
-    # superseded run without a Panel integrity failure. The same skip covers a
-    # cancel that lands mid-panel: `consolidate` / `post-review` come back
-    # `cancelled` and the report step would otherwise fail the check for a
-    # panel the run was not allowed to finish.
+    # `always()` rather than `!cancelled()` for `Blocking gate`'s reason: GitHub
+    # counts a SKIPPED required check as passing, and `cancelled()` is true for
+    # EVERY workflow cancel, not just a `cancel-in-progress` supersede. A manual
+    # cancel (UI, API, `gh run cancel`, which anyone with Actions write can do)
+    # has no replacement run at all, and a same-SHA replacement can itself
+    # decline to review (label removed, `skip-cursor-review`). A `!cancelled()`
+    # skip would hand that head SHA a green completeness gate over a panel that
+    # never finished.
     #
-    # Fail-closed for a run that was NOT cancelled is unchanged, and that is
-    # the property the old `always()` was protecting where it still matters.
-    # `cancelled()` is the workflow flag, not a job result. A decision job that
-    # failed, or that GitHub ended for its own `timeout-minutes` (the job
-    # result is `cancelled`, the workflow is not, so `cancelled()` is false),
-    # still satisfies `!= 'success'`, this job still runs, and the guard still
-    # exits 1. A skipped required check passes, so this skip is a pass for the
-    # superseded run only — the same reading as the deliberate no-panel
-    # branches, not a claim the panel was whole. The Blocking gate is untouched
-    # and still uses `always()`, so a blocking caller stays red on cancel.
+    # The supersede case is still not red, though: `Judge a cancelled run`
+    # below runs only when the run was cancelled and re-reads the PR's LIVE
+    # head. If it moved past the SHA this run was reviewing, a newer push
+    # superseded it — this check sits on a head nobody can merge any more, the
+    # new head is judged by its own checks, and the job passes without judging. If the
+    # head did NOT move (or cannot be read), nothing is known to have replaced
+    # this run on this SHA, so the job fails closed exactly as before. A job
+    # that hit its own `timeout-minutes` lands on the same fail-closed path
+    # whichever way GitHub reports `cancelled()` for it: either the guard
+    # reads its `cancelled` result, or the head check finds the head unmoved.
     #
     # That same "skipped counts as passing" rule is why those four conditions
     # cannot be read STRAIGHT off `gate`, `diff-size` and the matrix. Three of
@@ -6896,16 +6892,47 @@ jobs:
     # hits the cap again.
     name: Panel integrity
     needs: [gate, round-cap, diff-size, preflight, ledger, review, consolidate, post-review]
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.round-cap.result != 'success' || (needs.round-cap.outputs.capped != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && (needs.preflight.result != 'success' || needs.ledger.result != 'success' || needs.review.result != 'skipped'))))))) }}
+    if: ${{ always() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.round-cap.result != 'success' || (needs.round-cap.outputs.capped != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && (needs.preflight.result != 'success' || needs.ledger.result != 'success' || needs.review.result != 'skipped'))))))) }}
     runs-on: ubuntu-latest
-    # Reads job outputs and prints. No API call, no checkout, no network.
+    # Reads job outputs and prints. No checkout. One API read (the live PR
+    # head), and only on a cancelled run.
     timeout-minutes: 5
-    # Nothing at all: this job reads `needs` outputs and writes annotations.
-    # An empty block is not the same as an absent one — a `workflow_call`
-    # reusable with no `permissions:` INHERITS the caller job's, and the
-    # documented caller grants `pull-requests: write`.
-    permissions: {}
+    # `pull-requests: read` for that one read and nothing else. Never leave the
+    # block absent — a `workflow_call` reusable with no `permissions:` INHERITS
+    # the caller job's, and the documented caller grants `pull-requests: write`.
+    permissions:
+      pull-requests: read
     steps:
+      - name: Judge a cancelled run
+        # Only on a cancelled run; see the job comment. Passes ONLY when the
+        # PR's live head has moved past the SHA this run was reviewing, and
+        # then sets `superseded` so the two steps below stand down. Every other
+        # outcome — head unchanged, no PR head in the event, the read failing —
+        # exits 1, which skips the steps below and leaves the check red.
+        id: cancel
+        if: ${{ cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$PR_NUMBER" ] || [ -z "$RUN_HEAD" ]; then
+            echo "::error::Panel integrity: this run was cancelled and carries no pull-request head to compare, so nothing shows it was superseded. Re-run the workflow."
+            exit 1
+          fi
+          live_head=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha') || live_head=""
+          if [ -z "$live_head" ]; then
+            echo "::error::Panel integrity: this run was cancelled and the PR's current head could not be read, so whether a newer push superseded it is unknown. Re-run the workflow."
+            exit 1
+          fi
+          if [ "$live_head" = "$RUN_HEAD" ]; then
+            echo "::error::Panel integrity: this run was cancelled before its panel finished, and the PR head is still ${RUN_HEAD} — nothing has superseded it. Re-run the workflow, or re-apply the review label."
+            exit 1
+          fi
+          echo "::notice::Panel integrity: this run was cancelled after the PR head moved from ${RUN_HEAD} to ${live_head}. Required checks are read on the newer head; nothing is judged here."
+          echo "superseded=true" >> "$GITHUB_OUTPUT"
+
       - name: Fail if the panel decision itself did not complete
         # Fail-closed guard, and it has to come FIRST because every cause in the
         # step below is phrased in terms of job outputs that are EMPTY when the
@@ -6940,17 +6967,16 @@ jobs:
         # written around the consequence. `Ensure ledger artifact exists` carries
         # no `continue-on-error`; the job's 20-minute cap sits above only 15
         # minutes of step caps, so the two untimed steps can trip the JOB
-        # timeout; and an infrastructure-lost `ledger` is neither 'success' nor
-        # a step outcome at all. Both surface as result `cancelled` on a run
-        # that is still going. A workflow-level cancel never reaches this step:
-        # the job `if:` is `!cancelled()`, so a superseded run is skipped rather
-        # than judged here. Rare is the wrong bar for a guard whose failure
-        # mode is handing out a green required check.
+        # timeout; and a cancelled or infrastructure-lost `ledger` is neither
+        # 'success' nor a step outcome at all. (A run cancelled after a newer
+        # push stands down in `Judge a cancelled run` and never gets here.)
+        # Rare is the wrong bar for a guard whose failure mode is handing out a
+        # green required check.
         #
         # Note these are read as RESULTS, not as a reason to believe the matrix
         # ran: if `review` ran at all, all four succeeded, so this guard can only
         # fire on runs where the panel never started.
-        if: ${{ needs.gate.result != 'success' || needs.round-cap.result != 'success' || needs.diff-size.result != 'success' || needs.preflight.result != 'success' || needs.ledger.result != 'success' }}
+        if: ${{ steps.cancel.outputs.superseded != 'true' && (needs.gate.result != 'success' || needs.round-cap.result != 'success' || needs.diff-size.result != 'success' || needs.preflight.result != 'success' || needs.ledger.result != 'success') }}
         env:
           GATE_RESULT: ${{ needs.gate.result }}
           ROUND_CAP_RESULT: ${{ needs.round-cap.result }}
@@ -6962,6 +6988,7 @@ jobs:
           exit 1
 
       - name: Report panel integrity
+        if: ${{ steps.cancel.outputs.superseded != 'true' }}
         env:
           OK_COUNT: ${{ needs.consolidate.outputs.ok_count }}
           TOTAL: ${{ needs.consolidate.outputs.total }}
