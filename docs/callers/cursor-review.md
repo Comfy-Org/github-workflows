@@ -595,11 +595,22 @@ supersession shape below before you reach for either to clear one.
 
 The remaining shapes to expect before you require it:
 
-* **A cancelled run reports red.** GitHub counts a *skipped* required check as
-  passing, so this job runs on cancellation rather than handing a superseded run
-  a free green — the same reasoning the Blocking gate documents. Under the
-  `cancel-in-progress` caller above that red lands on the head SHA that was
-  superseded, not on the new one.
+* **A cancelled run passes only if the PR head has moved.** The job still
+  runs on a cancelled run (`always()`): GitHub counts a *skipped* required
+  check as passing, and a cancel is not always a supersede — a manual cancel
+  from the UI, the API or `gh run cancel` has no replacement run, and a
+  same-SHA replacement can decline to review (the label removed,
+  `skip-cursor-review` added). So on a cancelled run it first re-reads the
+  PR's live head. If a newer push moved it past the SHA this run was
+  reviewing, the check passes without judging: it sits on a head nobody can
+  merge, and required checks are read on the new head. If the head did **not** move, or
+  cannot be read, the check fails — re-run the workflow or re-apply the
+  review label. That includes a same-SHA re-trigger under `cancel-in-progress`
+  (re-applying the label while a panel is running): the cancelled run goes
+  red on that SHA, and the replacement run's later Panel integrity result is
+  the one to read. A decision job that **failed** or timed out on a run that
+  was not cancelled still fails the check through the guard. The Blocking gate
+  is separate and still goes red on cancellation.
 * **Do not require a leg check instead.** A panel cell's context name carries
   the model id (`edge-case (kimi-k3-max)`), so it changes whenever the panel
   list does — and a required check whose name no longer exists blocks every PR
@@ -616,9 +627,11 @@ The remaining shapes to expect before you require it:
   `Round cap`, `Diff size check`, `Preflight` **or `Prior-review ledger`** runs
   this job and fails it: an undecided run is not a clean run. (`Round cap` sits
   upstream of `Diff size check`, so a red one skips the panel just the same.) (`Prior-review ledger` is built
-  never to fail — every step in it is `continue-on-error` — but a job timeout,
-  a cancellation or a lost runner is not a step outcome, and "rare" is the wrong
-  bar for something that would otherwise hand you a green merge gate.)
+  never to fail — every step in it is `continue-on-error` — but a job timeout
+  or a lost runner is not a step outcome. GitHub reports both as a `cancelled`
+  job result while the workflow itself is still running, and "rare" is the wrong
+  bar for something that would otherwise hand you a green merge gate. A
+  cancelled workflow is the previous bullet, not this one.)
 * **It still skips when no review was warranted, and a skip is green.** The
   deliberate no-panel branches — no trigger label, an already-reviewed commit, a
   PR that hit its `max_rounds` cap, a PR over the diff-size cap, a fork the panel

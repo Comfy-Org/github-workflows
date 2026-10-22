@@ -52,6 +52,7 @@ LEG_STEP = "Fail the leg when the cell did not submit"
 UPLOAD_STEP = "Upload findings artifact"
 PANEL_JOB = "panel-integrity"
 PANEL_CONTEXT = "Panel integrity"
+CANCEL_STEP = "Judge a cancelled run"
 UNDECIDED_STEP = "Fail if the panel decision itself did not complete"
 REPORT_STEP = "Report panel integrity"
 
@@ -367,13 +368,16 @@ class PanelIntegrityJobTest(unittest.TestCase):
 
     def test_it_reports_on_cancellation(self):
         # `always()`, not `!cancelled()`: GitHub counts a SKIPPED required check
-        # as PASSING, so a cancelled run that skipped this job would mint a green
-        # context over a panel that never finished — the same fail-open the
-        # blocking gate documents at its own `if:`.
+        # as PASSING, and `cancelled()` is true for EVERY workflow cancel — a
+        # manual one has no replacement run, and a same-SHA replacement can
+        # decline to review. A skip there mints a green context over a panel
+        # that never finished, the fail-open the blocking gate documents at its
+        # own `if:`. The supersede case is told apart INSIDE the job by
+        # `Judge a cancelled run`, not by skipping it.
         condition = job_scalar(self.panel, "if")
         self.assertIsNotNone(condition)
         self.assertIn("always()", condition)
-        self.assertNotIn("!cancelled()", condition)
+        self.assertNotIn("cancelled()", condition)
 
     def test_it_is_gated_exactly_like_consolidate(self):
         # Reporting on a run where the panel was never supposed to happen — no
@@ -383,11 +387,16 @@ class PanelIntegrityJobTest(unittest.TestCase):
         for gate in GATE_CONDITIONS:
             self.assertIn(gate, condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
-    def test_it_holds_no_permissions(self):
+    def test_it_holds_only_pull_requests_read(self):
         # An ABSENT block is not "no permissions": a workflow_call reusable
         # INHERITS the caller job's, and the documented caller grants
-        # `pull-requests: write`.
-        self.assertEqual(job_scalar(self.panel, "permissions"), "{}")
+        # `pull-requests: write`. The one API read (the live PR head, on a
+        # cancelled run) needs `pull-requests: read` and nothing more.
+        self.assertEqual(job_scalar(self.panel, "permissions"), "")
+        self.assertEqual(
+            block_mapping(self.panel, "    permissions:", 6),
+            {"pull-requests": "read"},
+        )
 
     def test_it_is_bounded(self):
         self.assertEqual(job_scalar(self.panel, "timeout-minutes"), "5")
@@ -529,7 +538,8 @@ class PanelIntegrityJobTest(unittest.TestCase):
 
 
 class UndecidedRunFailsClosedTest(unittest.TestCase):
-    """The job must go RED, not skipped, when the decision jobs did not finish.
+    """The job must go RED, not skipped, when a decision job did not succeed
+    and the run itself was not cancelled.
 
     Every gate condition on `panel-integrity` reads a job OUTPUT, and a job that
     FAILED has empty outputs. Gating the job on those outputs alone therefore
@@ -539,6 +549,12 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
     integrity` would get a green merge gate over a run that never decided
     whether to review the PR at all. `Blocking gate` closes the same hole with
     the same two guards; this suite pins that they stay closed here too.
+
+    A run cancelled after a newer push is the one exception, and it is not a
+    skip: the job still runs, and `Judge a cancelled run` passes it only after
+    reading that the PR's live head moved (`CancelledRunTest`). A cancel with
+    the head unmoved, or a `cancelled` job result on a live run
+    (`timeout-minutes`), stays red.
     """
 
     def setUp(self):
@@ -684,9 +700,9 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
 CONTEXT_REF = re.compile(r"\b(?:needs|inputs|steps|vars|matrix|github|secrets)(?:\.[A-Za-z0-9_-]+)+")
 
 
-def evaluate(expression, context):
+def evaluate(expression, context, workflow_cancelled=False):
     """Evaluate an expression built only from context reads, string literals,
-    `always()`, `==`/`!=`, `&&`/`||` and parentheses.
+    `always()`, `cancelled()`, `==`/`!=`, `&&`/`||` and parentheses.
 
     `context` maps a dotted read (`needs.gate.result`, `inputs.<name>`,
     `steps.<id>.outputs.<name>`, `matrix.<key>`) to its value. A read it does
@@ -695,28 +711,43 @@ def evaluate(expression, context):
     `a == 'true' && inputs.b || ''` yields a string. Anything outside that
     small grammar fails the translation loudly rather than evaluating to a
     guess.
+
+    `workflow_cancelled` is GitHub's `cancelled()` — the workflow was
+    cancelled — and is distinct from a job result of `cancelled` (a
+    `timeout-minutes`, which does not cancel the workflow). It defaults to
+    false: the suites that build a `needs` map are describing a run that was
+    not itself cancelled.
     """
     expr = expression.strip()
     if expr.startswith("${{") and expr.endswith("}}"):
         expr = expr[3:-2].strip()
     py = CONTEXT_REF.sub(lambda match: repr(context.get(match.group(0), "")), expr)
+    # `!cancelled()` before `cancelled()`, or the negation is left as a `!`.
+    flag = "True" if workflow_cancelled else "False"
+    py = py.replace("!cancelled()", "not " + flag)
+    py = py.replace("cancelled()", flag)
     py = py.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
-    leftover = re.sub(r"'[^']*'|\b(True|False|and|or)\b|==|!=|[()\s]", "", py)
+    leftover = re.sub(r"'[^']*'|\b(True|False|and|or|not)\b|==|!=|[()\s]", "", py)
     if leftover:  # pragma: no cover - only on a grammar this helper does not know
         raise AssertionError("cannot evaluate expression remainder %r" % leftover)
     return eval(py, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
 
 
-def evaluate_if(condition, needs):
-    """Evaluate a job `if:` against `needs`, which maps a job to
+def evaluate_if(condition, needs, workflow_cancelled=False, steps=None):
+    """Evaluate a job or step `if:` against `needs`, which maps a job to
     `{"result": ..., "outputs": {...}}`. A job absent from it, or an output it
-    does not declare, reads as '' (see `evaluate`)."""
+    does not declare, reads as '' (see `evaluate`). `workflow_cancelled` is
+    GitHub's `cancelled()` and defaults to false. `steps` maps an earlier
+    step id to its `{output: value}`."""
     context = {}
+    for step, outputs in (steps or {}).items():
+        for name, value in outputs.items():
+            context["steps.%s.outputs.%s" % (step, name)] = value
     for job, entry in needs.items():
         context["needs.%s.result" % job] = entry.get("result", "")
         for name, value in entry.get("outputs", {}).items():
             context["needs.%s.outputs.%s" % (job, name)] = value
-    return evaluate(condition, context)
+    return evaluate(condition, context, workflow_cancelled=workflow_cancelled)
 
 
 class RoundCapIsADecisionJobTest(unittest.TestCase):
@@ -786,6 +817,9 @@ class RoundCapIsADecisionJobTest(unittest.TestCase):
         self.assertFalse(evaluate_if(self.guard_if, needs))
 
     def test_a_failed_round_cap_is_red_not_skipped(self):
+        # `cancelled` here is a job result (timeout-minutes), not a cancelled
+        # workflow. The run is still going, so the check must run and the
+        # guard must fire.
         for result in ("failure", "cancelled"):
             needs = self.fresh(**{
                 "round-cap": {"result": result},
@@ -797,6 +831,57 @@ class RoundCapIsADecisionJobTest(unittest.TestCase):
             })
             self.assertTrue(evaluate_if(self.condition, needs), result)
             self.assertTrue(evaluate_if(self.guard_if, needs), result)
+
+    def report_if(self):
+        for line in code_lines(step_named(self.panel, REPORT_STEP)):
+            if line.strip().startswith("if:"):
+                return line.strip()[len("if:"):].strip()
+        return None
+
+    def test_a_cancelled_run_still_runs_the_job(self):
+        # Every decision job `cancelled`, whether the RUN was cancelled or a
+        # job timed out on a live one: the job runs either way. A skip here is
+        # a green required check, and `cancelled()` cannot tell a supersede
+        # from a manual cancel.
+        needs = self.fresh(**{
+            job: {"result": "cancelled"}
+            for job in ("gate", "round-cap", "diff-size", "preflight", "ledger",
+                        "review", "consolidate", "post-review")
+        })
+        for cancelled in (True, False):
+            self.assertTrue(evaluate_if(self.condition, needs, workflow_cancelled=cancelled), cancelled)
+        # Not superseded (the head did not move, or this is a live run): the
+        # guard still fires.
+        self.assertTrue(evaluate_if(self.guard_if, needs))
+        self.assertTrue(evaluate_if(self.guard_if, needs, steps={"cancel": {}}))
+
+    def test_a_superseded_run_stands_down_after_the_head_check(self):
+        # `Judge a cancelled run` set `superseded`: the guard and the report
+        # step both stand down, so the job ends on that step's pass.
+        needs = self.fresh(**{
+            "gate": {"result": "cancelled"},
+            "review": {"result": "cancelled"},
+            "consolidate": {"result": "cancelled"},
+        })
+        superseded = {"cancel": {"superseded": "true"}}
+        self.assertFalse(evaluate_if(self.guard_if, needs, workflow_cancelled=True, steps=superseded))
+        report_if = self.report_if()
+        self.assertIsNotNone(report_if, f"`{REPORT_STEP}` must stand down on a superseded run")
+        self.assertFalse(evaluate_if(report_if, needs, workflow_cancelled=True, steps=superseded))
+        self.assertTrue(evaluate_if(report_if, needs, workflow_cancelled=True, steps={"cancel": {}}))
+
+    def test_a_cancel_mid_panel_still_runs_the_job(self):
+        # Decision jobs finished and the panel was in flight. `review` /
+        # `consolidate` come back `cancelled`, not `skipped`, so the job runs,
+        # and on an unmoved head the report step owns the red.
+        needs = self.fresh(**{
+            "review": {"result": "cancelled"},
+            "consolidate": {"result": "cancelled"},
+            "post-review": {"result": "skipped"},
+        })
+        self.assertTrue(evaluate_if(self.condition, needs, workflow_cancelled=True))
+        self.assertFalse(evaluate_if(self.guard_if, needs))
+        self.assertTrue(evaluate_if(self.report_if(), needs))
 
     def test_the_other_deliberate_stops_still_skip(self):
         unlabelled = self.fresh(**{
@@ -1372,6 +1457,93 @@ class RecordTokenUsageTest(unittest.TestCase):
         # A failed record step would turn a cell that submitted `ok` red, and
         # the aggregator would then flag the whole panel as inconsistent.
         self.assertEqual(step_scalar(self.step, "continue-on-error"), "true")
+
+class CancelledRunTest(unittest.TestCase):
+    """`Judge a cancelled run`, EXECUTED against a stub `gh`.
+
+    It is the only thing standing between a cancelled run and a red check, so
+    each way it can pass is pinned by running it: it passes ONLY when the live
+    PR head moved past the SHA this run reviewed. A manual cancel, a same-SHA
+    supersede, an event with no PR head and an unreadable head all stay red —
+    a skip, or a pass, there would be a green required check over a panel that
+    never finished.
+    """
+
+    RUN_HEAD = "a" * 40
+    NEW_HEAD = "b" * 40
+
+    def setUp(self):
+        self.panel = split_jobs(read_workflow())[PANEL_JOB]
+        self.step = step_named(self.panel, CANCEL_STEP)
+        self.assertIsNotNone(self.step, f"`{PANEL_JOB}` lost its `{CANCEL_STEP}` step")
+        self.workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.workdir)
+
+    def test_it_is_first_runs_only_on_cancel_and_gates_the_rest(self):
+        order = step_order(self.panel)
+        self.assertEqual(order[0], CANCEL_STEP)
+        lines = [line.strip() for line in code_lines(self.step)]
+        self.assertIn("if: ${{ cancelled() }}", lines)
+        self.assertIn("id: cancel", lines)
+        self.assertFalse(any("continue-on-error" in line for line in lines))
+        for name in (UNDECIDED_STEP, REPORT_STEP):
+            body = "\n".join(code_lines(step_named(self.panel, name)))
+            self.assertIn("steps.cancel.outputs.superseded != 'true'", body, name)
+
+    def run_cancel(self, live_head, pr_number="7", run_head=RUN_HEAD, gh_fails=False):
+        bindir = os.path.join(self.workdir, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+            f.write('echo "$@" >> "%s/gh-calls"\n' % self.workdir)
+            f.write("exit 1\n" if gh_fails else "echo '%s'\n" % live_head)
+        os.chmod(gh, 0o755)
+        output = os.path.join(self.workdir, "github-output")
+        open(output, "w", encoding="utf-8").close()
+        context = {
+            "github.token": "t",
+            "github.repository": "o/r",
+            "github.event.pull_request.number": pr_number,
+            "github.event.pull_request.head.sha": run_head,
+        }
+        env = {"PATH": bindir + os.pathsep + os.environ.get("PATH", ""), "GITHUB_OUTPUT": output}
+        for name, value in block_mapping(self.step, "        env:", 10).items():
+            env[name] = render(value, context)
+        done = subprocess.run(
+            [shutil.which("bash"), "-e", "-c", run_block(self.step)],
+            env=env, cwd=self.workdir, capture_output=True, text=True, timeout=60,
+        )
+        with open(output, encoding="utf-8") as f:
+            return done, f.read()
+
+    def test_a_moved_head_passes_and_marks_superseded(self):
+        done, output = self.run_cancel(self.NEW_HEAD)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("superseded=true", output)
+        with open(os.path.join(self.workdir, "gh-calls"), encoding="utf-8") as f:
+            self.assertIn("repos/o/r/pulls/7", f.read())
+
+    def test_an_unmoved_head_fails(self):
+        # A manual cancel, or a same-SHA supersede: nothing is known to report
+        # on this head, so the check stays red.
+        done, output = self.run_cancel(self.RUN_HEAD)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("::error::", done.stdout)
+        self.assertNotIn("superseded", output)
+
+    def test_an_unreadable_head_fails(self):
+        for kwargs in ({"gh_fails": True}, {"live_head": ""}):
+            done, output = self.run_cancel(kwargs.pop("live_head", self.NEW_HEAD), **kwargs)
+            self.assertEqual(done.returncode, 1, kwargs)
+            self.assertNotIn("superseded", output)
+
+    def test_no_pull_request_head_fails(self):
+        for kwargs in ({"pr_number": ""}, {"run_head": ""}):
+            done, output = self.run_cancel(self.NEW_HEAD, **kwargs)
+            self.assertEqual(done.returncode, 1, kwargs)
+            self.assertNotIn("superseded", output)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
