@@ -3,16 +3,17 @@
 
 Every job that checks this directory out runs a `Require a pinned workflows_ref`
 step, and those steps are COPY-PASTED on purpose: `workflow_call` has no
-anchors, no `uses: ./…` for a step, and no job-level `run:`, so eight literal
-copies is the only spelling available. Copies drift — one job gets a hardening
-the other seven miss, and the hole is invisible in a diff because the file still
-contains the guard. So the copies are pinned byte-for-byte here instead.
+anchors, no `uses: ./…` for a step, and no job-level `run:`, so one literal
+copy per guarded job is the only spelling available. Copies drift — one job gets
+a hardening the others miss, and the hole is invisible in a diff because the file
+still contains the guard. So the copies are pinned byte-for-byte here instead.
 
 What this suite asserts:
 
-  * exactly EIGHT guard steps. The count is asserted, not derived, so adding a
-    ninth guarded job is an explicit opt-in that makes an author read this file;
-  * all eight `env:` + `run:` blocks are byte-identical to each other;
+  * exactly `EXPECTED_GUARDS` guard steps. The count is asserted, not derived,
+    so guarding one more job is an explicit opt-in that makes an author read
+    this file;
+  * every guard's `env:` + `run:` block is byte-identical to the others;
   * the block carries the BE-15927 equality guard — the `job.workflow_sha`
     binding, the mismatch comparison, and a hard `exit` in that branch. Empty
     and 40-hex are covered by `check_workflow_pins.py`; equality is not, because
@@ -24,7 +25,7 @@ What this suite asserts:
 Deliberately parsed WITHOUT PyYAML, like test_workflow_job_isolation.py next
 door: this repo is stdlib-only and CI installs no requirements for this suite,
 so a yaml import would simply not run. A round-trip would also destroy exactly
-what is under test — this is a test about the literal bytes of eight blocks.
+what is under test — this is a test about the literal bytes of those blocks.
 
 Run: python3 .github/cursor-review/tests/test_workflow_ref_guard_parity.py
 """
@@ -119,7 +120,7 @@ def ledger_resolve_block():
 
 
 class GuardParityTest(unittest.TestCase):
-    def test_exactly_eight_guard_steps(self):
+    def test_exactly_the_expected_number_of_guard_steps(self):
         starts, _ = guard_blocks()
         self.assertEqual(
             len(starts),
@@ -137,9 +138,9 @@ class GuardParityTest(unittest.TestCase):
                 block,
                 blocks[0],
                 "the guard step at line %d differs from the one at line %d. The "
-                "eight copies are load-bearing: a hardening applied to one job "
+                "%d copies are load-bearing: a hardening applied to one job "
                 "and not the rest leaves the others silently weaker."
-                % (line_no + 1, starts[0] + 1),
+                % (line_no + 1, starts[0] + 1, len(blocks)),
             )
 
     def test_guard_binds_job_workflow_sha_through_env(self):
@@ -191,8 +192,8 @@ class GuardParityTest(unittest.TestCase):
         # Hex is case-insensitive and the 40-hex shape test here only WARNS, so
         # an upper-case-but-CORRECT ref reaches the comparison. Normalising only
         # $SHA (which is what public-repo-hygiene.yml does, because its shape
-        # test hard-fails first) would fail all eight jobs of a caller whose two
-        # pins agree.
+        # test hard-fails first) would fail every guarded job of a caller whose
+        # two pins agree.
         _, blocks = guard_blocks()
         self.assertIn("REF_LC=\"$(printf '%s' \"$REF\" | tr 'A-Z' 'a-z')\"", blocks[0])
 
