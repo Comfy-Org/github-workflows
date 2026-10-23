@@ -629,6 +629,26 @@ def is_panel_incomplete_reason(reason) -> bool:
     return isinstance(reason, str) and PANEL_INCOMPLETE_SUFFIX in reason
 
 
+def all_panel_reviewers_failed(reason) -> bool:
+    """True only for the produced ``N/N panel reviewers did not complete`` shape.
+
+    One or a few failed cells are plausibly transient provider capacity. Every
+    counted cell failing together is a systemic service, credential or account
+    failure until proven otherwise. An automatic retry would spend the PR's
+    retry budget and trigger label while the shared dependency is still down.
+    """
+    if not isinstance(reason, str):
+        return False
+    match = re.fullmatch(
+        rf"([0-9]+)/([0-9]+) {re.escape(PANEL_INCOMPLETE_SUFFIX)}(?:,.*)?",
+        reason,
+    )
+    if not match:
+        return False
+    failed, total = (int(value) for value in match.groups())
+    return total > 0 and failed == total
+
+
 def panel_gate(panel: list, max_failed: int = 0):
     """(withhold_reason or None, tolerated_cells). Pure.
 
@@ -1117,6 +1137,12 @@ def no_decision_next(reasons: list, label: str = ""):
     as COMMENT, which GitHub will not dismiss, so that clause is unreachable.
     """
     card = _load_card()
+    if any(all_panel_reviewers_failed(reason) for reason in reasons or []):
+        return card.NEXT_HUMAN, (
+            "A human is needed: zero reviewers completed, which indicates a systemic service, "
+            "credential or account failure. Verify that the shared dependency recovered before "
+            "spending another review round."
+        )
     causes = [cause for needle, cause in STRUCTURAL_CAUSES
               if any(isinstance(r, str) and needle in r for r in reasons or [])]
     if causes:
@@ -1190,6 +1216,12 @@ def auto_retry_eligible(reasons: list, retry_errored: bool = False, blocked_anyw
     """
     reasons = [r for r in (reasons or []) if isinstance(r, str) and r.strip()]
     if not reasons:
+        return False
+    if any(all_panel_reviewers_failed(reason) for reason in reasons):
+        # A partial panel can be a flaky cell. Zero completed cells across the
+        # matrix is shared-dependency evidence, and immediately relabelling is
+        # the one recovery that predictably burns another round during an
+        # account-wide outage.
         return False
     if REASON_HEAD_MOVED in reasons and all(r in RETRYABLE_CAUSES for r in reasons):
         return True

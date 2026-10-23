@@ -305,7 +305,10 @@ on:
           once per PR (the existing auto-retry ceiling), the status card says so
           before it happens, and `max_rounds` still applies; a round that failed
           for a structural reason, or that found something above the threshold,
-          is never re-run because the next round would hit the same wall.
+          is never re-run because the next round would hit the same wall. A
+          zero-completed-reviewer round is also never re-run automatically: all
+          cells failing together is treated as a systemic service, credential
+          or account outage until a human verifies recovery.
           Independent of `rereview_command`, which is the HUMAN path: that one
           keys on an authorized comment, and the retry posts no comment. The
           retry's own force signal is the marked block decide already writes

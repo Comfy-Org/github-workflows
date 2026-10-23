@@ -3820,7 +3820,16 @@ class AutoRetryTest(unittest.TestCase):
     # moved. Retrying it was impossible until the gate learned to re-run a
     # commit it had already reviewed, so this whole section is off by default.
 
-    PANEL_ERR = [{"model": "m", "review_type": "adversarial", "status": "error"}]
+    # One flaky cell in an otherwise usable panel. Keep this distinct from an
+    # all-zero panel, which is a systemic-outage signal and must not retry.
+    PANEL_ERR = [
+        {"model": "m1", "review_type": "adversarial", "status": "error"},
+        {"model": "m2", "review_type": "edge-case", "status": "ok"},
+    ]
+    PANEL_ZERO = [
+        {"model": "m1", "review_type": "adversarial", "status": "error"},
+        {"model": "m2", "review_type": "edge-case", "status": "error"},
+    ]
 
     def test_an_errored_panel_is_not_retried_by_default(self):
         self.run_decide(head=SHA, panel=self.PANEL_ERR)
@@ -3837,6 +3846,14 @@ class AutoRetryTest(unittest.TestCase):
         body = self.reviews_posted[0]["body"]
         self.assertIn(AA.AUTO_RETRY_MARKER, body)
         self.assertIn("re-run automatically", body)
+
+    def test_a_zero_completed_panel_routes_to_a_human_even_with_the_opt_in(self):
+        self.run_decide(head=SHA, panel=self.PANEL_ZERO, retry_errored="true")
+        self.assertFalse(self.retried())
+        body = self.reviews_posted[0]["body"]
+        self.assertNotIn(AA.AUTO_RETRY_MARKER, body)
+        self.assertIn("zero reviewers completed", body)
+        self.assertNotIn("remove and re-add", body)
 
     def test_the_opt_in_does_not_widen_the_other_causes(self):
         # Still structural, still a judge failure the panel cannot fix.
