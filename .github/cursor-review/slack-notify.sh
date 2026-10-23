@@ -1,23 +1,19 @@
 #!/bin/bash
 
-# Generic Slack notification script for GitHub Actions
-# Usage: ./slack-notify.sh <status> <title> <message> [details_file] [channel]
+# Slack DM notification script for GitHub Actions
+# Usage: ./slack-notify.sh <status> <title> <message>
 #
-# Delivery modes (checked in order):
-#   DM mode:      set SLACK_BOT_TOKEN + DM_GITHUB_USER
-#                 Resolves {DM_GITHUB_USER}@comfy.org to a Slack user ID and sends a DM.
-#                 Falls back silently (exit 0) if the user can't be resolved.
-#   Webhook mode: set SLACK_WEBHOOK_URL
-#                 Posts to the channel the webhook is configured for.
+# Delivery: set SLACK_BOT_TOKEN + DM_GITHUB_USER. Resolves
+# {DM_GITHUB_USER}@comfy.org to a Slack user ID and sends a DM. No-ops
+# silently (exit 0) when either is unset or the user can't be resolved;
+# only a bad token/scopes (a lookup error that isn't users_not_found)
+# exits non-zero.
 
 set -e
 
 STATUS="${1:-failure}"
 TITLE="${2:-GitHub Action Notification}"
 MESSAGE="${3:-No details provided}"
-DETAILS_FILE="${4:-}"
-CHANNEL="${5:-#prod-alerts}"
-WEBHOOK_URL="${SLACK_WEBHOOK_URL}"
 
 # Determine color based on status
 if [ "$STATUS" = "success" ]; then
@@ -26,12 +22,6 @@ elif [ "$STATUS" = "warning" ]; then
     COLOR="warning"
 else
     COLOR="danger"
-fi
-
-# Read additional details if file provided
-ADDITIONAL_DETAILS=""
-if [ -n "$DETAILS_FILE" ] && [ -f "$DETAILS_FILE" ]; then
-    ADDITIONAL_DETAILS=$(head -c 3000 "$DETAILS_FILE")
 fi
 
 # ── DM mode ────────────────────────────────────────────────────────────────────
@@ -81,17 +71,11 @@ if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${DM_GITHUB_USER:-}" ]; then
 
     RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-    DM_TEXT="$MESSAGE"
-    if [ -n "$ADDITIONAL_DETAILS" ]; then
-        DM_TEXT="${MESSAGE}
-\`\`\`${ADDITIONAL_DETAILS}\`\`\`"
-    fi
-
     PAYLOAD=$(jq -n \
         --arg channel  "$SLACK_USER_ID" \
         --arg color    "$COLOR" \
         --arg title    "$TITLE" \
-        --arg text     "$DM_TEXT" \
+        --arg text     "$MESSAGE" \
         --arg repo     "${GITHUB_REPOSITORY:-}" \
         --arg run_url  "$RUN_URL" \
         '{
@@ -127,95 +111,10 @@ if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${DM_GITHUB_USER:-}" ]; then
     fi
 fi
 
-# ── Webhook mode ───────────────────────────────────────────────────────────────
-if [ -z "$WEBHOOK_URL" ]; then
-    echo "❌ No delivery method configured: set SLACK_BOT_TOKEN+DM_GITHUB_USER or SLACK_WEBHOOK_URL"
-    exit 1
-fi
-
-# Optional top-level mention (webhook mode only).
-MENTION_TEXT=""
-if [ -n "${MENTION_USER_ID:-}" ]; then
-    MENTION_TEXT=$(jq -nr --arg u "$MENTION_USER_ID" '"<@" + $u + ">"')
-fi
-
-RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-# Build the full Slack payload via jq so every interpolated value (PR titles
-# containing quotes, branches with special chars, ADDITIONAL_DETAILS captured
-# from arbitrary command output) is properly JSON-escaped. The previous
-# heredoc-with-${var} approach generated invalid JSON whenever a value
-# contained `"` or `\`, which then tripped the `jq empty` validator below
-# and silently dropped notifications.
-SLACK_MESSAGE=$(jq -n \
-    --arg channel       "$CHANNEL" \
-    --arg mention_text  "$MENTION_TEXT" \
-    --arg color         "$COLOR" \
-    --arg title         "$TITLE" \
-    --arg message       "$MESSAGE" \
-    --arg repository    "${GITHUB_REPOSITORY:-}" \
-    --arg workflow      "${GITHUB_WORKFLOW:-}" \
-    --arg run_url       "$RUN_URL" \
-    --arg event_name    "${GITHUB_EVENT_NAME:-}" \
-    --arg ref_name      "${GITHUB_REF_NAME:-}" \
-    --arg actor         "${GITHUB_ACTOR:-}" \
-    --arg details       "$ADDITIONAL_DETAILS" \
-    --argjson ts        "$(date +%s)" \
-    '{
-        channel: $channel,
-        attachments: (
-            [{
-                color: $color,
-                title: $title,
-                text: $message,
-                fields: [
-                    { title: "Repository", value: $repository, short: true },
-                    { title: "Workflow",   value: $workflow,   short: true },
-                    { title: "Run",        value: ("<" + $run_url + "|View Details>"), short: true },
-                    { title: "Trigger",    value: $event_name, short: true },
-                    { title: "Branch",     value: $ref_name,   short: true },
-                    { title: "Actor",      value: $actor,      short: true }
-                ],
-                footer: "GitHub Actions",
-                ts: $ts
-            }]
-            + (if ($details | length) > 0 then [{
-                color: $color,
-                title: "Details",
-                text: ("```" + $details + "```"),
-                mrkdwn_in: ["text"]
-            }] else [] end)
-        )
-    }
-    + (if ($mention_text | length) > 0 then { text: $mention_text } else {} end)')
-
-# Validate JSON before sending
-echo "🔍 Validating JSON payload..."
-if ! echo "$SLACK_MESSAGE" | jq empty 2>/dev/null; then
-    echo "❌ Invalid JSON payload generated"
-    echo "Payload:"
-    echo "$SLACK_MESSAGE"
-    exit 1
-fi
-
-# Send to Slack and capture response
-echo "📤 Sending notification to Slack..."
-RESPONSE=$(curl -X POST -H 'Content-type: application/json' \
-    --data "$SLACK_MESSAGE" \
-    "$WEBHOOK_URL" \
-    --silent --show-error --write-out "\n%{http_code}")
-
-# Extract HTTP status code and body
-HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-BODY=$(echo "$RESPONSE" | head -n-1)
-
-# Check if Slack accepted the message
-if [ "$BODY" = "ok" ] && [ "$HTTP_CODE" = "200" ]; then
-    echo "✅ Slack notification sent successfully"
-    exit 0
-else
-    echo "❌ Slack notification failed"
-    echo "HTTP Code: $HTTP_CODE"
-    echo "Response: $BODY"
-    exit 1
-fi
+# ── No DM target ───────────────────────────────────────────────────────────────
+# SLACK_BOT_TOKEN and/or DM_GITHUB_USER is unset. That is a designed-for case,
+# not an error: a bot-authored PR whose triggerer resolves to empty, or a caller
+# that never configured the token. These notifications are best-effort, so
+# no-op green (matching this directory's README) rather than failing the step.
+echo "Slack DM not configured (needs SLACK_BOT_TOKEN + DM_GITHUB_USER) — skipping"
+exit 0
