@@ -28,9 +28,9 @@ class of problem rather than what a schema library calls "invalid":
     failure for a repo that has cleaned up and wants to stay clean.
 
 An unknown key is reported wherever the schema object it sits in accepts only the
-names it lists — whether it says so with `additionalProperties: false` (five
+names it lists — whether it says so with `additionalProperties: false` (seven
 objects, which jsonschema reports) or simply by naming `properties` and nothing
-else (103 more, which `_walk_unknown_keys` reports). A node that opts OUT of that
+else (105 more, which `_walk_unknown_keys` reports). A node that opts OUT of that
 — any of `_OPENER_KEYWORDS` — is left alone in both halves.
 
 A repo with no `.coderabbit.yaml` passes, and says so in the log — not every
@@ -110,10 +110,11 @@ _RANK_REJECTING = 2   # CodeRabbit discards the WHOLE file over this one
 STRIPPED_KEYWORDS = frozenset({"additionalProperties", "unevaluatedProperties"})
 
 # Keywords that leave a schema object OPEN to keys its own `properties` block does
-# not name. Upstream's schema closes only five objects with an explicit
-# `additionalProperties: false` (the document root, the `htmlhint` and `stylelint`
-# tool objects, `knowledge_base.mcp`, and `knowledge_base.linked_repositories[]`),
-# while 103 more declare `properties` and say nothing at all about the rest. A
+# not name. Upstream's schema closes only seven objects with an explicit
+# `additionalProperties: false` (the document root, `reviews.auto_approvals` and
+# its `overrides[]` items, the `htmlhint` and `stylelint` tool objects,
+# `knowledge_base.mcp`, and `knowledge_base.linked_repositories[]`), while 105
+# more declare `properties` and say nothing at all about the rest. A
 # typo inside one of those — `reviews.profil`, `golangci-lint.enabld` — is stripped
 # by CodeRabbit exactly like a root-level one, but jsonschema has nothing to
 # complain about, so `iter_errors` alone reports it nowhere. `_walk_unknown_keys`
@@ -305,6 +306,35 @@ def _suggest_home(key, schema_index, offending_path):
         return ""
     shown = ", ".join(f"`{c}`" for c in sorted(candidates))
     return f" Did you mean {shown}?"
+
+
+# Keys under which a schema node is evaluated as a BRANCH: a failure there
+# surfaces as the combinator's own (rejecting) error, never as a bare
+# `additionalProperties` one, so opening a closed object inside one would change
+# which documents the branch accepts. `_without_stripping` leaves them as found.
+_BRANCH_KEYWORDS = frozenset({"anyOf", "oneOf", "allOf", "not", "if", "then", "else"})
+
+
+def _without_stripping(node):
+    """A copy of the schema whose only errors are the file-rejecting ones.
+
+    Drops every `additionalProperties: false` / `unevaluatedProperties: false`
+    outside a combinator — what CodeRabbit does to a document is strip the keys
+    those name and then validate the rest, and removing the keyword is exactly
+    that model: it raises no error of its own and gates nothing else, so every
+    other keyword yields the errors it yielded before. Schema-valued forms are
+    kept; they validate the extra keys rather than strip them.
+    """
+    if isinstance(node, list):
+        return [_without_stripping(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    for key, value in node.items():
+        if key in STRIPPED_KEYWORDS and value is False:
+            continue
+        out[key] = value if key in _BRANCH_KEYWORDS else _without_stripping(value)
+    return out
 
 
 def _apply_cap(tagged):
@@ -625,8 +655,8 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
     """Unknown keys inside objects the schema closes BY OMISSION.
 
     jsonschema reports an unknown key only where the schema says `additionalProperties`
-    / `unevaluatedProperties` — five objects in upstream's schema. This walks the
-    parsed document alongside the schema and reports the other 103: a node that
+    / `unevaluatedProperties` — seven objects in upstream's schema. This walks the
+    parsed document alongside the schema and reports the other 105: a node that
     declares a dict-valued `properties` and NONE of `_OPENER_KEYWORDS` accepts
     exactly the names it lists, so any other key in the document is stripped.
 
@@ -831,6 +861,22 @@ def validate(text, schema, strict_unknown_keys=False):
     truncated = len(raw_errors) > MAX_FINDINGS
     del raw_errors[MAX_FINDINGS:]
 
+    # The `islice` is unranked FIFO in schema order, so it can delete a
+    # file-rejecting error before `_apply_cap` ever ranks it: an unbounded array
+    # of closed objects (`reviews.auto_approvals.overrides[]` declares no
+    # `maxItems`) raises one stripped error per element, all emitted ahead of a
+    # `maxLength` violation in a later property — 100 warnings, exit 0, on a file
+    # CodeRabbit rejects whole. So when the cap was hit, the rejecting errors are
+    # re-collected from a second pass that cannot raise anything else, bounded
+    # the same way, and replace whatever subset of them the first pass kept.
+    if truncated:
+        rejecting = Draft202012Validator(_without_stripping(schema))
+        raw_errors = [e for e in raw_errors if e.validator in STRIPPED_KEYWORDS] + [
+            e
+            for e in islice(rejecting.iter_errors(data), MAX_FINDINGS + 1)
+            if e.validator not in STRIPPED_KEYWORDS
+        ]
+
     # `islice` above bounds the ERROR count, not the finding count: one
     # `additionalProperties: false` error reports a whole mapping and `_extra_keys`
     # splits it into one finding per key, so a single error can fan out past the
@@ -886,7 +932,7 @@ def validate(text, schema, strict_unknown_keys=False):
             )
         )
 
-    # The other 103 objects: closed by OMISSION, so jsonschema said nothing about
+    # The other 105 objects: closed by OMISSION, so jsonschema said nothing about
     # them. Appended after the jsonschema findings rather than merged into their
     # sort, which keeps both halves in document order within themselves and the
     # whole list stable run to run. One past `remaining` so an overflow is

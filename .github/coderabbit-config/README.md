@@ -40,11 +40,12 @@ cleaned up and wants to stay clean.
 only the property names it lists — which upstream expresses two different ways,
 and both are checked:
 
-* **explicitly**, with `additionalProperties: false`. Five objects: the document
-  root, `knowledge_base.mcp`, `knowledge_base.linked_repositories[]`, and the
-  `htmlhint` / `stylelint` tool configs. jsonschema reports these.
+* **explicitly**, with `additionalProperties: false`. Seven objects: the document
+  root, `reviews.auto_approvals` and its `overrides[]` items, `knowledge_base.mcp`,
+  `knowledge_base.linked_repositories[]`, and the `htmlhint` / `stylelint` tool
+  configs. jsonschema reports these.
 * **by omission** — a `properties` block and no statement at all about anything
-  else. **103** objects, including `reviews`, `chat`, `knowledge_base`,
+  else. **105** objects, including `reviews`, `chat`, `knowledge_base`,
   `code_generation` and every individual tool config. jsonschema has no keyword to
   fire on here, so a schema-walk in `_walk_unknown_keys` reports them. This is
   what catches a typo *inside* an object — `reviews.profil`,
@@ -81,7 +82,7 @@ pin moves. Warn-only mode absorbs that as a warning; a caller running
 freshness, opposite sign, as catching a key upstream removed. Neither half is
 exempt — a root-level addition is missing from the vendored `properties` list and
 the vendored `additionalProperties: false` rejects it just as the by-omission rule
-would; by-omission is merely the larger surface (103 objects against 5). See the
+would; by-omission is merely the larger surface (105 objects against 7). See the
 caller doc's rollout section.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
