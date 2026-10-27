@@ -11,7 +11,7 @@ happened, not from invented ones:
     a `golangci-lint: enabled: false` into the schema default of `true`;
   * a `reviews.tools.github-checks.timeout_ms` that upstream has since removed —
     live in six org repos at the time of writing, and the whole reason the
-    unknown-key check cannot stop at the five objects the schema closes
+    unknown-key check cannot stop at the seven objects the schema closes
     explicitly (see `ClosedByOmissionTest`).
 
 Every test validates against the REAL vendored schema rather than a toy one, so
@@ -429,7 +429,7 @@ class MainTest(unittest.TestCase):
 class ClosedByOmissionTest(unittest.TestCase):
     """Unknown keys inside objects the schema closes by saying nothing.
 
-    Upstream declares `additionalProperties: false` on five objects and leaves 103
+    Upstream declares `additionalProperties: false` on seven objects and leaves 105
     more with a `properties` block and no statement about anything else. CodeRabbit
     strips an unrecognized key in either kind, so both must be reported — and the
     two halves must stay disjoint, since one fires only where the keyword is
@@ -722,6 +722,44 @@ class CapAndBudgetTest(unittest.TestCase):
         rejecting = [f for f in findings if "characters" in f[3]]
         self.assertEqual(len(rejecting), 1, msg="the maxLength error was capped away")
         self.assertIn("error", severities(findings))
+
+    def test_a_rejecting_error_is_not_crowded_out_before_ranking_either(self):
+        # The stage BEFORE `_apply_cap`: `islice(iter_errors(...))` is FIFO in
+        # schema order, and `auto_approvals.overrides[]` is an array of closed
+        # objects with no `maxItems`, so 150 elements each carrying one unknown
+        # key emit 150 stripped errors ahead of the `maxLength` violation in the
+        # later `path_instructions`. Without the rejecting-only second pass the
+        # islice keeps none of it and the file exits 0.
+        overrides = "".join("      - enabled: false\n        bogus: 1\n" for _ in range(150))
+        text = (
+            "reviews:\n  auto_approvals:\n    overrides:\n" + overrides
+            + "  path_instructions:\n    - path: x\n      instructions: "
+            + ("y" * 20_001) + "\n"
+        )
+        findings, notes = checker.validate(text, SCHEMA)
+        self.assertEqual(len(findings), checker.MAX_FINDINGS)
+        self.assertTrue(any("were dropped" in n for n in notes), msg=f"{notes}")
+        rejecting = [f for f in findings if "characters" in f[3]]
+        self.assertEqual(len(rejecting), 1, msg="the maxLength error was sliced away")
+        self.assertIn("path_instructions", rejecting[0][1])
+        self.assertIn("error", severities(findings))
+
+    def test_the_rejecting_only_schema_opens_nothing_inside_a_branch(self):
+        # Opening a closed object inside `anyOf` would change which documents
+        # that branch accepts, i.e. hide a rejecting error rather than isolate it.
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "a": {"type": "object", "additionalProperties": False, "properties": {}},
+                "b": {"anyOf": [{"type": "object", "additionalProperties": False}]},
+            },
+        }
+        opened = checker._without_stripping(schema)
+        self.assertNotIn("additionalProperties", opened)
+        self.assertNotIn("additionalProperties", opened["properties"]["a"])
+        self.assertIs(opened["properties"]["b"]["anyOf"][0]["additionalProperties"], False)
+        self.assertIs(schema["additionalProperties"], False, msg="the input was mutated")
 
     def test_the_unknown_key_fan_out_stops_working_at_the_cap(self):
         # The cap bounds the OUTPUT; this bounds the WORK. `k00000: 1` is ten
@@ -1058,10 +1096,15 @@ class OpennessTest(unittest.TestCase):
         # Not an arbitrary snapshot: this is the size of the gap being closed.
         # `omitted` grows by one per object the upstream schema adds without an
         # opener -- 103 at #179, 104 at #215, 105 once #250 vendored the `vale`
-        # tool. `explicit` holding at 5 is the load-bearing half: it says the
-        # refresh introduced no NEW opener keyword, so the walk still means what
-        # the docstring above claims. Bump these deliberately, never to go green.
-        self.assertEqual(len(explicit), 5)
+        # tool. `explicit` is the load-bearing half: every member must be CLOSED
+        # with `additionalProperties: false` (asserted below), so growth there
+        # means more explicitly closed objects, never a new way to open one. It went
+        # 5 -> 7 when upstream added `reviews.auto_approvals` and its
+        # `overrides[]` items, both closed that way. Bump these deliberately,
+        # never to go green.
+        self.assertEqual(len(explicit), 7)
+        for one in explicit:
+            self.assertIs(one.get("additionalProperties"), False, msg=f"{list(one)}")
         self.assertEqual(len(omitted), 105)
 
     def test_every_explicitly_open_object_uses_additional_properties(self):
@@ -1094,11 +1137,15 @@ class OpennessTest(unittest.TestCase):
         order, so a file-rejecting error arriving past the cap is deleted before
         ranking ever sees it — the same exit-0-on-a-whole-file-rejection the rank
         exists to prevent. It needs MAX_FINDINGS *stripped* errors ahead of it
-        (one rejecting error among them and the exit code is 1 regardless), and
-        against THIS schema that cannot be assembled. Four facts make it so, each
-        asserted below rather than summarized in a number — `maxItems` is NOT one
-        of them as a multiplicity bound, because jsonschema keeps validating
-        elements past it (a 150-element array really does raise 150 of them).
+        (one rejecting error among them and the exit code is 1 regardless).
+        Until `reviews.auto_approvals.overrides` that could not be assembled
+        against THIS schema; that array is the one exception, and the checker now
+        re-collects rejecting errors in a second pass whenever the cap is hit (see
+        `CapAndBudgetTest`). The facts below are still asserted rather than
+        summarized in a number, so a refresh that adds ANOTHER unbounded source
+        names it here — `maxItems` is NOT one of them as a multiplicity bound,
+        because jsonschema keeps validating elements past it (a 150-element
+        array really does raise 150 of them).
         """
         stripped_false, unbounded_multipliers, arrays_over_closed = [], [], []
 
@@ -1154,7 +1201,16 @@ class OpennessTest(unittest.TestCase):
         #    exceeding it raises a REJECTING `maxItems` error, and `iter_errors`
         #    walks a node's keywords in schema key order, so that error is emitted
         #    ahead of the element errors it would otherwise be buried under.
-        for path, array in [x for x in arrays_over_closed if isinstance(x, tuple)]:
+        #    Except the arrays listed here, which declare no `maxItems` at all and
+        #    are what the checker's rejecting-only second pass exists for.
+        uncapped = {"$.properties.reviews.properties.auto_approvals.properties.overrides"}
+        arrays = [x for x in arrays_over_closed if isinstance(x, tuple)]
+        self.assertEqual(
+            {path for path, array in arrays if "maxItems" not in array}, uncapped
+        )
+        for path, array in arrays:
+            if path in uncapped:
+                continue
             keys = list(array.keys())
             self.assertIn("maxItems", keys, msg=path)
             self.assertLess(keys.index("maxItems"), keys.index("items"), msg=path)

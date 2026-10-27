@@ -242,14 +242,88 @@
 					"type": "string",
 					"enum": ["quiet", "chill", "assertive"]
 				},
+				"auto_approvals": {
+					"default": {},
+					"description": "Automatic approvals | Control automatic approval, optional risk limits, and overrides for teams or paths. Limits and disabled overrides apply to approve and resolve commands too. Missing, failed, disabled or stale required assessments withhold approval.",
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"default": false,
+							"description": "Automatic approvals | Request changes for blocking findings. Automatically approve when required threads are resolved, the latest commit is reviewed, pre-merge checks pass, and configured risk limits are satisfied. In GitLab, required discussions must be resolved.",
+							"type": "boolean"
+						},
+						"max_merge_risk": {
+							"description": "Maximum merge risk for approval | Highest inclusive merge risk that permits approval. Omitted limits can be inherited; merge risk is unrestricted only when no configuration source sets a limit. A configured limit requires an assessment covering the current commit.",
+							"type": "string",
+							"enum": ["minimal", "low", "moderate", "high", "critical"]
+						},
+						"allow_author_approval": {
+							"default": true,
+							"description": "Allow author approval commands | Allow pull request authors to use top-level @coderabbitai approve and @coderabbitai resolve commands on their own pull requests. When disabled, another reviewer must run them. The pull request's branch configuration cannot re-enable this permission. Commands still honor approval risk limits. This does not require human review or change automatic approvals after normal review requirements pass.",
+							"type": "boolean"
+						},
+						"max_security_risk": {
+							"description": "Maximum security risk for approval | Highest inclusive security architecture risk that permits approval. Security risk assessments require the Advanced plan or above. Omitted limits can be inherited; security risk is unrestricted only when no configuration source sets a limit. This is separate from Security finding severity. A configured limit requires an assessment covering the current commit.",
+							"type": "string",
+							"enum": ["minimal", "low", "moderate", "high", "critical"]
+						},
+						"overrides": {
+							"description": "Overrides | Disable approvals or override risk limits by author team, changed paths, or both. When teams and paths are set, both must match. A matching file applies the override to the whole pull request. Any matching disabled override withholds approval. Otherwise, the strictest explicitly configured value wins for each limit; omitted values inherit the global limit. At most 15 distinct teams may be checked. Unavailable required team membership or changed-file evidence withholds approval.",
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"enabled": {
+										"description": "Automatic approvals | Set to false to withhold approval for matching pull requests, regardless of risk. Omit to use the global setting. Any matching disabled override wins. Review comments and requests for changes continue normally; overrides cannot turn on a globally disabled workflow.",
+										"type": "boolean",
+										"const": false
+									},
+									"teams": {
+										"description": "Teams | Apply this override when the pull request author belongs to any listed GitHub team. Use organization/team-slug.",
+										"minItems": 1,
+										"maxItems": 15,
+										"type": "array",
+										"items": {
+											"type": "string",
+											"pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\/[A-Za-z0-9][A-Za-z0-9-]*$"
+										}
+									},
+									"paths": {
+										"description": "Paths | Apply this override when any changed file matches these repository-relative globs. Uses the same glob syntax as path_filters, including ! exclusions. Renames match both old and new paths. When teams and paths are set, both must match. Omit to match all paths.",
+										"minItems": 1,
+										"type": "array",
+										"items": {
+											"type": "string",
+											"minLength": 1
+										}
+									},
+									"max_merge_risk": {
+										"description": "Maximum merge risk for approval | Override the global merge-risk limit for matching pull requests. Omit to inherit the global limit.",
+										"type": "string",
+										"enum": ["minimal", "low", "moderate", "high", "critical"]
+									},
+									"max_security_risk": {
+										"description": "Maximum security risk for approval | Override the global security-risk limit for matching pull requests. Omit to inherit the global limit. Security risk assessments require the Advanced plan or above.",
+										"type": "string",
+										"enum": ["minimal", "low", "moderate", "high", "critical"]
+									}
+								},
+								"additionalProperties": false
+							}
+						}
+					},
+					"additionalProperties": false
+				},
 				"request_changes_workflow": {
-					"default": false,
-					"description": "Automatically approve when CodeRabbit’s comments are resolved, the latest commit has been reviewed, and no pre-merge checks are failing. Note: In GitLab, all discussions must be resolved.",
+					"description": "Legacy alias for reviews.auto_approvals.enabled.",
+					"deprecated": true,
+					"x-undocumented": true,
 					"type": "boolean"
 				},
 				"allow_author_approval": {
-					"default": true,
-					"description": "Allow Author Approval | Controls whether pull request authors can use `@coderabbitai approve` and `@coderabbitai resolve` on their own pull requests. When disabled, anyone other than the author can still use them, provided CodeRabbit can identify both the commenter and the author. The pull request’s branch configuration cannot re-enable this setting.",
+					"description": "Legacy alias for reviews.auto_approvals.allow_author_approval.",
+					"deprecated": true,
+					"x-undocumented": true,
 					"type": "boolean"
 				},
 				"high_level_summary": {
@@ -285,6 +359,11 @@
 				"review_status": {
 					"default": true,
 					"description": "Post review status messages (e.g., when a review is skipped) in the walkthrough summary comment.",
+					"type": "boolean"
+				},
+				"review_info": {
+					"default": true,
+					"description": "Post review information such as the configuration used, reviewed commits, and skipped files.",
 					"type": "boolean"
 				},
 				"review_details": {
@@ -619,13 +698,13 @@
 							}
 						},
 						"autofix": {
-							"description": "Autofix | Configure autofix behavior.",
+							"description": "Fix comments | Configure the Fix comments finishing touch.",
 							"default": {},
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Autofix | Enable the autofix finishing touch (trigger via the 🪄 Autofix checkboxes under review comments or the `@coderabbitai autofix` command). When disabled, the autofix checkboxes are hidden, the command is removed from help, and CodeRabbit declines `@coderabbitai autofix` requests.",
+									"description": "Fix comments | Enable the Fix comments finishing touch (trigger via the 🪄 Fix comments checkbox under review comments or the `@coderabbitai fix comments` command). When disabled, the Fix comments checkboxes are hidden, the command is removed from help, and CodeRabbit declines one-off repair requests using `@coderabbitai fix comments` or the compatibility aliases `fix-comments`, `fix`, `autofix`, `auto-fix`, and `auto fix`, with or without `stacked pr`.",
 									"type": "boolean"
 								}
 							}
@@ -886,7 +965,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.8",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.10",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -981,7 +1060,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.14",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.15",
 									"type": "boolean"
 								}
 							}
@@ -1021,7 +1100,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.14",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.3.0",
 									"type": "boolean"
 								},
 								"level": {
@@ -1052,7 +1131,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPMD | PHPMD is a tool to find potential problems in PHP code. | v2.15.0",
+									"description": "Enable PHPMD | PHPMD is a tool to find potential problems in PHP code. | v3.0.0",
 									"type": "boolean"
 								}
 							}
@@ -1076,7 +1155,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.13.2",
+									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.14.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1104,7 +1183,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.8.1",
+									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.9.0",
 									"type": "boolean"
 								}
 							}
@@ -1128,7 +1207,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.19",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.25",
 									"type": "boolean"
 								}
 							}
@@ -1261,7 +1340,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Regal | Regal is a linter and language server for Rego. | v0.42.0",
+									"description": "Enable Regal | Regal is a linter and language server for Rego. | v0.43.0",
 									"type": "boolean"
 								}
 							}
@@ -1297,7 +1376,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.27.0",
+									"description": "Enable PMD | PMD is an extensible multilanguage static code analyzer. It’s mainly concerned with Java. | v7.28.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1337,7 +1416,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.22.0",
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.24.0",
 									"type": "boolean"
 								}
 							}
@@ -1373,7 +1452,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.177.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.179.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1389,7 +1468,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.50961",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.2.0",
 									"type": "boolean"
 								}
 							}
@@ -1413,7 +1492,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.3.0",
+									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.4.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1429,7 +1508,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.65.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.67.0",
 									"type": "boolean"
 								}
 							}
@@ -1441,7 +1520,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.74.0",
+									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.75.0",
 									"type": "boolean"
 								}
 							}
@@ -1465,7 +1544,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.8",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.1.2",
 									"type": "boolean"
 								}
 							}
@@ -1477,7 +1556,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.85.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.87.0",
 									"type": "boolean"
 								}
 							}
@@ -1489,7 +1568,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.8.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.8.5 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1507,13 +1586,13 @@
 							}
 						},
 						"brakeman": {
-							"description": "Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.6",
+							"description": "Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.1.0",
 							"default": {},
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Brakeman | Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.6",
+									"description": "Enable Brakeman | Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.1.0",
 									"type": "boolean"
 								}
 							}
@@ -1587,7 +1666,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.32.1",
+									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.33.0",
 									"type": "boolean"
 								}
 							}
@@ -1599,7 +1678,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.14",
+									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.17",
 									"type": "boolean"
 								}
 							}
@@ -1659,7 +1738,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.11.2",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.12.0",
 									"type": "boolean"
 								}
 							}
@@ -1771,7 +1850,7 @@
 						},
 						"filePatterns": {
 							"default": [],
-							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. An entry may also reference a same-organization repository the CodeRabbit installation can read, as repo:path or owner/repo:path (e.g. engineering-standards:frontend/react.md, globs supported); such files are read at that repository's default branch. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
+							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. An entry may also reference another repository the CodeRabbit installation can read, as repo:path or owner/repo:path (e.g. engineering-standards:frontend/react.md, globs supported); such files are read at that repository's default branch. A bare repo name uses the reviewed repository's owner. On GitHub.com, owner/repo:path may reference another organization when the CodeRabbit App is installed there with access to the source repository. Every cross-organization source requires author and review-actor read access under the existing identity rules, even when named by trusted target configuration. Other providers require the same organization. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/.claude/rules/**/*.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
 							"type": "array",
 							"items": {
 								"anyOf": [
