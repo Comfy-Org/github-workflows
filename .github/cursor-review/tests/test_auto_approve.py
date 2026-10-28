@@ -2012,6 +2012,27 @@ class RoundCapCommandTest(unittest.TestCase):
         rc, out, writes = self.run_cap([], strict=True, review_response=json.dumps(page))
         self.assertEqual((rc, out["capped"], writes), (1, "false", []))
 
+    def test_strict_reset_window_does_not_ignore_round_with_unknown_submission_time(self):
+        marked = review(1, None)
+        rc, out, writes = self.run_cap([marked], strict=True, timeline=[unlabeled("2026-01-01T00:00:00Z")])
+        self.assertEqual((rc, out["capped"], writes), (1, "false", []))
+        self.assertNotIn("rounds", out)
+
+    def test_unknown_submission_time_is_safe_when_count_is_preserved(self):
+        rc, out, writes = self.run_cap([review(1, None)], strict=True, preserve=True,
+                                       timeline=[unlabeled("2026-01-01T00:00:00Z")])
+        self.assertEqual((rc, out["rounds"], writes), (0, "1", []))
+
+    def test_legacy_reset_window_retains_existing_unknown_time_behavior(self):
+        rc, out, writes = self.run_cap([review(1, None)], timeline=[unlabeled("2026-01-01T00:00:00Z")])
+        self.assertEqual((rc, out["rounds"], writes), (0, "0", []))
+
+    def test_unknown_time_after_delivery_attempts_handoff(self):
+        rc, out, writes = self.run_cap([review(1, None)], strict=True, after_review=True,
+                                       timeline=[unlabeled("2026-01-01T00:00:00Z")])
+        self.assertEqual((rc, out["capped"]), (1, "false"))
+        self.assertEqual([(m, p) for m, p, _ in writes], [("POST", "repos/o/r/issues/1/labels")])
+
     def test_under_the_cap_runs_the_panel_and_writes_nothing(self):
         rc, out, writes = self.run_cap(self.FIVE[:4])
         self.assertEqual((rc, out["capped"], out["rounds"], writes), (0, "false", "4", []))

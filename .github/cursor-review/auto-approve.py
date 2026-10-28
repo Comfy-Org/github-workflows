@@ -4303,7 +4303,15 @@ def cmd_round_cap(args) -> int:
         )
         preserve = getattr(args, "preserve_round_count", False)
         review_options = {"round_poster": args.poster_login, "round_marker": marker} if strict else {}
-        rounds = round_reviews(list_reviews(args.repo, args.pr_number, **review_options), args.poster_login, None if preserve else since, marker,
+        reviews = list_reviews(args.repo, args.pr_number, **review_options)
+        if strict and since and not preserve:
+            for review in reviews:
+                if (review["user"]["login"].lower() == args.poster_login.lower()
+                        and review["body"].startswith(marker)
+                        and not any(b in _lf(review["body"]) for b in NON_ROUND_BANNERS)
+                        and (not isinstance(review["submitted_at"], str) or not review["submitted_at"])):
+                    raise ValueError("a possible review round has no submission time for the reset window")
+        rounds = round_reviews(reviews, args.poster_login, None if preserve else since, marker,
                                0 if getattr(args, "count_superseded_rounds", False) else max_rounds)
     except (RuntimeError, ValueError) as e:
         # Legacy callers fail open; strict callers stop the panel.
