@@ -5,14 +5,20 @@ on:
     paths:
       - 'scripts/review-readiness/**'
       - '.github/workflows/test-review-readiness.yml'
+      - '.github/workflows/review-readiness-shadow.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/review-readiness/**'
       - '.github/workflows/test-review-readiness.yml'
+      - '.github/workflows/review-readiness-shadow.yml'
 
 permissions:
   contents: read
+  pull-requests: read
+  checks: read
+  actions: read
+  statuses: read
 
 jobs:
   test:
@@ -25,3 +31,48 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m unittest discover -s scripts/review-readiness/tests -v
+
+  prepare-shadow:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    outputs:
+      input: ${{ steps.input.outputs.json }}
+    steps:
+      - id: input
+        env:
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -cn --arg repo "$TARGET_REPO" --argjson pr "$TARGET_PR" \
+            --arg author "$AUTHOR" --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
+            '{snapshot:{repo:$repo,pr:$pr,author:$author,base_sha:$base,head_sha:$head,tested_sha:$head,policy_version:"synthetic-ci"},policy:{version:"synthetic-ci",required_checks:[{name:"unit",revision:"tested"}],required_human_approvals:1}}')
+          printf 'json=%s\n' "$payload" >> "$GITHUB_OUTPUT"
+
+  shadow:
+    if: ${{ github.event_name == 'pull_request' }}
+    needs: prepare-shadow
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read
+      statuses: read
+    uses: ./.github/workflows/review-readiness-shadow.yml
+    with:
+      snapshot_and_policy_json: ${{ needs.prepare-shadow.outputs.input }}
+
+  verify-shadow:
+    if: ${{ github.event_name == 'pull_request' }}
+    needs: shadow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: review-readiness-shadow-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify report
+        run: |
+          jq -e '(.state == "WAITING" or .state == "BLOCKED") and .collection.snapshot == "matched" and .risk_collection == "observed"' readiness-report.json

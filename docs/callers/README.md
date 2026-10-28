@@ -10,6 +10,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `cursor-review.yml` | [cursor-review.md](cursor-review.md) | `CURSOR_API_KEY` |
 | `cursor-review-auto-label.yml` | [cursor-review-auto-label.md](cursor-review-auto-label.md) | `vars.APP_ID` + App key |
 | `pr-size.yml` | [pr-size.md](pr-size.md) | nothing (bot comment optional) |
+| `review-readiness-shadow.yml` | [review-readiness-shadow.md](review-readiness-shadow.md) | nothing |
 | `pr-risk.yml` | [pr-risk.md](pr-risk.md) | nothing |
 | `pr-derisk.yml` | [pr-derisk.md](pr-derisk.md) | `ANTHROPIC_API_KEY` |
 | `pr-area-label.yml` | [pr-area-label.md](pr-area-label.md) | `.github/area-labels.yml` (+ `ANTHROPIC_API_KEY`, org-wide) |
