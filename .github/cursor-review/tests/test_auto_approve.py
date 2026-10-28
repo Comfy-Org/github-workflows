@@ -1856,12 +1856,13 @@ class StrictRoundCapPrerequisiteTest(unittest.TestCase):
                 f.write("import json, os, sys\nopen(os.environ['ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
             path = os.path.join(d, "args")
             env = {"PATH": os.environ["PATH"], "CURSOR_REVIEW_ASSETS": d, "ARGS": path,
-                   "APP_SLUG": "review", "FAIL_CLOSED_ROUND_CAP": "true", "REPO": "o/r",
+                   "APP_SLUG": "review", "FAIL_CLOSED_ROUND_CAP": "true", "COUNT_SUPERSEDED_ROUNDS": "true", "REPO": "o/r",
                    "PR_NUMBER": "1", "MAX_ROUNDS": "3", "THRESHOLD": ""}
             subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True)
             with open(path, encoding="utf-8") as f:
                 args = json.load(f)
             self.assertIn("--fail-closed-round-cap", args)
+            self.assertIn("--count-superseded-rounds", args)
             self.assertEqual(args[args.index("--max-rounds") + 1], "3")
             self.assertEqual(args[args.index("--poster-login") + 1], "review[bot]")
 
@@ -1871,7 +1872,7 @@ class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
-                probe_error="HTTP 404", strict=False):
+                probe_error="HTTP 404", strict=False, count_superseded=False):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1908,7 +1909,7 @@ class RoundCapCommandTest(unittest.TestCase):
             out = os.path.join(d, "out")
             open(out, "w").close()
             args = argparse.Namespace(repo="o/r", pr_number="1", max_rounds=max_rounds, threshold="medium",
-                                      poster_login=BOT, fail_closed_round_cap=strict)
+                                      poster_login=BOT, fail_closed_round_cap=strict, count_superseded_rounds=count_superseded)
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_ids", lambda *a: {"11", "12"}), \
@@ -1965,6 +1966,17 @@ class RoundCapCommandTest(unittest.TestCase):
     def test_unreadable_reviews_fail_open(self):
         rc, out, writes = self.run_cap(self.FIVE, fail=("/reviews",))
         self.assertEqual((rc, out["capped"], writes), (0, "false", []))
+
+    def test_opt_in_counts_a_delivered_review_superseded_by_a_push(self):
+        fixture = RoundCounterTest()
+        moved = fixture._panel(1, "2026-01-01T00:00:00Z", OLD)
+        decision = fixture._decision(2, "2026-01-01T00:05:00Z", OLD, [AA.REASON_HEAD_MOVED])
+        reviews = [moved, decision, review(3, "2026-01-02T00:00:00Z"),
+                   review(4, "2026-01-03T00:00:00Z")]
+        _, default, _ = self.run_cap(reviews, max_rounds="3")
+        _, counted, _ = self.run_cap(reviews, max_rounds="3", count_superseded=True)
+        self.assertEqual((default["capped"], default["rounds"]), ("false", "2"))
+        self.assertEqual((counted["capped"], counted["rounds"]), ("true", "3"))
 
     def test_strict_cap_allows_two_and_hands_off_at_three(self):
         rc, out, _ = self.run_cap(self.FIVE[:2], max_rounds="3", strict=True)
