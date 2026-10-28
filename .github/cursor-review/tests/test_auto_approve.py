@@ -871,6 +871,28 @@ class ShapelessPayloadTest(unittest.TestCase):
             with self.subTest(node=bad), self.assertRaises(ValueError):
                 self.list_reviews_with(self.reviews_body([bad, self.good_node()]))
 
+    def test_missing_or_null_review_nodes_are_not_an_empty_history(self):
+        for value in (None, "missing"):
+            response = json.loads(self.reviews_body([]))
+            reviews = response["data"]["repository"]["pullRequest"]["reviews"]
+            if value == "missing":
+                del reviews["nodes"]
+            else:
+                reviews["nodes"] = None
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.list_reviews_with(json.dumps(response))
+
+    def test_missing_or_malformed_pagination_flag_is_not_a_complete_history(self):
+        for value in (None, "false", "missing"):
+            response = json.loads(self.reviews_body([]))
+            page = response["data"]["repository"]["pullRequest"]["reviews"]["pageInfo"]
+            if value == "missing":
+                del page["hasNextPage"]
+            else:
+                page["hasNextPage"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.list_reviews_with(json.dumps(response))
+
     def test_a_non_list_nodes_field_is_a_value_error(self):
         with self.assertRaises(ValueError):
             self.list_reviews_with(self.reviews_body(5))

@@ -2527,7 +2527,9 @@ def list_reviews(repo: str, pr_number) -> list:
         page = reviews.get("pageInfo") if isinstance(reviews, dict) else None
         if not isinstance(page, dict):
             raise ValueError(f"no reviews connection in the GraphQL response for {repo}#{pr_number}")
-        nodes = reviews.get("nodes") or []
+        if not isinstance(page.get("hasNextPage"), bool):
+            raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} have no valid pagination flag")
+        nodes = reviews.get("nodes")
         if not isinstance(nodes, list):
             raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} are not a list ({type(nodes).__name__})")
         out += [_review_node(n) for n in nodes]
