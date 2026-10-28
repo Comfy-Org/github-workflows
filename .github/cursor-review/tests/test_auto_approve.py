@@ -1822,11 +1822,56 @@ class CapFindingsTest(unittest.TestCase):
         self.assertNotIn("javascript:", body)
 
 
+class StrictRoundCapPrerequisiteTest(unittest.TestCase):
+    def run_prerequisite(self, limit, configured, token, slug):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            workflow = f.read()
+        step = workflow.split("- name: Validate strict cap prerequisites", 1)[1].split("\n      - name:", 1)[0]
+        script = step.split("run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        env = {"PATH": os.environ["PATH"], "MAX_ROUNDS": limit, "BOT_CONFIGURED": configured,
+               "BOT_TOKEN": token, "BOT_SLUG": slug}
+        return subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True).returncode
+
+    def test_no_bot_allows_a_positive_limit(self):
+        self.assertEqual(self.run_prerequisite("3", "false", "", ""), 0)
+
+    def test_configured_bot_needs_both_token_and_identity(self):
+        for token, slug in (("", ""), ("token", ""), ("", "bot")):
+            with self.subTest(token=bool(token), slug=bool(slug)):
+                self.assertNotEqual(self.run_prerequisite("3", "true", token, slug), 0)
+        self.assertEqual(self.run_prerequisite("3", "true", "token", "bot"), 0)
+
+    def test_zero_and_negative_limits_are_rejected(self):
+        for limit in ("0", "-1"):
+            with self.subTest(limit=limit):
+                self.assertNotEqual(self.run_prerequisite(limit, "false", "", ""), 0)
+    def test_count_step_passes_the_opt_in_to_the_real_entrypoint(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            workflow = f.read()
+        step = workflow.split("- name: Count review rounds", 1)[1].split("\n  diff-size:", 1)[0]
+        script = "\n".join(line[10:] for line in step.split("run: |\n", 1)[1].splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "auto-approve.py"), "w", encoding="utf-8") as f:
+                f.write("import json, os, sys\nopen(os.environ['ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
+            path = os.path.join(d, "args")
+            env = {"PATH": os.environ["PATH"], "CURSOR_REVIEW_ASSETS": d, "ARGS": path,
+                   "APP_SLUG": "review", "FAIL_CLOSED_ROUND_CAP": "true", "REPO": "o/r",
+                   "PR_NUMBER": "1", "MAX_ROUNDS": "3", "THRESHOLD": ""}
+            subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True)
+            with open(path, encoding="utf-8") as f:
+                args = json.load(f)
+            self.assertIn("--fail-closed-round-cap", args)
+            self.assertEqual(args[args.index("--max-rounds") + 1], "3")
+            self.assertEqual(args[args.index("--poster-login") + 1], "review[bot]")
+
+
+
 class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
-                probe_error="HTTP 404"):
+                probe_error="HTTP 404", strict=False):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1863,7 +1908,7 @@ class RoundCapCommandTest(unittest.TestCase):
             out = os.path.join(d, "out")
             open(out, "w").close()
             args = argparse.Namespace(repo="o/r", pr_number="1", max_rounds=max_rounds, threshold="medium",
-                                      poster_login=BOT)
+                                      poster_login=BOT, fail_closed_round_cap=strict)
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_ids", lambda *a: {"11", "12"}), \
@@ -1920,6 +1965,30 @@ class RoundCapCommandTest(unittest.TestCase):
     def test_unreadable_reviews_fail_open(self):
         rc, out, writes = self.run_cap(self.FIVE, fail=("/reviews",))
         self.assertEqual((rc, out["capped"], writes), (0, "false", []))
+
+    def test_strict_cap_allows_two_and_hands_off_at_three(self):
+        rc, out, _ = self.run_cap(self.FIVE[:2], max_rounds="3", strict=True)
+        self.assertEqual((rc, out["capped"], out["rounds"]), (0, "false", "2"))
+        rc, out, _ = self.run_cap(self.FIVE[:3], max_rounds="3", strict=True)
+        self.assertEqual((rc, out["capped"], out["rounds"]), (0, "true", "3"))
+
+    def test_strict_cap_stops_if_labels_cannot_be_read(self):
+        rc, _, _ = self.run_cap(self.FIVE[:2], max_rounds="3", fail=("repos/o/r/pulls/1$",), strict=True)
+        self.assertNotEqual(rc, 0)
+
+    def test_strict_cap_rejects_invalid_limit(self):
+        for limit in ("2.5", "0", "-1"):
+            with self.subTest(limit=limit):
+                rc, _, _ = self.run_cap([], max_rounds=limit, strict=True)
+                self.assertNotEqual(rc, 0)
+
+    def test_strict_cap_stops_if_review_history_is_unreadable(self):
+        rc, _, _ = self.run_cap(self.FIVE, max_rounds="3", fail=("/reviews",), strict=True)
+        self.assertNotEqual(rc, 0)
+
+    def test_strict_cap_stops_if_handoff_label_fails(self):
+        rc, _, _ = self.run_cap(self.FIVE[:3], max_rounds="3", fail=("issues/1/labels",), strict=True)
+        self.assertNotEqual(rc, 0)
 
     def test_a_failed_label_write_fails_open(self):
         # Capped-but-unlabelled would be permanent (no label to remove = no

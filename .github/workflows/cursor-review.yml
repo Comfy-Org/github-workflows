@@ -765,6 +765,14 @@ on:
         type: number
         required: false
         default: 5
+      fail_closed_round_cap:
+        description: >-
+          Stop the panel if review history or the handoff label cannot be read or
+          written. Requires a positive max_rounds and the configured posting bot
+          token when one is configured. Does not change reset or concurrency rules.
+        type: boolean
+        required: false
+        default: false
       runs_on:
         description: >-
           JSON-encoded `runs-on` for the four jobs that hold no write-scoped
@@ -1793,7 +1801,8 @@ jobs:
     # is minted, so this is a write-token job: it checks out NO PR code, only
     # this repo's assets at the pinned `workflows_ref`, and stays on
     # GitHub-hosted ubuntu-latest. The logic lives in auto-approve.py's
-    # `round-cap`, which fails OPEN on a read error (the panel runs).
+    # `round-cap`, which fails open on a read error by default; callers can opt in
+    # to fail-closed handling.
     name: Round cap
     needs: gate
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
@@ -1891,6 +1900,22 @@ jobs:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
+      - name: Validate strict cap prerequisites
+        if: ${{ inputs.fail_closed_round_cap }}
+        env:
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          BOT_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+        run: |
+          if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$MAX_ROUNDS"; then
+            echo "::error::fail_closed_round_cap requires a positive max_rounds"
+            exit 1
+          fi
+          if [ "$BOT_CONFIGURED" = true ] && { [ -z "$BOT_TOKEN" ] || [ -z "$BOT_SLUG" ]; }; then
+            echo "::error::The configured posting bot token could not be minted; cannot count its reviews"
+            exit 1
+          fi
+
       - name: Count review rounds
         id: cap
         if: ${{ inputs.max_rounds > 0 }}
@@ -1902,16 +1927,19 @@ jobs:
           APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
           MAX_ROUNDS: ${{ inputs.max_rounds }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
+          FAIL_CLOSED_ROUND_CAP: ${{ inputs.fail_closed_round_cap }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           if [ -n "$APP_SLUG" ]; then LOGIN="${APP_SLUG}[bot]"; else LOGIN="github-actions[bot]"; fi
+          STRICT_FLAG=()
+          if [ "$FAIL_CLOSED_ROUND_CAP" = true ]; then STRICT_FLAG=(--fail-closed-round-cap); fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" round-cap \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --max-rounds "$MAX_ROUNDS" \
             --threshold "$THRESHOLD" \
-            --poster-login "$LOGIN"
+            --poster-login "$LOGIN" "${STRICT_FLAG[@]}"
 
   diff-size:
     name: Diff size check
