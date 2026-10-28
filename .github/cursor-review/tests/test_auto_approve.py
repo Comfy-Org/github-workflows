@@ -1823,14 +1823,14 @@ class CapFindingsTest(unittest.TestCase):
 
 
 class StrictRoundCapPrerequisiteTest(unittest.TestCase):
-    def run_prerequisite(self, limit, configured, token, slug):
+    def run_prerequisite(self, limit, configured, token, slug, handoff="false", fail_closed="false"):
         with open(WORKFLOW_PATH, encoding="utf-8") as f:
             workflow = f.read()
         step = workflow.split("- name: Validate strict cap prerequisites", 1)[1].split("\n      - name:", 1)[0]
         script = step.split("run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
         env = {"PATH": os.environ["PATH"], "MAX_ROUNDS": limit, "BOT_CONFIGURED": configured,
-               "BOT_TOKEN": token, "BOT_SLUG": slug}
+               "BOT_TOKEN": token, "BOT_SLUG": slug, "HANDOFF_AFTER_CAP": handoff, "FAIL_CLOSED": fail_closed}
         return subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True).returncode
 
     def test_no_bot_allows_a_positive_limit(self):
@@ -1841,6 +1841,10 @@ class StrictRoundCapPrerequisiteTest(unittest.TestCase):
             with self.subTest(token=bool(token), slug=bool(slug)):
                 self.assertNotEqual(self.run_prerequisite("3", "true", token, slug), 0)
         self.assertEqual(self.run_prerequisite("3", "true", "token", "bot"), 0)
+
+    def test_immediate_handoff_requires_fail_closed_counting(self):
+        self.assertNotEqual(self.run_prerequisite("3", "false", "", "", handoff="true"), 0)
+        self.assertEqual(self.run_prerequisite("3", "false", "", "", handoff="true", fail_closed="true"), 0)
 
     def test_zero_and_negative_limits_are_rejected(self):
         for limit in ("0", "-1"):
@@ -1869,11 +1873,41 @@ class StrictRoundCapPrerequisiteTest(unittest.TestCase):
 
 
 
+class ImmediateHandoffStepTest(unittest.TestCase):
+    def test_step_runs_after_post_and_before_approval_with_policy_flags(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            workflow = f.read()
+        post = workflow.split("  post-review:\n", 1)[1].split("\n  dismiss-stale-approval:", 1)[0]
+        self.assertLess(post.index("- name: Post review"), post.index("- name: Hand off after the last delivered review"))
+        self.assertLess(post.index("- name: Hand off after the last delivered review"), post.index("- name: Auto-approve decision"))
+        step = post.split("- name: Hand off after the last delivered review", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("steps.post.outputs.delivered == 'true'", step)
+        self.assertIn("needs.round-cap.outputs.next_round == inputs.max_rounds", step)
+        script = "\n".join(line[10:] for line in step.split("run: |\n", 1)[1].splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "auto-approve.py"), "w", encoding="utf-8") as f:
+                f.write("import json, os, sys\nopen(os.environ['ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
+            path = os.path.join(d, "args")
+            env = {"PATH": os.environ["PATH"], "CURSOR_REVIEW_ASSETS": d, "ARGS": path,
+                   "APP_SLUG": "review", "BOT_TOKEN": "token", "BOT_APP_ID": "1",
+                   "COUNT_SUPERSEDED_ROUNDS": "true", "PRESERVE_ROUND_COUNT": "true",
+                   "REPO": "o/r", "PR_NUMBER": "1", "MAX_ROUNDS": "3", "THRESHOLD": ""}
+            subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True)
+            with open(path, encoding="utf-8") as f:
+                args = json.load(f)
+            for flag in ("--after-review", "--count-superseded-rounds", "--preserve-round-count"):
+                self.assertIn(flag, args)
+            self.assertEqual(args[args.index("--poster-login") + 1], "review[bot]")
+            env["BOT_TOKEN"] = ""
+            self.assertNotEqual(subprocess.run(["bash", "-e", "-c", script], env=env,
+                                               capture_output=True).returncode, 0)
+
+
 class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
-                probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False):
+                probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False, after_review=False):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1911,7 +1945,7 @@ class RoundCapCommandTest(unittest.TestCase):
             open(out, "w").close()
             args = argparse.Namespace(repo="o/r", pr_number="1", max_rounds=max_rounds, threshold="medium",
                                       poster_login=BOT, fail_closed_round_cap=strict, count_superseded_rounds=count_superseded,
-                                      preserve_round_count=preserve)
+                                      preserve_round_count=preserve, after_review=after_review)
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_ids", lambda *a: {"11", "12"}), \
@@ -2000,6 +2034,34 @@ class RoundCapCommandTest(unittest.TestCase):
         _, counted, _ = self.run_cap(reviews, max_rounds="3", count_superseded=True)
         self.assertEqual((default["capped"], default["rounds"]), ("false", "2"))
         self.assertEqual((counted["capped"], counted["rounds"]), ("true", "3"))
+
+    def test_after_third_review_hands_off_and_describes_completed_round(self):
+        rc, out, writes = self.run_cap(self.FIVE[:3], max_rounds="3", strict=True,
+                                       preserve=True, after_review=True)
+        self.assertEqual((rc, out["capped"]), (0, "true"))
+        bodies = [payload["body"] for _, path, payload in writes if path.endswith("/comments")]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("the latest review was delivered", bodies[0])
+        self.assertNotIn("no new panel ran", bodies[0])
+
+    def test_after_review_does_not_reuse_a_pre_review_handoff_notice(self):
+        prior = {"user": {"login": BOT}, "body": AA.ROUND_CAP_MARKER + "\n" + AA.PRESERVED_CAP_MARKER,
+                 "created_at": "2026-01-06T00:00:00Z"}
+        _, _, writes = self.run_cap(self.FIVE[:3], max_rounds="3", preserve=True, after_review=True,
+                                    comments=[prior])
+        bodies = [payload["body"] for _, path, payload in writes if path.endswith("/comments")]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("the latest review was delivered", bodies[0])
+
+    def test_after_review_fails_if_delivered_round_is_not_visible_yet(self):
+        rc, _, writes = self.run_cap(self.FIVE[:2], max_rounds="3", strict=True, after_review=True)
+        self.assertNotEqual(rc, 0)
+        self.assertIn(("POST", "repos/o/r/issues/1/labels"), [(m, p) for m, p, _ in writes])
+
+    def test_after_review_marks_handoff_if_history_cannot_be_read(self):
+        rc, _, writes = self.run_cap(self.FIVE[:3], max_rounds="3", after_review=True, fail=("/reviews",))
+        self.assertNotEqual(rc, 0)
+        self.assertIn(("POST", "repos/o/r/issues/1/labels"), [(m, p) for m, p, _ in writes])
 
     def test_strict_cap_allows_two_and_hands_off_at_three(self):
         rc, out, _ = self.run_cap(self.FIVE[:2], max_rounds="3", strict=True)

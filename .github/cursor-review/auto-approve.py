@@ -281,6 +281,7 @@ SKIP_REVIEW_LABEL = "skip-cursor-review"
 VETO_LABELS = (SKIP_REVIEW_LABEL,)
 ROUND_CAP_MARKER = "<!-- cursor-review-round-cap -->"
 PRESERVED_CAP_MARKER = "<!-- cursor-review-round-cap:preserved -->"
+AFTER_REVIEW_CAP_MARKER = "<!-- cursor-review-round-cap:after-review -->"
 # post-review.py opens two bodies with CONSOLIDATED_MARKER that report a round
 # which reviewed NOTHING — the "Review failed" error review and the
 # all-panel-cells-failed review (both `delivers=False`). Neither spent a panel's
@@ -4077,13 +4078,15 @@ def superseded_by_push(panel: dict, reviews: list, login: str, marker: str) -> s
     return ""
 
 
-def cap_comment_posted(comments: list, poster_login: str, since, preserve: bool = False) -> bool:
+def cap_comment_posted(comments: list, poster_login: str, since, preserve: bool = False,
+                       after_review: bool = False) -> bool:
     """True when this cap's comment is already on the PR (posted after `since`)."""
     return any(
         isinstance(c, dict)
         and ((c.get("user") or {}).get("login") or "").lower() == poster_login.lower()
         and (PRESERVED_CAP_MARKER if preserve else ROUND_CAP_MARKER) in (c.get("body") or "")
         and (preserve or PRESERVED_CAP_MARKER not in (c.get("body") or ""))
+        and ((AFTER_REVIEW_CAP_MARKER in (c.get("body") or "")) == after_review)
         and _after(c.get("created_at"), since)
         for c in comments
     )
@@ -4111,19 +4114,22 @@ def cap_findings(review_comments: list, open_ids, threshold: str) -> list:
 
 
 def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: str, review_url: str,
-                       preserve: bool = False) -> str:
+                       preserve: bool = False, after_review: bool = False) -> str:
     render_code_ref = _load_post_review().render_code_ref
     scope = f"above `{threshold}`" if threshold else "still open"
     lines = [
         ROUND_CAP_MARKER,
         "### 🛑 Cursor Review — round cap reached",
-        f"This PR has had {rounds} review round(s) (`max_rounds: {max_rounds}`), so no new "
-        f"panel ran and it is labelled `{HUMAN_REVIEW_LABEL}`. Auto-approve will not "
+        f"This PR has had {rounds} review round(s) (`max_rounds: {max_rounds}`); "
+        + ("the latest review was delivered" if after_review else "no new panel ran")
+        + f" and it is labelled `{HUMAN_REVIEW_LABEL}`. Auto-approve will not "
         "approve it while the label is on; " + ("removing the label does not reset the round count."
                                               if preserve else "removing the label resets the round count."),
     ]
     if preserve:
         lines.insert(1, PRESERVED_CAP_MARKER)
+    if after_review:
+        lines.insert(1, AFTER_REVIEW_CAP_MARKER)
     if findings:
         lines.append(f"\nFindings from the latest round {scope}:")
         for sev, path, line in findings[:30]:
@@ -4222,8 +4228,19 @@ def parse_max_rounds(value) -> int:
     return int(number)
 
 
+def uncertain_after_review_handoff(args, reason: str) -> int:
+    """Stop a later review while the delivered round's count is uncertain."""
+    try:
+        ensure_label(args.repo, args.pr_number)
+    except RuntimeError as e:
+        print(f"::error::Could not apply the human handoff label: {e}")
+    print(f"::error::{reason}; the handoff needs human verification.")
+    return 1
+
+
 def cmd_round_cap(args) -> int:
-    strict = getattr(args, "fail_closed_round_cap", False)
+    after_review = getattr(args, "after_review", False)
+    strict = getattr(args, "fail_closed_round_cap", False) or after_review
     set_output("capped", "false")
     set_output("labelled", "false")
     # The EFFECTIVE cap, for the workflow's `max_rounds` output: an invalid value
@@ -4256,6 +4273,8 @@ def cmd_round_cap(args) -> int:
             set_output("labelled", "true")
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not read this PR's labels: {e}")
+        if after_review:
+            return uncertain_after_review_handoff(args, "Could not read the PR labels after delivery")
         if strict:
             return 1
     try:
@@ -4267,6 +4286,8 @@ def cmd_round_cap(args) -> int:
                                0 if getattr(args, "count_superseded_rounds", False) else max_rounds)
     except (RuntimeError, ValueError) as e:
         # Legacy callers fail open; strict callers stop the panel.
+        if after_review:
+            return uncertain_after_review_handoff(args, "Could not count review rounds after delivery")
         if strict:
             print(f"::error::Could not count review rounds; stopping the panel: {e}")
             return 1
@@ -4278,6 +4299,8 @@ def cmd_round_cap(args) -> int:
     # than a guess.
     set_output("next_round", len(rounds) + 1)
     if len(rounds) < max_rounds:
+        if after_review:
+            return uncertain_after_review_handoff(args, "The delivered review is not yet reflected in the count")
         emit(f"Round cap: {len(rounds)}/{max_rounds} round(s) so far — running the panel.")
         return 0
 
@@ -4296,11 +4319,13 @@ def cmd_round_cap(args) -> int:
         return 0
     set_output("capped", "true")
     set_output("labelled", "true")
-    emit(f"🛑 **Round cap reached** — {len(rounds)}/{max_rounds} round(s); skipped the panel and labelled `{HUMAN_REVIEW_LABEL}`.")
+    emit(f"🛑 **Round cap reached** — {len(rounds)}/{max_rounds} round(s); "
+         + ("review delivered" if after_review else "skipped the panel")
+         + f" and labelled `{HUMAN_REVIEW_LABEL}`.")
     failed = []
     try:
         comments = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/comments?per_page=100")
-        if cap_comment_posted(comments, args.poster_login, since, preserve):
+        if cap_comment_posted(comments, args.poster_login, since, preserve, after_review):
             emit("Round cap: the cap comment is already on this PR — not posting it again.")
         else:
             latest = rounds[-1]
@@ -4308,7 +4333,7 @@ def cmd_round_cap(args) -> int:
                 f"repos/{args.repo}/pulls/{args.pr_number}/reviews/{latest['id']}/comments?per_page=100"
             )
             findings = cap_findings(review_comments, open_thread_ids(args.repo, int(args.pr_number)), threshold)
-            body = render_cap_comment(len(rounds), max_rounds, findings, threshold, latest.get("html_url") or "", preserve)
+            body = render_cap_comment(len(rounds), max_rounds, findings, threshold, latest.get("html_url") or "", preserve, after_review)
             gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{args.pr_number}/comments", "--input", "-"], {"body": body})
     except (RuntimeError, ValueError, KeyError) as e:
         failed.append(f"comment: {e}")
@@ -4744,6 +4769,7 @@ def main() -> int:
     c.add_argument("--fail-closed-round-cap", action="store_true")
     c.add_argument("--count-superseded-rounds", action="store_true")
     c.add_argument("--preserve-round-count", action="store_true")
+    c.add_argument("--after-review", action="store_true")
     e = sub.add_parser("approve-external")
     e.add_argument("--repo", required=True)
     e.add_argument("--pr-number", required=True)

@@ -766,6 +766,15 @@ on:
         type: number
         required: false
         default: 5
+      handoff_after_cap:
+        description: >-
+          After the last allowed delivered review, recount and hand the PR to a
+          human in the same run. Requires a positive max_rounds and
+          fail_closed_round_cap. This is not an
+          atomic cap on concurrent or undelivered runs.
+        type: boolean
+        required: false
+        default: false
       preserve_round_count:
         description: >-
           Keep counting prior delivered reviews when the human handoff label is
@@ -1916,14 +1925,20 @@ jobs:
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Validate strict cap prerequisites
-        if: ${{ inputs.fail_closed_round_cap }}
+        if: ${{ inputs.fail_closed_round_cap || inputs.handoff_after_cap }}
         env:
           MAX_ROUNDS: ${{ inputs.max_rounds }}
           BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
           BOT_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          HANDOFF_AFTER_CAP: ${{ inputs.handoff_after_cap }}
+          FAIL_CLOSED: ${{ inputs.fail_closed_round_cap }}
         run: |
           if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$MAX_ROUNDS"; then
             echo "::error::fail_closed_round_cap requires a positive max_rounds"
+            exit 1
+          fi
+          if [ "$HANDOFF_AFTER_CAP" = true ] && [ "$FAIL_CLOSED" != true ]; then
+            echo "::error::handoff_after_cap requires fail_closed_round_cap"
             exit 1
           fi
           if [ "$BOT_CONFIGURED" = true ] && { [ -z "$BOT_TOKEN" ] || [ -z "$BOT_SLUG" ]; }; then
@@ -6457,6 +6472,35 @@ jobs:
               --runner-note "$RUNNER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
+
+      - name: Hand off after the last delivered review
+        if: >-
+          ${{ inputs.handoff_after_cap && steps.post.outputs.delivered == 'true' &&
+              needs.round-cap.outputs.next_round != '' &&
+              needs.round-cap.outputs.next_round == inputs.max_rounds }}
+        env:
+          GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          BOT_APP_ID: ${{ inputs.bot_app_id }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          COUNT_SUPERSEDED_ROUNDS: ${{ inputs.count_superseded_rounds }}
+          PRESERVE_ROUND_COUNT: ${{ inputs.preserve_round_count }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$BOT_APP_ID" ] && { [ -z "$BOT_TOKEN" ] || [ -z "$APP_SLUG" ]; }; then
+            echo "::error::The posting identity could not be confirmed; handoff was not attempted"
+            exit 1
+          fi
+          if [ -n "$APP_SLUG" ]; then LOGIN="${APP_SLUG}[bot]"; else LOGIN="github-actions[bot]"; fi
+          FLAGS=(--after-review)
+          if [ "$COUNT_SUPERSEDED_ROUNDS" = true ]; then FLAGS+=(--count-superseded-rounds); fi
+          if [ "$PRESERVE_ROUND_COUNT" = true ]; then FLAGS+=(--preserve-round-count); fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" round-cap \
+            --repo "$REPO" --pr-number "$PR_NUMBER" --max-rounds "$MAX_ROUNDS" \
+            --threshold "$THRESHOLD" --poster-login "$LOGIN" "${FLAGS[@]}"
 
       - name: Auto-approve decision
         # Opt-in (inputs.approve_max_severity). Runs only after `Post review`
