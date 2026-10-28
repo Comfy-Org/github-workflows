@@ -61,3 +61,31 @@ not run automatically in a workflow or publish a check.
 ```sh
 python3 scripts/review-readiness/from_risk.py < report-envelope.json
 ```
+
+## GitHub review inventory
+
+`collect_reviews.py` accepts `snapshot` and `policy` on standard input and uses
+`gh api` to read the PR, its paginated reviews and its paginated review threads.
+It checks that the PR is open and its base, head and author match before and
+again after collection. A changed or unavailable snapshot discards the collected
+review and thread evidence. `collection` reports which reads were observed,
+partial, unavailable, or discarded.
+
+Only the latest submitted approval, dismissal, or change request per actor can
+count, and only when its review records the supplied head SHA. GitHub `User` and
+`Bot` identities are distinguished; unknown or malformed identities make review
+collection unavailable. Comments and unsubmitted reviews do not replace a
+submitted decision. Current unresolved, non-outdated review threads block even
+if a later thread page fails. A partial thread read is not a complete inventory.
+
+The collector never marks the finding inventory complete: GitHub review threads
+are only one potential source. It also does not collect checks, verify reviewer
+permissions or branch protection, prove a tested revision, publish a report, or
+verify that the caller's policy is authorized. Consequently this entry point can
+return `BLOCKED` or `WAITING`, but never `READY`. Separate GitHub reads are not
+atomic: review state can change during collection, and an ABA branch change can
+escape the recheck. It is advisory evidence, not a merge gate.
+
+```sh
+python3 scripts/review-readiness/collect_reviews.py < snapshot-and-policy.json
+```
