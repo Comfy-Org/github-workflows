@@ -106,6 +106,17 @@ def evaluate(data):
             if _proof(proof):
                 proofs.add(proof)
             results[name].append((result, _proof(proof)))
+    # A reported failure can block, but does not prove which revision ran and
+    # cannot satisfy a required successful check.
+    for item in _list(data.get("reported_failures", []), "reported_failures"):
+        item = _object(item, "reported failure")
+        if _scope(item.get("scope")) != scope:
+            continue
+        name = _text(item.get("name"), "reported failure.name")
+        if name in required and _proof(item.get("proof")):
+            blocked.append(f"required check reported failure: {name}")
+            proofs.add(item["proof"])
+
     for name, found in results.items():
         if any(result in ("failure", "error") for result, _ in found):
             blocked.append(f"required check failed: {name}")

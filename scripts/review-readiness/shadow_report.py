@@ -9,6 +9,7 @@ import sys
 import tempfile
 
 import collect_reviews
+import collect_actions
 import from_risk
 import readiness
 
@@ -54,6 +55,7 @@ def build(data, client, run_risk=grade, expected_repo=None):
     # Validate the snapshot and policy before sending anything to GitHub.
     readiness.evaluate({'snapshot': data.get('snapshot'), 'policy': data.get('policy'),
                         'checks_complete': False, 'checks': []})
+    collect_actions.selectors(data['policy'])
     snapshot = data['snapshot']
     if expected_repo is not None and snapshot['repo'].casefold() != expected_repo.casefold():
         raise ValueError('target repository does not match caller')

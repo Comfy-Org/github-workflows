@@ -7,6 +7,8 @@ import subprocess
 import sys
 
 import readiness
+import collect_actions
+from evidence_errors import EvidenceError
 
 THREAD_QUERY = '''
 query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
@@ -20,10 +22,6 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
   }
 }
 '''
-
-
-class EvidenceError(Exception):
-    pass
 
 
 class GitHub:
@@ -48,6 +46,28 @@ class GitHub:
         if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
             raise EvidenceError('invalid review pages')
         return [review for page in pages for review in page]
+
+    def list_check_runs(self, head):
+        path = f'repos/{self.owner}/{self.name}/commits/{head}/check-runs?per_page=100&filter=all'
+        pages = self._api(['--paginate', '--slurp', path])
+        if not isinstance(pages, list) or not pages:
+            raise EvidenceError('invalid check pages')
+        checks = []
+        totals = set()
+        for page in pages:
+            if not isinstance(page, dict) or type(page.get('total_count')) is not int or not isinstance(page.get('check_runs'), list):
+                raise EvidenceError('invalid check pages')
+            totals.add(page['total_count'])
+            checks.extend(page['check_runs'])
+        if len(totals) != 1 or len(checks) != next(iter(totals)):
+            raise EvidenceError('incomplete check pages')
+        return checks
+
+    def job(self, job_id):
+        return self._api([f'repos/{self.owner}/{self.name}/actions/jobs/{job_id}'])
+
+    def run(self, run_id):
+        return self._api([f'repos/{self.owner}/{self.name}/actions/runs/{run_id}'])
 
     def threads(self, cursor):
         args = ['graphql', '-f', f'query={THREAD_QUERY}', '-f', f'owner={self.owner}',
@@ -128,10 +148,12 @@ def collect(data, client):
     base = {'snapshot': data.get('snapshot'), 'policy': data.get('policy'),
             'checks_complete': False, 'checks': [], 'reviews': None, 'findings': None}
     readiness.evaluate(base)
+    rules = collect_actions.selectors(base['policy'])
     snapshot = base['snapshot']
     scope = {key: snapshot[key] for key in readiness.SCOPE_KEYS}
     proof = f"https://github.com/{snapshot['repo']}/pull/{snapshot['pr']}"
-    status = {'snapshot': 'unavailable', 'reviews': 'not_attempted', 'threads': 'not_attempted'}
+    matched_checks = []
+    status = {'snapshot': 'unavailable', 'reviews': 'not_attempted', 'threads': 'not_attempted', 'actions_checks': 'not_attempted'}
     try:
         if matches(client.pull(), snapshot):
             status['snapshot'] = 'matched'
@@ -148,19 +170,24 @@ def collect(data, client):
                 status['threads'] = 'observed'
             except EvidenceError:
                 status['threads'] = 'partial'
+            try:
+                base['reported_failures'], status['actions_checks'], matched_checks = collect_actions.collect(snapshot, rules, client)
+            except (EvidenceError, ValueError, TypeError):
+                status['actions_checks'] = 'unavailable'
             if not matches(client.pull(), snapshot):
                 status['snapshot'] = 'changed'
-                base['reviews'], base['findings'] = None, None
+                base['reviews'], base['findings'], base['reported_failures'] = None, None, []
         else:
             status['snapshot'] = 'changed'
     except EvidenceError:
         status['snapshot'] = 'unavailable'
-        base['reviews'], base['findings'] = None, None
+        base['reviews'], base['findings'], base['reported_failures'] = None, None, []
     if status['snapshot'] != 'matched':
-        for key in ('reviews', 'threads'):
+        for key in ('reviews', 'threads', 'actions_checks'):
             if status[key] != 'not_attempted':
                 status[key] = 'discarded'
     result = readiness.evaluate(base)
+    result['actions_checks_matched'] = matched_checks if status['snapshot'] == 'matched' else []
     result['collection'] = status
     return result
 
