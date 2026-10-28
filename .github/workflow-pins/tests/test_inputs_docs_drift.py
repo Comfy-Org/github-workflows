@@ -245,6 +245,7 @@ ROWS = (
         sentinel="workflows_ref",
         inputs_heading="## Inputs worth setting",
     ),
+    Row(workflow="review-readiness-shadow", sentinel="snapshot_and_policy_json", expect_header_with=False),
     Row(workflow="pr-risk", sentinel="workflows_ref"),
     Row(workflow="pr-size", sentinel="workflows_ref"),
     Row(workflow="public-repo-hygiene", sentinel="workflows_ref"),

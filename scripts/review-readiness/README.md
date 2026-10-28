@@ -89,3 +89,18 @@ escape the recheck. It is advisory evidence, not a merge gate.
 ```sh
 python3 scripts/review-readiness/collect_reviews.py < snapshot-and-policy.json
 ```
+
+## Integrated shadow report
+
+`shadow_report.py` runs the real risk grader with `REPORT_ONLY=1` and no
+publication options, then collects GitHub reviews for the same supplied snapshot.
+It runs the grader in a temporary directory and emits one JSON report to stdout.
+A changed or unavailable final snapshot discards the risk grade too. The report
+remains advisory: missing checks and incomplete findings prevent `READY`.
+
+The reusable workflow `review-readiness-shadow.yml` retains that report for
+30 days. Its caller provides the snapshot and policy; the report records the
+provided tested SHA but does not verify it. The target repository must match
+the caller repository. The workflow checks out its tools at its own immutable
+workflow revision and does not execute PR code. Only use a reviewed, merged
+provider revision in a caller. See the caller guide for trust and rollout limits.

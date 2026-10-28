@@ -1,0 +1,56 @@
+name: Review readiness shadow (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      snapshot_and_policy_json:
+        description: Snapshot and advisory policy JSON, supplied by the caller.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  actions: read
+  statuses: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # The runner exposes workflow_sha on the job context. Serialize that
+      # context because actionlint's static schema does not yet include it;
+      # the SHA guard fails closed on older runners or an absent value.
+      - name: Validate provider revision
+        env:
+          PROVIDER_SHA: ${{ fromJSON(toJSON(job)).workflow_sha }}
+        run: |
+          if [[ ! "$PROVIDER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Cannot resolve the reusable workflow revision.'
+            exit 1
+          fi
+      - name: Load provider tools at the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: _review_tool
+          persist-credentials: false
+      - name: Build advisory report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          SHADOW_EXPECTED_REPO: ${{ github.repository }}
+          SHADOW_INPUT: ${{ inputs.snapshot_and_policy_json }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SHADOW_INPUT" | python3 _review_tool/scripts/review-readiness/shadow_report.py > readiness-report.json
+      - name: Retain report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-readiness-shadow-${{ github.run_id }}-${{ github.run_attempt }}
+          path: readiness-report.json
+          if-no-files-found: error
+          retention-days: 30
