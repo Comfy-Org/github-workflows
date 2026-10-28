@@ -517,11 +517,11 @@ human-adjudicated bug and clean cases. It reads a JSON object from stdin and
 writes a paired comparison to stdout; it does not run a model, publish a review,
 or change GitHub. There is no bundled or implied production benchmark.
 
-Each case identifies `id`, `repo`, `base_sha`, `head_sha`, and a `truth` object
+Each case identifies `id`, `repo`, `pr`, `base_sha`, `head_sha`, and a `truth` object
 with `kind` (`bug`, `clean`, or `unknown`), `proof`, and `bug_ids`. A confirmed
 bug case has one or more unique bug IDs; a confirmed clean case has none. Truth
 and all judgments need HTTPS evidence links. A case has `baseline` and
-`candidate` runs. Each run carries `repo`, `base_sha`, `head_sha`,
+`candidate` runs. Each run carries `repo`, `pr`, `base_sha`, `head_sha`,
 `reviewer_version`, `run_proof`, the actual structured `record` from
 `review-output-mcp.py`, `record_sha256`, `adjudication_complete`,
 `adjudication_proof`, and `judgments`. Top-level `baseline_version` and
@@ -563,19 +563,19 @@ illustrative, not evidence of a real bug.
   "candidate_version": "v2",
   "cases": [{
     "id": "example-1",
-    "repo": "example/repo",
+    "repo": "example/repo", "pr": 42,
     "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "truth": {"kind": "bug", "proof": "https://example.com/bug", "bug_ids": ["bug-1"]},
     "baseline": {
-      "repo": "example/repo", "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo": "example/repo", "pr": 42, "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "reviewer_version": "v1",
       "run_proof": "https://example.com/run-1", "record": {"status": "ok", "findings": []},
       "record_sha256": "a1542dd12dffb7f59221e1935389c4e233c664776f1786ae407b150ea153d93f",
       "adjudication_complete": true, "adjudication_proof": "https://example.com/judgment-1", "judgments": []
     },
     "candidate": {
-      "repo": "example/repo", "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo": "example/repo", "pr": 42, "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "reviewer_version": "v2",
       "run_proof": "https://example.com/run-2", "record": {"status": "ok", "findings": []},
       "record_sha256": "a1542dd12dffb7f59221e1935389c4e233c664776f1786ae407b150ea153d93f",

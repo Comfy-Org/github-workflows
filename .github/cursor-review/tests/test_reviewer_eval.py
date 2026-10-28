@@ -34,7 +34,7 @@ def record(findings):
 def run(findings, judgments):
     output = record(findings)
     digest = hashlib.sha256(json.dumps(output, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
-    return {'repo': 'example/repo', 'base_sha': BASE, 'head_sha': HEAD, 'reviewer_version': 'v1', 'run_proof': PROOF, 'record': output, 'record_sha256': digest,
+    return {'repo': 'example/repo', 'pr': 42, 'base_sha': BASE, 'head_sha': HEAD, 'reviewer_version': 'v1', 'run_proof': PROOF, 'record': output, 'record_sha256': digest,
             'adjudication_complete': True, 'adjudication_proof': PROOF, 'judgments': judgments}
 
 
@@ -45,7 +45,7 @@ def judgment(index, verdict, bug=None):
 def case(kind='bug'):
     findings = [FINDING] if kind == 'bug' else []
     labels = [judgment(0, 'bug', 'issue-1')] if kind == 'bug' else []
-    return {'id': kind, 'repo': 'example/repo', 'base_sha': BASE, 'head_sha': HEAD,
+    return {'id': kind, 'repo': 'example/repo', 'pr': 42, 'base_sha': BASE, 'head_sha': HEAD,
             'truth': {'kind': kind, 'proof': PROOF, 'bug_ids': ['issue-1'] if kind == 'bug' else []},
             'baseline': run(findings, labels), 'candidate': run(findings, labels)}
 
@@ -83,11 +83,18 @@ class ReviewerEvaluationTests(unittest.TestCase):
             self.assertEqual(result['excluded'][0]['case'], 'bug')
 
     def test_other_base_and_mixed_reviewer_versions_are_excluded(self):
-        for field, value in [('base_sha', 'd' * 40), ('repo', 'other/repo'), ('reviewer_version', 'other'), ('run_proof', None)]:
+        for field, value in [('pr', 43), ('base_sha', 'd' * 40), ('repo', 'other/repo'), ('reviewer_version', 'other'), ('run_proof', None)]:
             item = case()
             item['candidate'][field] = value
             result = evaluator.evaluate({'baseline_version': 'v1', 'candidate_version': 'v1', 'cases': [item]})
             self.assertEqual(result['paired_cases'], 0, field)
+
+    def test_invalid_pr_is_rejected(self):
+        for value in [None, True, 0, -1]:
+            item = case()
+            item['pr'] = value
+            with self.assertRaises(ValueError):
+                evaluator.evaluate({'baseline_version': 'v1', 'candidate_version': 'v1', 'cases': [item]})
 
     def test_duplicate_bug_findings_do_not_inflate_detection(self):
         item = case()

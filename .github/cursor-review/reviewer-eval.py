@@ -59,6 +59,7 @@ def truth_for(case):
 
 def adjudicated(run, case, reviewer_version, bug_ids):
     if (not isinstance(run, dict) or run.get('repo') != case['repo']
+            or type(run.get('pr')) is not int or run['pr'] != case['pr']
             or run.get('head_sha') != case['head_sha']
             or run.get('base_sha') != case['base_sha']
             or run.get('reviewer_version') != reviewer_version or not proof(run.get('run_proof'))):
@@ -125,6 +126,8 @@ def evaluate(data):
         seen.add(identifier)
         if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', text(case.get('repo'), 'case.repo')):
             raise ValueError('case.repo must be owner/name')
+        if type(case.get('pr')) is not int or case['pr'] < 1:
+            raise ValueError('case.pr must be a positive integer')
         if not all(isinstance(case.get(k), str) and SHA.fullmatch(case[k]) for k in ('base_sha', 'head_sha')):
             raise ValueError('case needs base and head SHAs')
         try:
