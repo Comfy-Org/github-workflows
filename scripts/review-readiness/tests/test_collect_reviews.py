@@ -52,10 +52,10 @@ def run(client):
 
 
 class CollectReviewsTests(unittest.TestCase):
-    def test_current_human_approval_is_collected_but_other_sources_remain_incomplete(self):
+    def test_current_human_approval_remains_incomplete_without_permission_check(self):
         result = run(FakeClient())
         self.assertEqual(result['state'], 'WAITING')
-        self.assertNotIn('required human approvals incomplete', result['reasons'])
+        self.assertIn('required human approvals incomplete', result['reasons'])
         self.assertIn('finding evidence incomplete', result['reasons'])
         self.assertIn('check inventory incomplete', result['reasons'])
 
@@ -148,7 +148,7 @@ print(json.dumps(value))
             result = json.loads(proc.stdout)
             self.assertEqual(result['state'], 'BLOCKED')
             self.assertIn('unresolved finding', result['reasons'])
-            self.assertNotIn('required human approvals incomplete', result['reasons'])
+            self.assertIn('required human approvals incomplete', result['reasons'])
 
     def test_unbounded_thread_pagination_is_marked_partial(self):
         class Endless(FakeClient):

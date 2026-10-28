@@ -74,8 +74,9 @@ partial, unavailable, or discarded.
 Only the latest submitted approval, dismissal, or change request per actor can
 count, and only when its review records the supplied head SHA. GitHub `User` and
 `Bot` identities are distinguished; unknown or malformed identities make review
-collection unavailable. Comments and unsubmitted reviews do not replace a
-submitted decision. Current unresolved, non-outdated review threads block even
+collection unavailable. Review records are reported as incomplete even when the
+list was read successfully, because the collector does not check reviewer
+permissions. Comments and unsubmitted reviews do not replace a submitted decision. Current unresolved, non-outdated review threads block even
 if a later thread page fails. A partial thread read is not a complete inventory.
 
 The collector never marks the finding inventory complete: GitHub review threads
