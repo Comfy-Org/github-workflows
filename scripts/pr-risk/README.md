@@ -23,8 +23,11 @@ Set `report_only: true` on the reusable workflow to retain grade records and per
 results as a 30-day Actions artifact. It skips risk labels, sticky comments and the
 optional risk Check Run, even if their options are enabled. The workflow itself still
 creates GitHub Actions run/check records and retains its declared token permissions.
-An ungraded result is unknown, never a low-risk verdict. Separate GitHub reads can
-race with changes to the base or head; the artifact is not readiness evidence.
+An ungraded result is unknown, never a low-risk verdict. The mode reads overrides
+at the observed base SHA and discards a grade if the base or head differs on recheck,
+the recheck fails, or the grade names another head. The results record includes the
+base SHA. Reads can still race, including a revision changing and changing back;
+this is not an atomic snapshot or readiness evidence.
 
 ## How a grade is computed
 

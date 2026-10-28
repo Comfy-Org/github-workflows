@@ -367,7 +367,8 @@ on:
         description: >-
           Retain grade records as an Actions artifact without changing labels, posting comments,
           or publishing the optional Check Run. The record is advisory and does not establish
-          that separate reads used one immutable snapshot.
+          that separate reads used one immutable snapshot. Overrides use the observed base SHA;
+          a changed or unreadable final snapshot discards the grade.
         type: boolean
         required: false
         default: false
