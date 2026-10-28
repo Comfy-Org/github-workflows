@@ -104,3 +104,24 @@ provided tested SHA but does not verify it. The target repository must match
 the caller repository. The workflow checks out its tools at its own immutable
 workflow revision and does not execute PR code. Only use a reviewed, merged
 provider revision in a caller. See the caller guide for trust and rollout limits.
+
+## GitHub Actions failure evidence
+
+A policy may add `actions_checks`, with a required check `name` and an exact
+`workflow_path` for each source. The collector reads all check-run pages and
+links each candidate to its GitHub Actions job and pull-request workflow run.
+The GitHub Actions app, run attempt, workflow path, PR number, base and head must
+match; the latest unambiguous matching job's reported failure blocks.
+
+`actions_checks_matched` lists the matched names. An unreadable source, partial
+inventory, unstarted or ambiguous newer job remains unknown; older failures do
+not replace it. The collector rechecks the PR snapshot after collection and
+discards these signals when it changes. Reads are not atomic and do not establish
+reviewer permissions or a merge candidate.
+
+This is **negative-only evidence**: a successful check run is attached to the PR
+head, but that does not prove what revision its job actually tested. It never
+satisfies a required passing check or produces `READY`. Caller-supplied policy
+must be authorized separately. The pure evaluator accepts scoped
+`reported_failures` and includes their proof links, but does not itself verify
+the producer or link contents.
