@@ -5811,21 +5811,31 @@ jobs:
           if not degraded:
               findings = judge.get("findings") or []
           else:
-              # Judge unusable — union the per-cell findings, deduping identical
-              # (file, line, severity, body) across cells to cut obvious
-              # repeats without hiding different severity levels.
-              seen, findings = set(), []
+              # Keep the highest severity when cells report the same finding.
+              # Reuse the structured-output schema's severity order.
+              import importlib.util
+              spec = importlib.util.spec_from_file_location(
+                  "review_output", os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"))
+              review_output = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(review_output)
+              priority = {name: rank for rank, name in enumerate(review_output.SEVERITIES)}
+              seen, findings = {}, []
               for cell in panel:
                   if cell.get("status") != "ok":
                       continue
                   for fnd in cell.get("findings") or []:
                       if not isinstance(fnd, dict):
                           continue
-                      key = (fnd.get("file"), fnd.get("line"), fnd.get("severity"), fnd.get("body"))
-                      if key in seen:
+                      severity = fnd.get("severity")
+                      if not isinstance(severity, str) or severity not in priority:
+                          findings.append(fnd)
                           continue
-                      seen.add(key)
-                      findings.append(fnd)
+                      key = (fnd.get("file"), fnd.get("line"), fnd.get("body"))
+                      if key not in seen:
+                          seen[key] = len(findings)
+                          findings.append(fnd)
+                      elif priority[severity] < priority[findings[seen[key]]["severity"]]:
+                          findings[seen[key]] = fnd
 
           # auto-approve withholds on it (a reviewer leg did not succeed
           # although every panel cell reports ok).
