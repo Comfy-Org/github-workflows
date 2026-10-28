@@ -130,7 +130,26 @@ case "$kind" in
       echo "gh: Could not resolve to a PullRequest with the number of ${num} (HTTP 404)" >&2
       exit 1
     fi
-    cat "$STUB_DIR/base_ref"; echo ;;
+    if [[ "$filter" == *".base.sha"* ]]; then
+      count=0; [ ! -f "$STUB_DIR/snapshot_count" ] || count="$(cat "$STUB_DIR/snapshot_count")"
+      printf '%s' "$((count + 1))" > "$STUB_DIR/snapshot_count"
+      base_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      head_sha="c0ffee1234567890abcdef1234567890abcdef12"
+      if [ "$count" -gt 0 ] && [ -f "$STUB_DIR/snapshot_changed" ]; then
+        head_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      fi
+      if [ "$count" -gt 0 ] && [ -f "$STUB_DIR/snapshot_base_changed" ]; then
+        base_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      fi
+      if [ "$count" -gt 0 ] && [ -f "$STUB_DIR/snapshot_fail_after" ]; then
+        echo 'gh: snapshot unavailable (HTTP 403)' >&2; exit 1
+      fi
+      [ ! -f "$STUB_DIR/snapshot_bad" ] || head_sha=""
+      printf '%s\t%s\t%s\n' "$(cat "$STUB_DIR/base_ref")" "$base_sha" "$head_sha"
+    else
+      cat "$STUB_DIR/base_ref"; echo
+    fi ;;
+
   contents)
     case "$(cat "$STUB_DIR/contents_mode" 2>/dev/null || echo 404)" in
       404) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
@@ -155,6 +174,7 @@ WORK=""
 run_targets() {
   WORK="$(mktemp -d "$SANDBOX/work.XXXXXX")"
   : > "$STUB_LOG"
+  rm -f "$STUB_DIR/snapshot_count"
   RC=0
   OUT="$( cd "$WORK" && PATH="$SANDBOX/bin:$PATH" \
       env REPO=test/repo TOOL_DIR="$TOOLDIR" DRY_RUN=1 \
@@ -484,6 +504,8 @@ eq "report-only grades successfully" 0 "$RC"
 eq "report-only records the grade" graded "$(res '.status')"
 eq "report-only does not claim a label was applied" null "$(res '.label')"
 eq "report-only emits no check payload" 0 "$(jq -s length "$WORK/pr-risk-surfaces.jsonl")"
+has_text "policy is read at the immutable base revision" "risk.json?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$(calls)"
+eq "stable evidence records the base revision" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$(res '.base_sha')"
 no_text "report-only makes no label or comment API call" "issues/42/labels" "$(calls)"
 no_text "report-only makes no comment API call" "issues/42/comments" "$(calls)"
 if [ -f "$WORK/record-42.json" ]; then
@@ -491,6 +513,38 @@ if [ -f "$WORK/record-42.json" ]; then
 else
   bad "grade record missing"
 fi
+touch "$STUB_DIR/snapshot_changed"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0
+eq "a changed head makes the report ungraded" ungraded "$(res '.status')"
+eq "a changed head cannot retain a confident tier" unknown "$(res '.tier')"
+has_text "the report explains the changed revision" "snapshot changed" "$(results)"
+rm -f "$STUB_DIR/snapshot_changed"
+if [ ! -f "$WORK/record-42.json" ]; then
+  ok "stale grade record is discarded"
+else
+  bad "stale grade retained"
+fi
+touch "$STUB_DIR/snapshot_base_changed"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0
+eq "a changed base makes the report ungraded" ungraded "$(res '.status')"
+eq "a changed base cannot retain a confident tier" unknown "$(res '.tier')"
+rm -f "$STUB_DIR/snapshot_base_changed"
+touch "$STUB_DIR/snapshot_fail_after"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0
+eq "an unavailable final snapshot is ungraded" ungraded "$(res '.status')"
+eq "an unavailable final snapshot has no usable record" null "$(res '.record')"
+rm -f "$STUB_DIR/snapshot_fail_after"
+cp "$STUB_DIR/fixture.json" "$STUB_DIR/fixture-snapshot.json"
+jq '.data.repository.pullRequest.commits.nodes[0].commit.oid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$STUB_DIR/fixture-snapshot.json" > "$STUB_DIR/fixture.json"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0
+eq "a grade for another head is ungraded" ungraded "$(res '.status')"
+eq "a grade for another head is discarded" null "$(res '.record')"
+cp "$STUB_DIR/fixture-snapshot.json" "$STUB_DIR/fixture.json"
+touch "$STUB_DIR/snapshot_bad"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0
+eq "a missing initial head fails the target" 1 "$RC"
+eq "a missing initial head is not graded" failed "$(res '.status')"
+rm -f "$STUB_DIR/snapshot_bad"
 touch "$STUB_DIR/graphql_fail"
 run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0 PUBLISH_CHECK=1 PUBLISH_COMMENT=1
 eq "report-only preserves unavailable evidence" ungraded "$(res '.status')"

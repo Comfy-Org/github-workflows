@@ -248,25 +248,41 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
 }
 
 # ---- one target, end to end -------------------------------------------------------------------
-record_result() { # <pr> <status> <tier> <label> <record|""> <waited> <base-ref> <note>
+record_result() { # <pr> <status> <tier> <label> <record|""> <waited> <base-ref> <note> [base-sha]
   jq -cn --argjson pr "$1" --arg status "$2" --arg tier "$3" --arg label "$4" \
-         --arg record "$5" --argjson waited "$6" --arg base "$7" --arg note "$8" \
+         --arg record "$5" --argjson waited "$6" --arg base "$7" --arg note "$8" --arg base_sha "${9:-}" \
     '{pr:$pr, status:$status,
       tier:(if $tier == "" then null else $tier end),
       label:(if $label == "" then null else $label end),
       record:(if $record == "" then null else $record end),
       waited:$waited,
       base_ref:(if $base == "" then null else $base end),
+      base_sha:(if $base_sha == "" then null else $base_sha end),
       note:(if $note == "" then null else $note end)}' >> "$RESULTS"
 }
 
-process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
+read_report_snapshot() { # <pr> -> base ref, base SHA, head SHA; no fallback to a branch name
   init_scratch
-  local num="$1" base map rb record label deadline now label_rc
+  local num="$1" ref base_sha head_sha
+  retry_read "$OUTF" "repos/${REPO}/pulls/${num}" --jq '[.base.ref,.base.sha,.head.sha] | @tsv' || return 1
+  IFS=$'\t' read -r ref base_sha head_sha < "$OUTF"
+  [ -n "$ref" ] && [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\t%s\t%s' "$ref" "$base_sha" "$head_sha"
+}
+
+process_target() { # <num> -> rc 0 = reported or label in sync, rc 1 = failed
+  init_scratch
+  local num="$1" base policy_ref base_sha="" head_sha="" snapshot end_snapshot grade_head map rb record label deadline now label_rc
   record="record-${num}.json"
   G_TIER=""; G_WAITED=0
 
-  if [ -n "$BASE_REF" ] && [ "$TARGET_COUNT" -eq 1 ]; then
+  if [ "$REPORT_ONLY" = 1 ]; then
+    snapshot="$(read_report_snapshot "$num")" || {
+      record_result "$num" failed "" "" "" 0 "" "the PR snapshot could not be read — NOT graded"
+      return 1
+    }
+    IFS=$'\t' read -r base base_sha head_sha <<< "$snapshot"
+  elif [ -n "$BASE_REF" ] && [ "$TARGET_COUNT" -eq 1 ]; then
     # The event path: the payload already carries the base ref of the one PR being graded, so no
     # API call is spent re-reading it. NOT honoured for a supplied number — the target may be a
     # different PR than the event's (or there may be no event at all), and the event's base ref
@@ -279,11 +295,12 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
     }
   fi
 
-  map="$(fetch_override "$MAP_PATH" "repo-risk-map-${num}.json" "$base")" || {
+  policy_ref="${base_sha:-$base}"
+  map="$(fetch_override "$MAP_PATH" "repo-risk-map-${num}.json" "$policy_ref")" || {
     record_result "$num" failed "" "" "" 0 "$base" "the risk-map override could not be read from ${base} — NOT graded"
     return 1
   }
-  rb="$(fetch_override "$RB_PATH" "repo-risk-runbooks-${num}.json" "$base")" || {
+  rb="$(fetch_override "$RB_PATH" "repo-risk-runbooks-${num}.json" "$policy_ref")" || {
     record_result "$num" failed "" "" "" 0 "$base" "the runbook-registry override could not be read from ${base} — NOT graded"
     return 1
   }
@@ -304,11 +321,20 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
   # Report-only runs must not call any publisher, even when conflicting options are set.
   # A null label says no label was applied; unknown remains distinct from a low-risk grade.
   if [ "$REPORT_ONLY" = 1 ]; then
+    if [ "$G_TIER" != unknown ] && [ -n "$G_TIER" ]; then
+      grade_head="$(jq -r '.head_sha // ""' "$record")"
+      end_snapshot="$(read_report_snapshot "$num")" || end_snapshot=""
+      if [ "$snapshot" != "$end_snapshot" ] || [ "$grade_head" != "$head_sha" ]; then
+        rm -f "$record"
+        record_result "$num" ungraded unknown "" "" "$G_WAITED" "$base" "snapshot changed or could not be rechecked; discarded grade" "$base_sha"
+        return 0
+      fi
+    fi
     case "$G_TIER" in
       ""|unknown|null)
-        record_result "$num" ungraded unknown "" "$record" "$G_WAITED" "$base" "risk evidence unavailable; no label was written" ;;
+        record_result "$num" ungraded unknown "" "$record" "$G_WAITED" "$base" "risk evidence unavailable; no label was written" "$base_sha" ;;
       *)
-        record_result "$num" graded "$G_TIER" "" "$record" "$G_WAITED" "$base" "report only; no label was written" ;;
+        record_result "$num" graded "$G_TIER" "" "$record" "$G_WAITED" "$base" "report only; no label was written; separate reads are not atomic" "$base_sha" ;;
     esac
     return 0
   fi
