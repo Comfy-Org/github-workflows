@@ -4257,7 +4257,7 @@ def cmd_round_cap(args) -> int:
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
         )
         rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, since, marker,
-                               max_rounds)
+                               0 if getattr(args, "count_superseded_rounds", False) else max_rounds)
     except (RuntimeError, ValueError) as e:
         # Legacy callers fail open; strict callers stop the panel.
         if strict:
@@ -4738,6 +4738,7 @@ def main() -> int:
     c.add_argument("--threshold", default="")
     c.add_argument("--poster-login", required=True)
     c.add_argument("--fail-closed-round-cap", action="store_true")
+    c.add_argument("--count-superseded-rounds", action="store_true")
     e = sub.add_parser("approve-external")
     e.add_argument("--repo", required=True)
     e.add_argument("--pr-number", required=True)

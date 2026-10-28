@@ -765,6 +765,13 @@ on:
         type: number
         required: false
         default: 5
+      count_superseded_rounds:
+        description: >-
+          Include delivered reviews whose decisions found the head moved in the
+          round cap. Does not count undelivered panels or change reset behavior.
+        type: boolean
+        required: false
+        default: false
       fail_closed_round_cap:
         description: >-
           Stop the panel if review history or the handoff label cannot be read or
@@ -1928,12 +1935,14 @@ jobs:
           MAX_ROUNDS: ${{ inputs.max_rounds }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
           FAIL_CLOSED_ROUND_CAP: ${{ inputs.fail_closed_round_cap }}
+          COUNT_SUPERSEDED_ROUNDS: ${{ inputs.count_superseded_rounds }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           if [ -n "$APP_SLUG" ]; then LOGIN="${APP_SLUG}[bot]"; else LOGIN="github-actions[bot]"; fi
           STRICT_FLAG=()
-          if [ "$FAIL_CLOSED_ROUND_CAP" = true ]; then STRICT_FLAG=(--fail-closed-round-cap); fi
+          if [ "$FAIL_CLOSED_ROUND_CAP" = true ]; then STRICT_FLAG+=(--fail-closed-round-cap); fi
+          if [ "$COUNT_SUPERSEDED_ROUNDS" = true ]; then STRICT_FLAG+=(--count-superseded-rounds); fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" round-cap \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
