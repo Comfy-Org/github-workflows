@@ -753,8 +753,9 @@ on:
           comment listing the latest round's open findings above
           `approve_max_severity` (every open finding when that is empty), and
           sets the `approve_gate` output to `capped`. Auto-approve never
-          approves a PR carrying that label. Removing the label resets the
-          count: only rounds after its most recent removal count. A round whose
+          approves a PR carrying that label. By default removing the label resets
+          the count: only rounds after its most recent removal count. Set
+          preserve_round_count to retain earlier reviews. A round whose
           own decision found the PR head had moved (a newer push superseded
           it) does not count either, at most once per reviewed commit and at
           most `max_rounds` times, so a PR runs at most twice the cap's
@@ -765,6 +766,13 @@ on:
         type: number
         required: false
         default: 5
+      preserve_round_count:
+        description: >-
+          Keep counting prior delivered reviews when the human handoff label is
+          removed. This does not count undelivered panels or serialize runs.
+        type: boolean
+        required: false
+        default: false
       count_superseded_rounds:
         description: >-
           Include delivered reviews whose decisions found the head moved in the
@@ -1936,6 +1944,7 @@ jobs:
           THRESHOLD: ${{ inputs.approve_max_severity }}
           FAIL_CLOSED_ROUND_CAP: ${{ inputs.fail_closed_round_cap }}
           COUNT_SUPERSEDED_ROUNDS: ${{ inputs.count_superseded_rounds }}
+          PRESERVE_ROUND_COUNT: ${{ inputs.preserve_round_count }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -1943,6 +1952,7 @@ jobs:
           STRICT_FLAG=()
           if [ "$FAIL_CLOSED_ROUND_CAP" = true ]; then STRICT_FLAG+=(--fail-closed-round-cap); fi
           if [ "$COUNT_SUPERSEDED_ROUNDS" = true ]; then STRICT_FLAG+=(--count-superseded-rounds); fi
+          if [ "$PRESERVE_ROUND_COUNT" = true ]; then STRICT_FLAG+=(--preserve-round-count); fi
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" round-cap \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
@@ -7273,9 +7283,9 @@ jobs:
         run: |
           # The round cap is not exempt either, for the same reason as the size
           # cap below: no panel looked at this head. The PR is handed to a human
-          # (needs-human-review); removing that label resets the cap.
+          # (needs-human-review); reset behavior depends on the caller policy.
           if [ "$CAPPED" = "true" ]; then
-            echo "::error::This PR hit cursor-review's max_rounds cap, so no review ran on this head and it is labelled needs-human-review — an unreviewed head cannot pass a blocking gate. Have a human review it, then remove the label to resume automated rounds."
+            echo "::error::This PR hit cursor-review's max_rounds cap, so no review ran on this head and it is labelled needs-human-review — an unreviewed head cannot pass a blocking gate. Have a human review it; any further automated rounds depend on the caller policy."
             exit 1
           fi
           if [ "$DIFF_SIZE_RESULT" = "success" ] && [ "$WITHIN_CAP" != "true" ]; then
@@ -7349,7 +7359,7 @@ jobs:
             exit 1
           fi
           if printf '%s\n' "$labels" | grep -qixF 'needs-human-review'; then
-            echo "::error::This PR carries needs-human-review (cursor-review's max_rounds cap, or a human hand-off), so automated rounds are paused and no panel has reviewed this head — an unreviewed head cannot pass a blocking gate. Have a human review it, then remove the label to resume automated rounds."
+            echo "::error::This PR carries needs-human-review (cursor-review's max_rounds cap, or a human hand-off), so automated rounds are paused and no panel has reviewed this head — an unreviewed head cannot pass a blocking gate. Have a human review it; any further automated rounds depend on the caller policy."
             exit 1
           fi
 
