@@ -147,7 +147,8 @@ def eligible_approvals(items, author, client):
                     or role not in ('admin', 'write', 'maintain', 'read', 'triage', 'none')):
                 raise EvidenceError('invalid reviewer permission')
             if role in ('admin', 'write', 'maintain'):
-                eligible.append(item)
+                # GitHub User accounts can also be automation; role is not proof of a human.
+                complete = False
         except (EvidenceError, KeyError, TypeError):
             complete = False
             status = 'partial'

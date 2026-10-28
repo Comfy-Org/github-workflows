@@ -74,11 +74,13 @@ partial, unavailable, or discarded.
 Only the latest submitted approval, dismissal, or change request per actor can
 count, and only when its review records the supplied head SHA. GitHub `User` and
 `Bot` identities are distinguished; unknown or malformed identities make review
-collection unavailable. For each current human non-author approval, the collector
-reads the reviewer's current repository permission and counts only write,
-maintain or admin base access. Missing, malformed or unavailable permission
-responses make approval evidence incomplete; a successfully read lower role does
-not count. It checks at most 100 approvals and reports `reviewer_permissions` as
+collection unavailable. A GitHub `User` may be a machine account, so its type and
+repository permission do not establish a human identity. The collector checks the
+current base permission of current non-author `User` approvals, but never counts
+them as verified human approvals: write, maintain, or admin access leaves human
+identity incomplete, and lower roles do not qualify. Missing, malformed or
+unavailable permission responses also make approval evidence incomplete. It checks
+at most 100 approvals and reports `reviewer_permissions` as
 observed, partial, not needed, not attempted or discarded. Current change requests
 still block even if a permission read fails. Comments and unsubmitted reviews do
 not replace a submitted decision. Current unresolved, non-outdated review threads block even
