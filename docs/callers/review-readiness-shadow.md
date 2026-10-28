@@ -15,7 +15,8 @@ in the caller's `uses:`. The provider tools load at the workflow's own revision,
 never from the PR. This workflow runs only when explicitly called.
 
 The report records the supplied `tested_sha` but cannot prove that tests actually
-ran on it. It does not verify reviewer permissions or cover every finding source.
+ran on it. It does not verify reviewer permissions or cover every finding source, so
+review and finding evidence remains incomplete.
 Missing checks and incomplete findings prevent `READY`; known current failures
 can still produce `BLOCKED`. Data reads are not atomic, so a review change or an
 ABA revision change can race collection. It is not an authorization to merge or

@@ -158,7 +158,7 @@ def collect(data, client):
         if matches(client.pull(), snapshot):
             status['snapshot'] = 'matched'
             try:
-                base['reviews'] = {'scope': scope, 'complete': True, 'proof': proof,
+                base['reviews'] = {'scope': scope, 'complete': False, 'proof': proof,
                                    'approvals': approvals(client.list_reviews(), snapshot['head_sha'])}
                 status['reviews'] = 'observed'
             except EvidenceError:
