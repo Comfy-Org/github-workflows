@@ -5812,8 +5812,8 @@ jobs:
               findings = judge.get("findings") or []
           else:
               # Judge unusable — union the per-cell findings, deduping identical
-              # (file, line, body) across cells to cut the obvious cross-cell
-              # repetition the judge would normally collapse.
+              # (file, line, side, severity, body) across cells to cut obvious
+              # repeats without hiding distinct locations or severity levels.
               seen, findings = set(), []
               for cell in panel:
                   if cell.get("status") != "ok":
@@ -5821,7 +5821,8 @@ jobs:
                   for fnd in cell.get("findings") or []:
                       if not isinstance(fnd, dict):
                           continue
-                      key = (fnd.get("file"), fnd.get("line"), fnd.get("body"))
+                      key = (fnd.get("file"), fnd.get("line"), fnd.get("side"),
+                             fnd.get("severity"), fnd.get("body"))
                       if key in seen:
                           continue
                       seen.add(key)

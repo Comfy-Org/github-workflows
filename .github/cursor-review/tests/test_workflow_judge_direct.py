@@ -351,6 +351,22 @@ class ExfilGuardTest(unittest.TestCase):
         with open(os.path.join(self.workdir, "consolidated.json"), encoding="utf-8") as f:
             return outputs, json.load(f)
 
+    def test_degraded_union_keeps_distinct_diff_sides_and_severities(self):
+        self.configure("true")  # Seed status is error, selecting the degraded union.
+        base = {"file": "a.py", "line": 4, "side": "LEFT", "severity": "low", "body": "issue"}
+        findings = [base, dict(base), {**base, "side": "RIGHT"}, {**base, "severity": "high"}]
+        with open(os.path.join(self.workdir, "panel.json"), "w", encoding="utf-8") as f:
+            json.dump([{"model": "test", "review_type": "edge-case", "status": "ok", "findings": findings}], f)
+        done, outputs = run_step(step(self.consolidate, BUILD_STEP),
+                                 {"steps.aggregate.outputs.ok_count": "1",
+                                  "steps.aggregate.outputs.panel_inconsistent": "false"}, self.workdir)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        with open(os.path.join(self.workdir, "consolidated.json"), encoding="utf-8") as f:
+            retained = json.load(f)["findings"]
+        self.assertEqual(outputs["degraded"], "true")
+        self.assertEqual([(f["side"], f["severity"]) for f in retained],
+                         [("LEFT", "low"), ("RIGHT", "low"), ("LEFT", "high")])
+
     def test_the_seed_names_the_judge_that_will_run(self):
         self.assertEqual(self.configure("true")["model"], f"{JUDGE_MODEL} (direct)")
         self.assertEqual(self.configure("false")["model"], CURSOR_JUDGE)
