@@ -33,6 +33,7 @@ class FakeClient:
         self.reviews = [review()]
         self.pages = [{'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}]
         self.calls = []
+        self.permission_data = {'permission': 'write', 'user': {'login': 'reviewer', 'type': 'User'}}
 
     def pull(self):
         self.calls.append('pull')
@@ -41,6 +42,10 @@ class FakeClient:
     def list_reviews(self):
         self.calls.append('reviews')
         return self.reviews
+
+    def permission(self, login):
+        self.calls.append(('permission', login))
+        return self.permission_data
 
     def threads(self, cursor):
         self.calls.append(('threads', cursor))
@@ -52,12 +57,65 @@ def run(client):
 
 
 class CollectReviewsTests(unittest.TestCase):
-    def test_current_human_approval_remains_incomplete_without_permission_check(self):
+    def test_review_permission_read_is_separate_from_other_incomplete_evidence(self):
         result = run(FakeClient())
         self.assertEqual(result['state'], 'WAITING')
-        self.assertIn('required human approvals incomplete', result['reasons'])
+        self.assertNotIn('required human approvals incomplete', result['reasons'])
         self.assertIn('finding evidence incomplete', result['reasons'])
         self.assertIn('check inventory incomplete', result['reasons'])
+
+    def test_eligible_current_approval_is_recognized_after_permission_check(self):
+        client = FakeClient()
+        result = run(client)
+        self.assertIn(('permission', 'reviewer'), client.calls)
+        self.assertEqual(result['collection']['reviewer_permissions'], 'observed')
+        self.assertNotIn('required human approvals incomplete', result['reasons'])
+        self.assertEqual(result['state'], 'WAITING')
+
+    def test_ineligible_or_unavailable_permissions_do_not_count_as_approval(self):
+        for value in ('read', 'none', 'invalid', None):
+            client = FakeClient()
+            client.permission_data['permission'] = value
+            result = run(client)
+            self.assertIn('required human approvals incomplete', result['reasons'], value)
+
+    def test_permission_failure_stops_further_lookups(self):
+        client = FakeClient()
+        calls = []
+        def unavailable(login):
+            calls.append(login)
+            raise collector.EvidenceError('unavailable')
+        client.permission = unavailable
+        client.reviews = [review(), review(actor='other', number=2)]
+        result = run(client)
+        self.assertEqual(calls, ['reviewer'])
+        self.assertEqual(result['collection']['reviewer_permissions'], 'partial')
+        self.assertIn('required human approvals incomplete', result['reasons'])
+
+    def test_permission_for_a_different_identity_does_not_count(self):
+        client = FakeClient()
+        client.permission_data['user']['login'] = 'someone-else'
+        self.assertIn('required human approvals incomplete', run(client)['reasons'])
+
+    def test_permission_queries_are_bounded(self):
+        client = FakeClient()
+        items = [{'actor': f'user-{n}', 'human': True, 'state': 'approved'} for n in range(101)]
+        eligible, complete, status = collector.eligible_approvals(items, 'author', client)
+        self.assertEqual(eligible, [])
+        self.assertFalse(complete)
+        self.assertEqual(status, 'partial')
+        self.assertFalse(any(isinstance(call, tuple) and call[0] == 'permission' for call in client.calls))
+
+    def test_permission_failure_does_not_hide_change_requests(self):
+        client = FakeClient()
+        client.reviews = [review(), review(actor='other', state='CHANGES_REQUESTED', number=2)]
+        def unavailable(login): raise collector.EvidenceError('unavailable')
+        client.permission = unavailable
+        result = run(client)
+        self.assertEqual(result['state'], 'BLOCKED')
+        self.assertIn('human review requests changes', result['reasons'])
+        self.assertEqual(result['collection']['reviewer_permissions'], 'partial')
+        self.assertIn('required human approvals incomplete', result['reasons'])
 
     def test_paginated_unresolved_current_thread_blocks(self):
         client = FakeClient()
@@ -133,6 +191,8 @@ f = json.load(open(os.environ['FIXTURE_PATH']))
 if 'graphql' in sys.argv:
     page = f['pages'][int('cursor=next' in sys.argv)]
     value = {'data': {'repository': {'pullRequest': {'reviewThreads': page}}}}
+elif any('/collaborators/' in arg for arg in sys.argv):
+    value = {'permission': 'write', 'user': {'login': 'reviewer', 'type': 'User'}}
 elif '--slurp' in sys.argv:
     value = f['reviews']
 else:
@@ -148,7 +208,7 @@ print(json.dumps(value))
             result = json.loads(proc.stdout)
             self.assertEqual(result['state'], 'BLOCKED')
             self.assertIn('unresolved finding', result['reasons'])
-            self.assertIn('required human approvals incomplete', result['reasons'])
+            self.assertNotIn('required human approvals incomplete', result['reasons'])
 
     def test_unbounded_thread_pagination_is_marked_partial(self):
         class Endless(FakeClient):
@@ -158,7 +218,7 @@ print(json.dumps(value))
         client = Endless()
         result = run(client)
         self.assertEqual(result['collection']['threads'], 'partial')
-        self.assertLessEqual(len([call for call in client.calls if isinstance(call, tuple)]), 100)
+        self.assertLessEqual(len([call for call in client.calls if isinstance(call, tuple) and call[0] == 'threads']), 100)
 
     def test_unavailable_reviews_do_not_hide_known_open_threads(self):
         class UnavailableReviews(FakeClient):
