@@ -4269,7 +4269,10 @@ def cmd_round_cap(args) -> int:
     try:
         # For the `approve_gate` output only: a PR a human already handed to a
         # human reports `capped` even when auto-approve (and so decide) is off.
-        if has_label(read_pr(args.repo, args.pr_number), HUMAN_REVIEW_LABEL):
+        pr = read_pr(args.repo, args.pr_number)
+        if strict and not live_labels_readable(pr):
+            raise ValueError("the PR label list is missing or malformed")
+        if has_label(pr, HUMAN_REVIEW_LABEL):
             set_output("labelled", "true")
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not read this PR's labels: {e}")
