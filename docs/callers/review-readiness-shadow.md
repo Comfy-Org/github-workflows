@@ -15,9 +15,10 @@ in the caller's `uses:`. The provider tools load at the workflow's own revision,
 never from the PR. This workflow runs only when explicitly called.
 
 The report records the supplied `tested_sha` but cannot prove that tests actually
-ran on it. It checks current repository base permissions for human approvals, but does not
-verify code-owner rules or cover every finding source. Missing permission data
-keeps approval evidence incomplete.
+ran on it. It checks repository base permissions for User approvals, but cannot
+establish whether those accounts belong to humans. It does not count them as
+verified human approvals, verify code-owner rules, or cover every finding source.
+Missing permission data also keeps approval evidence incomplete.
 Missing checks and incomplete findings prevent `READY`; known current failures
 can still produce `BLOCKED`. Data reads are not atomic, so a review change or an
 ABA revision change can race collection. It is not an authorization to merge or

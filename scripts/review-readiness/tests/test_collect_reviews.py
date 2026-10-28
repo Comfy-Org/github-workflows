@@ -57,19 +57,27 @@ def run(client):
 
 
 class CollectReviewsTests(unittest.TestCase):
+    def test_github_user_type_and_write_permission_do_not_prove_human_identity(self):
+        client = FakeClient()
+        client.reviews = [review(actor='service-account')]
+        client.permission_data['user']['login'] = 'service-account'
+        result = run(client)
+        self.assertEqual(result['collection']['reviewer_permissions'], 'observed')
+        self.assertIn('required human approvals incomplete', result['reasons'])
+
     def test_review_permission_read_is_separate_from_other_incomplete_evidence(self):
         result = run(FakeClient())
         self.assertEqual(result['state'], 'WAITING')
-        self.assertNotIn('required human approvals incomplete', result['reasons'])
+        self.assertIn('required human approvals incomplete', result['reasons'])
         self.assertIn('finding evidence incomplete', result['reasons'])
         self.assertIn('check inventory incomplete', result['reasons'])
 
-    def test_eligible_current_approval_is_recognized_after_permission_check(self):
+    def test_current_approval_stays_unverified_after_permission_check(self):
         client = FakeClient()
         result = run(client)
         self.assertIn(('permission', 'reviewer'), client.calls)
         self.assertEqual(result['collection']['reviewer_permissions'], 'observed')
-        self.assertNotIn('required human approvals incomplete', result['reasons'])
+        self.assertIn('required human approvals incomplete', result['reasons'])
         self.assertEqual(result['state'], 'WAITING')
 
     def test_ineligible_or_unavailable_permissions_do_not_count_as_approval(self):
@@ -208,7 +216,7 @@ print(json.dumps(value))
             result = json.loads(proc.stdout)
             self.assertEqual(result['state'], 'BLOCKED')
             self.assertIn('unresolved finding', result['reasons'])
-            self.assertNotIn('required human approvals incomplete', result['reasons'])
+            self.assertIn('required human approvals incomplete', result['reasons'])
 
     def test_unbounded_thread_pagination_is_marked_partial(self):
         class Endless(FakeClient):
