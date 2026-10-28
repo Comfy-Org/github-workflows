@@ -2489,7 +2489,7 @@ def _review_node(node: dict) -> dict:
     }
 
 
-def list_reviews(repo: str, pr_number) -> list:
+def list_reviews(repo: str, pr_number, *, round_poster=None, round_marker=None) -> list:
     """Every review on the PR, REST-shaped, plus `edited`.
 
     A missing `pullRequest` or `reviews` connection, a page claiming more with
@@ -2532,6 +2532,21 @@ def list_reviews(repo: str, pr_number) -> list:
         nodes = reviews.get("nodes")
         if not isinstance(nodes, list):
             raise ValueError(f"the GraphQL reviews of {repo}#{pr_number} are not a list ({type(nodes).__name__})")
+        if round_poster is not None:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue  # _review_node reports this below
+                author, review_body = node.get("author"), node.get("body")
+                login = author.get("login") if isinstance(author, dict) else None
+                could_be_round = not isinstance(review_body, str) or review_body.startswith(round_marker)
+                if could_be_round and (not isinstance(login, str) or not login):
+                    raise ValueError("a possible review round has no readable author")
+                poster_base = round_poster.removesuffix("[bot]").lower()
+                if isinstance(login, str) and login.lower() == poster_base:
+                    if not isinstance(review_body, str):
+                        raise ValueError("a possible review round has no readable body")
+                    if review_body.startswith(round_marker) and author.get("__typename") not in ("Bot", "User"):
+                        raise ValueError("a possible review round has no readable author type")
         out += [_review_node(n) for n in nodes]
         if not page.get("hasNextPage"):
             return out
@@ -4287,7 +4302,8 @@ def cmd_round_cap(args) -> int:
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
         )
         preserve = getattr(args, "preserve_round_count", False)
-        rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, None if preserve else since, marker,
+        review_options = {"round_poster": args.poster_login, "round_marker": marker} if strict else {}
+        rounds = round_reviews(list_reviews(args.repo, args.pr_number, **review_options), args.poster_login, None if preserve else since, marker,
                                0 if getattr(args, "count_superseded_rounds", False) else max_rounds)
     except (RuntimeError, ValueError) as e:
         # Legacy callers fail open; strict callers stop the panel.

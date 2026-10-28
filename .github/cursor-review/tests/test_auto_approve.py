@@ -1930,7 +1930,7 @@ class RoundCapCommandTest(unittest.TestCase):
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
                 probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False, after_review=False,
-                pr_payload=None):
+                pr_payload=None, review_response=None):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1950,7 +1950,7 @@ class RoundCapCommandTest(unittest.TestCase):
             if "/timeline" in path:
                 return json.dumps([list(timeline)])
             if path.endswith("/reviews?per_page=100"):
-                return graphql_reviews(list(reviews))
+                return review_response if review_response is not None else graphql_reviews(list(reviews))
             if "/issues/1/comments" in path:
                 return json.dumps([list(comments)])
             if "/reviews/" in path and path.endswith("/comments?per_page=100"):
@@ -1977,6 +1977,40 @@ class RoundCapCommandTest(unittest.TestCase):
             return rc, read_outputs(out), writes
 
     FIVE = [review(i, f"2026-01-0{i}T00:00:00Z") for i in range(1, 6)]
+
+    def test_strict_cap_stops_when_review_author_or_body_is_unknown(self):
+        for field in ("author", "body"):
+            page = json.loads(graphql_reviews(self.FIVE[:1]))
+            page["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][field] = None
+            with self.subTest(field=field):
+                rc, out, writes = self.run_cap([], strict=True, review_response=json.dumps(page))
+                self.assertEqual((rc, out["capped"], writes), (1, "false", []))
+                self.assertNotIn("rounds", out)
+
+    def test_unknown_author_on_unmarked_review_does_not_stop_strict_cap(self):
+        page = json.loads(graphql_reviews([review(1, "2026-01-01T00:00:00Z", body="Looks good")]))
+        page["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["author"] = None
+        rc, out, writes = self.run_cap([], strict=True, review_response=json.dumps(page))
+        self.assertEqual((rc, out["rounds"], writes), (0, "0", []))
+
+    def test_legacy_cap_retains_fail_open_for_unknown_review_author(self):
+        page = json.loads(graphql_reviews(self.FIVE[:1]))
+        page["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["author"] = None
+        rc, out, writes = self.run_cap([], review_response=json.dumps(page))
+        self.assertEqual((rc, out["rounds"], writes), (0, "0", []))
+
+    def test_unknown_review_after_delivery_attempts_human_handoff(self):
+        page = json.loads(graphql_reviews(self.FIVE[:1]))
+        page["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["body"] = None
+        rc, out, writes = self.run_cap([], strict=True, after_review=True, review_response=json.dumps(page))
+        self.assertEqual((rc, out["capped"]), (1, "false"))
+        self.assertEqual([(m, p) for m, p, _ in writes], [("POST", "repos/o/r/issues/1/labels")])
+
+    def test_missing_author_type_on_potential_round_stops_strict_cap(self):
+        page = json.loads(graphql_reviews(self.FIVE[:1]))
+        del page["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["author"]["__typename"]
+        rc, out, writes = self.run_cap([], strict=True, review_response=json.dumps(page))
+        self.assertEqual((rc, out["capped"], writes), (1, "false", []))
 
     def test_under_the_cap_runs_the_panel_and_writes_nothing(self):
         rc, out, writes = self.run_cap(self.FIVE[:4])
