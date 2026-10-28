@@ -1907,7 +1907,8 @@ class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
-                probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False, after_review=False):
+                probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False, after_review=False,
+                pr_payload=None):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1937,7 +1938,7 @@ class RoundCapCommandTest(unittest.TestCase):
                     raise RuntimeError(probe_error)
                 return "{}"
             if path == "repos/o/r/pulls/1":
-                return json.dumps({"labels": [{"name": n} for n in labels]})
+                return json.dumps(pr_payload if pr_payload is not None else {"labels": [{"name": n} for n in labels]})
             raise AssertionError(path)
 
         with tempfile.TemporaryDirectory() as d:
@@ -2068,6 +2069,23 @@ class RoundCapCommandTest(unittest.TestCase):
         self.assertEqual((rc, out["capped"], out["rounds"]), (0, "false", "2"))
         rc, out, _ = self.run_cap(self.FIVE[:3], max_rounds="3", strict=True)
         self.assertEqual((rc, out["capped"], out["rounds"]), (0, "true", "3"))
+
+    def test_fail_closed_rejects_malformed_label_payloads(self):
+        for payload in ({}, {"labels": None}, {"labels": "bad"}, {"labels": [{"name": 4}]}):
+            with self.subTest(payload=payload):
+                rc, _, writes = self.run_cap(self.FIVE[:2], max_rounds="3", strict=True, pr_payload=payload)
+                self.assertNotEqual(rc, 0)
+                self.assertFalse(writes)
+
+    def test_default_policy_keeps_legacy_behavior_for_missing_labels(self):
+        rc, out, writes = self.run_cap(self.FIVE[:2], max_rounds="3", pr_payload={})
+        self.assertEqual((rc, out["capped"], out["rounds"], writes), (0, "false", "2", []))
+
+    def test_after_review_marks_handoff_when_label_payload_is_malformed(self):
+        rc, _, writes = self.run_cap(self.FIVE[:3], max_rounds="3", after_review=True,
+                                     pr_payload={"labels": None})
+        self.assertNotEqual(rc, 0)
+        self.assertIn(("POST", "repos/o/r/issues/1/labels"), [(m, p) for m, p, _ in writes])
 
     def test_strict_cap_stops_if_labels_cannot_be_read(self):
         rc, _, _ = self.run_cap(self.FIVE[:2], max_rounds="3", fail=("repos/o/r/pulls/1$",), strict=True)
