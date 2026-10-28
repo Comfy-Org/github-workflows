@@ -74,17 +74,22 @@ partial, unavailable, or discarded.
 Only the latest submitted approval, dismissal, or change request per actor can
 count, and only when its review records the supplied head SHA. GitHub `User` and
 `Bot` identities are distinguished; unknown or malformed identities make review
-collection unavailable. Review records are reported as incomplete even when the
-list was read successfully, because the collector does not check reviewer
-permissions. Comments and unsubmitted reviews do not replace a submitted decision. Current unresolved, non-outdated review threads block even
+collection unavailable. For each current human non-author approval, the collector
+reads the reviewer's current repository permission and counts only write,
+maintain or admin base access. Missing, malformed or unavailable permission
+responses make approval evidence incomplete; a successfully read lower role does
+not count. It checks at most 100 approvals and reports `reviewer_permissions` as
+observed, partial, not needed, not attempted or discarded. Current change requests
+still block even if a permission read fails. Comments and unsubmitted reviews do
+not replace a submitted decision. Current unresolved, non-outdated review threads block even
 if a later thread page fails. A partial thread read is not a complete inventory.
 
 The collector never marks the finding inventory complete: GitHub review threads
-are only one potential source. It also does not collect checks, verify reviewer
-permissions or branch protection, prove a tested revision, publish a report, or
+are only one potential source. It also does not verify branch protection or code-owner requirements, prove a
+tested revision, publish a report, or
 verify that the caller's policy is authorized. Consequently this entry point can
 return `BLOCKED` or `WAITING`, but never `READY`. Separate GitHub reads are not
-atomic: review state can change during collection, and an ABA branch change can
+atomic: reviews or permissions can change during collection, and an ABA branch change can
 escape the recheck. It is advisory evidence, not a merge gate.
 
 ```sh

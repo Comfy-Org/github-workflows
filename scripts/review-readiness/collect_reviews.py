@@ -3,6 +3,7 @@
 
 from datetime import datetime
 import json
+import re
 import subprocess
 import sys
 
@@ -46,6 +47,11 @@ class GitHub:
         if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
             raise EvidenceError('invalid review pages')
         return [review for page in pages for review in page]
+
+    def permission(self, login):
+        if not isinstance(login, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,39}', login):
+            raise EvidenceError('invalid reviewer login')
+        return self._api([f'repos/{self.owner}/{self.name}/collaborators/{login}/permission'])
 
     def list_check_runs(self, head):
         path = f'repos/{self.owner}/{self.name}/commits/{head}/check-runs?per_page=100&filter=all'
@@ -118,6 +124,37 @@ def approvals(reviews, head):
             for _, item in latest.values() if item['commit_id'] == head]
 
 
+def eligible_approvals(items, author, client):
+    """Filter approvals by current base permission, keeping blockers visible."""
+    eligible = []
+    complete = True
+    candidates = [item for item in items if item['human'] and item['state'] == 'approved'
+                  and item['actor'].casefold() != author.casefold()]
+    status = 'observed' if candidates else 'not_needed'
+    if len(candidates) > 100:
+        candidates = []
+        complete = False
+        status = 'partial'
+    eligible.extend(item for item in items if item['state'] != 'approved')
+    for item in candidates:
+        try:
+            data = client.permission(item['actor'])
+            user = data['user']
+            role = data['permission']
+            if (not isinstance(user, dict) or user.get('type') != 'User'
+                    or not isinstance(user.get('login'), str)
+                    or user['login'].casefold() != item['actor'].casefold()
+                    or role not in ('admin', 'write', 'maintain', 'read', 'triage', 'none')):
+                raise EvidenceError('invalid reviewer permission')
+            if role in ('admin', 'write', 'maintain'):
+                eligible.append(item)
+        except (EvidenceError, KeyError, TypeError):
+            complete = False
+            status = 'partial'
+            break
+    return eligible, complete, status
+
+
 def thread_findings(client):
     cursor = None
     seen = set()
@@ -153,13 +190,15 @@ def collect(data, client):
     scope = {key: snapshot[key] for key in readiness.SCOPE_KEYS}
     proof = f"https://github.com/{snapshot['repo']}/pull/{snapshot['pr']}"
     matched_checks = []
-    status = {'snapshot': 'unavailable', 'reviews': 'not_attempted', 'threads': 'not_attempted', 'actions_checks': 'not_attempted'}
+    status = {'snapshot': 'unavailable', 'reviews': 'not_attempted', 'reviewer_permissions': 'not_attempted', 'threads': 'not_attempted', 'actions_checks': 'not_attempted'}
     try:
         if matches(client.pull(), snapshot):
             status['snapshot'] = 'matched'
             try:
-                base['reviews'] = {'scope': scope, 'complete': False, 'proof': proof,
-                                   'approvals': approvals(client.list_reviews(), snapshot['head_sha'])}
+                items = approvals(client.list_reviews(), snapshot['head_sha'])
+                eligible, complete, status['reviewer_permissions'] = eligible_approvals(items, snapshot['author'], client)
+                base['reviews'] = {'scope': scope, 'complete': complete, 'proof': proof,
+                                   'approvals': eligible}
                 status['reviews'] = 'observed'
             except EvidenceError:
                 status['reviews'] = 'unavailable'
@@ -183,7 +222,7 @@ def collect(data, client):
         status['snapshot'] = 'unavailable'
         base['reviews'], base['findings'], base['reported_failures'] = None, None, []
     if status['snapshot'] != 'matched':
-        for key in ('reviews', 'threads', 'actions_checks'):
+        for key in ('reviews', 'reviewer_permissions', 'threads', 'actions_checks'):
             if status[key] != 'not_attempted':
                 status[key] = 'discarded'
     result = readiness.evaluate(base)
