@@ -1856,13 +1856,14 @@ class StrictRoundCapPrerequisiteTest(unittest.TestCase):
                 f.write("import json, os, sys\nopen(os.environ['ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
             path = os.path.join(d, "args")
             env = {"PATH": os.environ["PATH"], "CURSOR_REVIEW_ASSETS": d, "ARGS": path,
-                   "APP_SLUG": "review", "FAIL_CLOSED_ROUND_CAP": "true", "COUNT_SUPERSEDED_ROUNDS": "true", "REPO": "o/r",
+                   "APP_SLUG": "review", "FAIL_CLOSED_ROUND_CAP": "true", "COUNT_SUPERSEDED_ROUNDS": "true", "PRESERVE_ROUND_COUNT": "true", "REPO": "o/r",
                    "PR_NUMBER": "1", "MAX_ROUNDS": "3", "THRESHOLD": ""}
             subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True)
             with open(path, encoding="utf-8") as f:
                 args = json.load(f)
             self.assertIn("--fail-closed-round-cap", args)
             self.assertIn("--count-superseded-rounds", args)
+            self.assertIn("--preserve-round-count", args)
             self.assertEqual(args[args.index("--max-rounds") + 1], "3")
             self.assertEqual(args[args.index("--poster-login") + 1], "review[bot]")
 
@@ -1872,7 +1873,7 @@ class RoundCapCommandTest(unittest.TestCase):
     """The cap path end to end, with gh stubbed by endpoint."""
 
     def run_cap(self, reviews, max_rounds="5", timeline=(), comments=(), label_exists=True, fail=(), labels=(),
-                probe_error="HTTP 404", strict=False, count_superseded=False):
+                probe_error="HTTP 404", strict=False, count_superseded=False, preserve=False):
         writes = []
 
         def fake_gh(args, payload=None):
@@ -1909,7 +1910,8 @@ class RoundCapCommandTest(unittest.TestCase):
             out = os.path.join(d, "out")
             open(out, "w").close()
             args = argparse.Namespace(repo="o/r", pr_number="1", max_rounds=max_rounds, threshold="medium",
-                                      poster_login=BOT, fail_closed_round_cap=strict, count_superseded_rounds=count_superseded)
+                                      poster_login=BOT, fail_closed_round_cap=strict, count_superseded_rounds=count_superseded,
+                                      preserve_round_count=preserve)
             with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out}), \
                     mock.patch.object(AA, "gh", fake_gh), \
                     mock.patch.object(AA, "open_thread_ids", lambda *a: {"11", "12"}), \
@@ -1949,6 +1951,27 @@ class RoundCapCommandTest(unittest.TestCase):
         rc, out, writes = self.run_cap(self.FIVE, comments=[prior])
         self.assertEqual((rc, out["capped"]), (0, "true"))
         self.assertEqual([p for _, p, _ in writes], ["repos/o/r/issues/1/labels"])
+
+    def test_opt_in_keeps_review_count_when_handoff_label_is_removed(self):
+        rc, out, _ = self.run_cap(self.FIVE[:3], max_rounds="3", preserve=True,
+                                  timeline=[unlabeled("2026-01-03T12:00:00Z")])
+        self.assertEqual((rc, out["capped"], out["rounds"]), (0, "true", "3"))
+
+    def test_preserved_cap_replaces_old_reset_guidance_with_accurate_comment(self):
+        prior = {"user": {"login": BOT}, "body": AA.ROUND_CAP_MARKER,
+                 "created_at": "2026-01-06T00:00:00Z"}
+        _, _, writes = self.run_cap(self.FIVE[:3], max_rounds="3", preserve=True, comments=[prior])
+        posted = [payload["body"] for _, path, payload in writes if path.endswith("/comments")]
+        self.assertEqual(len(posted), 1)
+        self.assertIn("removing the label does not reset", posted[0])
+
+    def test_resettable_cap_ignores_prior_preserved_guidance(self):
+        prior = {"user": {"login": BOT}, "body": AA.ROUND_CAP_MARKER + "\n" + AA.PRESERVED_CAP_MARKER,
+                 "created_at": "2026-01-06T00:00:00Z"}
+        _, _, writes = self.run_cap(self.FIVE[:3], max_rounds="3", comments=[prior])
+        posted = [payload["body"] for _, path, payload in writes if path.endswith("/comments")]
+        self.assertEqual(len(posted), 1)
+        self.assertIn("removing the label resets", posted[0])
 
     def test_unlabel_resets_the_cap(self):
         rc, out, writes = self.run_cap(self.FIVE, timeline=[unlabeled("2026-01-03T12:00:00Z")])

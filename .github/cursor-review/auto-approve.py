@@ -58,7 +58,7 @@ Five subcommands, each run from a job that checks out NO PR code:
 ``round-cap`` (in `round-cap`, before the panel starts)
     Count the consolidated reviews the posting identity has already left on
     this PR — only those after the most recent removal of ``needs-human-review``,
-    so removing the label resets the cap. At or over `max_rounds`, label the PR
+    so removing the label resets the cap by default. At or over `max_rounds`, label the PR
     ``needs-human-review`` (creating the label if missing), post ONE comment
     listing the latest round's open findings above the threshold (at most once
     per cap, keyed on ``ROUND_CAP_MARKER``), and tell the workflow to skip the
@@ -270,7 +270,7 @@ PANEL_REVIEW_TYPES = ("adversarial", "edge-case")
 TOLERABLE_CELL_STATUS = "error"
 
 # The label the round cap applies and decide() refuses to approve over. Its
-# removal (an `unlabeled` timeline event) is what resets the round count.
+# removal (an `unlabeled` timeline event) resets the round count by default.
 HUMAN_REVIEW_LABEL = "needs-human-review"
 # The per-PR veto. cursor-review.yml's `gate` job and its `trigger` concurrency
 # slot hard-code the same string, so a rename has to land in all three.
@@ -280,6 +280,7 @@ SKIP_REVIEW_LABEL = "skip-cursor-review"
 # vetoed PR, so nothing else would withdraw an approval already standing.
 VETO_LABELS = (SKIP_REVIEW_LABEL,)
 ROUND_CAP_MARKER = "<!-- cursor-review-round-cap -->"
+PRESERVED_CAP_MARKER = "<!-- cursor-review-round-cap:preserved -->"
 # post-review.py opens two bodies with CONSOLIDATED_MARKER that report a round
 # which reviewed NOTHING — the "Review failed" error review and the
 # all-panel-cells-failed review (both `delivers=False`). Neither spent a panel's
@@ -4076,12 +4077,13 @@ def superseded_by_push(panel: dict, reviews: list, login: str, marker: str) -> s
     return ""
 
 
-def cap_comment_posted(comments: list, poster_login: str, since) -> bool:
+def cap_comment_posted(comments: list, poster_login: str, since, preserve: bool = False) -> bool:
     """True when this cap's comment is already on the PR (posted after `since`)."""
     return any(
         isinstance(c, dict)
         and ((c.get("user") or {}).get("login") or "").lower() == poster_login.lower()
-        and ROUND_CAP_MARKER in (c.get("body") or "")
+        and (PRESERVED_CAP_MARKER if preserve else ROUND_CAP_MARKER) in (c.get("body") or "")
+        and (preserve or PRESERVED_CAP_MARKER not in (c.get("body") or ""))
         and _after(c.get("created_at"), since)
         for c in comments
     )
@@ -4108,7 +4110,8 @@ def cap_findings(review_comments: list, open_ids, threshold: str) -> list:
     return out
 
 
-def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: str, review_url: str) -> str:
+def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: str, review_url: str,
+                       preserve: bool = False) -> str:
     render_code_ref = _load_post_review().render_code_ref
     scope = f"above `{threshold}`" if threshold else "still open"
     lines = [
@@ -4116,8 +4119,11 @@ def render_cap_comment(rounds: int, max_rounds: int, findings: list, threshold: 
         "### 🛑 Cursor Review — round cap reached",
         f"This PR has had {rounds} review round(s) (`max_rounds: {max_rounds}`), so no new "
         f"panel ran and it is labelled `{HUMAN_REVIEW_LABEL}`. Auto-approve will not "
-        "approve it while the label is on; removing the label resets the round count.",
+        "approve it while the label is on; " + ("removing the label does not reset the round count."
+                                              if preserve else "removing the label resets the round count."),
     ]
+    if preserve:
+        lines.insert(1, PRESERVED_CAP_MARKER)
     if findings:
         lines.append(f"\nFindings from the latest round {scope}:")
         for sev, path, line in findings[:30]:
@@ -4256,7 +4262,8 @@ def cmd_round_cap(args) -> int:
         since = last_unlabeled_at(
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
         )
-        rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, since, marker,
+        preserve = getattr(args, "preserve_round_count", False)
+        rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, None if preserve else since, marker,
                                0 if getattr(args, "count_superseded_rounds", False) else max_rounds)
     except (RuntimeError, ValueError) as e:
         # Legacy callers fail open; strict callers stop the panel.
@@ -4274,11 +4281,8 @@ def cmd_round_cap(args) -> int:
         emit(f"Round cap: {len(rounds)}/{max_rounds} round(s) so far — running the panel.")
         return 0
 
-    # The label is the hand-off AND the only reset, so it goes on BEFORE the PR
-    # is committed to `capped`. Capped-but-unlabelled would be permanent: every
-    # later trigger recounts, retries the same failing write and skips the panel,
-    # with no label for a human to remove. Legacy callers fail open on this
-    # error; fail-closed callers stop and require the label or token to be fixed.
+    # Apply the handoff before recording `capped`. Legacy callers fail open if
+    # that write fails; fail-closed callers require the label or token to be fixed.
     try:
         ensure_label(args.repo, args.pr_number)
     except RuntimeError as e:
@@ -4296,7 +4300,7 @@ def cmd_round_cap(args) -> int:
     failed = []
     try:
         comments = _paginate(f"repos/{args.repo}/issues/{args.pr_number}/comments?per_page=100")
-        if cap_comment_posted(comments, args.poster_login, since):
+        if cap_comment_posted(comments, args.poster_login, since, preserve):
             emit("Round cap: the cap comment is already on this PR — not posting it again.")
         else:
             latest = rounds[-1]
@@ -4304,7 +4308,7 @@ def cmd_round_cap(args) -> int:
                 f"repos/{args.repo}/pulls/{args.pr_number}/reviews/{latest['id']}/comments?per_page=100"
             )
             findings = cap_findings(review_comments, open_thread_ids(args.repo, int(args.pr_number)), threshold)
-            body = render_cap_comment(len(rounds), max_rounds, findings, threshold, latest.get("html_url") or "")
+            body = render_cap_comment(len(rounds), max_rounds, findings, threshold, latest.get("html_url") or "", preserve)
             gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{args.pr_number}/comments", "--input", "-"], {"body": body})
     except (RuntimeError, ValueError, KeyError) as e:
         failed.append(f"comment: {e}")
@@ -4739,6 +4743,7 @@ def main() -> int:
     c.add_argument("--poster-login", required=True)
     c.add_argument("--fail-closed-round-cap", action="store_true")
     c.add_argument("--count-superseded-rounds", action="store_true")
+    c.add_argument("--preserve-round-count", action="store_true")
     e = sub.add_parser("approve-external")
     e.add_argument("--repo", required=True)
     e.add_argument("--pr-number", required=True)
