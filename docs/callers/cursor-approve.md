@@ -687,7 +687,7 @@ diff the workflow fetches from the GitHub API.)
 
 | Input | Default | Meaning |
 |---|---|---|
-| `commit_sha` | — (required) | The PR head to judge; checked out read-only with full history. |
+| `commit_sha` | — (required) | The PR head to judge; checked out read-only with the history back to its merge base. |
 | `model` | `claude-opus-5-5-xhigh` | Cursor model id (cursor-review's judge model). |
 | `runs_on` | `"ubuntu-latest"` | JSON-encoded `runs-on`, as in cursor-review. |
 | `prior_rounds` | `0` | 0–3, passed to the base: the same value as `cursor-approve.yml`'s. See [Prior rounds](#prior-rounds). |

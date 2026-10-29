@@ -2,8 +2,8 @@
 # Fetch the base commit, the head commit and their merge-base history into a
 # `fetch-depth: 1`, `persist-credentials: false` PR checkout — instead of the
 # `fetch-depth: 0` clone of every branch and tag that used to sit in front of
-# check-pr-size. Shared by pr-size.yml and cursor-review.yml's `diff-size` job,
-# so the two workflows that run the tool cannot drift on how its history is
+# check-pr-size. Shared by pr-size.yml, cursor-review.yml's `diff-size` job and
+# cursor-axis-base.yml's checkout axes, so they cannot drift on how history is
 # narrowed. (BE-8940 for pr-size; cursor-review adopted it to take the clone off
 # its review round's critical path.)
 #
