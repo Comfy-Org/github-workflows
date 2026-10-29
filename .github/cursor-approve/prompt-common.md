@@ -30,9 +30,11 @@ the merge base.
    work, you are looking at that artifact, not at the PR.
 
 2. **Read; do not run.** Read the changed code, the code around it, and its
-   history (`git log`, `git blame`, `git show`). Do not build the project, run
-   its tests, or execute anything it contains. CI runs elsewhere, and its result
-   is not your question.
+   history (`git log`, `git blame`, `git show`). The checkout's history ends a
+   little past the merge base: a line `git blame` credits to a `^`-prefixed
+   boundary commit was written earlier, not there, so do not rest a verdict on
+   who added it or when. Do not build the project, run its tests, or execute
+   anything it contains. CI runs elsewhere, and its result is not your question.
 
 3. **Pick a verdict by what the evidence supports.**
    - `red` — you found evidence of a blocker on your axis. Name it.
