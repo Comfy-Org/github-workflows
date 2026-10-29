@@ -467,8 +467,21 @@ jobs:
         with:
           ref: ${{ inputs.commit_sha }}
           path: pr
-          fetch-depth: 0
+          # Depth 1 plus the next step instead of a full clone: only the merge
+          # base needs history, and a full clone takes minutes on a monorepo.
+          fetch-depth: 1
           persist-credentials: false
+
+      - name: Fetch the merge-base history
+        # The shared script cursor-review.yml's diff-size job uses. Fails the
+        # axis when no trustworthy merge base of BASE_SHA and commit_sha exists.
+        if: inputs.checkout
+        working-directory: pr
+        env:
+          FETCH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ inputs.commit_sha }}
+        run: bash "$GITHUB_WORKSPACE/_cursor_approve_assets/scripts/check-pr-size/fetch-history.sh"
 
       - name: Fetch the change (no checkout)
         if: ${{ !inputs.checkout && (inputs.axis == 'business' || inputs.axis == 'design') }}
@@ -542,7 +555,7 @@ jobs:
           { printf '# %s\n\n' "$PR_TITLE"; printf '%s\n' "$PR_BODY"; } > "$ctx"
           merge_base="$BASE_SHA"
           if [ "$CHECKOUT" = "true" ]; then
-            merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
+            merge_base="$(git -C pr merge-base "$BASE_SHA" "$COMMIT_SHA")"
           fi
           {
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
@@ -858,8 +871,17 @@ jobs:
         with:
           ref: ${{ inputs.commit_sha }}
           path: pr
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
+
+      - name: Fetch the merge-base history
+        # As the Cursor job.
+        working-directory: pr
+        env:
+          FETCH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ inputs.commit_sha }}
+        run: bash "$GITHUB_WORKSPACE/_cursor_approve_assets/scripts/check-pr-size/fetch-history.sh"
 
       - name: Download the prior verdicts
         if: inputs.prior_rounds > 0
@@ -890,7 +912,7 @@ jobs:
           ctx_dir="pr/.git"
           ctx="$ctx_dir/cursor-approve-context.md"
           { printf '# %s\n\n' "$PR_TITLE"; printf '%s\n' "$PR_BODY"; } > "$ctx"
-          merge_base="$(git -C pr merge-base "origin/$BASE_REF" "$COMMIT_SHA" 2>/dev/null || printf '%s' "$BASE_SHA")"
+          merge_base="$(git -C pr merge-base "$BASE_SHA" "$COMMIT_SHA")"
           # Rule 1's exact diff. `--text --no-textconv --no-ext-diff`: the
           # checkout's own .gitattributes (`-diff`, `binary`, a textconv
           # driver) must not shrink a file's change to "Binary files differ"
