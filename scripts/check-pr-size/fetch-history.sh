@@ -4,8 +4,8 @@
 # `fetch-depth: 0` clone of every branch and tag that used to sit in front of
 # check-pr-size. Shared by pr-size.yml, cursor-review.yml's `diff-size` job and
 # cursor-axis-base.yml's checkout axes, so they cannot drift on how history is
-# narrowed. (BE-8940 for pr-size; cursor-review adopted it to take the clone off
-# its review round's critical path.)
+# narrowed. (cursor-review adopted it to take the clone off its review round's
+# critical path.)
 #
 # Run from the root of the PR checkout. Inputs:
 #   env FETCH_TOKEN  the job's read-only token (`permissions: contents: read`)
