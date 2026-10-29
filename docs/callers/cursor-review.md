@@ -148,6 +148,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `approve_only_max_runs` | `10` | Cap on `approve_only_on_push` re-checks per panel round, counted on the status card; a new panel round resets it. At the cap a push is left to a relabel (or `auto_rereview_after_dismissal`). Clamped to `50`, the heads the card's record keeps; unparsable re-checks nothing. |
 | `carry_forward_unchanged_diff` | `false` | Opt-in, for stacked PRs: when a push or a retarget would dismiss the approver's approval but the PR's **own** changes are identical to the ones a round reviewed (a rebase or re-merge onto a moved base, e.g. a lower PR of the stack changed or landed), re-approve the live head, then dismiss the old approval; the card keeps its approval and no round is scheduled. Identical is the compare API's diff from the merge base the approval recorded to the reviewed commit against the diff from the live base to the live head, file by file, context lines and hunk headings included, hunk line numbers ignored. Anything it cannot vouch for dismisses as before, and an approval that records no merge base (every one an earlier version posted, too) never carries. Only under `pull_request_target`, and only with `approve_max_severity` set and `bot_app_id` posting the rounds (with `defer_approval`, pass cursor-approve that App's `poster_login` too). See [Auto-approve](#auto-approve) for every condition and the [trust model](#trust-model) for what it trusts. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. A round whose own decision found the PR head had moved (a newer push superseded it) does not count, at most once per reviewed commit and at most `max_rounds` times. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
+| `fail_closed_round_cap` | `false` | Stop the panel if the cap cannot be evaluated or handoff fails. Requires a positive `max_rounds` and, when configured, the posting bot token and identity. This preserves the existing reset, superseded-round exemptions and concurrency behavior; it does not guarantee a lifetime limit on all reviewer executions. |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 | `approver_environment` | `''` | The caller-repo environment that holds `APPROVER_TOKEN` (as an environment secret). Declared as `environment:` on the jobs that read the token, only under `pull_request_target`, and on none that checks out PR code. With a deployment-branch policy of the base branch only, the token is unreachable from `pull_request` runs. Use with a `pull_request_target` caller — see the [trust model](#trust-model). Empty = no environment. |
 | `axes_alongside_panel` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md): start its `start` phase and the **correctness** and **conformance** axes as soon as the round cap has run, beside the panel, instead of after this workflow — so an approved round no longer waits ~5 minutes for the axes after the panel. The caller keeps its decide job on `approve_gate == 'pass'` (plus the `axes_ok` term the guide gives) and gates its own start and axes on the `axes_started` output. Needs a `pull_request_target` caller, `defer_approval: true`, `approve_max_severity` and `APPROVER_TOKEN`; a round over the diff-size cap or with a failed preflight runs no axis. Every job it adds is skipped while it is `false`. See [Axes alongside the panel](cursor-approve.md#axes-alongside-the-panel). |
@@ -1228,8 +1229,9 @@ round with no decision, and one whose head moved during the decision's own post
   Creating a repo label needs `issues: write`, which the caller's
   `pull-requests: write` does not grant, so **create `needs-human-review` once
   by hand** unless the `bot_app_id` App has Issues write. If the label cannot be
-  applied, the cap fails open for that run (the panel runs) with a warning,
-  rather than capping a PR it gave no way to reset;
+  applied, the cap fails open for that run (the panel runs) with a warning by
+  default. With `fail_closed_round_cap: true`, the cap job fails and the panel
+  does not run; fix the label or token and retry;
 - posts **one** comment listing the latest round's open findings above
   `approve_max_severity` (every open finding when that is empty). A hidden
   `<!-- cursor-review-round-cap -->` marker keeps a re-trigger from posting it
@@ -1239,8 +1241,9 @@ round with no decision, and one whose head moved during the decision's own post
 While the label is on, auto-approve never approves the PR. **Removing the label
 resets the cap**: only rounds after its most recent removal (read from the issue
 timeline) count, so a human who has looked at the PR can hand it back to the bot
-for another `max_rounds` rounds. A count that cannot be read fails open — the
-panel runs, as it did before the cap existed. Under `blocking: true` a capped
+for another `max_rounds` rounds. By default, a count that cannot be read fails
+open and the panel runs. With `fail_closed_round_cap: true`, the cap job fails
+and the panel does not run. Under `blocking: true` a capped
 head holds **Blocking gate** red, the same as an over-cap diff: no panel looked
 at it. With `max_rounds` above 0 the gate reads the live label on every event,
 so resolving the old threads cannot turn it green while `needs-human-review` is

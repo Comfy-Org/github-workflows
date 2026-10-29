@@ -4217,6 +4217,7 @@ def parse_max_rounds(value) -> int:
 
 
 def cmd_round_cap(args) -> int:
+    strict = getattr(args, "fail_closed_round_cap", False)
     set_output("capped", "false")
     set_output("labelled", "false")
     # The EFFECTIVE cap, for the workflow's `max_rounds` output: an invalid value
@@ -4225,11 +4226,13 @@ def cmd_round_cap(args) -> int:
     try:
         max_rounds = parse_max_rounds(args.max_rounds)
     except ValueError as e:
-        # Fail OPEN like every other way this step can go wrong: a caller typo
-        # must not take the whole panel down (diff-size hangs off this job).
+        # Legacy callers fail open; strict callers stop the panel.
         print(f"::error::{e} — the round cap is not applied this run.")
-        return 0
+        return 1 if strict else 0
     if max_rounds <= 0:
+        if strict:
+            print("::error::strict round cap requires a positive max_rounds")
+            return 1
         emit("Round cap: off (`max_rounds: 0`).")
         return 0
     set_output("max_rounds", max_rounds)
@@ -4247,6 +4250,8 @@ def cmd_round_cap(args) -> int:
             set_output("labelled", "true")
     except (RuntimeError, ValueError) as e:
         print(f"::warning::Could not read this PR's labels: {e}")
+        if strict:
+            return 1
     try:
         since = last_unlabeled_at(
             _paginate(f"repos/{args.repo}/issues/{args.pr_number}/timeline?per_page=100"), HUMAN_REVIEW_LABEL
@@ -4254,7 +4259,10 @@ def cmd_round_cap(args) -> int:
         rounds = round_reviews(list_reviews(args.repo, args.pr_number), args.poster_login, since, marker,
                                max_rounds)
     except (RuntimeError, ValueError) as e:
-        # Fail OPEN: the panel runs exactly as it did before the cap existed.
+        # Legacy callers fail open; strict callers stop the panel.
+        if strict:
+            print(f"::error::Could not count review rounds; stopping the panel: {e}")
+            return 1
         print(f"::warning::Could not count this PR's review rounds, so the round cap is not applied this run: {e}")
         return 0
     set_output("rounds", len(rounds))
@@ -4269,11 +4277,14 @@ def cmd_round_cap(args) -> int:
     # The label is the hand-off AND the only reset, so it goes on BEFORE the PR
     # is committed to `capped`. Capped-but-unlabelled would be permanent: every
     # later trigger recounts, retries the same failing write and skips the panel,
-    # with no label for a human to remove. So a label that cannot be applied
-    # fails OPEN, like an unreadable count.
+    # with no label for a human to remove. Legacy callers fail open on this
+    # error; fail-closed callers stop and require the label or token to be fixed.
     try:
         ensure_label(args.repo, args.pr_number)
     except RuntimeError as e:
+        if strict:
+            print(f"::error::Round cap reached but handoff label failed; stopping the panel: {e}")
+            return 1
         print(f"::warning::Round cap reached ({len(rounds)}/{max_rounds}) but the `{HUMAN_REVIEW_LABEL}` label "
               f"could not be applied ({e}), so the cap is not applied this run and the panel runs. Create the "
               f"label in this repo (creating one needs `issues: write`), or check the posting token's "
@@ -4726,6 +4737,7 @@ def main() -> int:
     c.add_argument("--max-rounds", required=True)
     c.add_argument("--threshold", default="")
     c.add_argument("--poster-login", required=True)
+    c.add_argument("--fail-closed-round-cap", action="store_true")
     e = sub.add_parser("approve-external")
     e.add_argument("--repo", required=True)
     e.add_argument("--pr-number", required=True)
