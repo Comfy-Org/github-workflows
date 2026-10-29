@@ -509,3 +509,78 @@ review for everyone is a normal PR to this directory:
 
 Consumers pinned to a SHA pick up changes when they bump the SHA; consumers on a
 floating major tag pick them up on the next run.
+
+## Offline reviewer evaluation
+
+`reviewer-eval.py` compares two reviewer versions against the **same** curated,
+human-adjudicated bug and clean cases. It reads a JSON object from stdin and
+writes a paired comparison to stdout; it does not run a model, publish a review,
+or change GitHub. There is no bundled or implied production benchmark.
+
+Each case identifies `id`, `repo`, `pr`, `base_sha`, `head_sha`, and a `truth` object
+with `kind` (`bug`, `clean`, or `unknown`), `proof`, and `bug_ids`. A confirmed
+bug case has one or more unique bug IDs; a confirmed clean case has none. Truth
+and all judgments need HTTPS evidence links. A case has `baseline` and
+`candidate` runs. Each run carries `repo`, `pr`, `base_sha`, `head_sha`,
+`reviewer_version`, `run_proof`, the actual structured `record` from
+`review-output-mcp.py`, `record_sha256`, `adjudication_complete`,
+`adjudication_proof`, and `judgments`. Top-level `baseline_version` and
+`candidate_version` select the exact versions being compared.
+
+A judgment has the zero-based finding `index`, `verdict` (`bug` or
+`false_positive`), the matching `bug_id` (null for a false positive), and a
+`proof` link. Each finding needs one judgment. The record digest is SHA-256 of
+UTF-8 JSON serialized with sorted keys, no extra whitespace and unescaped Unicode:
+
+```sh
+python3 -c 'import hashlib,json,sys; r=json.load(open(sys.argv[1],encoding="utf-8")); print(hashlib.sha256(json.dumps(r,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest())' findings.json
+python3 .github/cursor-review/reviewer-eval.py < adjudicated-cases.json
+```
+
+Only pairs where **both** versions finished on the specified repo/base/head,
+the records match their adjudicated digests, and all findings are judged are
+scored. Unknown truth, stale or failed reviews, missing proof, changed records,
+and incomplete judgments are listed as excluded; they are never counted as
+clean or as missed bugs. Invalid or contradictory labels fail the command.
+
+The output includes denominators, confirmed bugs found, false positives,
+duplicates, clean-case alarms, recall, finding precision and clean-case alarm
+rate. A zero denominator produces null. Each bug counts at most once toward
+recall; repeated findings are reported as duplicates and lower precision. The
+caller must verify the identities, source provenance, labels and linked evidence:
+the tool validates link syntax and record integrity, not the truth or authenticity
+of what they assert. Results are descriptive for the paired cases only and do not
+set an acceptance threshold or authorize a pilot.
+
+For example, this **synthetic** confirmed-bug case has a clean baseline review
+and a clean candidate review. Both missed `bug-1`; the output has one paired case
+and zero of one confirmed bugs found for each version. The links and SHAs are
+illustrative, not evidence of a real bug.
+
+```json
+{
+  "baseline_version": "v1",
+  "candidate_version": "v2",
+  "cases": [{
+    "id": "example-1",
+    "repo": "example/repo", "pr": 42,
+    "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "truth": {"kind": "bug", "proof": "https://example.com/bug", "bug_ids": ["bug-1"]},
+    "baseline": {
+      "repo": "example/repo", "pr": 42, "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "reviewer_version": "v1",
+      "run_proof": "https://example.com/run-1", "record": {"status": "ok", "findings": []},
+      "record_sha256": "a1542dd12dffb7f59221e1935389c4e233c664776f1786ae407b150ea153d93f",
+      "adjudication_complete": true, "adjudication_proof": "https://example.com/judgment-1", "judgments": []
+    },
+    "candidate": {
+      "repo": "example/repo", "pr": 42, "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "reviewer_version": "v2",
+      "run_proof": "https://example.com/run-2", "record": {"status": "ok", "findings": []},
+      "record_sha256": "a1542dd12dffb7f59221e1935389c4e233c664776f1786ae407b150ea153d93f",
+      "adjudication_complete": true, "adjudication_proof": "https://example.com/judgment-2", "judgments": []
+    }
+  }]
+}
+```
