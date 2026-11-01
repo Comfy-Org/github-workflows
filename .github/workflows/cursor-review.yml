@@ -1777,7 +1777,7 @@ jobs:
         # of the artifact all download it continue-on-error, and consolidate
         # emits the unavailable banner when the file does not arrive).
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -2442,7 +2442,7 @@ jobs:
         # Shared with the panel cells + judge so the diff is generated ONCE, and
         # those jobs need no PR checkout of their own.
         if: steps.check.outputs.over_cap != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pr-diff
           path: |
@@ -3439,14 +3439,14 @@ jobs:
         # since the last reviewed round" diff) is built ONCE in the diff-size
         # job and shared here, so this cell needs no PR checkout of its own —
         # the only PR-authored content it ever sees is the diff text it reviews.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
 
       - name: Download prior-review ledger
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -3693,7 +3693,7 @@ jobs:
 
       - name: Upload findings artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: findings-${{ matrix.review_type }}-${{ matrix.model }}
           path: /tmp/findings-out/findings.json
@@ -3933,7 +3933,7 @@ jobs:
       - name: Download reviewed diff
         # Built once in the diff-size job (generated files already excluded),
         # shared here, so this cell needs no PR checkout of its own.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
@@ -3941,7 +3941,7 @@ jobs:
       - name: Download prior-review ledger
         # Same artifact, same tolerance as the `review` job: absent on round 1.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -4167,7 +4167,7 @@ jobs:
         # collide with a Cursor cell's `findings-<review_type>-<model>` (with
         # replacement off the two may share an id) and so `consolidate` can
         # tell it apart. The id is charset-checked in preflight.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: findings-direct-${{ matrix.review_type }}-${{ inputs.openai_direct_model }}
           path: /tmp/findings-out/findings.json
@@ -4364,7 +4364,7 @@ jobs:
       - name: Download reviewed diff
         # Built once in the diff-size job (generated files already excluded),
         # shared here, so this cell needs no PR checkout of its own.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
@@ -4372,7 +4372,7 @@ jobs:
       - name: Download prior-review ledger
         # Same artifact, same tolerance as the `review` job: absent on round 1.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -4643,7 +4643,7 @@ jobs:
         # collide with a Cursor cell's `findings-<review_type>-<model>` (with
         # replacement off the two may share an id) and so `consolidate` can
         # tell it apart. The id is charset-checked in preflight.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: findings-direct-${{ matrix.review_type }}-${{ inputs.anthropic_direct_model }}
           path: /tmp/findings-out/findings.json
@@ -4742,7 +4742,7 @@ jobs:
         # Best effort: accounting must never fail a review cell.
         if: always() && steps.key.outputs.present == 'true'
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: usage-direct-${{ matrix.review_type }}-${{ inputs.anthropic_direct_model }}
           path: /tmp/usage-out/usage.json
@@ -4902,7 +4902,7 @@ jobs:
         # since the last reviewed round" diff) the panel reviewed, built once
         # in diff-size — so the judge adjudicates against exactly what the
         # panel saw, and this job needs no PR checkout.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
@@ -4968,13 +4968,13 @@ jobs:
       - name: Download prior-review ledger
         id: ledger_download
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
 
       - name: Download panel findings
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/panel
           pattern: findings-*
@@ -5206,7 +5206,7 @@ jobs:
         # because something else took the name first included) fails this
         # job, and `consolidate` adopts only from a job that succeeded.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cursor-review-judge-direct
           path: /tmp/judge-findings.json
@@ -5312,7 +5312,7 @@ jobs:
         if: always() && steps.judge_direct.outcome != 'skipped'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: usage-direct-judge-${{ inputs.judge_direct_model }}
           path: /tmp/usage-out/usage.json
@@ -5506,7 +5506,7 @@ jobs:
         # since the last reviewed round" diff) the panel reviewed, built once
         # in diff-size — so the judge adjudicates against exactly what the
         # panel saw, and this job needs no PR checkout.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
@@ -5521,13 +5521,13 @@ jobs:
       - name: Download prior-review ledger
         id: ledger_download
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
 
       - name: Download panel findings
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/panel
           pattern: findings-*
@@ -5730,7 +5730,7 @@ jobs:
         # degraded panel-union path posts instead.
         if: steps.aggregate.outputs.ok_count != '0' && needs.preflight.outputs.judge_direct == 'true' && needs.judge-direct.result == 'success'
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-judge-direct
           path: /tmp/judge-direct
@@ -5920,7 +5920,7 @@ jobs:
         # posted. `post-review` is gated on this job SUCCEEDING, so it simply
         # does not run; the failure stays visible as this job's own red status
         # and `notify-complete` names which half broke.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cursor-review-consolidated
           path: |
@@ -6127,7 +6127,7 @@ jobs:
         # download failure reads as "artifact plumbing broke" when what actually
         # happened is upstream.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-consolidated
           path: /tmp/consolidated
@@ -6162,7 +6162,7 @@ jobs:
         # The same generated-file-excluded diff the panel and the judge read,
         # taken from `diff-size`'s artifact — post-review.py anchors its inline
         # comments against it, so this job needs no PR checkout.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: pr-diff
           path: /tmp
@@ -6170,7 +6170,7 @@ jobs:
       - name: Download prior-review ledger
         id: ledger_download
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
