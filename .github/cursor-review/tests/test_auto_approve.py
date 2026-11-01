@@ -30,6 +30,7 @@ import json
 import itertools
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -4861,6 +4862,19 @@ class CarryForwardRegeneratedTest(CarryForwardFixture):
                 ("gen/[ab].json", "gen/a.json", False)):
             with self.subTest(glob=glob, path=path):
                 self.assertEqual(AA.matches_regenerated_glob(path, [glob]), expected)
+
+    def test_a_long_path_cannot_stall_the_match(self):
+        # The PR author picks the path. A backtracking match spent over 45s on
+        # this one, and 299 paths at 25s each outlast the job's 5 minutes, which
+        # leaves the stale approval standing.
+        def stalled(*_):
+            raise TimeoutError("the match backtracked")
+        previous = signal.signal(signal.SIGALRM, stalled)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        signal.alarm(5)
+        self.assertFalse(AA.matches_regenerated_glob("a/" * 2047 + "x", ["**/a/**/a/**/a/**/b"]))
+        self.assertTrue(AA.matches_regenerated_glob("a/" * 2047 + "b", ["**/a/**/a/**/a/**/b"]))
 
     def test_a_path_that_could_forge_a_record_never_matches(self):
         # git allows these, and the name lands in a body parsed back for its

@@ -2789,25 +2789,34 @@ def normalize_patch(patch: str) -> str:
     return "\n".join(lines)
 
 
-def glob_regex(glob: str) -> str:
-    """`glob` as a regex over a whole repo-relative path: `*` and `?` stop at a
-    `/`, `**/` spans directories, `**` spans anything, the rest is literal."""
-    out, i = [], 0
-    while i < len(glob):
+def glob_matches(glob: str, path: str) -> bool:
+    """Whether `glob` matches a whole repo-relative path: `*` and `?` stop at a
+    `/`, `**/` spans directories, `**` spans anything, the rest is literal.
+
+    Not a regex: the PR author picks the path, and backtracking through a few
+    `**` on a long one would outlast the job, leaving the stale approval standing.
+    This walks the offsets the glob so far can reach, once per glob character."""
+    at, i, end = {0}, 0, len(path)
+    while i < len(glob) and at:
         if glob.startswith("**/", i):
-            out.append("(?:.*/)?")
+            at |= {j + 1 for j in range(min(at), end) if path[j] == "/"}
             i += 3
         elif glob.startswith("**", i):
-            out.append(".*")
+            at = set(range(min(at), end + 1))
             i += 2
-        else:
-            out.append({"*": "[^/]*", "?": "[^/]"}.get(glob[i], re.escape(glob[i])))
+        elif glob[i] == "*":
+            for j in range(min(at), end):
+                if j in at and path[j] != "/":
+                    at.add(j + 1)
             i += 1
-    return "".join(out)
+        else:
+            at = {j + 1 for j in at if j < end and (path[j] != "/" if glob[i] == "?" else path[j] == glob[i])}
+            i += 1
+    return end in at
 
 
 def matches_regenerated_glob(path: str, globs: list) -> bool:
-    return bool(REGENERATED_PATH_RE.fullmatch(path)) and any(re.fullmatch(glob_regex(g), path) for g in globs)
+    return bool(REGENERATED_PATH_RE.fullmatch(path)) and any(glob_matches(g, path) for g in globs)
 
 
 def only_merges_from_base(live_read, reviewed: str) -> bool:
