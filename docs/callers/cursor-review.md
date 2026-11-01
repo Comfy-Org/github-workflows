@@ -147,6 +147,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `approve_only_on_push` | `false` | Re-run only the **axes** on a push after a round whose panel passed. On `synchronize`/`reopened`, when the approver's [status card](cursor-approve.md#a-push-re-checked-by-the-axes-alone) shows the last round got past its panel (its axes ran, whatever they said), the reusable runs **no panel** and sets `approve_gate` to `pass`, so the caller's existing cursor-approve jobs judge the pushed head. After `auto_rereview_delay_minutes` (a burst of pushes yields one re-check, on the head still live), and only while the PR is open, not a draft, carries the review label and neither `skip-cursor-review` nor `needs-human-review`, has no approver approval already on that head, no open review thread above `approve_max_severity` (or unbadged), no review label applied since the approver's last decision (a full round in flight), and is under `approve_only_max_runs`. No consolidated review is posted, so it never counts toward `max_rounds`. Needs `max_rounds` > 0 (an uncapped round's card names no round to count re-checks under) and never follows the **last** round of `max_rounds`, which is a human's. A panel round that does not pass leaves the lane: the next push needs a full round, as before — and so, for good, does a status card anyone but the approver identity ever edited (read from the comment's edit history: anyone with write access can edit it). When it re-checks a push, `auto_rereview_after_dismissal` does not relabel for it. Relabelling still runs a full round. Needs `APPROVER_TOKEN`, `approve_max_severity` and a `pull_request_target` caller; no effect under `run_without_label`. With `auto_rereview_after_dismissal` on too, a push on a round whose **panel** blocked (cursor-review's own decide requested changes — not an untrusted or capped round) starts a **full** round by itself through the same debounced relabel, once per head, under the same conditions and `max_rounds`. |
 | `approve_only_max_runs` | `10` | Cap on `approve_only_on_push` re-checks per panel round, counted on the status card; a new panel round resets it. At the cap a push is left to a relabel (or `auto_rereview_after_dismissal`). Clamped to `50`, the heads the card's record keeps; unparsable re-checks nothing. |
 | `carry_forward_unchanged_diff` | `false` | Opt-in, for stacked PRs: when a push or a retarget would dismiss the approver's approval but the PR's **own** changes are identical to the ones a round reviewed (a rebase or re-merge onto a moved base, e.g. a lower PR of the stack changed or landed), re-approve the live head, then dismiss the old approval; the card keeps its approval and no round is scheduled. Identical is the compare API's diff from the merge base the approval recorded to the reviewed commit against the diff from the live base to the live head, file by file, context lines and hunk headings included, hunk line numbers ignored. Anything it cannot vouch for dismisses as before, and an approval that records no merge base (every one an earlier version posted, too) never carries. Only under `pull_request_target`, and only with `approve_max_severity` set and `bot_app_id` posting the rounds (with `defer_approval`, pass cursor-approve that App's `poster_login` too). See [Auto-approve](#auto-approve) for every condition and the [trust model](#trust-model) for what it trusts. |
+| `carry_forward_regenerated_globs` | `''` | Opt-in, with `carry_forward_unchanged_diff`: newline- or space-separated globs naming checked-in generated files allowed to differ from what a round reviewed, when the push is nothing but merges from the base. Empty changes nothing. **Their content is not re-reviewed, so a glob must only name files a required CI check regenerates and verifies from code.** See [Auto-approve](#auto-approve) for the conditions and the glob syntax. |
 | `max_rounds` | `5` | Cap on review rounds per PR (`0` → no cap). At or over it, no panel runs: the PR is labelled `needs-human-review`, one comment lists the latest round's open findings above the threshold, and the `approve_gate` output is `capped`. A round whose own decision found the PR head had moved (a newer push superseded it) does not count, at most once per reviewed commit and at most `max_rounds` times. Removing the label resets the count. See [round cap](#round-cap-and-the-approve_gate-output). |
 | `runs_on` | `'"ubuntu-latest"'` | JSON-encoded `runs-on` for `diff-size`, `preflight`, the `review` panel and `consolidate` only — the jobs that hold no write credential. Every other job stays on GitHub-hosted `ubuntu-latest`. A self-hosted pool is fine only if it is one-job-per-fresh-pod, identity-free and private-network-isolated (those jobs run models with shell over PR code), on linux/x64 with bash, git, curl, jq, python3, gh, tar and GNU coreutils. Empty falls back to the default, so `${{ vars.CURSOR_REVIEW_RUNS_ON }}` is safe while the variable is unset; e.g. `'["self-hosted", "linux", "x64"]'`. |
 | `approver_environment` | `''` | The caller-repo environment that holds `APPROVER_TOKEN` (as an environment secret). Declared as `environment:` on the jobs that read the token, only under `pull_request_target`, and on none that checks out PR code. With a deployment-branch policy of the base branch only, the token is unreachable from `pull_request` runs. Use with a `pull_request_target` caller — see the [trust model](#trust-model). Empty = no environment. |
@@ -1081,6 +1082,30 @@ has nothing left to carry. A run that reads the PR once both have landed
 carries it, and a merge-commit merge keeps those commits in the base and
 carries.
 
+**Keeping it across a regenerated artifact (`carry_forward_regenerated_globs`).**
+When a PR rewrites a checked-in generated file that the base also regenerates,
+its lines in that file differ after every merge from the base, so the identity
+check above correctly dismisses, though nothing hand-written changed. List such files here and, when the PR's own diff differs, the approval
+still carries if all of this holds, on top of every condition above:
+
+- every commit the PR gained since the reviewed commit is a merge with a parent
+  on the live base, read from the compare of the live base with the live head —
+  an ordinary commit, a merge of another branch, a retarget with no new commit,
+  a reviewed commit the head no longer contains (a rebase), or more commits than
+  the API returns (250) dismisses;
+- the set of changed files (name, previous name, status) is the same, so a merge
+  that adds or drops a file, artifact or not, dismisses;
+- every file whose patch differs matches a glob, and every other file's patch is
+  identical. A matching file must still have a patch: one too large for the
+  compare API to return dismisses.
+
+Each glob matches the whole repo-relative path, so a bare `gen.json` means the
+file at the root only: `*` and `?` stop at a `/`, `**/` spans directories, `**`
+spans anything, and everything else is literal. This differs from
+`extra_generated_globs`, where a bare name matches any directory. A path holding
+anything but letters, digits and `._/@+-` never matches, since its name goes in
+the review body. The carried approval and the log name the files that differed.
+
 **Widened callers: keep `edited` from cancelling a panel.** The label-only
 caller above keys its group on `github.event.label.name`, so `edited` never
 shares a group with the labelled run. If you dropped the label from the group
@@ -1183,6 +1208,14 @@ push, or re-applying the review label).
   — can at most keep an approval from carrying. It never carries an approval
   by `github-actions[bot]`, and like every approval it posts only under
   `pull_request_target`.
+
+- **`carry_forward_regenerated_globs` approves content no round read.** A merge
+  can put anything in a file a glob names, by hand as easily as by regenerating
+  it, and the carry cannot tell which. So a glob must only name files a
+  **required** CI check regenerates from code and fails on any difference; then
+  that check, not the approval, vouches for the content. Without one, a glob is a
+  path into the repo that needs push access and no review. Set the input in the
+  caller, on the base branch: a value a PR could influence defeats this.
 
 So even in this shape the approval is no stronger than **push access** to the
 repo. Do not let it be the only review that satisfies a ruleset for code that

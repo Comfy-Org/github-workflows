@@ -395,6 +395,24 @@ on:
         type: boolean
         required: false
         default: false
+      carry_forward_regenerated_globs:
+        description: >-
+          Opt-in, with `carry_forward_unchanged_diff`: newline- or
+          space-separated globs naming checked-in generated files allowed to
+          differ from what a round reviewed. Empty (the default) changes
+          nothing. When the PR's own diff differs, the approval still carries
+          only if every commit the PR gained since the reviewed commit is a
+          merge with a parent on the base, the set of changed files (name,
+          previous name, status) is the same, and every file whose patch
+          differs matches a glob; everything else above still applies. Each
+          glob matches the whole repo-relative path: `*` and `?` stop at a
+          `/`, `**/` spans directories, and a path holding anything but
+          letters, digits and `._/@+-` never matches. Their content is NOT
+          re-reviewed, so a glob must only name files a required CI check
+          regenerates and verifies from code.
+        type: string
+        required: false
+        default: ''
       approve_only_on_push:
         description: >-
           Opt-in: on a push (`synchronize`, or `reopened`) to a PR whose LAST
@@ -6564,7 +6582,8 @@ jobs:
     # base the approval recorded, or what a carried approval copied forward),
     # never from a review the bot identity posted. Only under
     # `pull_request_target`; it compares compare-API diffs and never reads the
-    # PR's tree.
+    # PR's tree. `carry_forward_regenerated_globs` also lets a push of nothing
+    # but merges from the base carry when only files those globs name differ.
     #
     # NOT gated on `approve_max_severity`: unsetting that input is the kill
     # switch for NEW approvals, and an approval already on the PR must still be
@@ -6719,6 +6738,7 @@ jobs:
           # under pull_request_target, and reads the compare API with
           # FALLBACK_TOKEN (this job's contents: read), not the approver token.
           CARRY_FORWARD: ${{ inputs.carry_forward_unchanged_diff }}
+          CARRY_FORWARD_REGENERATED_GLOBS: ${{ inputs.carry_forward_regenerated_globs }}
           # Only the stale card's next-step sentence: the `approve-only` job
           # decides the re-check itself.
           APPROVE_ONLY: ${{ inputs.approve_only_on_push }}
@@ -6788,6 +6808,7 @@ jobs:
             --can-relabel "$CAN_RELABEL" \
             --run-without-label "$RUN_WITHOUT_LABEL" \
             --carry-forward "$CARRY_FORWARD" \
+            --carry-forward-regenerated-globs "$CARRY_FORWARD_REGENERATED_GLOBS" \
             --event-name "$EVENT_NAME" \
             --approve-only "$APPROVE_ONLY" \
             --approve-only-delay-minutes "$AUTO_REREVIEW_DELAY" \
