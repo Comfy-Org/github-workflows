@@ -30,6 +30,7 @@ import json
 import itertools
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -3980,7 +3981,7 @@ class AutoRetryTest(unittest.TestCase):
 POST_REVIEW = AA._load_post_review()
 
 
-class CarryForwardTest(unittest.TestCase):
+class CarryForwardFixture(unittest.TestCase):
     """dismiss-stale's carry-forward (BE-20585).
 
     On a stack, a change to a lower PR re-merges or rebases every PR above it,
@@ -4121,13 +4122,13 @@ class CarryForwardTest(unittest.TestCase):
         raise AssertionError(f"unexpected gh call {args}")
 
     def run_dismiss(self, carry="true", event="pull_request_target", threshold="low", authors="",
-                    all_approvals=False, login=None, auto="false", env=None):
+                    all_approvals=False, login=None, auto="false", env=None, globs=""):
         args = argparse.Namespace(
             repo="o/r", pr_number="1", head_sha=self.pr["head"]["sha"], approver_login=login or self.LOGIN,
             all_approvals=all_approvals, threshold=threshold, approve_authors=authors, max_rounds="5",
             poster_login=self.POSTER, review_label="cursor-review", auto_rereview=auto,
             auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false",
-            carry_forward=carry, event_name=event)
+            carry_forward=carry, event_name=event, carry_forward_regenerated_globs=globs)
         environ = dict({"GITHUB_OUTPUT": self.output_path}, **(env or {}))
         with mock.patch.object(AA, "gh", self.gh), mock.patch.object(AA, "emit", self.emitted.append), \
                 mock.patch.dict(os.environ, environ), \
@@ -4154,6 +4155,8 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(self.posted, [])
         self.assertEqual(self.dismissed, {11: message})
 
+
+class CarryForwardTest(CarryForwardFixture):
     # -- the carry ---------------------------------------------------------
 
     def test_an_unchanged_own_diff_moves_the_approval_to_the_live_head(self):
@@ -4608,6 +4611,281 @@ class CarryForwardTest(unittest.TestCase):
         self.assertEqual(self.run_dismiss(), 0, self.printed)
         self.assertEqual(self.dismissed, {50: AA.SKIP_REVIEW_WITHDRAWN_MESSAGE})
         self.assertEqual(len(self.patches), 1)
+
+
+class CarryForwardRegeneratedTest(CarryForwardFixture):
+    """`--carry-forward-regenerated-globs`, the opt-in extension of the carry.
+
+    A PR that rewrites a checked-in generated file the base also regenerates has
+    other lines in it after every merge from the base. Only that exact push may
+    carry, and only when nothing but the named files differ. The PR, unless a case
+    says otherwise: REVIEWED changed svc/a.go and gen/quote.json, and LIVE merged
+    BASE_SHA into it. As GitHub answers, the live compare lists what the head has
+    and the base does not: the merge and REVIEWED, never the commits it brought in.
+    """
+
+    ARTIFACT, OTHER = "gen/quote.json", "9" * 40
+    GLOBS = "gen/*.json"
+
+    def setUp(self):
+        super().setUp()
+        self.compares = {(self.MERGE_BASE, self.REVIEWED): self.two_files(10, 20),
+                         (self.BASE_SHA, self.LIVE): self.two_files(42, 50, artifact_added="+regenerated",
+                                                                    commits=self.merged())}
+
+    def commit(self, sha, *parents):
+        return {"sha": sha, "parents": [{"sha": p} for p in parents]}
+
+    def merged(self):
+        return [self.commit(self.REVIEWED, self.MERGE_BASE), self.commit(self.LIVE, self.REVIEWED, self.BASE_SHA)]
+
+    def two_files(self, start, artifact_start, artifact_added="+new", added="+new", commits=()):
+        data = self.files(start, patch=self.patch(start, added=added), cmp_status="diverged", behind_by=3)
+        data["files"].append({"filename": self.ARTIFACT, "status": "modified", "changes": 2,
+                              "patch": self.patch(artifact_start, added=artifact_added)})
+        data["commits"], data["total_commits"] = list(commits), len(commits)
+        data["status"], data["behind_by"] = ("ahead", 0) if not commits else ("diverged", 3)
+        return data
+
+    @property
+    def live(self):
+        return self.compares[(self.BASE_SHA, self.LIVE)]
+
+    def assert_carried_naming_the_artifact(self, rc):
+        self.assertEqual(rc, 0, self.printed)
+        body = self.posted_body()
+        self.assertEqual(self.posted[0][1]["commit_id"], self.LIVE)
+        self.assertIn(f"Only regenerated artifacts differ: `{self.ARTIFACT}`.", body)
+        self.assertEqual(AA.CARRIED_MARKER_RE.search(body).groups(), (self.REVIEWED, self.MERGE_BASE))
+        self.emitted_line(f"only regenerated artifacts differ: `{self.ARTIFACT}`")
+
+    # -- what carries ------------------------------------------------------
+
+    def test_a_clean_merge_with_a_byte_identical_own_diff_still_carries(self):
+        # The base path, with and without the globs: nothing differs, so the
+        # commits are not read and the body claims nothing about artifacts.
+        for globs in ("", self.GLOBS):
+            with self.subTest(globs=globs):
+                self.setUp()
+                self.compares[(self.BASE_SHA, self.LIVE)] = self.two_files(42, 50)
+                self.compares[(self.BASE_SHA, self.LIVE)]["commits"] = [self.commit(self.LIVE, self.REVIEWED)]
+                self.assertEqual(self.run_dismiss(globs=globs), 0, self.printed)
+                self.assertNotIn("regenerated", self.posted_body())
+                self.assertEqual(self.dismissed, {11: AA.carried_message(self.LIVE)})
+
+    def test_merges_where_only_a_matching_file_differs_carry(self):
+        self.assert_carried_naming_the_artifact(self.run_dismiss(globs=self.GLOBS))
+        # Saying "identical" here would be false: it was not.
+        self.assertEqual(self.dismissed, {11: AA.carried_message(self.LIVE, [self.ARTIFACT])})
+        self.assertIn("apart from regenerated artifacts", self.dismissed[11])
+
+    def test_globs_may_be_newline_or_space_separated(self):
+        for globs in (f"svc/none.go\n{self.GLOBS}\n", f"svc/none.go {self.GLOBS}"):
+            with self.subTest(globs=globs):
+                self.setUp()
+                self.assert_carried_naming_the_artifact(self.run_dismiss(globs=globs))
+
+    def test_several_merges_since_the_review_carry(self):
+        middle = "8" * 40
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE),
+                                self.commit(middle, self.REVIEWED, self.BASE_SHA2),
+                                self.commit(self.LIVE, middle, self.BASE_SHA)]
+        self.live["total_commits"] = 3
+        self.assert_carried_naming_the_artifact(self.run_dismiss(globs=self.GLOBS))
+
+    def test_a_chain_of_artifact_carries_keeps_comparing_against_the_round(self):
+        # Carried once already. The commits are counted from what a round read,
+        # not from the last carry, and the record stays the round's.
+        self.reviews = [self.approval(11, state="DISMISSED"), self.carried(50, head=self.OTHER)]
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE),
+                                self.commit(self.OTHER, self.REVIEWED, self.BASE_SHA2),
+                                self.commit(self.LIVE, self.OTHER, self.BASE_SHA)]
+        self.live["total_commits"] = 3
+        self.assert_carried_naming_the_artifact(self.run_dismiss(globs=self.GLOBS))
+        self.assertEqual(self.dismissed, {50: AA.carried_message(self.LIVE, [self.ARTIFACT])})
+
+    def test_the_carried_body_still_reads_back_as_a_carried_approval(self):
+        self.assertEqual(self.run_dismiss(globs=self.GLOBS), 0, self.printed)
+        body = self.posted_body()
+        posted = {"id": 100, "user": {"login": self.LOGIN}, "state": "APPROVED", "body": body}
+        self.assertEqual(AA.carry_baseline(posted), (self.REVIEWED, self.MERGE_BASE))
+        self.assertEqual(AA.stale_reviews_to_dismiss([posted], self.LOGIN, self.LIVE, "main"), [])
+        self.assertEqual(AA.APPROVED_THRESHOLD_RE.search(body).group(1), "low")
+
+    # -- what dismisses ----------------------------------------------------
+
+    def assert_dismissed(self, globs=None):
+        self.assert_dismissed_as_before(self.run_dismiss(globs=self.GLOBS if globs is None else globs))
+        self.emitted_line("differ from the ones reviewed")
+
+    def test_the_same_push_with_no_globs_dismisses(self):
+        for globs in ("", " \n "):
+            with self.subTest(globs=globs):
+                self.setUp()
+                self.assert_dismissed(globs)
+
+    def test_globs_naming_another_file_dismiss(self):
+        self.assert_dismissed("gen/other.json")
+
+    def test_a_conflict_resolution_changing_another_file_dismisses(self):
+        self.compares[(self.BASE_SHA, self.LIVE)] = self.two_files(42, 50, artifact_added="+regenerated",
+                                                                   added="+resolved", commits=self.merged())
+        self.assert_dismissed()
+        self.emitted_line("match no `carry_forward_regenerated_globs` entry")
+
+    def test_an_ordinary_commit_touching_only_the_artifact_dismisses(self):
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE), self.commit(self.LIVE, self.REVIEWED)]
+        self.assert_dismissed()
+        self.emitted_line("not provably all merges from the base")
+
+    def test_an_ordinary_commit_under_a_later_merge_dismisses(self):
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE), self.commit(self.OTHER, self.REVIEWED),
+                                self.commit(self.LIVE, self.OTHER, self.BASE_SHA)]
+        self.live["total_commits"] = 3
+        self.assert_dismissed()
+
+    def test_a_merge_that_adds_or_drops_a_file_dismisses(self):
+        def add(name):
+            self.live["files"].append({"filename": name, "status": "added", "changes": 1, "patch": self.patch(1)})
+
+        def drop(name):
+            self.live["files"][:] = [f for f in self.live["files"] if f["filename"] != name]
+
+        for label, change in (("adds a file", lambda: add("svc/b.go")), ("adds an artifact", lambda: add("gen/b.json")),
+                              ("drops a file", lambda: drop("svc/a.go")), ("drops the artifact", lambda: drop(self.ARTIFACT))):
+            with self.subTest(label):
+                self.setUp()
+                change()
+                self.assert_dismissed()
+                self.emitted_line("the set of changed files is different")
+
+    def test_a_changed_status_or_previous_name_dismisses(self):
+        for field, value in (("status", "added"), ("previous_filename", "gen/old.json")):
+            with self.subTest(field):
+                self.setUp()
+                self.live["files"][1][field] = value
+                self.assert_dismissed()
+
+    def test_a_merge_whose_other_parent_is_not_on_the_base_dismisses(self):
+        # The other branch's commit is in the list, so neither parent is on the
+        # base, and that commit is ordinary too.
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE), self.commit(self.OTHER, self.MERGE_BASE),
+                                self.commit(self.LIVE, self.REVIEWED, self.OTHER)]
+        self.live["total_commits"] = 3
+        self.assert_dismissed()
+
+    def test_a_merge_of_a_branch_that_itself_merged_the_base_dismisses(self):
+        self.live["commits"] = [self.commit(self.REVIEWED, self.MERGE_BASE),
+                                self.commit(self.OTHER, self.MERGE_BASE, self.BASE_SHA),
+                                self.commit(self.LIVE, self.REVIEWED, self.OTHER)]
+        self.live["total_commits"] = 3
+        self.assert_dismissed()
+
+    def test_a_head_no_longer_holding_the_reviewed_commit_dismisses(self):
+        # Rewritten history: the reviewed commit is gone from the list, though
+        # every commit left in it is a merge from the base.
+        self.live["commits"] = [self.commit(self.OTHER, self.MERGE_BASE, self.BASE_SHA2),
+                                self.commit(self.LIVE, self.OTHER, self.BASE_SHA)]
+        self.assert_dismissed()
+
+    def test_a_commit_with_one_parent_is_no_merge_even_on_the_base(self):
+        data = {"commits": [self.commit(self.REVIEWED, self.MERGE_BASE), self.commit(self.LIVE, self.BASE_SHA)],
+                "total_commits": 2}
+        self.assertFalse(AA.only_merges_from_base(data, self.REVIEWED))
+
+    def test_a_retarget_adding_no_commit_dismisses(self):
+        self.pr["head"]["sha"] = self.REVIEWED
+        self.compares[(self.BASE_SHA, self.REVIEWED)] = self.two_files(
+            42, 50, artifact_added="+regenerated", commits=[self.commit(self.REVIEWED, self.MERGE_BASE)])
+        self.assert_dismissed_as_before(self.run_dismiss(globs=self.GLOBS, all_approvals=True), AA.BASE_CHANGED_MESSAGE)
+
+    def test_a_commit_list_it_cannot_trust_dismisses(self):
+        # Cut short at the API's cap, a commit it holds back could be anything,
+        # and a parent it holds back would pass for one on the base.
+        for label, change in (("cut short", lambda: self.live.update(total_commits=251)),
+                              ("no total", lambda: self.live.pop("total_commits")),
+                              ("no list", lambda: self.live.pop("commits")),
+                              ("no parents", lambda: self.live["commits"][1].pop("parents")),
+                              ("bad parent", lambda: self.live["commits"][1].update(parents=["x", "y"])),
+                              ("not a commit", lambda: self.live["commits"].__setitem__(1, "x"))):
+            with self.subTest(label):
+                self.setUp()
+                change()
+                self.assert_dismissed()
+
+    def test_an_artifact_too_large_to_diff_dismisses(self):
+        # Nothing to compare: the rule never gets to weigh it.
+        self.live["files"][1].pop("patch")
+        self.assert_dismissed_as_before(self.run_dismiss(globs=self.GLOBS))
+        self.emitted_line("could not vouch")
+
+    def test_the_carrys_other_preconditions_still_hold(self):
+        for label, kwargs, change in (
+                ("a tightened threshold", {"threshold": "nit"}, None),
+                ("the switch off", {"carry": "false"}, None),
+                ("another event", {"event": "pull_request"}, None),
+                ("an author it does not admit", {"authors": "someone-else"}, None),
+                ("a veto label", {}, lambda: self.pr["labels"].append({"name": "skip-cursor-review"})),
+                ("a draft", {}, lambda: self.pr.update(draft=True))):
+            with self.subTest(label):
+                self.setUp()
+                if change:
+                    change()
+                self.run_dismiss(globs=self.GLOBS, **kwargs)
+                self.assertEqual(self.posted, [], self.emitted)
+                self.assertIn(11, self.dismissed)
+
+    def test_the_workflow_passes_the_input_to_dismiss_stale(self):
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+        with open(os.path.join(root, ".github", "workflows", "cursor-review.yml"), encoding="utf-8") as f:
+            workflow = f.read()
+        self.assertIn("CARRY_FORWARD_REGENERATED_GLOBS: ${{ inputs.carry_forward_regenerated_globs }}", workflow)
+        self.assertIn('--carry-forward-regenerated-globs "$CARRY_FORWARD_REGENERATED_GLOBS"', workflow)
+
+    # -- the globs ---------------------------------------------------------
+
+    def test_how_a_glob_matches(self):
+        for glob, path, expected in (
+                ("gen/quote.json", "gen/quote.json", True),
+                ("gen/quote.json", "x/gen/quote.json", False),
+                ("quote.json", "gen/quote.json", False),
+                ("gen/*.json", "gen/quote.json", True),
+                ("gen/*.json", "gen/sub/quote.json", False),
+                ("gen/?.json", "gen/q.json", True),
+                ("gen/?.json", "gen/quote.json", False),
+                ("gen/**/q.json", "gen/q.json", True),
+                ("gen/**/q.json", "gen/a/b/q.json", True),
+                ("**/q.json", "q.json", True),
+                ("**/q.json", "a/q.json", True),
+                ("gen/**", "gen/a/b.json", True),
+                ("gen.json", "genxjson", False),
+                ("gen/[ab].json", "gen/a.json", False)):
+            with self.subTest(glob=glob, path=path):
+                self.assertEqual(AA.matches_regenerated_glob(path, [glob]), expected)
+
+    def test_a_long_path_cannot_stall_the_match(self):
+        # The PR author picks the path. A backtracking match spent over 45s on
+        # this one, and 299 paths at 25s each outlast the job's 5 minutes, which
+        # leaves the stale approval standing.
+        def stalled(*_):
+            raise TimeoutError("the match backtracked")
+        previous = signal.signal(signal.SIGALRM, stalled)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        signal.alarm(5)
+        self.assertFalse(AA.matches_regenerated_glob("a/" * 2047 + "x", ["**/a/**/a/**/a/**/b"]))
+        self.assertTrue(AA.matches_regenerated_glob("a/" * 2047 + "b", ["**/a/**/a/**/a/**/b"]))
+
+    def test_a_path_that_could_forge_a_record_never_matches(self):
+        # git allows these, and the name lands in a body parsed back for its
+        # records: this line would precede the real threshold, loosening it.
+        for path in ("gen/x\n_Threshold: `high` (set).json", "gen/`x`.json", "gen/<!-- x -->.json"):
+            with self.subTest(path=path):
+                self.assertFalse(AA.matches_regenerated_glob(path, ["**"]))
+                self.setUp()
+                for files in self.compares.values():
+                    files["files"][1]["filename"] = path
+                self.assert_dismissed("**")
 
 
 class ApprovalMergeBaseTest(unittest.TestCase):

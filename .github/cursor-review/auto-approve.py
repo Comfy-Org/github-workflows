@@ -53,7 +53,9 @@ Five subcommands, each run from a job that checks out NO PR code:
     lower stacked PR landed — the approval is re-posted on the live head, and
     only then is the stale one dismissed. Only under ``--event-name
     pull_request_target``; the carry-forward section below lists every
-    condition.
+    condition. ``--carry-forward-regenerated-globs`` (the workflow's
+    `carry_forward_regenerated_globs`, empty by default) lets a push of nothing
+    but merges from the base carry when only files those globs name differ.
 
 ``round-cap`` (in `round-cap`, before the panel starts)
     Count the consolidated reviews the posting identity has already left on
@@ -2664,6 +2666,16 @@ def annotation_cause(error, fallback: str) -> str:
 # landed. A POST that failed ambiguously (a timeout, no review id) re-lists the
 # reviews and withdraws any carried approval of the live head it may have
 # landed anyway. A withdrawal that fails turns the job red.
+#
+# `--carry-forward-regenerated-globs` admits one difference: a checked-in
+# generated file the PR rewrites shifts whenever the base regenerates it, so
+# its patch differs though nothing hand-written did. That carries only when, on
+# top of everything above, the set of (name, previous name, status) is the same,
+# every file whose patch differs matches a glob, and everything the PR gained
+# since the reviewed commit is a merge from the base (only_merges_from_base).
+# Those files' content is not re-reviewed, so a glob may only name files a
+# required CI check regenerates and verifies from code; this module cannot see
+# whether one does.
 
 COMPARE_FILE_CAP = 300
 COMPARE_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@(.*)$")
@@ -2674,10 +2686,16 @@ UNTRUSTED_POSTERS = ("github-actions[bot]",)
 APPROVED_THRESHOLD_RE = re.compile(r"^_Threshold: `(" + "|".join(ALLOWED_THRESHOLDS) + r")` ", re.M)
 CARRIED_MESSAGE = ("Carried forward to `{head}`: this PR's own changes are identical to the ones reviewed, so the "
                    "approval moved to the live head.")
+CARRIED_REGENERATED_MESSAGE = ("Carried forward to `{head}`: this PR's own changes are identical to the ones reviewed "
+                               "apart from regenerated artifacts, so the approval moved to the live head.")
+# A path a regenerated glob may match. Its name lands in a signed review body,
+# parsed back for its records, and in the log, so a name that could break a line
+# or a code span (git allows both) is simply never a regenerated artifact.
+REGENERATED_PATH_RE = re.compile(r"[A-Za-z0-9._/@+-]+")
 
 
-def carried_message(head: str) -> str:
-    return CARRIED_MESSAGE.format(head=(head or "?")[:7])
+def carried_message(head: str, regenerated=()) -> str:
+    return (CARRIED_REGENERATED_MESSAGE if regenerated else CARRIED_MESSAGE).format(head=(head or "?")[:7])
 
 
 def leading_markers(body) -> str:
@@ -2769,6 +2787,84 @@ def normalize_patch(patch: str) -> str:
         lines.append(f"@@ {gap} @@{hunk.group(3)}")
         prev_end = start + length
     return "\n".join(lines)
+
+
+def glob_matches(glob: str, path: str) -> bool:
+    """Whether `glob` matches a whole repo-relative path: `*` and `?` stop at a
+    `/`, `**/` spans directories, `**` spans anything, the rest is literal.
+
+    Not a regex: the PR author picks the path, and backtracking through a few
+    `**` on a long one would outlast the job, leaving the stale approval standing.
+    This walks the offsets the glob so far can reach, once per glob character."""
+    at, i, end = {0}, 0, len(path)
+    while i < len(glob) and at:
+        if glob.startswith("**/", i):
+            at |= {j + 1 for j in range(min(at), end) if path[j] == "/"}
+            i += 3
+        elif glob.startswith("**", i):
+            at = set(range(min(at), end + 1))
+            i += 2
+        elif glob[i] == "*":
+            for j in range(min(at), end):
+                if j in at and path[j] != "/":
+                    at.add(j + 1)
+            i += 1
+        else:
+            at = {j + 1 for j in at if j < end and (path[j] != "/" if glob[i] == "?" else path[j] == glob[i])}
+            i += 1
+    return end in at
+
+
+def matches_regenerated_glob(path: str, globs: list) -> bool:
+    return bool(REGENERATED_PATH_RE.fullmatch(path)) and any(glob_matches(g, path) for g in globs)
+
+
+def only_merges_from_base(live_read, reviewed: str) -> bool:
+    """Whether everything the PR gained since `reviewed` is a merge from its base.
+
+    `live_read` is the compare of the live base with the live head, whose commits
+    are what the head has and the base does not: the merges, but not the commits
+    they brought in. So a parent missing from that list is on the base, and what
+    `reviewed` already held is what its parents reach inside the list. The rest
+    must each be a merge with a parent on the base, and there must be some: a
+    retarget added nothing, and `reviewed` missing from the list means the head
+    no longer contains it. A list the API cut short proves none of this."""
+    commits = live_read.get("commits") if isinstance(live_read, dict) else None
+    if not isinstance(commits, list) or live_read.get("total_commits") != len(commits):
+        return False
+    parents = {}
+    for c in commits:
+        listed = c.get("parents") if isinstance(c, dict) else None
+        if not isinstance(listed, list) or not all(isinstance(p, dict) for p in listed):
+            return False
+        parents[c.get("sha")] = [p.get("sha") for p in listed]
+    if reviewed not in parents:
+        return False
+    held, walk = set(), [reviewed]
+    while walk:
+        sha = walk.pop()
+        if sha in parents and sha not in held:
+            held.add(sha)
+            walk.extend(parents[sha])
+    added = [sha for sha in parents if sha not in held]
+    return bool(added) and all(len(parents[sha]) >= 2 and any(p not in parents for p in parents[sha])
+                               for sha in added)
+
+
+def regenerated_only(before: list, after: list, globs: list, live_read, reviewed: str):
+    """(the files that differ, "") when `before` and `after` differ only in files
+    `globs` name, on a push of nothing but merges from the base; else ([], why)."""
+    if not globs:
+        return [], ""
+    if [change[:3] for change in before] != [change[:3] for change in after]:
+        return [], "the set of changed files is different"
+    differ = [a[0] for a, b in zip(before, after) if a != b]
+    others = [name for name in differ if not matches_regenerated_glob(name, globs)]
+    if others:
+        return [], f"{len(others)} changed file(s) match no `carry_forward_regenerated_globs` entry"
+    if not only_merges_from_base(live_read, reviewed):
+        return [], f"the commits since `{reviewed[:7]}` are not provably all merges from the base"
+    return differ, ""
 
 
 def round_merge_base(reviews: list, poster_login: str, head: str) -> str:
@@ -2936,10 +3032,11 @@ def carry_card_url(args) -> str:
 
 
 def render_carried_body(card_url: str, head: str, base_ref: str, reviewed: str, merge_base: str, from_sha: str,
-                        threshold: str) -> str:
+                        threshold: str, regenerated=()) -> str:
     """A marked approval of `head` carried forward from `from_sha`, whose own
     changes a round reviewed at `reviewed` (diffed from `merge_base`) and
-    approved under `threshold` — the original's, never loosened by a chain."""
+    approved under `threshold` — the original's, never loosened by a chain.
+    `regenerated` names the files allowed to differ, which no round re-read."""
     url = safe_card_url(card_url)
     lines = [
         APPROVE_MARKER,
@@ -2950,10 +3047,18 @@ def render_carried_body(card_url: str, head: str, base_ref: str, reviewed: str, 
         f"Carried forward from `{from_sha[:7]}`: only what this PR is based on changed; its own changes are "
         f"identical to the ones reviewed at `{reviewed[:7]}`.",
     ]
+    if regenerated:
+        lines[-1] = (f"Carried forward from `{from_sha[:7]}`: only merges from the base landed; this PR's own changes "
+                     f"are identical to the ones reviewed at `{reviewed[:7]}`, apart from the artifacts below.")
+        lines.append(f"Only regenerated artifacts differ: {regenerated_names(regenerated)}.")
     # Guarded as in render_body: this body is parsed back for its markers.
     if threshold in ALLOWED_THRESHOLDS:
         lines.append(f"\n_Threshold: `{threshold}` (set by this repo's `approve_max_severity`)._")
     return "\n".join(lines)
+
+
+def regenerated_names(regenerated) -> str:
+    return ", ".join(f"`{name}`" for name in regenerated)
 
 
 def try_carry_forward(args, ctx: dict, approval):
@@ -2990,17 +3095,22 @@ def try_carry_forward(args, ctx: dict, approval):
              f"`{merge_base[:7]}`, is not an ancestor of the reviewed commit `{reviewed[:7]}`.")
         return None, None
     before = own_changes(reviewed_read)
-    after = own_changes(compare(args.repo, ctx["base_sha"], ctx["head"]))
+    live_read = compare(args.repo, ctx["base_sha"], ctx["head"])
+    after = own_changes(live_read)
     if before is None or after is None:
         emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the compare API could not "
              "vouch for every changed file (300+ files, a binary or oversized patch, or a read error).")
         return None, None
+    regenerated = []
     if before != after:
-        emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the PR's own changes differ "
-             f"from the ones reviewed at `{reviewed[:7]}`.")
-        return None, None
+        globs = (getattr(args, "carry_forward_regenerated_globs", "") or "").split()
+        regenerated, why = regenerated_only(before, after, globs, live_read, reviewed)
+        if not regenerated:
+            emit(f"Auto-approve: not carrying the approval of `{from_sha[:7]}` forward — the PR's own changes differ "
+                 f"from the ones reviewed at `{reviewed[:7]}`{f': {why}' if why else ''}.")
+            return None, None
     new_body = render_carried_body(carry_card_url(args), ctx["head"], ctx["base"], reviewed, merge_base, from_sha,
-                                   granted.group(1))
+                                   granted.group(1), regenerated)
     try:
         posted = json.loads(gh(
             ["api", "-X", "POST", f"repos/{args.repo}/pulls/{args.pr_number}/reviews", "--input", "-"],
@@ -3051,9 +3161,10 @@ def try_carry_forward(args, ctx: dict, approval):
         emit("Auto-approve: the PR changed while the carried-forward approval was being posted — withdrawn again.")
         return None, None
     emit(f"Auto-approve: carried the approval of `{from_sha[:7]}` forward to `{ctx['head'][:7]}` — the PR's own "
-         f"changes are identical to the ones reviewed at `{reviewed[:7]}`.")
+         f"changes are identical to the ones reviewed at `{reviewed[:7]}`"
+         + (f"; only regenerated artifacts differ: {regenerated_names(regenerated)}." if regenerated else "."))
     return {"id": posted["id"], "user": {"login": login}, "state": "APPROVED", "body": new_body, "edited": False,
-            "commit_id": ctx["head"]}, None
+            "commit_id": ctx["head"], "regenerated": regenerated}, None
 
 
 def withdraw_unconfirmed_carries(args, head: str, stale_id):
@@ -3263,7 +3374,8 @@ def cmd_dismiss_stale(args) -> int:
                                                  handed_off)
     for rid in ids:
         try:
-            dismiss(args.repo, args.pr_number, rid, carried_message(live_head) if rid in carried else message)
+            dismiss(args.repo, args.pr_number, rid, (carried_message(live_head, carried[rid].get("regenerated"))
+                                                if rid in carried else message))
         except RuntimeError as e:
             # Collapsed per id: these are joined into an ::error:: annotation, and
             # each carries `gh`'s multi-line stderr.
@@ -4755,6 +4867,7 @@ def main() -> int:
     # BE-20585: re-approve instead of dismissing when the push left the PR's
     # own changes identical; posts only when --event-name is pull_request_target.
     s.add_argument("--carry-forward", default="false")
+    s.add_argument("--carry-forward-regenerated-globs", default="")
     s.add_argument("--event-name", default="")
     # `approve_only_on_push`: only the stale card's next-step sentence.
     s.add_argument("--approve-only", default="false")
