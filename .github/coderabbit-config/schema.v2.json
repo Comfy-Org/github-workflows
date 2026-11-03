@@ -289,7 +289,7 @@
 										}
 									},
 									"paths": {
-										"description": "Paths | Apply this override when any changed file matches these repository-relative globs. Uses the same glob syntax as path_filters, including ! exclusions. Renames match both old and new paths. When teams and paths are set, both must match. Omit to match all paths.",
+										"description": "Paths | Apply this override when any changed file matches these repository-relative globs. Uses the same glob syntax as `path_filters`, including ! exclusions. Renames match both old and new paths. When teams and paths are set, both must match. Omit to match all paths.",
 										"minItems": 1,
 										"type": "array",
 										"items": {
@@ -373,17 +373,17 @@
 				},
 				"review_progress": {
 					"default": true,
-					"description": "Publish the canonical user-facing review status and progress updates (GitHub progress reports/check runs today; other platform equivalents may follow).",
+					"description": "On GitHub with CodeRabbit Cloud, report each review as a check run named `CodeRabbit` that shows the review's progress and outcome. When disabled, CodeRabbit posts the `CodeRabbit` commit status instead, if `commit_status` is enabled. GitLab, Azure DevOps, Bitbucket, and self-hosted CodeRabbit use the commit status.",
 					"type": "boolean"
 				},
 				"commit_status": {
 					"default": true,
-					"description": "Mirror review progress using legacy commit statuses for compatibility with required checks and existing automations. This setting is only used when review_progress is disabled.",
+					"description": "Post a commit status named `CodeRabbit` on the pull request's latest commit. It is pending while CodeRabbit reviews and turns successful when the review ends, including when it is skipped or rate limited. Used on GitLab, Azure DevOps, Bitbucket, and self-hosted CodeRabbit, and on GitHub when `review_progress` is disabled. Require it in branch protection to keep pull requests from merging while a review is in progress.",
 					"type": "boolean"
 				},
 				"fail_commit_status": {
 					"default": false,
-					"description": "On review errors, fail the active outward review status surface. When review_progress is enabled this applies to progress reporting; otherwise it applies to the legacy commit-status mirror when enabled.",
+					"description": "Report a review that stops because of an error as failed, so a required `CodeRabbit` check blocks merging. When disabled, the GitHub check run ends as neutral and the commit status ends as successful, with the error in its description. Rate-limited reviews never fail.",
 					"type": "boolean"
 				},
 				"collapse_walkthrough": {
@@ -529,7 +529,7 @@
 				},
 				"enable_prompt_for_ai_agents": {
 					"default": true,
-					"description": "Prompt for AI Agents | Include the '🤖 Prompt for AI Agents' section in inline review comments to provide codegen instructions for AI agents.",
+					"description": "Prompt for Coding Agents | Include the '🤖 Prompt for Coding Agents' section in inline review comments to provide codegen instructions for AI agents.",
 					"type": "boolean"
 				},
 				"path_filters": {
@@ -906,13 +906,13 @@
 					"type": "object",
 					"properties": {
 						"ast-grep": {
-							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.3",
+							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.50.0",
 							"default": {},
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.3",
+									"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.50.0",
 									"type": "boolean"
 								},
 								"rule_dirs": {
@@ -965,7 +965,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.10",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.17.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1100,7 +1100,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.3.0",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.3.1",
 									"type": "boolean"
 								},
 								"level": {
@@ -1207,7 +1207,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.25",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.29",
 									"type": "boolean"
 								}
 							}
@@ -1316,7 +1316,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.91.0",
+									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.92.0",
 									"type": "boolean"
 								}
 							}
@@ -1440,7 +1440,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.30.1",
+									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.30.2",
 									"type": "boolean"
 								}
 							}
@@ -1452,7 +1452,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.179.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.183.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1468,7 +1468,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.2.0",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.5.0",
 									"type": "boolean"
 								}
 							}
@@ -1508,7 +1508,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.67.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.68.0",
 									"type": "boolean"
 								}
 							}
@@ -1544,7 +1544,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.1.2",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.1.3",
 									"type": "boolean"
 								}
 							}
@@ -1556,7 +1556,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.87.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.88.0",
 									"type": "boolean"
 								}
 							}
@@ -1568,7 +1568,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.8.5 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.9.3 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1654,7 +1654,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.6.0",
+									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.7.0",
 									"type": "boolean"
 								}
 							}
@@ -1678,7 +1678,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.17",
+									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.18",
 									"type": "boolean"
 								}
 							}
@@ -1702,7 +1702,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.31",
+									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.35",
 									"type": "boolean"
 								}
 							}
@@ -1726,7 +1726,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable ember-template-lint | ember-template-lint is a linter for Handlebars template files that checks for common issues such as accessibility violations, deprecated patterns, and template anti-patterns. | v7.9.3",
+									"description": "Enable ember-template-lint | ember-template-lint is a linter for Handlebars template files that checks for common issues such as accessibility violations, deprecated patterns, and template anti-patterns. | v7.9.4",
 									"type": "boolean"
 								}
 							}
@@ -1995,7 +1995,7 @@
 				},
 				"automatic_repository_linking": {
 					"default": false,
-					"description": "Automatic Repository Linking | Deprecated. This setting has no effect. Use knowledge_base.automatic_linking_mode instead.",
+					"description": "Automatic Repository Linking | Deprecated. This setting has no effect. Use `knowledge_base.automatic_linking_mode` instead.",
 					"deprecated": true,
 					"type": "boolean"
 				},
