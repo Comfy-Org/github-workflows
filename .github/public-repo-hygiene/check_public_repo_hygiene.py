@@ -425,7 +425,16 @@ PUBLIC_COMFY_ORG_REPOS = frozenset(
 # `test_team_allowlist_is_sorted_and_duplicate_free`: new team slugs go in
 # their case-insensitive alphabetical slot, not at the end, and a duplicate
 # (in any casing) fails the build rather than collapsing silently into the set.
-PUBLIC_COMFY_ORG_TEAMS = frozenset({"comfy-cloud-team", "core-engine-team"})
+PUBLIC_COMFY_ORG_TEAMS = frozenset(
+    {
+        # Published in comfy-cli's CODEOWNERS proposal, PR #945.
+        "cloud-infra",
+        "comfy-cloud-team",
+        # Published in comfy-cli's CODEOWNERS proposal, PR #945.
+        "comfy-standard-approver",
+        "core-engine-team",
+    }
+)
 
 # Casefolded views of the two lists above, used for MEMBERSHIP only (BE-8697).
 # The lists themselves stay the human-edited source of truth in their canonical
