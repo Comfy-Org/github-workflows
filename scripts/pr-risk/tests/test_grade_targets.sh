@@ -478,6 +478,30 @@ run_targets PR_NUMBERS=42 BASE_REF=main MAP_PATH='.github/risk.json'
 eq "a normal override path is unaffected"  0 "$RC"
 eq "…and the target still grades"          graded "$(res '.status')"
 
+echo "— report-only mode keeps evidence without publishing —"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0 PUBLISH_CHECK=1 PUBLISH_COMMENT=1
+eq "report-only grades successfully" 0 "$RC"
+eq "report-only records the grade" graded "$(res '.status')"
+eq "report-only does not claim a label was applied" null "$(res '.label')"
+eq "report-only emits no check payload" 0 "$(jq -s length "$WORK/pr-risk-surfaces.jsonl")"
+no_text "report-only makes no label or comment API call" "issues/42/labels" "$(calls)"
+no_text "report-only makes no comment API call" "issues/42/comments" "$(calls)"
+if [ -f "$WORK/record-42.json" ]; then
+  ok "report-only retains the grade record"
+else
+  bad "grade record missing"
+fi
+touch "$STUB_DIR/graphql_fail"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=1 DRY_RUN=0 PUBLISH_CHECK=1 PUBLISH_COMMENT=1
+eq "report-only preserves unavailable evidence" ungraded "$(res '.status')"
+eq "unavailable evidence is not a low-risk verdict" unknown "$(res '.tier')"
+eq "unavailable evidence writes no label" null "$(res '.label')"
+no_text "unavailable evidence makes no label write" "issues/42/labels" "$(calls)"
+rm -f "$STUB_DIR/graphql_fail"
+run_targets PR_NUMBERS=42 BASE_REF=main REPORT_ONLY=bad DRY_RUN=0
+eq "invalid report-only mode fails closed" 2 "$RC"
+no_text "invalid mode makes no API call" "api " "$(calls)"
+
 echo "— phase 26: a mid-way mktemp failure leaves no scratch file behind —"
 # init_scratch takes THREE mktemps and `gt_die`s on any of them. With the EXIT trap armed after
 # init_scratch returned, a failure on the second or third exited 2 with the file(s) already created

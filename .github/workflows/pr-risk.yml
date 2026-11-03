@@ -363,6 +363,14 @@ on:
         type: string
         required: false
         default: .github/risk-runbooks.json
+      report_only:
+        description: >-
+          Retain grade records as an Actions artifact without changing labels, posting comments,
+          or publishing the optional Check Run. The record is advisory and does not establish
+          that separate reads used one immutable snapshot.
+        type: boolean
+        required: false
+        default: false
       sticky_comment:
         description: >-
           Publish ONE sticky PR comment, and keep it SMALL: the visible body is a single line —
@@ -1004,6 +1012,7 @@ jobs:
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
           # The sticky comment rides the `pull-requests: write` this job already holds for the
           # label; the Check Run does not, so it is only RENDERED here (see the `surfaces` output).
+          REPORT_ONLY: ${{ inputs.report_only && '1' || '0' }}
           PUBLISH_COMMENT: ${{ inputs.sticky_comment && '1' || '0' }}
           PUBLISH_CHECK: ${{ inputs.check_run && '1' || '0' }}
           JOB_TIMEOUT_MINUTES: 30      # keep in sync with timeout-minutes on the job
@@ -1012,12 +1021,24 @@ jobs:
           set -uo pipefail
           bash _pr_risk_tool/scripts/pr-risk/grade-targets.sh
 
+      - name: Retain risk records
+        if: ${{ always() && inputs.report_only }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-risk-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pr-risk-results.jsonl
+            record-*.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Step summary
         if: always()
         env:
           TIER: ${{ steps.grade.outputs.tier }}
           WAITED: ${{ steps.grade.outputs.waited }}
           TARGETS: ${{ steps.grade.outputs.targets }}
+          REPORT_ONLY: ${{ inputs.report_only && '1' || '0' }}
         run: |
           set -uo pipefail
           RESULTS=pr-risk-results.jsonl
@@ -1044,6 +1065,10 @@ jobs:
                       "$RESULTS" 2>/dev/null || printf '0\t0\t0\t0')"
           IFS=$'\t' read -r N_GRADED N_UNGRADED N_FAILED N_SKIPPED <<<"$COUNTS"
           {
+            if [ "$REPORT_ONLY" = 1 ]; then
+              echo "> Report only: no risk label, comment or optional Check Run was published."
+              echo
+            fi
             if [ "$ROWS" -eq 0 ]; then
               # No target was even attempted — a usage error (an empty or malformed target list),
               # which is a different failure from an unreadable PR and must not borrow its
@@ -1088,7 +1113,7 @@ jobs:
               else
                 echo "## PR risk grade: ${head_tier:-unknown} (advisory)"
                 echo
-                echo "The PR could not be read via the API; nothing was graded (labeled ungraded — this is NOT a low-risk verdict)."
+                echo "${note:-The PR could not be read via the API; this is NOT a low-risk verdict.}"
               fi
             else
               # A BATCH has no single tier and no room for N axis tables, so it reports one row
@@ -1146,6 +1171,7 @@ jobs:
     if: >-
       needs.grade.result != 'skipped' &&
       inputs.check_run &&
+      !inputs.report_only &&
       !cancelled()
     name: Publish the risk Check Run
     runs-on: ubuntu-latest
