@@ -239,6 +239,11 @@ A map must MAP every provenance class (`runbook`, `agent-supervised`, `human`,
 tier nobody chose — that is how a map that forgot `external` used to grade a fork
 the same as a teammate.
 
+Live schema 5 records include `observed_base_sha` from the PR read and `head_sha` from its
+latest commit. The base is an observation, not proof that the override files or
+changed-file list were read at that revision: those reads are separate and can race
+with a base update. Do not use this record alone as current-snapshot readiness evidence.
+
 Every graded record carries `map_version` + `registry_version`, so grades made
 under different maps stay comparable and a map revision can be replayed against
 accumulated records.

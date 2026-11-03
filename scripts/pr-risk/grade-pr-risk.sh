@@ -640,7 +640,7 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
   q='query($owner:String!,$name:String!,$num:Int!){
   repository(owner:$owner,name:$name){ pullRequest(number:$num){
     number title state isDraft createdAt updatedAt closedAt mergedAt
-    author{ login __typename } authorAssociation baseRefName headRefName isCrossRepository
+    author{ login __typename } authorAssociation baseRefName baseRefOid headRefName isCrossRepository
     additions deletions changedFiles
     labels(first:100){ pageInfo{ hasNextPage } nodes{ name } }
     commits(last:1){ nodes{ commit{ oid statusCheckRollup{ state
@@ -786,7 +786,7 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
        then {list: null, status: "unknown",
              reason: "changed-file list is short (\($files | length) of \(.changedFiles)) — GitHub caps the files API at 3000 files"}
        else {list: $files, status: "ok", reason: null} end) as $fread
-    | {schema_version:4, repo:$repo, pr:.number, title:.title, author:(.author.login // null),
+    | {schema_version:5, repo:$repo, pr:.number, title:.title, author:(.author.login // null),
        # The actor type GitHub itself assigns the author, recorded because the LOGIN cannot answer
        # it here: GraphQL reports a Bot login UNSUFFIXED, so `cloud-code-bot[bot]` arrives as
        # `cloud-code-bot` and the `[bot]` test in the shared resolver never fires on this path.
@@ -798,7 +798,8 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
        labels:$labels, agent_coded:($labels | index("agent-coded") != null),
        labels_status:(if $labels_trunc then "unknown" else "ok" end),
        created_at:.createdAt, updated_at:.updatedAt, closed_at:.closedAt, merged_at:.mergedAt,
-       base_ref:.baseRefName, head_ref:.headRefName, is_draft:.isDraft,
+       base_ref:.baseRefName, observed_base_sha:(.baseRefOid // null),
+       head_ref:.headRefName, is_draft:.isDraft,
        # THE COMMIT THIS GRADE IS ABOUT. Recorded so a publish surface attaches the grade to the
        # commit whose rollup and file list produced it, rather than re-reading "head" one job
        # later: grading waits out the rollup settle, so a push inside that window would otherwise
