@@ -35,21 +35,40 @@ class WorkflowByokTest(unittest.TestCase):
         )
 
     def test_key_check_runs_only_when_a_panel_would_start(self):
+        # Not on a same-SHA re-trigger either: that runs no panel, so a
+        # keyless author must not be told one was skipped.
         self.assertIn(
-            "if: inputs.byok && steps.check.outputs.should_run == 'true'", self.gate
+            "if: inputs.byok && steps.check.outputs.should_run == 'true' && "
+            "steps.dup.outputs.already_reviewed != 'true'",
+            self.gate,
+        )
+
+    def test_dedupe_runs_before_the_key_check(self):
+        self.assertLess(
+            self.gate.index("name: Check for prior review on this commit"),
+            self.gate.index("name: Check the BYOK key"),
         )
 
     def test_key_check_reads_presence_only(self):
         self.assertIn("KEY_PRESENT: ${{ secrets.CURSOR_API_KEY != '' }}", self.gate)
 
-    def test_later_gate_steps_honour_the_veto(self):
-        # The dedupe lookup and the Anthropic probe spend API calls; neither
-        # should run for a round the veto already cancelled.
-        for step_if in (
-            "if: steps.check.outputs.should_run == 'true' && steps.byok.outputs.status != 'missing'\n",
-            "if: steps.check.outputs.should_run == 'true' && steps.byok.outputs.status != 'missing' && steps.dup",
-        ):
-            self.assertIn(step_if, self.gate)
+    def test_the_anthropic_probe_honours_the_veto(self):
+        # The probe spends API calls; it must not run for a round the veto
+        # already cancelled.
+        self.assertIn(
+            "if: steps.check.outputs.should_run == 'true' && "
+            "steps.byok.outputs.status != 'missing' && steps.dup",
+            self.gate,
+        )
+
+    def test_blocking_gate_fails_closed_on_a_missing_key(self):
+        # The veto folds into should_run, so without this step a keyless
+        # author's round reads as review-free and greens the required check.
+        job = text(self.jobs["blocking-gate"])
+        self.assertIn("if: ${{ needs.gate.outputs.byok_status == 'missing' }}", job)
+        step = job[job.index("name: Fail if the author has no BYOK key"):]
+        step = step[: step.index("- name:", 1)]
+        self.assertIn("exit 1", step)
 
     def test_comment_job_runs_only_on_a_byok_verdict_and_posts_only_on_missing(self):
         job = text(self.jobs["byok-comment"])

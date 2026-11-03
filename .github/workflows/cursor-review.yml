@@ -880,13 +880,15 @@ on:
         description: >-
           OPT-IN. Bring-your-own-key: the caller passes the PR AUTHOR's own
           Cursor key as CURSOR_API_KEY (resolved in the caller's `secrets:`
-          mapping, which GitHub evaluates server-side, so no other person's key
-          reaches a runner — see docs/callers/cursor-review.md#byok), and an
-          EMPTY key means the author has none. Then, on a run that would start
-          a panel, `gate` skips the panel and a sticky PR comment tells the
-          author how to add a key; once one exists the next round flips that
-          comment to ✅. Events that start no panel need no key. Default false
-          = an empty key fails at preflight, as before.
+          mapping, which GitHub evaluates server-side, so this workflow's jobs
+          only ever hold that one key — who can read the caller's key roster
+          is a separate question, see docs/callers/cursor-review.md#byok), and
+          an EMPTY key means the author has none. Then, on a run that would
+          start a panel, `gate` skips the panel, a sticky PR comment tells the
+          author how to add a key (once one exists the next round flips that
+          comment to ✅), and with `blocking` the Blocking gate stays red.
+          Events that start no panel need no key. Default false = no key check
+          here: pass a non-empty key.
         type: boolean
         required: false
         default: false
@@ -1300,30 +1302,9 @@ jobs:
           echo "Label '$LABEL_NAME' is not the trigger label — skipping."
           echo "should_run=false" >> "$GITHUB_OUTPUT"
 
-      - name: Check the BYOK key
-        # With `byok` the caller passes the PR author's own key as
-        # CURSOR_API_KEY, and an empty one means the author has none. Checked
-        # only on a run `check` would start a panel on: the other events (a
-        # push, a retarget) start none and spend nothing, so they need no key.
-        # Presence only, computed on this GitHub-hosted job that checks out
-        # nothing, like the direct-API key presence steps above.
-        id: byok
-        if: inputs.byok && steps.check.outputs.should_run == 'true'
-        env:
-          KEY_PRESENT: ${{ secrets.CURSOR_API_KEY != '' }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          if [ "$KEY_PRESENT" = "true" ]; then
-            echo "status=ok" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "status=missing" >> "$GITHUB_OUTPUT"
-          echo "::warning::byok: no Cursor key for the PR author (${PR_AUTHOR}) — skipping the panel."
-          echo "**Cursor review skipped:** \`byok\` is on and the caller passed no Cursor key for the PR author (\`${PR_AUTHOR}\`)." >> "$GITHUB_STEP_SUMMARY"
-
       - name: Check for prior review on this commit
         id: dup
-        if: steps.check.outputs.should_run == 'true' && steps.byok.outputs.status != 'missing'
+        if: steps.check.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1494,6 +1475,29 @@ jobs:
             echo "No prior review for $HEAD_SHA — proceeding."
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Check the BYOK key
+        # With `byok` the caller passes the PR author's own key as
+        # CURSOR_API_KEY, and an empty one means the author has none. Checked
+        # only on a run `check` would start a panel on: the other events (a
+        # push, a retarget) start none and spend nothing, so they need no key.
+        # After the same-SHA dedupe, so a re-trigger on an already-reviewed
+        # head (which runs no panel either) is not announced as a skip.
+        # Presence only, computed on this GitHub-hosted job that checks out
+        # nothing, like the direct-API key presence steps above.
+        id: byok
+        if: inputs.byok && steps.check.outputs.should_run == 'true' && steps.dup.outputs.already_reviewed != 'true'
+        env:
+          KEY_PRESENT: ${{ secrets.CURSOR_API_KEY != '' }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$KEY_PRESENT" = "true" ]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=missing" >> "$GITHUB_OUTPUT"
+          echo "::warning::byok: no Cursor key for the PR author (${PR_AUTHOR}) — skipping the panel."
+          echo "**Cursor review skipped:** \`byok\` is on and the caller passed no Cursor key for the PR author (\`${PR_AUTHOR}\`)." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Probe the direct Anthropic key
         # Presence is not usability: a key whose organization hit its usage
@@ -7365,6 +7369,21 @@ jobs:
           GATE_RESULT: ${{ needs.gate.result }}
         run: |
           echo "::error::The cursor-review trigger job did not succeed (gate: $GATE_RESULT), so whether this PR should have been reviewed is unknown — refusing to pass the blocking gate. Re-run the failed job."
+          exit 1
+
+      - name: Fail if the author has no BYOK key
+        # The `byok` veto folds into `should_run`, so a keyless author's
+        # panel-starting round reads as review-free to the guard below and
+        # falls through to a thread query that finds nothing — green over an
+        # unreviewed PR, the same fail-open the over-cap path was un-exempted
+        # to close. `missing` is only ever set on a round that WOULD have run a
+        # panel (not on a review-free event or a same-SHA re-trigger), so this
+        # holds red exactly until a round with a key lands.
+        if: ${{ needs.gate.outputs.byok_status == 'missing' }}
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          echo "::error::byok is on and the caller passed no Cursor key for the PR author (${PR_AUTHOR}), so no review ran — an unreviewed PR cannot pass a blocking gate. Add a key for the author, then re-trigger the review."
           exit 1
 
       - name: Fail if the fresh review did not land
