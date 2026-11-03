@@ -126,6 +126,7 @@ class EligibilityTest(unittest.TestCase):
     """The whole truth table, because the dangerous answers are the `True`s."""
 
     ERRORED = "2/6 " + auto_approve.PANEL_INCOMPLETE_SUFFIX
+    ZERO_COMPLETED = "6/6 " + auto_approve.PANEL_INCOMPLETE_SUFFIX
 
     def eligible(self, reasons, on):
         return auto_approve.auto_retry_eligible(reasons, retry_errored=on)
@@ -147,6 +148,33 @@ class EligibilityTest(unittest.TestCase):
     def test_an_errored_panel_needs_the_flag(self):
         self.assertFalse(self.eligible([self.ERRORED], False))
         self.assertTrue(self.eligible([self.ERRORED], True))
+
+    def test_a_zero_completed_panel_is_never_auto_retried(self):
+        # Every cell failing together is a systemic outage until proven
+        # otherwise. Relabelling here spends the retry and another panel on
+        # the same unavailable account.
+        self.assertFalse(self.eligible([self.ZERO_COMPLETED], True))
+        self.assertFalse(self.eligible([self.ZERO_COMPLETED, HEAD_MOVED], True))
+
+    def test_only_a_real_all_failed_reason_trips_the_circuit_breaker(self):
+        self.assertTrue(auto_approve.all_panel_reviewers_failed(self.ZERO_COMPLETED))
+        for reason in (
+            self.ERRORED,
+            "6/7 " + auto_approve.PANEL_INCOMPLETE_SUFFIX,
+            "0/6 " + auto_approve.PANEL_INCOMPLETE_SUFFIX,
+            "6/6 unrelated failure",
+            "no panel metadata",
+            "",
+            None,
+        ):
+            with self.subTest(reason=reason):
+                self.assertFalse(auto_approve.all_panel_reviewers_failed(reason))
+
+    def test_a_zero_completed_panel_does_not_tell_a_human_to_relabel(self):
+        marker, message = auto_approve.no_decision_next([self.ZERO_COMPLETED])
+        self.assertEqual(card.NEXT_HUMAN, marker)
+        self.assertIn("zero reviewers completed", message)
+        self.assertNotIn("relabel", message.lower())
 
     def test_errored_alongside_a_race_is_eligible(self):
         self.assertTrue(self.eligible([self.ERRORED, HEAD_MOVED], True))
