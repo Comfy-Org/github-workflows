@@ -306,8 +306,9 @@ class WorkflowJobIsolationTest(unittest.TestCase):
         # `auto-retry` (BE-19526): the round's relabel, which must fire runs, so
         # never GITHUB_TOKEN. It checks out only this repo's pinned assets. So
         # does `auto-rereview` (BE-20262), the relabel a dismissal schedules.
+        # `byok-comment` is `over-cap-comment`'s twin: checkout-free, comment only.
         self.assertEqual(holders, {"over-cap-comment", "post-review", "dismiss-stale-approval", "round-cap",
-                                   "auto-retry", "auto-rereview"})
+                                   "auto-retry", "auto-rereview", "byok-comment"})
 
     def test_the_anthropic_key_reaches_only_the_gate_and_its_direct_cells(self):
         # `gate` only resolves a presence boolean; the cells and the direct

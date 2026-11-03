@@ -51,7 +51,7 @@ Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-revi
 
 | | |
 |---|---|
-| `secrets.CURSOR_API_KEY` | **Required.** Org-level in Comfy-Org. |
+| `secrets.CURSOR_API_KEY` | **Required.** Org-level in Comfy-Org. With `byok`, the PR author's own key instead — see [BYOK](#byok). |
 | `secrets.OPENAI_API_KEY` | Optional. Only read when `openai_direct_model` is set; use a project-scoped service-account key with a spend limit. |
 | `secrets.ANTHROPIC_API_KEY` | Optional. Only used when `anthropic_direct_model` or `judge_direct_model` is set; use a key scoped to its own Anthropic workspace with a spend limit, never a personal key. A key that hits that limit falls back to Cursor for the run (see `anthropic_direct_model`). |
 | `secrets.SLACK_BOT_TOKEN` | Optional. Without it the review still posts; only the DMs are skipped. |
@@ -155,6 +155,46 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `axes` | `correctness,conformance` | With `axes_alongside_panel`: the axes the status card lists. A non-empty subset of `correctness` and `conformance`, the only axes run here — anything else fails the start phase (`axes_started` `failure`). Pass the same list to your decide job. |
 | `axis_prior_rounds` | `0` | With `axes_alongside_panel`: cursor-approve's `prior_rounds` (0–3) for the start phase and both axes. Pass the same value to your decide job. |
 | `axis_direct_model` | `''` | With `axes_alongside_panel`: run the axes on the direct Anthropic API (needs `ANTHROPIC_API_KEY`), as the axis workflows' `axis_direct_model`. |
+| `byok` | `false` | Bring-your-own-key: the caller passes the PR **author's** own Cursor key as `CURSOR_API_KEY`, and an empty one means the author has none. On a run that would start a panel, `gate` then skips it (a `::warning::` and a job-summary line) and the `byok-comment` job posts one sticky PR comment telling the author how to add a key; the round after they have one flips it to ✅. Events that start no panel (a push, a retarget) need no key. See [BYOK](#byok) for the caller wiring. |
+| `byok_help` | `''` | With `byok`: markdown appended to the missing-key comment — who to ask, or a link to your onboarding doc. Empty = the generic text only. |
+
+## BYOK
+
+Run the panel on each PR author's **own** Cursor key instead of a shared one.
+The reusable never sees anyone else's key: the caller resolves the author's key
+in its `secrets:` mapping, which GitHub evaluates server-side for a `uses:` job,
+so only that one value reaches the reusable (and is masked there like any
+passed secret). The keys live in one JSON secret, login → key:
+
+| | |
+|---|---|
+| `secrets.CURSOR_BYOK_KEYS` | `{"<github-login>": "<cursor-api-key>", ...}`. Org-level, so adding a person needs no PR. GitHub never shows a secret again, so keep the source of truth elsewhere (e.g. a password-manager item) and re-write the whole value on each change. Logins are matched exactly as GitHub spells them. |
+| `vars.CURSOR_REVIEW_BYOK` | `true` turns BYOK on. Org- or repo-level. |
+| `vars.CURSOR_BYOK_ORG_KEY_AUTHORS` | Optional JSON array of logins that keep the shared key, e.g. `["my-app[bot]"]` for bot-authored PRs. |
+
+```yaml
+    with:
+      byok: ${{ vars.CURSOR_REVIEW_BYOK == 'true' }}
+      byok_help: Ask in #your-channel to get your key added.
+    secrets:
+      # BYOK off → the shared key. On → the shared key for an exempt author,
+      # else the author's own key, EMPTY when they have none (the reusable then
+      # skips the panel and comments). Do not "simplify" this to the
+      # `byok && own || shared` shape: that falls back to the shared key for
+      # exactly the authors BYOK is meant to stop.
+      CURSOR_API_KEY: ${{ vars.CURSOR_REVIEW_BYOK != 'true' && secrets.CURSOR_API_KEY || (contains(fromJSON(vars.CURSOR_BYOK_ORG_KEY_AUTHORS || '[]'), github.event.pull_request.user.login) && secrets.CURSOR_API_KEY || fromJSON(secrets.CURSOR_BYOK_KEYS || '{}')[github.event.pull_request.user.login]) }}
+```
+
+If you also call the [cursor-approve](cursor-approve.md) axis workflows
+directly, pass them the same expression, but ending `|| secrets.CURSOR_API_KEY`:
+they declare the key required and only run after a panel that already had one.
+
+What BYOK does not change: the author's key reaches the panel's agents, which
+run over PR code, exactly as the shared key does today — so ask people to use a
+spend-capped key. A fork PR still skips at the gate, before any key matters.
+Never use `secrets[...]` with a computed name to look keys up instead: that
+provisions the whole secrets context to the runner (zizmor
+`overprovisioned-secrets`).
 
 ## Running a model experiment
 
