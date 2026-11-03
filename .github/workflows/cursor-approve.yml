@@ -387,7 +387,7 @@ jobs:
         # as a verdict (a test pins the name).
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.prior_rounds > 0 }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: prior-axes
           path: ${{ runner.temp }}/prior/prior-axes.json
@@ -420,7 +420,7 @@ jobs:
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: axis-business
           path: ${{ runner.temp }}/axes/axis-business
@@ -429,7 +429,7 @@ jobs:
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: axis-design
           path: ${{ runner.temp }}/axes/axis-design
@@ -438,7 +438,7 @@ jobs:
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: axis-correctness
           path: ${{ runner.temp }}/axes/axis-correctness
@@ -447,7 +447,7 @@ jobs:
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: axis-completeness
           path: ${{ runner.temp }}/axes/axis-completeness
@@ -456,7 +456,7 @@ jobs:
         if: steps.token.outputs.present == 'true' && inputs.phase == 'decide'
         # A failed axis uploaded nothing; that is "no result", not an error here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: axis-conformance
           path: ${{ runner.temp }}/axes/axis-conformance
