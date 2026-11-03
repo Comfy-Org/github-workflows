@@ -189,6 +189,23 @@ If you also call the [cursor-approve](cursor-approve.md) axis workflows
 directly, pass them the same expression, but ending `|| secrets.CURSOR_API_KEY`:
 they declare the key required and only run after a panel that already had one.
 
+**Who can read the roster.** The server-side mapping keeps the *reusable* to
+one key; it does not keep the *caller* honest. Under `pull_request` GitHub runs
+the caller from the PR's head, so a same-repo PR can rewrite its `secrets:`
+mapping — or add a step or a new workflow — and dump `CURSOR_BYOK_KEYS`, every
+author's key, not just its own. So:
+
+1. Call cursor-review from **`pull_request_target`**, as in the [trust
+   model](#trust-model): the caller then comes from the base branch, so a PR
+   cannot change which key it is handed. Keep that caller free of any step that
+   checks out or runs PR code.
+2. That still does not fence the secret itself: Actions secrets have no
+   branch policy for a `uses:` job (it cannot declare `environment:`), so a
+   workflow pushed on any branch of a repo the secret reaches — `on: push`
+   needs no PR — can read it. Grant the org secret only to repos where
+   everyone with write access may be trusted with every listed key, and do not
+   enable BYOK where that is not true.
+
 What BYOK does not change: the author's key reaches the panel's agents, which
 run over PR code, exactly as the shared key does today — so ask people to use a
 spend-capped key. A fork PR still skips at the gate, before any key matters.
