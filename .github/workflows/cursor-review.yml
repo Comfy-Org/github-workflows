@@ -876,10 +876,38 @@ on:
         type: string
         required: false
         default: ''
+      byok:
+        description: >-
+          OPT-IN. Bring-your-own-key: the caller passes the PR AUTHOR's own
+          Cursor key as CURSOR_API_KEY (resolved in the caller's `secrets:`
+          mapping, which GitHub evaluates server-side, so this workflow's jobs
+          only ever hold that one key — who can read the caller's key roster
+          is a separate question, see docs/callers/cursor-review.md#byok), and
+          an EMPTY key means the author has none. Then, on a run that would
+          start a panel, `gate` skips the panel, a sticky PR comment tells the
+          author how to add a key (once one exists the next round flips that
+          comment to ✅), and with `blocking` the Blocking gate stays red.
+          Events that start no panel need no key. Default false = no key check
+          here: pass a non-empty key.
+        type: boolean
+        required: false
+        default: false
+      byok_help:
+        description: >-
+          With `byok`: markdown appended to the missing-key comment, e.g. who to
+          ask or a link to your onboarding doc for adding a key. Default '' =
+          the generic text only.
+        type: string
+        required: false
+        default: ''
     secrets:
       CURSOR_API_KEY:
-        description: Cursor API key for cursor-agent (the panel + judge models bill through it).
-        required: true
+        description: >-
+          Cursor API key for cursor-agent (the panel + judge models bill through
+          it). Required in practice; declared optional only so a `byok` caller
+          can pass an empty value for an author with no key (the panel is then
+          skipped, see `byok`).
+        required: false
       OPENAI_API_KEY:
         description: >-
           OpenAI API key for the optional direct-API review cell. Required only
@@ -1079,7 +1107,10 @@ jobs:
       # startup on the pin bump, whether or not it set the command.
       pull-requests: read
     outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
+      # `check`'s verdict, vetoed by a `byok` author with no key.
+      should_run: ${{ steps.check.outputs.should_run == 'true' && steps.byok.outputs.status != 'missing' && 'true' || 'false' }}
+      # ok / missing on a `byok` run that would start a panel, else empty.
+      byok_status: ${{ steps.byok.outputs.status }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
       approve_author_ok: ${{ steps.author.outputs.approve_author_ok }}
       openai_key_present: ${{ steps.openai_key.outputs.present }}
@@ -1445,6 +1476,29 @@ jobs:
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check the BYOK key
+        # With `byok` the caller passes the PR author's own key as
+        # CURSOR_API_KEY, and an empty one means the author has none. Checked
+        # only on a run `check` would start a panel on: the other events (a
+        # push, a retarget) start none and spend nothing, so they need no key.
+        # After the same-SHA dedupe, so a re-trigger on an already-reviewed
+        # head (which runs no panel either) is not announced as a skip.
+        # Presence only, computed on this GitHub-hosted job that checks out
+        # nothing, like the direct-API key presence steps above.
+        id: byok
+        if: inputs.byok && steps.check.outputs.should_run == 'true' && steps.dup.outputs.already_reviewed != 'true'
+        env:
+          KEY_PRESENT: ${{ secrets.CURSOR_API_KEY != '' }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$KEY_PRESENT" = "true" ]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=missing" >> "$GITHUB_OUTPUT"
+          echo "::warning::byok: no Cursor key for the PR author (${PR_AUTHOR}) — skipping the panel."
+          echo "**Cursor review skipped:** \`byok\` is on and the caller passed no Cursor key for the PR author (\`${PR_AUTHOR}\`)." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Probe the direct Anthropic key
         # Presence is not usability: a key whose organization hit its usage
         # limit (an HTTP 400 naming the reset time), ran out of credit, or was
@@ -1464,7 +1518,7 @@ jobs:
         # it); it never prints the key or any header. Best effort: a crash
         # here leaves the outputs empty, which preflight reads as "not probed".
         id: anthropic_probe
-        if: steps.check.outputs.should_run == 'true' && steps.dup.outputs.already_reviewed != 'true' && steps.anthropic_key.outputs.present == 'true'
+        if: steps.check.outputs.should_run == 'true' && steps.byok.outputs.status != 'missing' && steps.dup.outputs.already_reviewed != 'true' && steps.anthropic_key.outputs.present == 'true'
         continue-on-error: true
         # Two models at worst: 2 x (3 x 20 s + 60 s) = 4 minutes; the script
         # stops retrying at PROBE_BUDGET_SECONDS, and writes every output in
@@ -2749,6 +2803,110 @@ jobs:
             echo "This PR is OVER diff_size_cap and got no review panel — the ::warning:: annotation and step summary on the 'Diff size check' job are the signal."
           else
             echo "This PR is within diff_size_cap, so there is no skip to announce; nothing was owed on this run."
+          fi
+
+  byok-comment:
+    name: Comment when the author has no BYOK key
+    needs: gate
+    # A `byok` run that would have started a panel: `missing` posts (or
+    # refreshes) the sticky notice, `ok` flips an existing one to ✅ and never
+    # posts. The same shape as `over-cap-comment` above — bot identity with a
+    # run-token fallback, author-filtered marker lookup, every copy updated,
+    # a live-head check — for the same reasons, documented there.
+    if: ${{ !cancelled() && inputs.byok && (needs.gate.outputs.byok_status == 'missing' || needs.gate.outputs.byok_status == 'ok') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The GITHUB_TOKEN fallback; `post-review` already requires it.
+      pull-requests: write
+    env:
+      BOT_CONFIGURED: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Mint bot token
+        id: bot
+        if: env.BOT_CONFIGURED == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Upsert sticky BYOK comment
+        id: upsert
+        # Best-effort, like the over-cap upsert: the gate's ::warning:: and step
+        # summary are the primary signal, and a failed comment must not turn a
+        # skipped review red.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || '' }}
+          RUN_LOGIN: github-actions[bot]
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BYOK_STATUS: ${{ needs.gate.outputs.byok_status }}
+          BYOK_HELP: ${{ inputs.byok_help }}
+        run: |
+          set -euo pipefail
+          # Fails closed on an unreadable head, as the over-cap upsert does.
+          if ! LIVE_HEAD="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')" || [ -z "$LIVE_HEAD" ]; then
+            echo "Could not read the PR's current head (see gh error above) — refusing to write a verdict that may already be stale." >&2
+            exit 1
+          fi
+          if [ "$LIVE_HEAD" != "$EVENT_HEAD_SHA" ]; then
+            echo "This run's head (${EVENT_HEAD_SHA}) is no longer the PR head (${LIVE_HEAD}) — a newer run owns the verdict. Not writing."
+            exit 0
+          fi
+          MARKER='<!-- cursor-review-byok-missing-key -->'
+          if [ "$BYOK_STATUS" = "ok" ]; then
+            {
+              printf '%s\n\n' "$MARKER"
+              printf '✅ **A Cursor key is now set up for @%s**, so the review is no longer skipped for a missing key. Check this run for the panel'"'"'s result.\n' "$PR_AUTHOR"
+            } > body.md
+          else
+            {
+              printf '%s\n\n' "$MARKER"
+              printf '⚠️ **Cursor review skipped** — this repo runs cursor-review on the PR author'"'"'s own Cursor API key, and none is set up for @%s. **No review panel ran on this PR.**\n\n' "$PR_AUTHOR"
+              # The backticks are a markdown code span, not a substitution.
+              # shellcheck disable=SC2016
+              printf 'To enable it, create a Cursor API key at https://cursor.com/settings/api-keys (set a spend limit), get it added for your GitHub login, then re-apply the `%s` label.\n' "$REVIEW_LABEL"
+              if [ -n "$BYOK_HELP" ]; then
+                printf '\n%s\n' "$BYOK_HELP"
+              fi
+            } > body.md
+          fi
+          existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -r --arg m "$MARKER" --arg login "$BOT_LOGIN" --arg run_login "$RUN_LOGIN" '
+                .[] | select(($login != "" and (.user.login // "") == $login)
+                             or (.user.login // "") == $run_login)
+                    | select((.user.type // "") == "Bot")
+                    | select(((.body // "") | startswith($m)))
+                    | .id')"
+          if [ -n "$existing" ]; then
+            patched=0
+            failed=0
+            for id in $existing; do
+              if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null; then
+                echo "Updated sticky BYOK comment ${id}."
+                patched=$((patched + 1))
+              else
+                failed=$((failed + 1))
+                echo "Failed to update sticky BYOK comment ${id} (see gh error above); continuing." >&2
+              fi
+            done
+            if [ "$patched" -eq 0 ] && [ "$failed" -gt 0 ]; then
+              echo "No sticky comment could be updated (${failed} failed); the PR may show a stale notice." >&2
+              exit 1
+            fi
+          elif [ "$BYOK_STATUS" = "missing" ]; then
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
+            echo "Posted BYOK missing-key comment."
+          else
+            # Never POST on the happy path.
+            echo "Author has a key and no existing comment — nothing to post."
           fi
 
   preflight:
@@ -7211,6 +7369,21 @@ jobs:
           GATE_RESULT: ${{ needs.gate.result }}
         run: |
           echo "::error::The cursor-review trigger job did not succeed (gate: $GATE_RESULT), so whether this PR should have been reviewed is unknown — refusing to pass the blocking gate. Re-run the failed job."
+          exit 1
+
+      - name: Fail if the author has no BYOK key
+        # The `byok` veto folds into `should_run`, so a keyless author's
+        # panel-starting round reads as review-free to the guard below and
+        # falls through to a thread query that finds nothing — green over an
+        # unreviewed PR, the same fail-open the over-cap path was un-exempted
+        # to close. `missing` is only ever set on a round that WOULD have run a
+        # panel (not on a review-free event or a same-SHA re-trigger), so this
+        # holds red exactly until a round with a key lands.
+        if: ${{ needs.gate.outputs.byok_status == 'missing' }}
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          echo "::error::byok is on and the caller passed no Cursor key for the PR author (${PR_AUTHOR}), so no review ran — an unreviewed PR cannot pass a blocking gate. Add a key for the author, then re-trigger the review."
           exit 1
 
       - name: Fail if the fresh review did not land

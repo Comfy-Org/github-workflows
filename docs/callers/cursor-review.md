@@ -51,7 +51,7 @@ Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-revi
 
 | | |
 |---|---|
-| `secrets.CURSOR_API_KEY` | **Required.** Org-level in Comfy-Org. |
+| `secrets.CURSOR_API_KEY` | **Required.** Org-level in Comfy-Org. With `byok`, the PR author's own key instead — see [BYOK](#byok). |
 | `secrets.OPENAI_API_KEY` | Optional. Only read when `openai_direct_model` is set; use a project-scoped service-account key with a spend limit. |
 | `secrets.ANTHROPIC_API_KEY` | Optional. Only used when `anthropic_direct_model` or `judge_direct_model` is set; use a key scoped to its own Anthropic workspace with a spend limit, never a personal key. A key that hits that limit falls back to Cursor for the run (see `anthropic_direct_model`). |
 | `secrets.SLACK_BOT_TOKEN` | Optional. Without it the review still posts; only the DMs are skipped. |
@@ -155,6 +155,78 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `axes` | `correctness,conformance` | With `axes_alongside_panel`: the axes the status card lists. A non-empty subset of `correctness` and `conformance`, the only axes run here — anything else fails the start phase (`axes_started` `failure`). Pass the same list to your decide job. |
 | `axis_prior_rounds` | `0` | With `axes_alongside_panel`: cursor-approve's `prior_rounds` (0–3) for the start phase and both axes. Pass the same value to your decide job. |
 | `axis_direct_model` | `''` | With `axes_alongside_panel`: run the axes on the direct Anthropic API (needs `ANTHROPIC_API_KEY`), as the axis workflows' `axis_direct_model`. |
+| `byok` | `false` | Bring-your-own-key: the caller passes the PR **author's** own Cursor key as `CURSOR_API_KEY`, and an empty one means the author has none. On a run that would start a panel, `gate` then skips it (a `::warning::` and a job-summary line) and the `byok-comment` job posts one sticky PR comment telling the author how to add a key; the round after they have one flips it to ✅. Events that start no panel (a push, a retarget, a re-trigger on an already-reviewed head) need no key. With `blocking`, a skipped round holds the Blocking gate red until a round with a key lands. See [BYOK](#byok) for the caller wiring. |
+| `byok_help` | `''` | With `byok`: markdown appended to the missing-key comment — who to ask, or a link to your onboarding doc. Empty = the generic text only. |
+
+## BYOK
+
+Run the panel on each PR author's **own** Cursor key instead of a shared one.
+The reusable never sees anyone else's key: the caller resolves the author's key
+in its `secrets:` mapping, which GitHub evaluates server-side for a `uses:` job,
+so only that one value reaches the reusable (and is masked there like any
+passed secret). That bounds what the *reusable* holds, not who can read the
+roster — see [who can read the roster](#who-can-read-the-roster) below. The
+keys live in one JSON secret, login → key:
+
+| | |
+|---|---|
+| `secrets.CURSOR_BYOK_KEYS` | `{"<github-login>": "<cursor-api-key>", ...}` — a JSON **object**. Malformed JSON makes `fromJSON` fail while GitHub evaluates `secrets:`, which fails the whole call (every job, the stale-approval dismissal included), so validate the value before writing it. Org-level, so adding a person needs no PR. GitHub never shows a secret again, so keep the source of truth elsewhere (e.g. a password-manager item) and re-write the whole value on each change. Logins are matched exactly as GitHub spells them. |
+| `vars.CURSOR_REVIEW_BYOK` | `true` turns BYOK on. Org- or repo-level. |
+| `vars.CURSOR_BYOK_ORG_KEY_AUTHORS` | Optional JSON **array** of logins that keep the shared key, e.g. `["my-app[bot]"]` for bot-authored PRs. Never a bare JSON string: `contains` on a string is a substring match, so `"bot"` would exempt every login containing it. Malformed JSON fails the call, as above. |
+
+```yaml
+    with:
+      byok: ${{ vars.CURSOR_REVIEW_BYOK == 'true' }}
+      byok_help: "Ask in #your-channel to get your key added."
+    secrets:
+      # BYOK off → the shared key. On → the shared key for an exempt author,
+      # else the author's own key, EMPTY when they have none (the reusable then
+      # skips the panel and comments). Each branch repeats its own guard and
+      # the chain ends `|| ''`: an `a && b || c` chain falls through to `c`
+      # whenever `b` is EMPTY, so without the guards an unset shared key would
+      # silently hand the reusable a personal key. Do not "simplify" it.
+      CURSOR_API_KEY: ${{ vars.CURSOR_REVIEW_BYOK != 'true' && secrets.CURSOR_API_KEY || vars.CURSOR_REVIEW_BYOK == 'true' && contains(fromJSON(vars.CURSOR_BYOK_ORG_KEY_AUTHORS || '[]'), github.event.pull_request.user.login) && secrets.CURSOR_API_KEY || vars.CURSOR_REVIEW_BYOK == 'true' && !contains(fromJSON(vars.CURSOR_BYOK_ORG_KEY_AUTHORS || '[]'), github.event.pull_request.user.login) && fromJSON(secrets.CURSOR_BYOK_KEYS || '{}')[github.event.pull_request.user.login] || '' }}
+```
+
+If you also call the [cursor-approve](cursor-approve.md) axis workflows
+directly, pass them the **same** expression, with no `|| secrets.CURSOR_API_KEY`
+fallback: under `approve_only_on_push` an axis runs on a push with no panel and
+no BYOK check, so a fallback would bill the shared key for exactly the keyless
+author BYOK is meant to stop. Without a key the axis fails, and a failed axis
+uploads no verdict, so decide does not approve.
+
+### Who can read the roster
+
+The server-side mapping keeps the *reusable* to one key; it does not keep the
+*caller* honest. Under `pull_request` GitHub runs
+the caller from the PR's head, so a same-repo PR can rewrite its `secrets:`
+mapping — or add a step or a new workflow — and dump `CURSOR_BYOK_KEYS`, every
+author's key, not just its own. So:
+
+1. Call cursor-review from **`pull_request_target`**, as in the [trust
+   model](#trust-model): the caller then comes from the base branch, so a PR
+   cannot change which key it is handed. Keep that caller free of any step that
+   checks out or runs PR code.
+2. That still does not fence the secret itself: Actions secrets have no
+   branch policy for a `uses:` job (it cannot declare `environment:`), so a
+   workflow pushed on any branch of a repo the secret reaches — `on: push`
+   needs no PR — can read it. Grant the org secret only to repos where
+   everyone with write access may be trusted with every listed key, and do not
+   enable BYOK where that is not true.
+
+What BYOK does change is whose key is exposed. The panel's agents run with
+`--trust` and a shell over PR code, and their shell children inherit
+`CURSOR_API_KEY`, exactly as with the shared key today — but that code is not
+only the author's: a collaborator's push to their branch, base-branch content
+and a label any triager can apply all reach those agents. Prompt-injected
+content can therefore exfiltrate the author's key or spend on it. A spend cap
+bounds the spend, not the key's account-level access, so ask people for a
+**dedicated, spend-capped key** they can revoke, never their everyday one. A
+fork PR still skips at the gate, before any key matters.
+
+Never use `secrets[...]` with a computed name to look keys up instead: that
+provisions the whole secrets context to the runner (zizmor
+`overprovisioned-secrets`).
 
 ## Running a model experiment
 
@@ -776,6 +848,8 @@ review to clear it. It holds the check red on all of:
   inline payload) — findings a thread query cannot see;
 * **the diff being over `diff_size_cap`.** No panel ran, so nothing was reviewed.
   Get the PR under the cap, or raise the cap on the caller;
+* **a [`byok`](#byok) round skipped for a missing key.** No panel ran either.
+  Add a key for the author and re-trigger the review;
 * being triggered by an event with no pull request in its payload (`merge_group`,
   `push`, `workflow_dispatch`), which the gate cannot judge — use the trigger
   shape above.

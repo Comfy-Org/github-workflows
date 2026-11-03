@@ -442,6 +442,8 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `axes` | `correctness,conformance` | With `axes_alongside_panel`: the start card's axis list (cursor-approve `axes`); a non-empty subset of `correctness` and `conformance`, else the start fails. |
 | `axis_prior_rounds` | `0` | With `axes_alongside_panel`: `prior_rounds` for the start phase and both axes. |
 | `axis_direct_model` | `''` | With `axes_alongside_panel`: the axes' `axis_direct_model` (direct Anthropic API, `ANTHROPIC_API_KEY`). |
+| `byok` | `false` | Bring-your-own-key: `CURSOR_API_KEY` is the PR author's own key, resolved by the caller; empty = the author has none, so the panel is skipped with a sticky comment. See [the caller guide](../../docs/callers/cursor-review.md#byok). |
+| `byok_help` | `''` | With `byok`: markdown appended to the missing-key comment (who to ask, an onboarding link). |
 
 ### `workflows_ref` must equal the `uses:` pin
 
