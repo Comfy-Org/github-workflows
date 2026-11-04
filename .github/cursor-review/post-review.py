@@ -356,8 +356,8 @@ def _as_text(captured) -> str:
     return captured or ""
 
 
-def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.CompletedProcess:
-    """POST the review, keeping the RESPONSE HEADERS (BE-12691).
+def _gh_post_review_once(repo: str, pr_number: str, payload: str) -> subprocess.CompletedProcess:
+    """A single POST attempt, keeping the RESPONSE HEADERS (BE-12691).
 
     `-i` is what makes `Retry-After` / `X-RateLimit-Reset` reachable: `gh api` prints
     only the body by default, and there is no other knob that surfaces a response
@@ -410,6 +410,107 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
                 "unknown"
             ),
         )
+
+
+# Bounded retry for a write GitHub's own infrastructure dropped, not one GitHub
+# validated and refused. A clean six-model panel with zero findings has been lost
+# outright to a single transient 502 on the no-findings POST (oploop1144-5): every
+# reviewer job and `Consolidate panel` succeeded, the write never retried, and the
+# round's only artifact was two red checks and nothing on the PR. `gh` itself does not
+# retry a POST (its own backoff only covers idempotent GETs), so this has to.
+POST_REVIEW_MAX_ATTEMPTS = 3
+# Small and bounded on purpose: three attempts plus the existing confirm_landed reads
+# between them must still fit well inside the job's own `timeout-minutes: 10`,
+# alongside the throttle path's own up-to-90s waits documented at the `post-review`
+# job. Not exponential — a 5xx is GitHub's infrastructure, not a rate limit, so there
+# is no declared window to respect, only "try again shortly."
+POST_REVIEW_RETRY_DELAYS_SECONDS = (5, 15)
+
+
+def _is_retryable_delivery_failure(result: subprocess.CompletedProcess) -> bool:
+    """Whether THIS failure is GitHub's infrastructure, not GitHub's validation.
+
+    True for a 5xx (a 502/503/504 from an edge or proxy in front of the API that
+    served or dropped the request) and for a transport-level failure with no HTTP
+    status at all (a dropped connection, or this script's own `TimeoutExpired`
+    branch) — the same "request may never have been judged" set `post_may_have_landed`
+    already reasons about, minus the 4xx members of `RETRYABLE_4XX_STATUSES`.
+
+    False for every 4xx, including the throttle-shaped ones (403/408/425/429): those
+    already have their own backoff-then-READ in `confirm_landed`/`is_throttle`, and
+    retrying the WRITE under a declared embargo is exactly what escalates a secondary
+    rate limit for the whole App installation. A genuine validation 4xx (422 over a
+    bad inline position, 401, a plain permission 403) must stay red immediately, per
+    AGENTS.md rule 9 ("do not swallow a genuine 4xx") — this function returns False
+    for it precisely because `gh_http_status` reports it in the 400-499 range outside
+    the retryable set.
+    """
+    status = gh_http_status(result)
+    if status is None:
+        return True
+    return 500 <= status < 600
+
+
+def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.CompletedProcess:
+    """`_gh_post_review_once`, retried on a 5xx or transport error.
+
+    Checks whether the PREVIOUS attempt actually landed before retrying — a 5xx can be
+    raised on a write GitHub's API committed before the response failed (the same
+    gateway-timeout shape `post_may_have_landed`'s docstring already names), so
+    resending blindly risks a duplicate review this script has no way to undo.
+    `confirm_landed` is the existing byte-identical-body-at-this-SHA check every other
+    failure path already uses; reusing it here costs one bounded read and closes the
+    same race a second way.
+
+    Every caller keeps reading this function's return value exactly as before —
+    `gh_http_status`, `is_throttle`, `is_read_only_token_error`, `post_may_have_landed`
+    and `confirm_landed` all still see a real `gh` result, just possibly from a later
+    attempt. A throttle-shaped 403/429/408/425 is never retried here; it still reaches
+    the caller on the first attempt and takes its existing backoff-then-read path
+    unchanged.
+    """
+    result = _gh_post_review_once(repo, pr_number, payload)
+    attempt = 1
+    while (
+        result.returncode != 0
+        and _is_retryable_delivery_failure(result)
+        and attempt < POST_REVIEW_MAX_ATTEMPTS
+    ):
+        try:
+            request = json.loads(payload)
+        except ValueError:
+            request = {}
+        landed = confirm_landed(
+            result,
+            repo,
+            pr_number,
+            request.get("commit_id") or "",
+            request.get("body") or "",
+        )
+        if landed is True:
+            # Already on the PR under this exact body and commit SHA — stop here
+            # rather than resend. The caller's own post_may_have_landed/confirm_landed
+            # call will reach the same conclusion from this same `result` and report
+            # it as delivered; retrying would only risk a duplicate.
+            break
+        delay = POST_REVIEW_RETRY_DELAYS_SECONDS[
+            min(attempt - 1, len(POST_REVIEW_RETRY_DELAYS_SECONDS) - 1)
+        ]
+        print(
+            f"Review: POST failed on attempt {attempt}/{POST_REVIEW_MAX_ATTEMPTS} "
+            f"({gh_error_line(result)}) — retrying in {delay}s.",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+        attempt += 1
+        result = _gh_post_review_once(repo, pr_number, payload)
+    if result.returncode != 0 and attempt >= POST_REVIEW_MAX_ATTEMPTS:
+        print(
+            f"Review: delivery failed after {attempt} attempts, last status "
+            f"{gh_http_status(result)} ({gh_error_line(result)}).",
+            file=sys.stderr,
+        )
+    return result
 
 
 # The first line `gh -i` writes: `HTTP/2.0 403 Forbidden`, `HTTP/1.1 429 Too Many
