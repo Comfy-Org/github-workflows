@@ -1423,8 +1423,15 @@ def only_poster_spoke(thread: dict, poster_login: str) -> bool:
     )
 
 
-def plan_thread_resolution(threads: list, poster_login: str, threshold: str, honour_non_gating: bool = False):
+def plan_thread_resolution(threads: list, poster_login: str, threshold: str, honour_non_gating: bool = False,
+                           all_or_nothing: bool = True):
     """([(thread, severity)] to resolve, {verdict: count}). Pure.
+
+    `all_or_nothing=False` is the `resolve-below` path
+    (`resolve_below_threshold_on_post`): every eligible thread is planned
+    whatever else is open, because a finding at or below the threshold never
+    gates and so has nothing to wait for. Eligibility per thread
+    (classify_thread) is unchanged.
 
     `honour_non_gating` is True only for a round that gated under `delta` — the
     same `delta and marked` condition decide_gate's open-thread check uses. Under
@@ -1458,7 +1465,7 @@ def plan_thread_resolution(threads: list, poster_login: str, threshold: str, hon
         counts[verdict] += 1
         if verdict == RESOLVED:
             plan.append((thread, severity))
-    if blocked:
+    if blocked and all_or_nothing:
         counts[SKIP_ABOVE] += len(plan)
         counts[RESOLVED] = 0
         return [], counts
@@ -1468,6 +1475,16 @@ def plan_thread_resolution(threads: list, poster_login: str, threshold: str, hon
 def resolve_reply(severity: str, threshold: str, commit_sha: str) -> str:
     return (f"Resolved by auto-approve: {severity.capitalize()} finding, at or below the "
             f"`{threshold}` threshold, on commit {(commit_sha or '')[:7]}.\n\n{AUTO_RESOLVE_MARKER}")
+
+
+def on_post_reply(severity: str, threshold: str, commit_sha: str) -> str:
+    """The `resolve-below` reply: resolved when posted, whatever the round's
+    outcome. Carries AUTO_RESOLVE_MARKER, so the ledger never counts it as an
+    answer, exactly as for resolve_reply."""
+    return (f"Not actioning: {severity.capitalize()} finding, at or below this repo's `{threshold}` "
+            f"blocking threshold, so it does not gate this PR (commit {(commit_sha or '')[:7]}). "
+            "Resolved automatically so nothing waits on it — unresolve or reply if it should be "
+            f"addressed.\n\n{AUTO_RESOLVE_MARKER}")
 
 
 def _graphql(query: str, **variables) -> dict:
@@ -1492,10 +1509,13 @@ def still_eligible(thread_id: str, poster_login: str) -> bool:
 
 
 def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str,
-                             honour_non_gating: bool = False) -> dict:
+                             honour_non_gating: bool = False, all_or_nothing: bool = True,
+                             reply=None) -> dict:
     """Reply to and resolve the poster's own at-or-below-threshold threads.
 
-    Call ONLY after an APPROVE has been posted and the head re-checked. Every
+    Call ONLY after an APPROVE has been posted and the head re-checked — or,
+    with `all_or_nothing=False` and `reply=on_post_reply`, from `resolve-below`
+    after any posted round (see cmd_resolve_below). Every
     failure is logged and skipped: nothing here is fatal, and nothing here undoes
     the approval. Returns the counts it logged (plus ``failed``).
     """
@@ -1508,7 +1528,8 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
     try:
         gate = _load_gate_unresolved()
         threads = list(gate.iter_threads(owner, name, int(pr)))
-        plan, planned = plan_thread_resolution(threads, poster_login, threshold, honour_non_gating)
+        plan, planned = plan_thread_resolution(threads, poster_login, threshold, honour_non_gating,
+                                               all_or_nothing)
     except (Exception, SystemExit) as e:  # noqa: BLE001 - never fatal: the APPROVE has landed
         print(f"::warning::Auto-resolve: could not read this PR's review threads, so none were resolved: {e or 'thread query failed'}")
         return counts
@@ -1522,7 +1543,7 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
         if streak >= MAX_CONSECUTIVE_FAILURES:
             counts["deferred"] += len(plan) - index
             print(f"::warning::Auto-resolve: stopped after {streak} consecutive failures; "
-                  f"{len(plan) - index} eligible thread(s) left for the next approving round.")
+                  f"{len(plan) - index} eligible thread(s) left for a later round.")
             break
         thread_id = thread.get("id") or ""
         try:
@@ -1546,7 +1567,7 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
         streak = 0
         counts[RESOLVED] += 1
         try:
-            _graphql(REPLY_MUTATION, threadId=thread_id, body=resolve_reply(severity, threshold, commit_sha))
+            _graphql(REPLY_MUTATION, threadId=thread_id, body=(reply or resolve_reply)(severity, threshold, commit_sha))
         except Exception as e:  # noqa: BLE001 - the thread is already resolved
             print(f"::warning::Auto-resolve: resolved thread {thread_id} but could not reply on it: {e}")
     emit(f"Auto-resolve: resolved {counts[RESOLVED]}, skipped-human {counts[SKIP_HUMAN]}, "
@@ -5066,6 +5087,48 @@ def cmd_withdraw(args) -> int:
     return rc
 
 
+def cmd_resolve_below(args) -> int:
+    """`resolve_below_threshold_on_post`: right after a round's review is
+    posted, resolve the poster's own at-or-below-threshold threads and reply that
+    they will not be actioned — whatever the round decided (approve, request
+    changes, no decision, deferred to cursor-approve's axes), and whatever else
+    is open. Such a finding never gates, so leaving it open only makes the
+    author (or an agent) spend a pass on it, and a reply in it then stops the
+    approve-time sweep from ever resolving it.
+
+    Per-thread eligibility is classify_thread's, unchanged: the poster's own
+    thread, badged at or below the threshold, unresolved, nobody else spoke,
+    not marked non-gating. Nothing is resolved while the PR carries
+    `needs-human-review` or `skip-cursor-review`, or when its labels cannot be
+    read. Never fatal: always returns 0.
+    """
+    try:
+        threshold = validate_threshold((args.threshold or "").strip())
+    except ValueError as e:
+        print(f"::warning::Resolve-below: skipped — {e}")
+        return 0
+    try:
+        pr_now = read_pr(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        print(f"::warning::Resolve-below: skipped — could not read the PR: {e}")
+        return 0
+    if not live_labels_readable(pr_now):
+        print("::warning::Resolve-below: skipped — the PR's labels could not be read.")
+        return 0
+    for label in (HUMAN_REVIEW_LABEL, SKIP_REVIEW_LABEL):
+        if has_label(pr_now, label):
+            emit(f"Resolve-below: skipped — the PR carries `{label}`, so its threads are left for a person.")
+            return 0
+    try:
+        scope = validate_scope(getattr(args, "approve_scope", "") or "")
+    except ValueError as e:
+        print(f"::warning::Resolve-below: {e}; resolving as `{SCOPE_FULL}`")
+        scope = SCOPE_FULL
+    resolve_eligible_threads(args.repo, args.pr_number, args.poster_login or "", threshold, args.commit_sha,
+                             scope == SCOPE_DELTA, all_or_nothing=False, reply=on_post_reply)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -5212,7 +5275,16 @@ def main() -> int:
     w.add_argument("--approver-login", required=True)
     # cursor-review's approve_gate: `capped` also withdraws the standing block.
     w.add_argument("--approve-gate", default="")
+    b = sub.add_parser("resolve-below")
+    b.add_argument("--threshold", required=True)
+    b.add_argument("--repo", required=True)
+    b.add_argument("--pr-number", required=True)
+    b.add_argument("--commit-sha", required=True)
+    b.add_argument("--poster-login", required=True)
+    b.add_argument("--approve-scope", default=SCOPE_FULL)
     args = parser.parse_args()
+    if args.cmd == "resolve-below":
+        return cmd_resolve_below(args)
     if args.cmd == "approve-external":
         return cmd_approve_external(args)
     if args.cmd == "withdraw":

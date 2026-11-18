@@ -752,6 +752,24 @@ on:
         type: boolean
         required: false
         default: false
+      resolve_below_threshold_on_post:
+        description: >-
+          Opt-in: right after every round's review is posted, resolve the
+          posting identity's own threads at or below `approve_max_severity` and
+          reply that they will not be actioned — whatever the round decided
+          (approve, request changes, no decision, or deferred to
+          cursor-approve's axes) and whatever else is open. Default false: such
+          threads are resolved only by an approving round, and only when
+          nothing above the threshold is open. The findings are still posted;
+          the per-thread rules are the approve-time sweep's (badged, unresolved,
+          nobody else commented, not marked non-gating), and nothing is resolved
+          while the PR carries `needs-human-review` or `skip-cursor-review`.
+          No effect without `approve_max_severity`, or for an author
+          `approve_authors` does not list. Resolving needs write access (the
+          `bot_app_id` App, or APPROVER_TOKEN).
+        type: boolean
+        required: false
+        default: false
       approve_max_failed_reviewers:
         description: >-
           How many panel reviewers may ERROR (status `error`: the cell ran but
@@ -6770,6 +6788,47 @@ jobs:
             --can-relabel "$CAN_RELABEL" \
             --retry-errored-rounds "$RETRY_ERRORED_ROUNDS" \
             --retry-delay-minutes "$RETRY_DELAY_MINUTES"
+
+      - name: Resolve below-threshold threads
+        # Opt-in (inputs.resolve_below_threshold_on_post). Runs after the review
+        # is posted and after `Auto-approve decision` whatever it decided: a
+        # finding at or below approve_max_severity never gates, so its thread is
+        # resolved now (with a "not actioning" reply) instead of waiting for an
+        # approving round. Never fatal (auto-approve.py cmd_resolve_below), and
+        # continue-on-error for the same reason as the decision step.
+        if: ${{ inputs.resolve_below_threshold_on_post && inputs.approve_max_severity != '' && needs.gate.outputs.approve_author_ok != 'false' }}
+        continue-on-error: true
+        env:
+          APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THRESHOLD: ${{ inputs.approve_max_severity }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVE_SCOPE: ${{ steps.approve.outputs.approve_scope_effective || inputs.approve_scope }}
+        run: |
+          # Same identity precedence as `Auto-approve decision`: resolving needs
+          # write access, and the thread events it fires get their own
+          # concurrency slot on a blocking caller (docs/callers/cursor-review.md).
+          if [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
+          elif [ -n "$BOT_TOKEN" ]; then
+            export GH_TOKEN="$BOT_TOKEN"
+          else
+            export GH_TOKEN="$FALLBACK_TOKEN"
+          fi
+          # The identity `Post review` posted the findings under — only threads
+          # it started are ever resolved.
+          if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"; fi
+          python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" resolve-below \
+            --threshold "$THRESHOLD" \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --commit-sha "$HEAD_SHA" \
+            --poster-login "$POSTER" \
+            --approve-scope "$APPROVE_SCOPE"
 
   dismiss-stale-approval:
     # Companion to `Auto-approve decision`. A ruleset with
