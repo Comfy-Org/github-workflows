@@ -3999,6 +3999,19 @@ def _latest_panel_round(reviews: list, poster_login: str):
     return latest
 
 
+def panel_round_hidden_by_edit(reviews: list, poster_login: str) -> bool:
+    """True when an edited review by `poster_login` is what makes
+    `_latest_panel_round` read None: it is newer than the latest readable round,
+    or there is no readable round at all. Then a round existed that can no
+    longer be read — unlike a PR the panel never posted a round on."""
+    poster = (poster_login or "").strip().lower()
+    if not poster or _latest_panel_round(reviews, poster) is not None:
+        return False
+    return any(isinstance(r, dict) and _review_id(r) is not None and r.get("edited")
+               and ((r.get("user") or {}).get("login") or "").lower() == poster
+               for r in reviews)
+
+
 def panel_round_head(reviews: list, poster_login: str) -> str:
     """The commit the latest panel round reviewed, from its round sentinel; ""
     when none can be read (see `_latest_panel_round`)."""
@@ -4808,15 +4821,22 @@ def external_panel_merge_base(args) -> tuple:
     App). Unlike approval_merge_base, which RECORDS what it reads, this record
     can only refuse an approval, never grant one, so an identity any workflow
     can post as is still worth reading here. No poster means no round to read;
-    an unreadable review list is a reason to refuse, not an absent record."""
+    an unreadable review list is a reason to refuse, not an absent record. So
+    is a round an EDIT hid (panel_round_hidden_by_edit): the approve-only start
+    gate may have validated that very round's merge base, and a body edited
+    during the axes (repo write access suffices) must not turn the check off."""
     poster = (getattr(args, "poster_login", "") or "").strip()
     if not poster:
         return "", ""
     try:
-        return panel_round_merge_base(list_reviews(args.repo, args.pr_number), poster), ""
+        reviews = list_reviews(args.repo, args.pr_number)
     except (RuntimeError, ValueError) as e:
         return "", (f"the panel round's merge base could not be read to rule out a rewrite of the base branch "
                     f"({annotation_cause(e, 'unknown error')})")
+    if panel_round_hidden_by_edit(reviews, poster):
+        return "", ("the latest panel round was edited, so its merge base can no longer be read to rule out a "
+                    "rewrite of the base branch")
+    return panel_round_merge_base(reviews, poster), ""
 
 
 def cmd_approve_external(args) -> int:

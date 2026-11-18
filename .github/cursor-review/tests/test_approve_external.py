@@ -519,6 +519,39 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assertEqual(fake.dismissed, [])
 
+    def test_a_panel_round_edited_after_the_start_gate_refuses_on_a_rewritten_base(self):
+        # The start gate validated round 300; someone then edits it (or posts and
+        # edits a newer review as the poster) and rewrites the base under the
+        # same name. The round reads as None, but the approval must not stand.
+        edited = dict(self.panel_round(), lastEditedAt="2026-01-01T00:00:00Z")
+        fake = FakeGitHub(reviews=[edited, prior_approval(SHA)], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3, "ahead_by": 1})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_a_newer_edited_poster_review_hides_the_round_and_refuses(self):
+        newer = {"id": 301, "state": "COMMENTED", "user": {"login": self.PANEL}, "body": "x",
+                 "lastEditedAt": "2026-01-01T00:00:00Z"}
+        fake = FakeGitHub(reviews=[self.panel_round(), newer], pr_override=self.pr(self.MERGE_BASE))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+
+    def test_an_older_edited_poster_review_does_not_hide_the_round(self):
+        older = {"id": 299, "state": "COMMENTED", "user": {"login": self.PANEL}, "body": "x",
+                 "lastEditedAt": "2026-01-01T00:00:00Z"}
+        fake = FakeGitHub(reviews=[older, self.panel_round()], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0, "ahead_by": 2})
+        self.assertEqual((rc, outcome), (0, "approved"))
+
+    def test_no_panel_round_at_all_still_approves(self):
+        # Standalone cursor-approve with no panel round: the record stays optional.
+        fake = FakeGitHub(pr_override=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        cmp.assert_not_called()
+
     # With no bot App the panel posts as `github-actions[bot]`, and the
     # approve-only start gate reads that round: so does the rewrite check.
     ACTIONS = "github-actions[bot]"
