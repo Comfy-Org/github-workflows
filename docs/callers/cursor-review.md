@@ -1028,6 +1028,23 @@ approver to have **write access** to the repo (e.g. `APPROVER_TOKEN` from a
 member of a team with write); without it the approval still lands and each
 resolve logs a warning. Withdrawing an approval later does not unresolve anything.
 
+**Resolving them as soon as they are posted (`resolve_below_threshold_on_post`).**
+The rule above leaves a Low / Nit open on any round that does not approve — a
+round with one Medium and three Lows leaves all four for the author (or an
+agent) to answer, and a reply in a Low then stops the later approval from ever
+resolving it. With `resolve_below_threshold_on_post: true` the **Resolve
+below-threshold threads** step runs after every posted round (after `Auto-approve
+decision`, whatever it decided, including `defer_approval` rounds) and resolves
+the eligible threads right away, replying ``Not actioning: Low finding, at or
+below this repo's `medium` blocking threshold …`` with the same
+`<!-- cursor-review-auto-resolve -->` marker, so the ledger treats it exactly
+like the approve-time reply. Rules 1–4 above still apply per thread, and a
+thread a delta round marked non-gating is still left open; what is dropped is
+only the all-or-nothing condition and the wait for an APPROVE. Nothing is
+resolved while the PR carries `needs-human-review` or `skip-cursor-review`, or
+when its labels cannot be read. The finding is still posted, so anyone who wants
+it actioned can unresolve it or reply. Same write-access requirement, same caps.
+
 **On the blocking caller, give thread events their own concurrency slot.** A
 resolve made with `APPROVER_TOKEN` or the bot App's token (not `GITHUB_TOKEN`)
 fires `pull_request_review_thread: resolved`, and under the PR-number-only group

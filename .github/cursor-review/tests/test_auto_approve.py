@@ -2636,6 +2636,113 @@ class AutoResolveWiringTest(unittest.TestCase):
 
 
 
+
+class ResolveBelowPlanTest(unittest.TestCase):
+    """plan_thread_resolution(all_or_nothing=False): the `resolve-below` path."""
+
+    def test_eligible_threads_are_planned_past_an_open_blocker(self):
+        for blocker in (thread("hi", "high"), thread("med", "medium"), thread("bare", None)):
+            with self.subTest(blocker=blocker["id"]):
+                todo, counts = AA.plan_thread_resolution(
+                    [thread("ok", "low"), thread("ok2", "nit"), blocker], POSTER, "low", all_or_nothing=False)
+                self.assertEqual([t["id"] for t, _ in todo], ["ok", "ok2"])
+                self.assertEqual(counts["resolved"], 2)
+
+    def test_per_thread_rules_are_unchanged(self):
+        todo, _ = AA.plan_thread_resolution([
+            thread("med", "medium"), thread("human-replied", "low", repliers=["alice"]),
+            thread("human-started", "low", author="alice"), thread("bare", None),
+            thread("already", "low", resolved=True),
+        ], POSTER, "low", all_or_nothing=False)
+        self.assertEqual(todo, [])
+
+    def test_default_is_still_all_or_nothing(self):
+        todo, _ = AA.plan_thread_resolution([thread("ok", "low"), thread("med", "medium")], POSTER, "low")
+        self.assertEqual(todo, [])
+
+
+class ResolveBelowCommandTest(unittest.TestCase):
+    """cmd_resolve_below: resolve + 'not actioning' reply after any round."""
+
+    def run_cmd(self, threads, labels=(), threshold="low", poster=POSTER, pr_error=None, labels_raw=None):
+        self.mutations = []
+        fake_graphql = graphql_fake(self.mutations, threads)
+
+        def fake_gh(args, payload=None):
+            if args[:2] == ["api", "graphql"]:
+                return fake_graphql(args)
+            if pr_error:
+                raise pr_error
+            pr = {"head": {"sha": SHA}, "base": {"ref": "main"},
+                  "labels": labels_raw if labels_raw is not None else [{"name": n} for n in labels]}
+            return json.dumps(pr)
+
+        args = argparse.Namespace(threshold=threshold, repo="o/r", pr_number="1", commit_sha=SHA,
+                                  poster_login=poster, approve_scope="full")
+        with mock.patch.object(AA, "gh", fake_gh), \
+                mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                mock.patch.object(GATE, "iter_threads", lambda *a: iter(threads)), \
+                mock.patch.object(AA, "emit", lambda *a: None):
+            return AA.cmd_resolve_below(args)
+
+    def test_resolves_low_and_nit_while_a_medium_is_open(self):
+        rc = self.run_cmd([thread("M", "medium"), thread("L", "low"), thread("N", "nit")])
+        self.assertEqual(rc, 0)
+        self.assertEqual([(k, t) for k, t, _ in self.mutations],
+                         [("recheck", "L"), ("resolve", "L"), ("reply", "L"),
+                          ("recheck", "N"), ("resolve", "N"), ("reply", "N")])
+        reply = self.mutations[2][2]
+        self.assertIn(AA.AUTO_RESOLVE_MARKER, reply)
+        self.assertIn("Not actioning: Low finding, at or below this repo's `low` blocking threshold", reply)
+
+    def test_threshold_medium_resolves_mediums_too(self):
+        self.run_cmd([thread("M", "medium"), thread("H", "high")], threshold="medium")
+        self.assertEqual([t for k, t, _ in self.mutations if k == "resolve"], ["M"])
+
+    def test_hand_off_or_skip_label_resolves_nothing(self):
+        for label in (AA.HUMAN_REVIEW_LABEL, AA.SKIP_REVIEW_LABEL):
+            with self.subTest(label=label):
+                self.assertEqual(self.run_cmd([thread("L", "low")], labels=[label]), 0)
+                self.assertEqual(self.mutations, [])
+
+    def test_unreadable_pr_or_labels_resolves_nothing(self):
+        self.assertEqual(self.run_cmd([thread("L", "low")], pr_error=RuntimeError("boom")), 0)
+        self.assertEqual(self.mutations, [])
+        self.assertEqual(self.run_cmd([thread("L", "low")], labels_raw=True), 0)
+        self.assertEqual(self.mutations, [])
+
+    def test_bad_threshold_resolves_nothing(self):
+        self.assertEqual(self.run_cmd([thread("L", "low")], threshold="bogus"), 0)
+        self.assertEqual(self.mutations, [])
+
+
+class ResolveBelowWiringTest(unittest.TestCase):
+    """The opt-in step: gated, after the decision, never failing the job."""
+
+    def setUp(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as f:
+            self.src = f.read()
+        start = self.src.index("      - name: Resolve below-threshold threads")
+        self.step = self.src[start: self.src.index("\n  dismiss-stale-approval:", start)]
+
+    def test_input_is_opt_in(self):
+        block = self.src[self.src.index("      resolve_below_threshold_on_post:"):]
+        block = block[: block.index("      approve_max_failed_reviewers:")]
+        self.assertIn("type: boolean", block)
+        self.assertIn("default: false", block)
+
+    def test_step_is_gated_and_non_fatal(self):
+        self.assertIn("inputs.resolve_below_threshold_on_post && inputs.approve_max_severity != ''", self.step)
+        self.assertIn("needs.gate.outputs.approve_author_ok != 'false'", self.step)
+        self.assertIn("continue-on-error: true", self.step)
+        self.assertLess(self.src.index("auto-approve.py\" decide"), self.src.index("auto-approve.py\" resolve-below"))
+
+    def test_step_passes_the_poster_login(self):
+        self.assertIn('--poster-login "$POSTER"', self.step)
+        self.assertIn('if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; '
+                      'else POSTER="github-actions[bot]"; fi', self.step)
+
+
 CARD = AA._load_card()
 APPROVER = "cursor-approver"
 
