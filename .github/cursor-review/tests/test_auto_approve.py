@@ -2742,6 +2742,69 @@ class ResolveBelowWiringTest(unittest.TestCase):
         self.assertIn('if [ -n "$BOT_TOKEN" ] && [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; '
                       'else POSTER="github-actions[bot]"; fi', self.step)
 
+    def test_step_resolves_as_the_bot_app_before_the_approver(self):
+        # An approver PAT can approve yet be refused resolveReviewThread
+        # ("Resource not accessible by personal access token"), which failed
+        # every resolve; the App posted the threads, so it resolves them.
+        bot = self.step.index('export GH_TOKEN="$BOT_TOKEN"')
+        approver = self.step.index('export GH_TOKEN="$APPROVER_TOKEN"')
+        fallback = self.step.index('export GH_TOKEN="$FALLBACK_TOKEN"')
+        self.assertLess(bot, approver)
+        self.assertLess(approver, fallback)
+        self.assertIn('if [ -n "$BOT_TOKEN" ]; then\n            export GH_TOKEN="$BOT_TOKEN"', self.step)
+
+    def test_decide_step_keeps_approving_as_the_approver(self):
+        # The approval itself must stay with APPROVER_TOKEN (only it satisfies
+        # the ruleset); only its thread sweep moves to the App (RESOLVER_TOKEN).
+        start = self.src.index("      - name: Auto-approve decision")
+        step = self.src[start: self.src.index("      - name: Resolve below-threshold threads", start)]
+        self.assertLess(step.index('export GH_TOKEN="$APPROVER_TOKEN"'), step.index('export GH_TOKEN="$BOT_TOKEN"'))
+        self.assertIn("RESOLVER_TOKEN: ${{ steps.bot_token.outputs.token }}", step)
+
+
+class ResolverTokenTest(unittest.TestCase):
+    """resolve_eligible_threads runs every call as RESOLVER_TOKEN when set."""
+
+    def run_resolve(self, env):
+        seen = []
+        mutations = []
+        fake_graphql = graphql_fake(mutations, [thread("T1", "low")])
+
+        def fake_gh(args, payload=None):
+            seen.append(os.environ.get("GH_TOKEN"))
+            return fake_graphql(args)
+
+        def fake_iter(owner, name, pr):
+            seen.append(os.environ.get("GH_TOKEN"))
+            return iter([thread("T1", "low")])
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(AA, "gh", fake_gh), \
+                mock.patch.object(AA, "_load_gate_unresolved", lambda: GATE), \
+                mock.patch.object(GATE, "iter_threads", fake_iter), \
+                mock.patch.object(AA, "emit", lambda *a: None):
+            if "RESOLVER_TOKEN" not in env:
+                os.environ.pop("RESOLVER_TOKEN", None)
+            counts = AA.resolve_eligible_threads("o/r", "1", POSTER, "low", SHA)
+            after = os.environ.get("GH_TOKEN")
+        return counts, seen, after, [k for k, _, _ in mutations]
+
+    def test_resolver_token_is_used_for_every_call_and_restored(self):
+        counts, seen, after, kinds = self.run_resolve({"GH_TOKEN": "approver-pat", "RESOLVER_TOKEN": "app-token"})
+        self.assertEqual(counts[AA.RESOLVED], 1)
+        self.assertEqual(kinds, ["recheck", "resolve", "reply"])
+        self.assertEqual(set(seen), {"app-token"})
+        self.assertEqual(after, "approver-pat")
+
+    def test_without_resolver_token_the_ambient_token_is_used(self):
+        _, seen, after, _ = self.run_resolve({"GH_TOKEN": "approver-pat"})
+        self.assertEqual(set(seen), {"approver-pat"})
+        self.assertEqual(after, "approver-pat")
+
+    def test_empty_resolver_token_falls_back_to_the_ambient_token(self):
+        _, seen, _, _ = self.run_resolve({"GH_TOKEN": "approver-pat", "RESOLVER_TOKEN": ""})
+        self.assertEqual(set(seen), {"approver-pat"})
+
 
 CARD = AA._load_card()
 APPROVER = "cursor-approver"

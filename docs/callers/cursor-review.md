@@ -138,6 +138,7 @@ pull-requests: write   # posting the consolidated review (and, at the round cap,
 | `approve_authors` | `''` (everyone) | Per-author opt-in for auto-approve: a comma- or space-separated list of GitHub logins (case-insensitive, leading `@` ignored). A PR whose author is not listed gets auto-approve **off** — `approve_gate` is `off`, no APPROVE or REQUEST_CHANGES is posted, the decision note says *auto-approve not enabled for author `<login>`* — while the panel still reviews and posts its threads and the approver withdraws its own earlier approvals and dismisses its own REQUEST_CHANGES, since narrowing the list moves no head SHA. Empty means every author; a non-empty list that names nobody (`,`, `@`) fails closed and auto-approves no one. See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `approve_scope` | `delta` | What an auto-approve round after the first gates on. `delta`: a finding above `approve_max_severity` blocks only when it sits inside a hunk of the verified incremental block (the changes since the last reviewed commit), re-raises an earlier finding whose thread is still unresolved (the judge names that thread in `repeat_of`, or the finding sits on the path and line of an earlier round's thread that is still open — so a re-raise of an unanswered thread gates without a `repeat_of`), or is High/Critical anywhere in the reviewed diff. Every other finding is still posted, as a thread marked *Outside this round's changes: not blocking auto-approve*, and is never auto-resolved — it stays open for a human (and still counts for the `blocking` gate). Round 1, an incremental block that was unavailable or discarded, an empty one (a pure rebase, or no new-side hunk), one naming a path that cannot be parsed, an unknown prior-review ledger, and a list of earlier open threads that could not be read all fail closed to `full`; so does an explicitly empty value (only the input's own default picks `delta`). The decision note states the scope used, the gating vs non-gating counts, and why each gating finding gated. `full`: every finding counts wherever it sits (the behaviour before this input). The panel reviews the full diff either way. No effect without `approve_max_severity`. |
 | `defer_approval` | `false` | Only for a caller that runs [cursor-approve](cursor-approve.md) after this workflow: a round that would approve still reports `approve_gate` = `pass`, but posts **no** approval and resolves no thread, and withdraws the approver's own earlier auto-approvals and requests for changes instead — so cursor-approve's decide is the only approver. Requests changes as usual. No effect without `approve_max_severity`. |
+| `resolve_below_threshold_on_post` | `false` | Opt-in: after every posted round, whatever it decided (approve, request changes, no decision, or deferred), resolve the posting identity's own threads at or below `approve_max_severity` with a "not actioning" reply, instead of waiting for an approving round with nothing above the threshold open. Same per-thread rules as the approve-time sweep; nothing while `needs-human-review` / `skip-cursor-review` is on the PR. Resolves as the `bot_app_id` App first (it posted the threads), then `APPROVER_TOKEN`, then `GITHUB_TOKEN`. See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `approve_max_failed_reviewers` | `0` | How many panel reviewers may **error** (the cell ran but failed, timed out, or never uploaded) before auto-approve withholds its decision. `0` keeps the strict rule: any reviewer that did not complete means no decision. `N` tolerates up to N errored reviewers and names them in the decision (e.g. "approved with 1/6 reviewers errored: `<model>:edge-case`"). See [auto-approve](#auto-approve). No effect without `approve_max_severity`. |
 | `rereview_command` | `''` (off) | A comment command, e.g. `/review`, that asks for ANOTHER round on the **same commit**. Empty leaves the same-commit dedupe absolute. Set the same value on [`cursor-review-auto-label.yml`](cursor-review-auto-label.md) — that half turns the comment into the label event, this half stops the dedupe from skipping the round it starts; setting only one is a silent no-op. Authorized = an `OWNER` / `MEMBER` / `COLLABORATOR` association on the comment. One request buys one round, and `max_rounds` still applies. See [below](#asking-for-another-round-on-the-same-commit). |
 | `auto_retry_errored_rounds` | `false` | Re-run a round AUTOMATICALLY when it could not decide because **reviewers errored** — provider capacity, a cell timeout — rather than because of anything in the diff. The status card and the standing block say so before it happens, naming the wait. Once per PR (the existing auto-retry ceiling), and `max_rounds` still applies. A round that failed for a structural reason, or that found something above the threshold, is never re-run: the next round would hit the same wall. Needs a token that can relabel — the `bot_app_id` App token or `APPROVER_TOKEN`, not `GITHUB_TOKEN`, whose label edits fire no run. Independent of `rereview_command`: the retry posts no comment and is not authorized by one. No effect without `approve_max_severity`. See [below](#retrying-a-round-the-panel-broke). |
@@ -1000,7 +1001,8 @@ same gate feeds `defer_approval`, so cursor-approve's axes see it too.
 conversation resolved would otherwise hold an approval hostage to the Low / Nit
 threads it approved over. So after an APPROVE is posted **and** the post-write
 re-read confirms the head and base did not move (and no `needs-human-review`
-label landed), the approver identity resolves a thread when all of these hold:
+label landed), the resolving identity — the `bot_app_id` App when one is
+configured, else the approver — resolves a thread when all of these hold:
 
 1. it is unresolved;
 2. its first comment was posted by the identity that posts the findings — the
@@ -1015,18 +1017,22 @@ Each thread is re-read just before it is touched (a reply that landed since the
 snapshot leaves it for a person), then resolved with `resolveReviewThread`, then
 given a reply — ``Resolved by auto-approve: Low finding, at or below the `low`
 threshold, on commit abc1234.`` (hidden marker `<!-- cursor-review-auto-resolve -->`).
-Resolve comes first so a failed resolve leaves no approver reply behind to make
-the thread look human-touched on every later round.
+Resolve comes first so a failed resolve leaves no reply behind to make the
+thread look human-touched on every later round.
 If **any** live thread is above the threshold or unbadged, nothing is resolved,
 not even the eligible ones; a REQUEST_CHANGES or "nothing" round resolves nothing.
 A failure on one thread is logged and skipped: it never undoes the approval. A
 round resolves at most 30 threads and stops after 3 failures in a row (a missing
 permission or a rate limit); the rest wait for the next approving round. The step
 summary logs the resolved / skipped-human / skipped-unbadged /
-skipped-above-threshold / failed / deferred counts. Resolving a thread needs the
-approver to have **write access** to the repo (e.g. `APPROVER_TOKEN` from a
-member of a team with write); without it the approval still lands and each
-resolve logs a warning. Withdrawing an approval later does not unresolve anything.
+skipped-above-threshold / failed / deferred counts. Resolving a thread needs
+**write access** to the repo. Both the approve-time sweep and
+`resolve_below_threshold_on_post` resolve (and reply) as the `bot_app_id` App
+first — it posted the threads — then `APPROVER_TOKEN`, then `GITHUB_TOKEN`; the
+approval itself is still posted as `APPROVER_TOKEN`. The App comes first because
+an approver PAT can approve yet be refused `resolveReviewThread` ("Resource not
+accessible by personal access token"). Without write access the approval still
+lands and each resolve logs a warning. Withdrawing an approval later does not unresolve anything.
 
 **Resolving them as soon as they are posted (`resolve_below_threshold_on_post`).**
 The rule above leaves a Low / Nit open on any round that does not approve — a

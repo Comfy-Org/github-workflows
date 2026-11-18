@@ -766,7 +766,8 @@ on:
           while the PR carries `needs-human-review` or `skip-cursor-review`.
           No effect without `approve_max_severity`, or for an author
           `approve_authors` does not list. Resolving needs write access (the
-          `bot_app_id` App, or APPROVER_TOKEN).
+          `bot_app_id` App, else APPROVER_TOKEN; the App is preferred because
+          it posted the threads, and an approver PAT may be refused).
         type: boolean
         required: false
         default: false
@@ -6674,6 +6675,10 @@ jobs:
         env:
           APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
+          # The approve-time thread sweep resolves as the bot App (the threads'
+          # poster) when there is one, not as GH_TOKEN's approver: an approver
+          # PAT can approve yet be refused resolveReviewThread. Empty → GH_TOKEN.
+          RESOLVER_TOKEN: ${{ steps.bot_token.outputs.token }}
           APP_SLUG: ${{ steps.bot_token.outputs.app-slug }}
           FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THRESHOLD: ${{ inputs.approve_max_severity }}
@@ -6809,13 +6814,17 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           APPROVE_SCOPE: ${{ steps.approve.outputs.approve_scope_effective || inputs.approve_scope }}
         run: |
-          # Same identity precedence as `Auto-approve decision`: resolving needs
-          # write access, and the thread events it fires get their own
-          # concurrency slot on a blocking caller (docs/callers/cursor-review.md).
-          if [ -n "$APPROVER_TOKEN" ]; then
-            export GH_TOKEN="$APPROVER_TOKEN"
-          elif [ -n "$BOT_TOKEN" ]; then
+          # Resolving needs write access, and the thread events it fires get
+          # their own concurrency slot on a blocking caller
+          # (docs/callers/cursor-review.md). The bot App comes FIRST — the
+          # reverse of `Auto-approve decision`, which must approve as the
+          # approver: the App posted these threads, while an approver PAT can
+          # approve yet be refused resolveReviewThread ("Resource not
+          # accessible by personal access token"), failing every resolve.
+          if [ -n "$BOT_TOKEN" ]; then
             export GH_TOKEN="$BOT_TOKEN"
+          elif [ -n "$APPROVER_TOKEN" ]; then
+            export GH_TOKEN="$APPROVER_TOKEN"
           else
             export GH_TOKEN="$FALLBACK_TOKEN"
           fi

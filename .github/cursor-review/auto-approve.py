@@ -170,7 +170,8 @@ On a trusted round:
 After an APPROVE that survived the post-write head/base re-check — and only
 then — the poster's own threads (``--poster-login``) whose badge is at or below
 the threshold, and in which no other account has commented, are resolved and
-then get a reply from the approver identity (``AUTO_RESOLVE_MARKER``), so a
+then get a reply (``AUTO_RESOLVE_MARKER``) — both as the `bot_app_id` App when
+the step passes its token (``RESOLVER_TOKEN``), else as the approver — so a
 ruleset that requires resolved conversations does not hold the approval hostage
 to nits. If any live thread is above the threshold or unbadged, nothing is
 resolved. Each thread is re-read just before it is resolved; at most
@@ -1518,7 +1519,31 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
     after any posted round (see cmd_resolve_below). Every
     failure is logged and skipped: nothing here is fatal, and nothing here undoes
     the approval. Returns the counts it logged (plus ``failed``).
+
+    Every call here runs as ``RESOLVER_TOKEN`` when the step provides one (the
+    `bot_app_id` App's token: the identity that posted these threads), else
+    the ambient ``GH_TOKEN``. `decide` acts as the approver, and an approver
+    PAT can approve yet be refused ``resolveReviewThread`` ("Resource not
+    accessible by personal access token"), which failed every resolve.
     """
+    token = os.environ.get("RESOLVER_TOKEN", "")
+    if not token:
+        return _resolve_eligible_threads(repo, pr, poster_login, threshold, commit_sha,
+                                         honour_non_gating, all_or_nothing, reply)
+    saved = os.environ.get("GH_TOKEN")
+    os.environ["GH_TOKEN"] = token
+    try:
+        return _resolve_eligible_threads(repo, pr, poster_login, threshold, commit_sha,
+                                         honour_non_gating, all_or_nothing, reply)
+    finally:
+        if saved is None:
+            os.environ.pop("GH_TOKEN", None)
+        else:
+            os.environ["GH_TOKEN"] = saved
+
+
+def _resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str,
+                              honour_non_gating: bool, all_or_nothing: bool, reply) -> dict:
     counts = {RESOLVED: 0, SKIP_HUMAN: 0, SKIP_UNBADGED: 0, SKIP_ABOVE: 0, SKIP_NON_GATING: 0,
               "failed": 0, "deferred": 0}
     if not poster_login:
@@ -1553,8 +1578,8 @@ def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, c
                 counts[SKIP_HUMAN] += 1
                 streak = 0
                 continue
-            # Resolve FIRST, reply second. The reply is from the approver
-            # identity, so a reply left on a thread whose resolve then failed
+            # Resolve FIRST, reply second. The reply is from the resolving
+            # identity (RESOLVER_TOKEN's, else the approver's), so a reply left on a thread whose resolve then failed
             # would make it SKIP_HUMAN forever (or, approver == poster, be
             # duplicated every round). A resolved thread is never re-planned,
             # so a failed reply costs only the explanation.
