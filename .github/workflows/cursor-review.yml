@@ -766,8 +766,9 @@ on:
           while the PR carries `needs-human-review` or `skip-cursor-review`.
           No effect without `approve_max_severity`, or for an author
           `approve_authors` does not list. Resolving needs write access (the
-          `bot_app_id` App, else APPROVER_TOKEN; the App is preferred because
-          it posted the threads, and an approver PAT may be refused).
+          `bot_app_id` App, else APPROVER_TOKEN, else GITHUB_TOKEN; the App is
+          preferred because it posted the threads, and an approver PAT may be
+          refused).
         type: boolean
         required: false
         default: false

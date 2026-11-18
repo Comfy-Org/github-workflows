@@ -1026,12 +1026,17 @@ round resolves at most 30 threads and stops after 3 failures in a row (a missing
 permission or a rate limit); the rest wait for the next approving round. The step
 summary logs the resolved / skipped-human / skipped-unbadged /
 skipped-above-threshold / failed / deferred counts. Resolving a thread needs
-**write access** to the repo. Both the approve-time sweep and
-`resolve_below_threshold_on_post` resolve (and reply) as the `bot_app_id` App
-first — it posted the threads — then `APPROVER_TOKEN`, then `GITHUB_TOKEN`; the
-approval itself is still posted as `APPROVER_TOKEN`. The App comes first because
-an approver PAT can approve yet be refused `resolveReviewThread` ("Resource not
-accessible by personal access token"). Without write access the approval still
+**write access** to the repo. This workflow's approve-time sweep (in `Auto-approve
+decision`) and `resolve_below_threshold_on_post` resolve (and reply) as the
+`bot_app_id` App first — it posted the threads — then `APPROVER_TOKEN`, then
+`GITHUB_TOKEN`; the approval itself is still posted as `APPROVER_TOKEN`. The App
+comes first because an approver PAT can approve yet be refused
+`resolveReviewThread` ("Resource not accessible by personal access token").
+Under `defer_approval`, this workflow's decide resolves nothing and the sweep is
+[cursor-approve](cursor-approve.md)'s, which has no App token and still resolves
+as `APPROVER_TOKEN` — pair it with `resolve_below_threshold_on_post` if that
+token cannot resolve. A thread that carries an earlier auto-resolve reply and was
+unresolved since is left for a person. Without write access the approval still
 lands and each resolve logs a warning. Withdrawing an approval later does not unresolve anything.
 
 **Resolving them as soon as they are posted (`resolve_below_threshold_on_post`).**

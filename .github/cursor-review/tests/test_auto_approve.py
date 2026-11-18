@@ -2685,6 +2685,18 @@ class ResolveBelowCommandTest(unittest.TestCase):
                 mock.patch.object(AA, "emit", lambda *a: None):
             return AA.cmd_resolve_below(args)
 
+    def test_a_thread_reopened_after_an_auto_resolve_is_left_alone(self):
+        # The App's own marker reply does not trip only_poster_spoke, so a
+        # person who unresolves the thread must not see it re-resolved (and
+        # re-replied) every round.
+        t = thread("R", "low", repliers=[POSTER])
+        t["participants"]["nodes"][1]["body"] = "Not actioning: Low finding.\n\n" + AA.AUTO_RESOLVE_MARKER
+        self.assertEqual(self.run_cmd([t]), 0)
+        self.assertEqual([(k, tid) for k, tid, _ in self.mutations], [("recheck", "R")])
+
+    def test_recheck_query_reads_comment_bodies(self):
+        self.assertIn("nodes { author { __typename login } body }", AA.THREAD_RECHECK_QUERY)
+
     def test_resolves_low_and_nit_while_a_medium_is_open(self):
         rc = self.run_cmd([thread("M", "medium"), thread("L", "low"), thread("N", "nit")])
         self.assertEqual(rc, 0)

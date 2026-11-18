@@ -1355,7 +1355,7 @@ query($threadId: ID!) {
       isResolved
       participants: comments(first: 100) {
         totalCount
-        nodes { author { __typename login } }
+        nodes { author { __typename login } body }
       }
     }
   }
@@ -1506,7 +1506,18 @@ def still_eligible(thread_id: str, poster_login: str) -> bool:
     node = (_graphql(THREAD_RECHECK_QUERY, threadId=thread_id).get("data") or {}).get("node")
     if not isinstance(node, dict):
         raise RuntimeError("thread re-read returned no node")
-    return not node.get("isResolved") and only_poster_spoke(node, poster_login)
+    return not node.get("isResolved") and only_poster_spoke(node, poster_login) and not already_auto_resolved(node)
+
+
+def already_auto_resolved(node: dict) -> bool:
+    """True when a comment in the thread carries AUTO_RESOLVE_MARKER: an earlier
+    sweep resolved it, so an unresolved thread like this was reopened by a
+    person and is theirs. Needed since the sweep can reply AS the poster (the
+    App, via RESOLVER_TOKEN or resolve-below's precedence): that reply never
+    trips only_poster_spoke the way an approver-authored reply did, and the
+    thread would otherwise be re-resolved and re-replied every round."""
+    nodes = ((node or {}).get("participants") or {}).get("nodes") or []
+    return any(AUTO_RESOLVE_MARKER in ((n or {}).get("body") or "") for n in nodes)
 
 
 def resolve_eligible_threads(repo: str, pr, poster_login: str, threshold: str, commit_sha: str,
