@@ -411,9 +411,12 @@ jobs:
         # login is needed — panel-threads.py selects threads by the consolidated
         # marker plus a Bot author, not by this identity. continue-on-error: the
         # panel context is an aid, so a failed read is no context, never a failed
-        # start phase (which would skip the axes).
+        # start phase (which would skip the axes). The script gives up after its
+        # own 180s budget (an empty file + ::warning::); timeout-minutes backstops
+        # that inside the job's 10 minutes, which continue-on-error does not survive.
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.panel_threads_context }}
         continue-on-error: true
+        timeout-minutes: 4
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           REPO: ${{ github.repository }}

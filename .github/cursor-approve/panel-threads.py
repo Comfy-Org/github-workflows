@@ -43,6 +43,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -61,6 +62,13 @@ MAX_REPLIES = 10
 # on) go last, resolved below open, and a higher severity ahead of a lower one,
 # so the open, live, most-severe threads are the ones that survive a cap.
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "nit": 4}
+# The whole collection's budget. The start job's timeout-minutes is 10 and the
+# axes run only if it succeeds, so the read must give up well inside it — past
+# this it degrades to no context, exactly like a failed query — and a page cap
+# so a malformed pageInfo (hasNextPage with a repeated cursor) cannot loop.
+DEADLINE_SECONDS = 180
+MAX_PAGES = 10
+QUERY_TIMEOUT_SECONDS = 120
 
 
 def _load(rel_path: str, name: str):
@@ -96,22 +104,30 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
         nodes {
           isResolved
           isOutdated
+          resolvedBy { login }
           path
           line
           startLine
+          originalLine
+          originalStartLine
           firstComment: comments(first: 1) {
             nodes {
               # __typename tells a Bot (a GraphQL login with no `[bot]` suffix)
               # from a user who merely shares the name.
               author { __typename login }
               body
-              pullRequestReview { body }
+              pullRequestReview { body state }
             }
           }
-          comments(first: 50) {
+          # The NEWEST replies: the latest is usually the author's current
+          # position or a "fixed in <sha>", and taking the head would let
+          # early replies push it out. One more than MAX_REPLIES, since on a
+          # short thread the window also holds the finding itself.
+          comments(last: 11) {
             totalCount
             nodes {
               author { __typename login }
+              authorAssociation
               body
             }
           }
@@ -123,7 +139,7 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
 """
 
 
-def run_graphql(owner: str, name: str, pr: int, cursor):
+def run_graphql(owner: str, name: str, pr: int, cursor, timeout: float = QUERY_TIMEOUT_SECONDS):
     """One page of the reviewThreads query via the gh CLI.
 
     Raises RuntimeError on a failed or timed-out query; `main` catches it and
@@ -138,26 +154,39 @@ def run_graphql(owner: str, name: str, pr: int, cursor):
     ]
     args += ["-F", "cursor=null"] if cursor is None else ["-f", f"cursor={cursor}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("GraphQL query timed out after 120s") from None
+        raise RuntimeError(f"GraphQL query timed out after {timeout:.0f}s") from None
     if result.returncode != 0:
         raise RuntimeError(f"GraphQL query failed: {result.stderr.strip()}")
     return json.loads(result.stdout)
 
 
-def iter_review_threads(owner: str, name: str, pr: int):
-    """Yield every review thread node on the PR, paging transparently."""
+def iter_review_threads(owner: str, name: str, pr: int, deadline_s: float = DEADLINE_SECONDS,
+                        max_pages: int = MAX_PAGES, clock=time.monotonic):
+    """Yield every review thread node on the PR, paging transparently.
+
+    Raises RuntimeError once `deadline_s` or `max_pages` is spent: each query is
+    given only what remains of the budget, so the whole read is bounded, not
+    just each page.
+    """
     cursor = None
-    while True:
-        data = run_graphql(owner, name, pr, cursor)
+    end = clock() + deadline_s
+    for _ in range(max_pages):
+        remaining = end - clock()
+        if remaining <= 0:
+            raise RuntimeError(f"collection exceeded its {deadline_s:.0f}s budget")
+        data = run_graphql(owner, name, pr, cursor, timeout=min(QUERY_TIMEOUT_SECONDS, remaining))
         threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
         for thread in threads["nodes"]:
             yield thread
         page = threads["pageInfo"]
         if not page["hasNextPage"]:
             return
+        if not page.get("endCursor") or page["endCursor"] == cursor:
+            raise RuntimeError("hasNextPage with no new endCursor")
         cursor = page["endCursor"]
+    raise RuntimeError(f"more than {max_pages} pages of review threads")
 
 
 def _first_comment(thread: dict) -> dict:
@@ -177,6 +206,10 @@ def is_panel_thread(thread: dict) -> bool:
         return False
     review = first.get("pullRequestReview") or {}
     if not (review.get("body") or "").startswith(CONSOLIDATED_MARKER):
+        return False
+    # A dismissed review is the documented way to ask for a fresh one, so its
+    # threads no longer speak for the panel (build-ledger drops them too).
+    if review.get("state") == "DISMISSED":
         return False
     return ((first.get("author") or {}).get("__typename") or "") == BOT_USER_TYPE
 
@@ -206,31 +239,42 @@ def build_entry(thread: dict) -> dict:
 
     comment_block = thread.get("comments") or {}
     nodes = comment_block.get("nodes") or []
+    total = comment_block.get("totalCount")
+    # `comments` is the thread's TAIL. When it reaches back to the start (the
+    # window holds every comment) nodes[0] is the finding again; otherwise every
+    # node is a reply.
+    if not isinstance(total, int) or total <= len(nodes):
+        nodes = nodes[1:]
     replies = []
-    # nodes[0] is the finding again (the `comments` alias starts from the first);
-    # the replies are everything after it.
-    for comment in nodes[1:]:
+    for comment in nodes:
         if not isinstance(comment, dict):
             continue
         author = (comment.get("author") or {}).get("login") or "(unknown)"
+        association = comment.get("authorAssociation")
         replies.append({"author": _utf8(author),
+                        "association": _utf8(association) if isinstance(association, str) else "",
                         "body": _utf8(_truncate(comment.get("body") or "", MAX_REPLY_CHARS))})
-    # More than the page carried, or more than we keep, is a truncation.
-    total = comment_block.get("totalCount")
-    replies_truncated = (isinstance(total, int) and total > len(nodes)) or len(replies) > MAX_REPLIES
-    replies = replies[:MAX_REPLIES]
+    # Keep the newest; more replies on the thread than we keep is a truncation.
+    reply_total = total - 1 if isinstance(total, int) else len(replies)
+    replies = replies[-MAX_REPLIES:]
+    replies_truncated = reply_total > len(replies)
 
-    line = thread.get("line")
-    if isinstance(line, bool) or not isinstance(line, int):
-        line = thread.get("startLine")
-    if isinstance(line, bool) or not isinstance(line, int):
-        line = None
+    line = None
+    # An outdated thread has no current `line`/`startLine`; its original anchor
+    # still names where the finding was.
+    for key in ("line", "startLine", "originalLine", "originalStartLine"):
+        value = thread.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            line = value
+            break
+    resolved_by = (thread.get("resolvedBy") or {}).get("login")
 
     return {
         "path": _utf8(thread.get("path") or ""),
         "line": line,
         "severity": severity,  # a lowercase label or None
         "resolved": bool(thread.get("isResolved")),
+        "resolved_by": _utf8(resolved_by) if isinstance(resolved_by, str) else "",
         "outdated": bool(thread.get("isOutdated")),
         "finding": _utf8(finding),
         "replies": replies,
