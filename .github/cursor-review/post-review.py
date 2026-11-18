@@ -2030,16 +2030,22 @@ def strip_severity_badge(severity: str, body: str) -> str:
     return body[len(badge):] if body.startswith(badge) else body
 
 
-def render_round_sentinel(head: str, base: str, merge_base: str) -> str:
+def render_round_sentinel(head: str, base: str, merge_base: str, base_ref: str = "") -> str:
     """The round sentinel: what THIS round reviewed, and what it diffed against.
 
     Read back by build-ledger.py from the last consolidated review, and used by the
     next round's incremental block to pin the OLD patch to the merge base this round
     used rather than recomputing one from a base that may since have moved.
 
-    Every field is a 40-hex commit SHA or the empty string — see `_ROUND_SHA_RE`. The
-    JSON is sorted-key and separator-tight so the line is byte-stable across rounds,
-    which is what lets a reader pin the opener as one exact literal.
+    Every SHA field is a 40-hex commit SHA or the empty string — see `_ROUND_SHA_RE`.
+    `base_ref` is the name of the base BRANCH this round reviewed against (not a SHA):
+    hex-encoded so no ref name can carry `-->`, `"`, a newline or a `::` workflow
+    command into the comment or whatever echoes it, exactly as auto-approve.py's own
+    base marker encodes it. auto-approve.py's `approve-only` reads it back to drop the
+    axes-only lane when the PR has been retargeted since the panel reviewed it (the
+    head-to-head compare the lane scopes against never sees the base). Empty when
+    unknown. The JSON is sorted-key and separator-tight so the line is byte-stable
+    across rounds, which is what lets a reader pin the opener as one exact literal.
     """
 
     def field(value) -> str:
@@ -2047,7 +2053,12 @@ def render_round_sentinel(head: str, base: str, merge_base: str) -> str:
         return text if _ROUND_SHA_RE.match(text) else ""
 
     payload = json.dumps(
-        {"base": field(base), "head": field(head), "merge_base": field(merge_base)},
+        {
+            "base": field(base),
+            "base_ref": (base_ref or "").strip().encode("utf-8").hex(),
+            "head": field(head),
+            "merge_base": field(merge_base),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -2956,6 +2967,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--base-ref",
+        default="",
+        help=(
+            "The PR's base-branch NAME for this round, recorded (hex-encoded) in the "
+            "round sentinel. auto-approve.py's approve-only reads it to drop the "
+            "axes-only lane when the PR has been retargeted since this round. Empty "
+            "(unknown) is recorded as empty, which the reader fails closed on."
+        ),
+    )
+    parser.add_argument(
         "--merge-base-sha",
         default="",
         help=(
@@ -3031,7 +3052,7 @@ def main():
     # shape outright besides, so a sentinel there could only ever be misleading; the
     # all-failed body carries no such shape, which is why withholding it is the control.
     review_header = "{}\n{}".format(
-        header, render_round_sentinel(args.commit_sha, args.base_sha, args.merge_base_sha)
+        header, render_round_sentinel(args.commit_sha, args.base_sha, args.merge_base_sha, args.base_ref)
     )
     banners = ""
     if args.notice:

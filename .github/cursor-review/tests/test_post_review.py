@@ -5333,6 +5333,8 @@ if __name__ == "__main__":
 HEAD_40 = "a" * 40
 BASE_40 = "b" * 40
 MERGE_BASE_40 = "c" * 40
+BASE_REF_NAME = "main"
+BASE_REF_HEX = BASE_REF_NAME.encode("utf-8").hex()
 
 
 class RoundSentinelTest(PostHarness, unittest.TestCase):
@@ -5350,7 +5352,7 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
     the cases below are the only ones that pass a real 40-hex `commit_sha`.
     """
 
-    ARGV = ["--base-sha", BASE_40, "--merge-base-sha", MERGE_BASE_40]
+    ARGV = ["--base-sha", BASE_40, "--base-ref", BASE_REF_NAME, "--merge-base-sha", MERGE_BASE_40]
 
     def _sentinel_line(self, body):
         lines = [
@@ -5385,8 +5387,29 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
         self._assert_directly_under_the_header(payload["body"])
         self.assertEqual(
             self._payload(payload["body"]),
-            {"base": BASE_40, "head": HEAD_40, "merge_base": MERGE_BASE_40},
+            {"base": BASE_40, "base_ref": BASE_REF_HEX, "head": HEAD_40, "merge_base": MERGE_BASE_40},
         )
+
+    def test_the_base_branch_name_is_recorded_hex_encoded(self):
+        """The base REF (not a SHA) rides the sentinel hex-encoded, so no branch name
+        can carry `-->`, a newline or a `::` command into the comment. approve-only
+        decodes it to drop the axes-only lane on a retarget."""
+        payload = self.run_main(
+            [finding("app.py", 11)],
+            commit_sha=HEAD_40,
+            extra_argv=["--base-sha", BASE_40, "--base-ref", "release/1.2", "--merge-base-sha", MERGE_BASE_40],
+        )[0]
+        encoded = self._payload(payload["body"])["base_ref"]
+        self.assertEqual(bytes.fromhex(encoded).decode("utf-8"), "release/1.2")
+        self.assertNotIn("/", encoded, "the ref is hex, not raw")
+
+    def test_an_unknown_base_ref_is_recorded_empty(self):
+        payload = self.run_main(
+            [finding("app.py", 11)],
+            commit_sha=HEAD_40,
+            extra_argv=["--base-sha", BASE_40, "--merge-base-sha", MERGE_BASE_40],
+        )[0]
+        self.assertEqual(self._payload(payload["body"])["base_ref"], "")
 
     def test_the_no_findings_body_carries_it(self):
         payload = self.run_main([], commit_sha=HEAD_40, extra_argv=self.ARGV)[0]
@@ -5487,7 +5510,8 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
                 )
                 expected = "a" * 40 if bad and bad.strip() == "a" * 40 else ""
                 self.assertEqual(
-                    payload, {"base": expected, "head": expected, "merge_base": expected}
+                    payload,
+                    {"base": expected, "base_ref": "", "head": expected, "merge_base": expected},
                 )
 
     def test_an_unresolvable_merge_base_is_recorded_as_empty_not_dropped(self):
@@ -5501,16 +5525,16 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
         )[0]
         self.assertEqual(
             self._payload(payload["body"]),
-            {"base": BASE_40, "head": HEAD_40, "merge_base": ""},
+            {"base": BASE_40, "base_ref": "", "head": HEAD_40, "merge_base": ""},
         )
 
     def test_the_payload_is_one_line_with_sorted_keys(self):
-        rendered = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40)
+        rendered = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40, BASE_REF_NAME)
         self.assertNotIn("\n", rendered)
         self.assertEqual(
             rendered,
             '<!-- cursor-review:round v1 '
-            f'{{"base":"{BASE_40}","head":"{HEAD_40}","merge_base":"{MERGE_BASE_40}"}} -->',
+            f'{{"base":"{BASE_40}","base_ref":"{BASE_REF_HEX}","head":"{HEAD_40}","merge_base":"{MERGE_BASE_40}"}} -->',
         )
 
     # -- containment --------------------------------------------------------- #
@@ -5569,7 +5593,7 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
         self._assert_directly_under_the_header(body)
         self.assertEqual(
             BL._parse_round_sentinel(body),
-            {"base": BASE_40, "head": HEAD_40, "merge_base": MERGE_BASE_40},
+            {"base": BASE_40, "base_ref": BASE_REF_HEX, "head": HEAD_40, "merge_base": MERGE_BASE_40},
         )
 
     def test_a_clamped_body_still_hands_the_next_round_its_merge_base(self):

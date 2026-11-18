@@ -3958,22 +3958,25 @@ def _approve_only_cap(args) -> int:
     return min(int(match.group(1)), _load_card().RECHECK_HEADS_KEPT) if match else 0
 
 
-def panel_round_head(reviews: list, poster_login: str) -> str:
-    """The commit the latest panel round reviewed, from its round sentinel; ""
-    when none can be read.
+def _latest_panel_round(reviews: list, poster_login: str):
+    """The latest panel round `poster_login` posted, as its review dict, or None.
 
     The newest consolidated review `poster_login` — the identity the panel
     posts as, round-cap's — left that reviewed something (no NON_ROUND_BANNERS).
     Any other bot is ignored, since the marker is a public constant: its review
     must not move the anchor past changes the panel never saw. An axes-only
-    re-check posts no consolidated review, so this stays on the panel's commit
+    re-check posts no consolidated review, so this stays on the panel's round
     across re-checks — unlike the card's "Reviewed commit". No poster, an
-    edited review newer than it, or a sentinel-less one, reads as "" (fail
-    closed). `github-actions[bot]` is accepted when it IS the poster: with no
-    bot App the panel posts as it."""
+    edited review newer than it, or none at all, reads as None (fail closed).
+    `github-actions[bot]` is accepted when it IS the poster: with no bot App the
+    panel posts as it.
+
+    `panel_round_head` and `panel_round_base_ref` both read from this ONE
+    review, so the commit a push is scoped against and the base that commit was
+    reviewed against can never come from two different rounds."""
     poster = (poster_login or "").strip().lower()
     if not poster:
-        return ""
+        return None
     marker = _load_post_review().CONSOLIDATED_MARKER
     latest, edited = None, []
     for r in reviews:
@@ -3992,8 +3995,30 @@ def panel_round_head(reviews: list, poster_login: str) -> str:
         if latest is None or _review_id(r) > _review_id(latest):
             latest = r
     if latest is None or any(rid > _review_id(latest) for rid in edited):
-        return ""
-    return round_head(latest)
+        return None
+    return latest
+
+
+def panel_round_head(reviews: list, poster_login: str) -> str:
+    """The commit the latest panel round reviewed, from its round sentinel; ""
+    when none can be read (see `_latest_panel_round`)."""
+    return round_head(_latest_panel_round(reviews, poster_login) or {})
+
+
+def panel_round_base_ref(reviews: list, poster_login: str) -> str:
+    """The base branch the latest panel round reviewed against, from its round
+    sentinel; "" when no round, no sentinel, or no recorded base ref can be read
+    (see `_latest_panel_round` and `round_base_ref`). "" fails closed: the
+    approve-only base check refuses the axes-only lane on an unreadable base."""
+    return round_base_ref(_latest_panel_round(reviews, poster_login) or {})
+
+
+def _printable_base(ref: str) -> str:
+    """A base ref safe to echo into the log and job summary, backticked, or a
+    placeholder when it is not. A ref is the PR author's text; echoing it raw
+    would let one carrying a newline or `::` smuggle a workflow command, the same
+    reason `approve_only_paths_scope` screens an out-of-scope path name."""
+    return f"`{ref}`" if REGENERATED_PATH_RE.fullmatch(ref or "") else "a base with an unprintable name"
 
 
 def approve_only_paths_scope(repo: str, reviewed: str, head: str, globs: list):
@@ -4101,8 +4126,24 @@ def cmd_approve_only(args) -> int:
     # other — never fail open.
     globs = (getattr(args, "approve_only_paths", "") or "").split()
     if globs:
-        reason, summary = approve_only_paths_scope(
-            args.repo, panel_round_head(reviews, getattr(args, "poster_login", "") or ""), head, globs)
+        poster = getattr(args, "poster_login", "") or ""
+        # The scope compares the push head-to-head against the panel's commit and
+        # never looks at the PR's base. A retarget since that round (base A → base
+        # B) moves the base out from under a compare that still reads docs-only, so
+        # the axes alone would approve a diff against B that no panel round read.
+        # Require the live base to be the one the panel reviewed; a missing or
+        # unreadable record refuses too (a round from before the base was recorded
+        # cannot prove it was not retargeted since). A same-ref advance (main moving
+        # on) keeps the same ref and is deliberately NOT a mismatch.
+        _, live_base = pr_head_base(pr)
+        reviewed_base = panel_round_base_ref(reviews, poster)
+        if not reviewed_base:
+            return skip("the panel round recorded no base branch, so a retarget since it reviewed cannot be "
+                        "ruled out; the push needs a full round")
+        if reviewed_base != live_base:
+            return skip(f"the PR's base is now {_printable_base(live_base)} but the panel reviewed against "
+                        f"{_printable_base(reviewed_base)} (a retarget), so the push needs a full round")
+        reason, summary = approve_only_paths_scope(args.repo, panel_round_head(reviews, poster), head, globs)
         if reason:
             return skip(reason)
         emit(f"📁 **Approver-only path scope** — {summary}.")
@@ -4251,6 +4292,25 @@ def round_head(panel: dict) -> str:
     except (ValueError, AttributeError, RecursionError):
         return ""
     return head if isinstance(head, str) and SHA_HEX_RE.fullmatch(head) else ""
+
+
+def round_base_ref(panel: dict) -> str:
+    """The base branch a consolidated review's round sentinel recorded, decoded
+    from the hex post-review.py wrote; "" when the body carries no sentinel, the
+    sentinel records no `base_ref` (a round from before this field existed), or
+    the record is garbled. Fails closed: a reader treats "" as "base unknown"
+    and refuses the axes-only lane on it."""
+    match = ROUND_SENTINEL_RE.search(_lf(panel.get("body")))
+    try:
+        encoded = json.loads(match.group(1)).get("base_ref") if match else ""
+    except (ValueError, AttributeError, RecursionError):
+        return ""
+    if not isinstance(encoded, str) or not encoded:
+        return ""
+    try:
+        return bytes.fromhex(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
 
 
 def _review_id(r: dict):

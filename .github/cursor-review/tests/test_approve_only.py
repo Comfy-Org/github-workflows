@@ -591,10 +591,16 @@ def cmp_data(filenames, status="ahead", behind=0, files=None):
     return {"status": status, "ahead_by": len(listed), "behind_by": behind, "total_commits": 1, "files": listed}
 
 
-def panel_round(rid, sha=X, login=POSTER, **extra):
-    """A consolidated review carrying post-review.py's round sentinel for `sha`."""
+def panel_round(rid, sha=X, login=POSTER, base_ref="main", **extra):
+    """A consolidated review carrying post-review.py's round sentinel for `sha`.
+
+    `base_ref` is the base branch the round reviewed against, hex-encoded as
+    post-review.py writes it; "main" matches FakeGitHub's PR base, and "" models
+    a round from before the base was recorded."""
     marker = AA._load_post_review().CONSOLIDATED_MARKER
-    sentinel = f'<!-- cursor-review:round v1 {{"base":"{Z}","head":"{sha}","merge_base":"{Z}"}} -->'
+    encoded = base_ref.encode("utf-8").hex() if base_ref else ""
+    sentinel = (f'<!-- cursor-review:round v1 '
+                f'{{"base":"{Z}","base_ref":"{encoded}","head":"{sha}","merge_base":"{Z}"}} -->')
     return {"id": rid, "user": {"login": login}, "state": "COMMENTED", "commit_id": sha,
             "body": f"{marker}\n\n{sentinel}\n\nfindings", "submitted_at": "2026-10-12T07:00:00Z", **extra}
 
@@ -632,6 +638,31 @@ class PanelRoundHeadTest(unittest.TestCase):
         # The card's "Reviewed commit" moves to each re-checked head; the panel's does not.
         reviews = [panel_round(3, X), block(rid=9, sha=Y), REREVIEW.approval(10, Y)]
         self.assertEqual(AA.panel_round_head(reviews, POSTER), X)
+
+
+class PanelRoundBaseRefTest(unittest.TestCase):
+    """The retarget check's anchor: the base the last panel round reviewed against."""
+
+    def test_the_newest_round_names_its_base_decoded_from_hex(self):
+        self.assertEqual(
+            AA.panel_round_base_ref([panel_round(3, X, base_ref="old"), panel_round(5, Z, base_ref="main")], POSTER),
+            "main", "the base comes from the SAME round as the commit — the newest")
+        self.assertEqual(AA.panel_round_base_ref([panel_round(5, Z, base_ref="release/1.2")], POSTER), "release/1.2")
+
+    def test_no_round_a_missing_base_a_forgery_or_an_edited_newest_reads_empty(self):
+        self.assertEqual(AA.panel_round_base_ref([block()], POSTER), "", "no panel round")
+        self.assertEqual(AA.panel_round_base_ref([panel_round(3, X, base_ref="")], POSTER), "",
+                         "a round from before the base was recorded")
+        self.assertEqual(AA.panel_round_base_ref([panel_round(3, X, login="dev")], POSTER), "", "not the poster")
+        self.assertEqual(
+            AA.panel_round_base_ref([panel_round(3, X), panel_round(5, Z, edited=True)], POSTER), "",
+            "an edited newer round rules out the older one")
+
+    def test_a_garbled_hex_base_reads_empty(self):
+        forged = {"id": 5, "user": {"login": POSTER}, "state": "COMMENTED",
+                  "body": f"{AA._load_post_review().CONSOLIDATED_MARKER}\n\n"
+                          '<!-- cursor-review:round v1 {"base":"","base_ref":"zz","head":"","merge_base":""} -->\n'}
+        self.assertEqual(AA.panel_round_base_ref([forged], POSTER), "")
 
 
 class PathScopeUnitTest(unittest.TestCase):
@@ -756,12 +787,56 @@ class PathScopeEligibilityTest(Base):
                                         compare=cmp_data(["docs/guide.md"], status="diverged", behind=4)), 0)
         self.assertEqual(self.outputs()["go"], "false")
 
+    def test_a_retarget_since_the_panel_round_falls_through(self):
+        # Panel reviewed against `feature-x`; the PR now targets `main` (live base).
+        # The head-to-head compare is still docs-only, but the diff against `main`
+        # is one no panel round read — so the push needs a full round, not the axes.
+        fake = self.fake(reviews=[panel_round(3, X, base_ref="feature-x"), block()])
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.assertEqual(fake.patches, [], "nothing is announced on the card")
+
+    def test_a_panel_round_without_a_recorded_base_falls_through(self):
+        # A round from before the base was recorded cannot prove it was not retargeted.
+        self.assertEqual(self.run_stage(self.fake(reviews=[panel_round(3, X, base_ref=""), block()]),
+                                        "check", paths="docs/**", compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_the_same_base_advancing_still_goes(self):
+        # Out of scope by design: the base ref is unchanged, so a docs-only push is
+        # re-checked even though `main` itself may have moved on since the round.
+        self.assertEqual(self.run_stage(self.fake(), "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "true")
+
+    def test_an_unprintable_live_base_still_falls_through_without_crashing(self):
+        # The base is the PR author's text; a mismatch on a ref carrying a newline
+        # or a `::` command must still fall through, and never reach the log raw.
+        fake = self.fake(reviews=[panel_round(3, X, base_ref="main"), block()])
+        fake.pr["base"]["ref"] = "x\n::error::Approved"
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+
     def test_an_empty_scope_keeps_todays_behaviour_without_a_compare(self):
         # No compare stub: if the empty-scope path read the compare API, the
         # FakeGitHub would raise on the unexpected call.
         fake = self.fake()
         self.assertEqual(self.run_stage(fake, "check", paths=""), 0)
         self.assertEqual(self.outputs()["eligible"], "true")
+
+
+class PrintableBaseTest(unittest.TestCase):
+    """The base ref is echoed into the log and job summary only when it is safe."""
+
+    def test_a_plain_branch_name_is_backticked(self):
+        self.assertEqual(AA._printable_base("main"), "`main`")
+        self.assertEqual(AA._printable_base("release/1.2"), "`release/1.2`")
+
+    def test_a_ref_that_could_inject_is_replaced_by_a_placeholder(self):
+        for ref in ("x\n::error::Approved", "a`b", "x\r::stop-commands::t", "", "a b"):
+            self.assertEqual(AA._printable_base(ref), "a base with an unprintable name", repr(ref))
 
 
 if __name__ == "__main__":
