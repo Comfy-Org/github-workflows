@@ -4803,10 +4803,14 @@ def external_base_rewrite(args, pr, merge_base: str) -> str:
 def external_panel_merge_base(args) -> tuple:
     """(the latest panel round's recorded merge base or "", why it is unknown or "").
 
-    No trusted poster means no panel round to read, as approval_merge_base;
+    The round is `_latest_panel_round`'s — the same one the approve-only start
+    gate read — so `github-actions[bot]` counts when it IS the poster (no bot
+    App). Unlike approval_merge_base, which RECORDS what it reads, this record
+    can only refuse an approval, never grant one, so an identity any workflow
+    can post as is still worth reading here. No poster means no round to read;
     an unreadable review list is a reason to refuse, not an absent record."""
     poster = (getattr(args, "poster_login", "") or "").strip()
-    if not poster or poster.lower() in UNTRUSTED_POSTERS:
+    if not poster:
         return "", ""
     try:
         return panel_round_merge_base(list_reviews(args.repo, args.pr_number), poster), ""
@@ -4937,7 +4941,7 @@ def cmd_approve_external(args) -> int:
                                            != _str_field(pr, "base", "sha").lower()):
         # The base tip moved during the POST: re-check it still holds the panel
         # round's merge base, so a same-name rewrite withdraws the approval.
-        moved = bool(external_base_rewrite(args, pr_now, panel_merge_base))
+        moved = rewritten = bool(external_base_rewrite(args, pr_now, panel_merge_base))
     if moved or labelled_now or vetoed_now or labels_unreadable:
         # Veto, then hand-off, first, as before the POST.
         if vetoed_now:
@@ -4958,10 +4962,13 @@ def cmd_approve_external(args) -> int:
         except RuntimeError as e:
             print(f"::error::The PR changed while the approval was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
             return 1
-        if outcome in ("vetoed", "error"):
+        if outcome in ("vetoed", "error") or rewritten:
             # Not only the review just posted: any other standing approval by
             # this identity (an earlier run's, or one posted concurrently) would
             # still count toward branch protection on a PR that cannot be cleared.
+            # A rewritten base likewise voids every approval of this head, as
+            # before the POST — and one left standing would also let
+            # external_block's own_approval_on skip the block below.
             if withdraw_own_approvals(args, message):
                 return 1
         # The withdrawn approval leaves the PR unblocked unless this does.
