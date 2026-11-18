@@ -463,19 +463,27 @@ on:
           globs that bound an axes-only re-check to pushes that change nothing
           but these paths. Empty (the default) keeps today's behaviour — every
           eligible push re-checks on the axes alone. When non-empty, the
-          `approve-only` job compares the panel-reviewed commit (the card's
-          "Reviewed commit") to the new head and re-checks ONLY when the head is
-          strictly ahead of it (no force-push, no divergence) AND every file
-          changed since it — a rename's old and new path both — matches a glob.
-          Any non-matching file, a diverged or force-pushed head, a push that
-          changed too many files to scope, or a failed compare makes the push
-          fall through to a full round (`auto_rereview_after_dismissal`), never
-          an unscoped axes pass. Each glob matches the whole repo-relative path:
-          `*` and `?` stop at a `/`, `**/` spans directories, `**` spans
-          anything, the rest is literal (the `carry_forward_regenerated_globs`
-          syntax). The job summary records the changed-file count and the first
-          path out of scope. Suggested value for a docs-drift lane: `docs/**
-          **/*.md`. No effect without `approve_only_on_push`.
+          `approve-only` job compares the commit the last panel round reviewed
+          (its round sentinel — not the card's "Reviewed commit", which each
+          axes-only re-check moves forward) to the new head and re-checks ONLY
+          when the head is strictly ahead of it (no force-push, no divergence)
+          AND every file changed since it — a rename's old and new path both —
+          matches a glob. Any non-matching file, a diverged or force-pushed
+          head, a push that changed too many files to scope, or an unreadable
+          compare or file list means no axes-only re-check, never an unscoped
+          axes pass: the push takes the full-round path, which
+          `auto_rereview_after_dismissal` starts by itself only for a card
+          whose approval went stale — on a round the axes did not approve,
+          relabel for the full round. Each glob matches the whole
+          repo-relative path: `*` and `?` stop at a `/`, `**/` spans
+          directories, `**` spans anything, the rest is literal (the
+          `carry_forward_regenerated_globs` syntax). The job summary records
+          the changed-file count and the first path out of scope. Keep the
+          globs to inert content: a broad `**/*.md` also matches agent
+          instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`), and
+          `docs/**` matches build inputs such as `docs/conf.py`. Suggested
+          value for a docs-drift lane: `docs/**/*.md`. No effect without
+          `approve_only_on_push`.
         type: string
         required: false
         default: ''

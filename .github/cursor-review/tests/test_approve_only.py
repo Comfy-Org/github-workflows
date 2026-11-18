@@ -587,6 +587,32 @@ def cmp_data(filenames, status="ahead", behind=0, files=None):
     return {"status": status, "ahead_by": len(listed), "behind_by": behind, "total_commits": 1, "files": listed}
 
 
+def panel_round(rid, sha=X, login=POSTER, **extra):
+    """A consolidated review carrying post-review.py's round sentinel for `sha`."""
+    marker = AA._load_post_review().CONSOLIDATED_MARKER
+    sentinel = f'<!-- cursor-review:round v1 {{"base":"{Z}","head":"{sha}","merge_base":"{Z}"}} -->'
+    return {"id": rid, "user": {"login": login}, "state": "COMMENTED", "commit_id": sha,
+            "body": f"{marker}\n\n{sentinel}\n\nfindings", "submitted_at": "2026-10-12T07:00:00Z", **extra}
+
+
+class PanelRoundHeadTest(unittest.TestCase):
+    """The scope's anchor: the last panel round's commit, never the card's."""
+
+    def test_the_newest_bot_round_names_its_commit(self):
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z), block()]), Z)
+        self.assertEqual(AA.panel_round_head([panel_round(5, Z), panel_round(3, X)]), Z, "order is by id")
+
+    def test_no_round_a_human_forgery_or_an_edited_newest_round_reads_empty(self):
+        self.assertEqual(AA.panel_round_head([block()]), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X, login="dev")]), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z, edited=True)]), "")
+
+    def test_an_axes_only_recheck_does_not_move_it(self):
+        # The card's "Reviewed commit" moves to each re-checked head; the panel's does not.
+        reviews = [panel_round(3, X), block(rid=9, sha=Y), REREVIEW.approval(10, Y)]
+        self.assertEqual(AA.panel_round_head(reviews), X)
+
+
 class PathScopeUnitTest(unittest.TestCase):
     """`approve_only_paths_scope` in isolation — the compare/glob/divergence rules."""
     GLOBS = ["docs/**", "**/*.md"]
@@ -633,12 +659,60 @@ class PathScopeUnitTest(unittest.TestCase):
 
     def test_no_reviewed_commit_recorded_falls_through(self):
         reason, _ = AA.approve_only_paths_scope("o/r", "", Y, self.GLOBS)
-        self.assertIn("no reviewed commit", reason)
+        self.assertIn("no panel round records the commit", reason)
+
+    def test_a_missing_or_non_list_file_list_falls_through_but_an_empty_one_passes(self):
+        for files in ("missing", None, {"filename": "docs/a.md"}, "docs/a.md"):
+            data = {"status": "ahead", "ahead_by": 1, "behind_by": 0}
+            if files != "missing":
+                data["files"] = files
+            reason, _ = self.scope(data)
+            self.assertIn("listed no changed files", reason or "", repr(files))
+        reason, summary = self.scope(cmp_data([]))
+        self.assertIsNone(reason)
+        self.assertIn("0 changed file(s)", summary)
+
+    def test_a_rename_without_its_old_path_falls_through(self):
+        for previous in (None, "", 7):
+            entry = {"filename": "docs/b.md", "status": "renamed"}
+            if previous is not None:
+                entry["previous_filename"] = previous
+            reason, _ = self.scope(cmp_data(None, files=[entry]))
+            self.assertIn("old path could not be read", reason or "", repr(previous))
+
+    def test_an_unprintable_out_of_scope_name_is_never_echoed(self):
+        for name in ("x\n::error::Approved", "a`b.go", "x\r::stop-commands::t"):
+            reason, summary = self.scope(cmp_data([name]))
+            self.assertIn("a file with an unprintable name is outside", reason)
+            for text in (reason, summary):
+                self.assertNotIn("::", text)
+                self.assertNotIn("\n", text)
 
 
 class PathScopeEligibilityTest(Base):
     """The scope gate through `cmd_approve_only`: it decides eligibility, so a
     push out of scope leaves `eligible`/`go` false and a full round runs."""
+
+    def fake(self, card=None, reviews=None, **kw):
+        # The panel round on X the scope is anchored on, then its decision.
+        return super().fake(card=card, reviews=[panel_round(3, X), block()] if reviews is None else reviews, **kw)
+
+    def test_the_scope_is_anchored_on_the_panel_round_not_the_card(self):
+        # The card says Y (an axes-only re-check moved it); the panel saw X.
+        seen = []
+
+        def cmp(repo, base, head):
+            seen.append(base)
+            return cmp_data(["docs/guide.md"])
+        fake = self.fake(card=red_card(sha=Y), reviews=[panel_round(3, X), block(sha=Y)], head=Z)
+        with mock.patch.object(AA, "compare", cmp):
+            self.run_stage(fake, "check", head=Z, paths="docs/**")
+        self.assertEqual(seen, [X])
+
+    def test_no_readable_panel_round_falls_through(self):
+        self.assertEqual(self.run_stage(self.fake(reviews=[block()]), "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
 
     def test_a_docs_only_push_is_re_checked(self):
         fake = self.fake()
