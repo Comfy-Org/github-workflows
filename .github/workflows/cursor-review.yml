@@ -457,6 +457,36 @@ on:
         type: number
         required: false
         default: 10
+      approve_only_paths:
+        description: >-
+          Opt-in, with `approve_only_on_push`: newline- or space-separated
+          globs that bound an axes-only re-check to pushes that change nothing
+          but these paths. Empty (the default) keeps today's behaviour — every
+          eligible push re-checks on the axes alone. When non-empty, the
+          `approve-only` job compares the commit the last panel round reviewed
+          (its round sentinel — not the card's "Reviewed commit", which each
+          axes-only re-check moves forward) to the new head and re-checks ONLY
+          when the head is strictly ahead of it (no force-push, no divergence)
+          AND every file changed since it — a rename's old and new path both —
+          matches a glob. Any non-matching file, a diverged or force-pushed
+          head, a push that changed too many files to scope, or an unreadable
+          compare or file list means no axes-only re-check, never an unscoped
+          axes pass: the push takes the full-round path, which
+          `auto_rereview_after_dismissal` starts by itself only for a card
+          whose approval went stale — on a round the axes did not approve,
+          relabel for the full round. Each glob matches the whole
+          repo-relative path: `*` and `?` stop at a `/`, `**/` spans
+          directories, `**` spans anything, the rest is literal (the
+          `carry_forward_regenerated_globs` syntax). The job summary records
+          the changed-file count and the first path out of scope. Keep the
+          globs to inert content: a broad `**/*.md` also matches agent
+          instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`), and
+          `docs/**` matches build inputs such as `docs/conf.py`. Suggested
+          value for a docs-drift lane: `docs/**/*.md`. No effect without
+          `approve_only_on_push`.
+        type: string
+        required: false
+        default: ''
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -6785,6 +6815,8 @@ jobs:
       # `auto_rereview_after_dismissal` wants the next round started.
       auto_rereview: ${{ steps.dismiss.outputs.auto_rereview }}
       rereview_head: ${{ steps.dismiss.outputs.rereview_head }}
+      # The panel's posting identity (round-cap's), for `approve-only`.
+      poster_login: ${{ steps.dismiss.outputs.poster_login }}
     env:
       # Now that this job runs for every caller, not only auto-approve ones, a
       # `bot_app_id` caller reaches it on runs with no secrets (Dependabot PRs
@@ -6951,6 +6983,8 @@ jobs:
           fi
           # The identity round-cap counts rounds under (its `Count review rounds`).
           if [ -n "$APP_SLUG" ]; then POSTER="${APP_SLUG}[bot]"; else POSTER="github-actions[bot]"; fi
+          # `approve-only` anchors `approve_only_paths` on this identity's rounds.
+          echo "poster_login=$POSTER" >> "$GITHUB_OUTPUT"
           python3 "$CURSOR_REVIEW_ASSETS/auto-approve.py" dismiss-stale \
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
@@ -8173,6 +8207,10 @@ jobs:
         id: check
         env:
           APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          # `approve_only_paths` reads the compare API (`contents: read`), which
+          # this job's GITHUB_TOKEN has and an approver token scoped to reviews
+          # may not — gh_read prefers it. Empty scope never reads it.
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -8181,6 +8219,8 @@ jobs:
           MAX_RUNS: ${{ inputs.approve_only_max_runs }}
           MAX_ROUNDS: ${{ inputs.max_rounds }}
           DELAY_MINUTES: ${{ inputs.auto_rereview_delay_minutes }}
+          APPROVE_ONLY_PATHS: ${{ inputs.approve_only_paths }}
+          POSTER_LOGIN: ${{ needs.dismiss-stale-approval.outputs.poster_login }}
           APPROVER_ENVIRONMENT: ${{ inputs.approver_environment }}
         run: |
           # The card lives under the approver identity, and the caller's
@@ -8206,7 +8246,9 @@ jobs:
             --approve-authors "$APPROVE_AUTHORS" \
             --max-runs "$MAX_RUNS" \
             --max-rounds "$MAX_ROUNDS" \
-            --delay-minutes "$DELAY_MINUTES"
+            --delay-minutes "$DELAY_MINUTES" \
+            --approve-only-paths "$APPROVE_ONLY_PATHS" \
+            --poster-login "$POSTER_LOGIN"
 
       - name: Wait before re-checking
         # The debounce, shared with `auto-rereview`: clamped to 30 minutes;
@@ -8227,6 +8269,8 @@ jobs:
         if: steps.check.outputs.eligible == 'true'
         env:
           APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          # See the `check` step: the compare API for `approve_only_paths`.
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -8234,6 +8278,8 @@ jobs:
           APPROVE_AUTHORS: ${{ inputs.approve_authors }}
           MAX_RUNS: ${{ inputs.approve_only_max_runs }}
           MAX_ROUNDS: ${{ inputs.max_rounds }}
+          APPROVE_ONLY_PATHS: ${{ inputs.approve_only_paths }}
+          POSTER_LOGIN: ${{ needs.dismiss-stale-approval.outputs.poster_login }}
         run: |
           export GH_TOKEN="$APPROVER_TOKEN"
           LOGIN="$(gh api user --jq .login)"
@@ -8246,7 +8292,9 @@ jobs:
             --threshold "$THRESHOLD" \
             --approve-authors "$APPROVE_AUTHORS" \
             --max-runs "$MAX_RUNS" \
-            --max-rounds "$MAX_ROUNDS"
+            --max-rounds "$MAX_ROUNDS" \
+            --approve-only-paths "$APPROVE_ONLY_PATHS" \
+            --poster-login "$POSTER_LOGIN"
 
   auto-rereview:
     # BE-20262: start the round a dismissal left wanting, once per head, after

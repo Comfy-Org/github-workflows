@@ -3958,6 +3958,104 @@ def _approve_only_cap(args) -> int:
     return min(int(match.group(1)), _load_card().RECHECK_HEADS_KEPT) if match else 0
 
 
+def panel_round_head(reviews: list, poster_login: str) -> str:
+    """The commit the latest panel round reviewed, from its round sentinel; ""
+    when none can be read.
+
+    The newest consolidated review `poster_login` — the identity the panel
+    posts as, round-cap's — left that reviewed something (no NON_ROUND_BANNERS).
+    Any other bot is ignored, since the marker is a public constant: its review
+    must not move the anchor past changes the panel never saw. An axes-only
+    re-check posts no consolidated review, so this stays on the panel's commit
+    across re-checks — unlike the card's "Reviewed commit". No poster, an
+    edited review newer than it, or a sentinel-less one, reads as "" (fail
+    closed). `github-actions[bot]` is accepted when it IS the poster: with no
+    bot App the panel posts as it."""
+    poster = (poster_login or "").strip().lower()
+    if not poster:
+        return ""
+    marker = _load_post_review().CONSOLIDATED_MARKER
+    latest, edited = None, []
+    for r in reviews:
+        if not isinstance(r, dict) or _review_id(r) is None:
+            continue
+        if ((r.get("user") or {}).get("login") or "").lower() != poster:
+            continue
+        # As round_merge_base: an edited body may have lost its marker, so it
+        # counts before the body filter — it rules out every older round.
+        if r.get("edited"):
+            edited.append(_review_id(r))
+            continue
+        body = _lf(r.get("body"))
+        if not body.startswith(marker) or any(b in body for b in NON_ROUND_BANNERS):
+            continue
+        if latest is None or _review_id(r) > _review_id(latest):
+            latest = r
+    if latest is None or any(rid > _review_id(latest) for rid in edited):
+        return ""
+    return round_head(latest)
+
+
+def approve_only_paths_scope(repo: str, reviewed: str, head: str, globs: list):
+    """`approve_only_paths`: whether the axes alone may re-check this push.
+
+    Returns ``(reason, summary)``. ``reason`` is None when every file changed
+    between `reviewed` — the last panel round's commit (panel_round_head), not
+    the card's "Reviewed commit", which each axes-only re-check moves forward —
+    and `head` matches a glob AND `head` is
+    strictly ahead of `reviewed` (so the panel has seen the base of the delta);
+    otherwise it is a fragment for `skip()` naming the first file outside the
+    globs, a divergence, or a read failure. ``summary`` is a one-line record for
+    the job summary either way — the changed-file count on a pass.
+
+    Fails CLOSED: no readable panel-round commit, a compare the API could not
+    return (or would not vouch for every file: a missing or non-list `files`),
+    a force-pushed or diverged head, a rename without its old path, or any file
+    outside the globs all keep `reason` set, so the caller falls through to a
+    full round. The glob syntax is `glob_matches`', as for
+    `carry_forward_regenerated_globs`. A path outside the globs is named only
+    when REGENERATED_PATH_RE passes it: the name is the PR author's, and it
+    lands in the log and the job summary.
+    """
+    short = (reviewed or "?")[:7]
+    changed_label = "`approve_only_paths`"
+    if not SHA_HEX_RE.fullmatch((reviewed or "").lower()):
+        return ("no panel round records the commit it reviewed, so there is nothing to scope the push against",
+                "")
+    data = compare(repo, reviewed, head)
+    if data is None:
+        return (f"the compare of `{short}` to `{head[:7]}` could not be read, so the push needs a full round", "")
+    if not is_ancestor_compare(data):
+        return (f"the head is not a clean descendant of the reviewed commit `{short}` "
+                "(a force-push or divergence), so the push needs a full round", "")
+    files = data.get("files")
+    if not isinstance(files, list):
+        return (f"the compare of `{short}` to `{head[:7]}` listed no changed files, so the push needs a "
+                "full round", "")
+    if len(files) >= COMPARE_FILE_CAP:
+        return (f"the push changed too many files to scope against {changed_label} "
+                f"(>= {COMPARE_FILE_CAP}), so the push needs a full round", "")
+    changed = len(files)
+    for f in files:
+        name = f.get("filename") if isinstance(f, dict) else None
+        if not isinstance(name, str) or not name:
+            return (f"a changed file could not be read from the compare of `{short}`, so the push "
+                    "needs a full round", "")
+        # A rename moves two paths; both must be in scope or it is a code move.
+        previous = f.get("previous_filename")
+        if f.get("status") == "renamed" and (not isinstance(previous, str) or not previous):
+            return (f"a renamed file's old path could not be read from the compare of `{short}`, so the "
+                    "push needs a full round", "")
+        previous = previous if isinstance(previous, str) else ""
+        for path in (name, previous) if previous else (name,):
+            if not any(glob_matches(g, path) for g in globs):
+                shown = f"`{path}`" if REGENERATED_PATH_RE.fullmatch(path) else "a file with an unprintable name"
+                return (f"{shown} is outside {changed_label} ({changed} changed file(s) since "
+                        f"`{short}`), so the push needs a full round",
+                        f"{changed} changed file(s) since `{short}`; {shown} is outside {changed_label}")
+    return (None, f"{changed} changed file(s) since `{short}`, all within {changed_label}")
+
+
 def cmd_approve_only(args) -> int:
     """cursor-review's `approve-only` job, stage `check` or `start` (above)."""
     set_output("eligible" if args.stage == "check" else "go", "false")
@@ -3997,6 +4095,17 @@ def cmd_approve_only(args) -> int:
     why = approve_only_blocker(args, pr, reviews, timeline, body, head, threads, editors)
     if why:
         return skip(why)
+    # `approve_only_paths`: with a non-empty scope, re-check a push only when
+    # every file it changed since the last panel round's commit is in scope. A
+    # mismatch, a diverged head, or an unreadable compare is a blocker like any
+    # other — never fail open.
+    globs = (getattr(args, "approve_only_paths", "") or "").split()
+    if globs:
+        reason, summary = approve_only_paths_scope(
+            args.repo, panel_round_head(reviews, getattr(args, "poster_login", "") or ""), head, globs)
+        if reason:
+            return skip(reason)
+        emit(f"📁 **Approver-only path scope** — {summary}.")
     if args.stage == "check":
         set_output("eligible", "true")
         try:
@@ -4895,6 +5004,11 @@ def main() -> int:
     o.add_argument("--max-rounds", default="0")
     # Announced on the card at `check`, not waited for here — the job waits.
     o.add_argument("--delay-minutes", default="0")
+    # `approve_only_paths`: when non-empty, the axes re-check a push only when
+    # every file it changed since the reviewed commit matches a glob.
+    o.add_argument("--approve-only-paths", default="")
+    # The panel's posting identity: only its rounds anchor that scope.
+    o.add_argument("--poster-login", default="")
     r = sub.add_parser("auto-retry")
     r.add_argument("--repo", required=True)
     r.add_argument("--pr-number", required=True)

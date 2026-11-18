@@ -15,6 +15,7 @@ python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 """
 
 import argparse
+import contextlib
 import importlib.util
 import os
 import re
@@ -23,6 +24,8 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(__file__)
+
+_UNSET = object()  # run_stage: "do not patch AA.compare" vs "patch it to return None"
 
 
 def _load(path, name):
@@ -73,19 +76,25 @@ class Base(unittest.TestCase):
             return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
 
     def run_stage(self, fake, stage, head=Y, threshold="medium", authors="", max_runs="10", threads=(),
-                  max_rounds="5", editors=()):
+                  max_rounds="5", editors=(), paths="", compare=_UNSET):
         args = argparse.Namespace(stage=stage, repo="o/r", pr_number="1", head_sha=head, approver_login=LOGIN,
                                   review_label="", threshold=threshold, approve_authors=authors,
-                                  max_runs=max_runs, max_rounds=max_rounds, delay_minutes="10")
+                                  max_runs=max_runs, max_rounds=max_rounds, delay_minutes="10",
+                                  approve_only_paths=paths, poster_login=POSTER)
         reader = (mock.Mock(side_effect=RuntimeError("graphql 502")) if threads is None
                   else mock.Mock(return_value=list(threads)))
         history = (mock.Mock(side_effect=RuntimeError("graphql 502")) if editors is None
                    else mock.Mock(return_value=list(editors)))
+        # `approve_only_paths` reads the compare API; stub it unless a case opts
+        # in (the default-empty path never calls it, so it is left untouched).
+        compare_cm = (mock.patch.object(AA, "compare", mock.Mock(return_value=compare))
+                      if compare is not _UNSET else contextlib.nullcontext())
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
                 mock.patch.object(AA, "_load_card", lambda: CARD), \
                 mock.patch.object(AA, "open_thread_severities", reader), \
                 mock.patch.object(AA, "card_foreign_editors", history), \
                 mock.patch.object(AA, "emit", lambda *a: None), \
+                compare_cm, \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             return AA.cmd_approve_only(args)
@@ -555,6 +564,204 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIn("cursor-review-reusable-approve-only-${{ github.repository }}-"
                       "${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}", self.job)
         self.assertIn("cancel-in-progress: false", self.job)
+
+    def test_both_stages_pass_the_path_scope_and_its_read_token(self):
+        # Both the check and the start invocation forward the new input, and
+        # each step offers FALLBACK_TOKEN so the compare API runs with the job's
+        # contents: read rather than the reviews-scoped approver token.
+        self.assertEqual(self.job.count('--approve-only-paths "$APPROVE_ONLY_PATHS"'), 2)
+        self.assertEqual(self.job.count("APPROVE_ONLY_PATHS: ${{ inputs.approve_only_paths }}"), 2)
+        self.assertEqual(self.job.count("FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}"), 2)
+        # The scope's anchor is read only from the panel poster's rounds.
+        self.assertEqual(self.job.count('--poster-login "$POSTER_LOGIN"'), 2)
+        self.assertEqual(self.job.count("POSTER_LOGIN: ${{ needs.dismiss-stale-approval.outputs.poster_login }}"), 2)
+        self.assertIn("poster_login: ${{ steps.dismiss.outputs.poster_login }}", self.text)
+
+    def test_approve_only_paths_defaults_empty(self):
+        block = self.text[self.text.index("      approve_only_paths:\n"):]
+        block = block[:block.index("\n      ", block.index("default:"))]
+        self.assertIn("default: ''", block)
+        self.assertIn("type: string", block)
+
+
+def cmp_data(filenames, status="ahead", behind=0, files=None):
+    """A GitHub compare payload: `filenames` become added files with a patch."""
+    listed = files if files is not None else [{"filename": n, "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}
+                                              for n in filenames]
+    return {"status": status, "ahead_by": len(listed), "behind_by": behind, "total_commits": 1, "files": listed}
+
+
+def panel_round(rid, sha=X, login=POSTER, **extra):
+    """A consolidated review carrying post-review.py's round sentinel for `sha`."""
+    marker = AA._load_post_review().CONSOLIDATED_MARKER
+    sentinel = f'<!-- cursor-review:round v1 {{"base":"{Z}","head":"{sha}","merge_base":"{Z}"}} -->'
+    return {"id": rid, "user": {"login": login}, "state": "COMMENTED", "commit_id": sha,
+            "body": f"{marker}\n\n{sentinel}\n\nfindings", "submitted_at": "2026-10-12T07:00:00Z", **extra}
+
+
+class PanelRoundHeadTest(unittest.TestCase):
+    """The scope's anchor: the last panel round's commit, never the card's."""
+
+    def test_the_newest_bot_round_names_its_commit(self):
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z), block()], POSTER), Z)
+        self.assertEqual(AA.panel_round_head([panel_round(5, Z), panel_round(3, X)], POSTER), Z, "order is by id")
+
+    def test_no_round_a_human_forgery_or_an_edited_newest_round_reads_empty(self):
+        self.assertEqual(AA.panel_round_head([block()], POSTER), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X, login="dev")], POSTER), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z, edited=True)], POSTER), "")
+        # An edited newer review that lost its marker still rules out the older round.
+        stripped = {"id": 5, "user": {"login": POSTER}, "state": "COMMENTED", "body": "gone", "edited": True}
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), stripped], POSTER), "")
+        # An edited OLDER review, or another login's edit, does not.
+        self.assertEqual(AA.panel_round_head([dict(stripped, id=1), panel_round(3, X)], POSTER), X)
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), dict(stripped, user={"login": "dev"})], POSTER), X)
+
+    def test_only_the_configured_poster_anchors_it(self):
+        # The marker is public: another bot's newer round must not move the
+        # anchor past changes the panel never reviewed.
+        reviews = [panel_round(3, X), panel_round(5, Z, login="other-app[bot]")]
+        self.assertEqual(AA.panel_round_head(reviews, POSTER), X)
+        self.assertEqual(AA.panel_round_head(reviews, POSTER.upper()), X, "logins compare case-insensitively")
+        self.assertEqual(AA.panel_round_head(reviews, ""), "", "no poster: fail closed")
+        # No bot App: the panel posts as github-actions[bot], which then counts.
+        gha = [panel_round(3, X, login="github-actions[bot]"), panel_round(5, Z, login=POSTER)]
+        self.assertEqual(AA.panel_round_head(gha, "github-actions[bot]"), X)
+
+    def test_an_axes_only_recheck_does_not_move_it(self):
+        # The card's "Reviewed commit" moves to each re-checked head; the panel's does not.
+        reviews = [panel_round(3, X), block(rid=9, sha=Y), REREVIEW.approval(10, Y)]
+        self.assertEqual(AA.panel_round_head(reviews, POSTER), X)
+
+
+class PathScopeUnitTest(unittest.TestCase):
+    """`approve_only_paths_scope` in isolation — the compare/glob/divergence rules."""
+    GLOBS = ["docs/**", "**/*.md"]
+
+    def scope(self, data, globs=None):
+        with mock.patch.object(AA, "compare", mock.Mock(return_value=data)):
+            return AA.approve_only_paths_scope("o/r", X, Y, globs if globs is not None else self.GLOBS)
+
+    def test_a_docs_only_push_is_in_scope(self):
+        reason, summary = self.scope(cmp_data(["docs/a.md", "README.md", "pkg/notes.md"]))
+        self.assertIsNone(reason)
+        self.assertIn("3 changed file(s)", summary)
+        self.assertIn("all within", summary)
+
+    def test_a_code_file_falls_out_of_scope_and_is_named(self):
+        reason, _ = self.scope(cmp_data(["docs/a.md", "src/main.go"]))
+        self.assertIsNotNone(reason)
+        self.assertIn("`src/main.go` is outside", reason)
+        self.assertIn("2 changed file(s)", reason)
+
+    def test_a_force_pushed_or_diverged_head_falls_through(self):
+        for status, behind in (("diverged", 3), ("behind", 2), ("identical", 0)):
+            reason, _ = self.scope(cmp_data(["docs/a.md"], status=status, behind=behind))
+            self.assertIn("not a clean descendant", reason, status)
+
+    def test_a_failed_compare_falls_through_never_open(self):
+        reason, _ = self.scope(None)
+        self.assertIn("could not be read", reason)
+
+    def test_a_truncated_file_list_falls_through(self):
+        big = [{"filename": f"docs/f{i}.md", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}
+               for i in range(AA.COMPARE_FILE_CAP)]
+        reason, _ = self.scope(cmp_data(None, files=big))
+        self.assertIn("too many files", reason)
+
+    def test_a_rename_needs_both_paths_in_scope(self):
+        moved_out = [{"filename": "src/a.go", "previous_filename": "docs/a.md", "status": "renamed", "changes": 0}]
+        reason, _ = self.scope(cmp_data(None, files=moved_out))
+        self.assertIn("`src/a.go` is outside", reason)
+        moved_within = [{"filename": "docs/b.md", "previous_filename": "docs/a.md", "status": "renamed", "changes": 0}]
+        reason2, summary2 = self.scope(cmp_data(None, files=moved_within))
+        self.assertIsNone(reason2)
+        self.assertIn("all within", summary2)
+
+    def test_no_reviewed_commit_recorded_falls_through(self):
+        reason, _ = AA.approve_only_paths_scope("o/r", "", Y, self.GLOBS)
+        self.assertIn("no panel round records the commit", reason)
+
+    def test_a_missing_or_non_list_file_list_falls_through_but_an_empty_one_passes(self):
+        for files in ("missing", None, {"filename": "docs/a.md"}, "docs/a.md"):
+            data = {"status": "ahead", "ahead_by": 1, "behind_by": 0}
+            if files != "missing":
+                data["files"] = files
+            reason, _ = self.scope(data)
+            self.assertIn("listed no changed files", reason or "", repr(files))
+        reason, summary = self.scope(cmp_data([]))
+        self.assertIsNone(reason)
+        self.assertIn("0 changed file(s)", summary)
+
+    def test_a_rename_without_its_old_path_falls_through(self):
+        for previous in (None, "", 7):
+            entry = {"filename": "docs/b.md", "status": "renamed"}
+            if previous is not None:
+                entry["previous_filename"] = previous
+            reason, _ = self.scope(cmp_data(None, files=[entry]))
+            self.assertIn("old path could not be read", reason or "", repr(previous))
+
+    def test_an_unprintable_out_of_scope_name_is_never_echoed(self):
+        for name in ("x\n::error::Approved", "a`b.go", "x\r::stop-commands::t"):
+            reason, summary = self.scope(cmp_data([name]))
+            self.assertIn("a file with an unprintable name is outside", reason)
+            for text in (reason, summary):
+                self.assertNotIn("::", text)
+                self.assertNotIn("\n", text)
+
+
+class PathScopeEligibilityTest(Base):
+    """The scope gate through `cmd_approve_only`: it decides eligibility, so a
+    push out of scope leaves `eligible`/`go` false and a full round runs."""
+
+    def fake(self, card=None, reviews=None, **kw):
+        # The panel round on X the scope is anchored on, then its decision.
+        return super().fake(card=card, reviews=[panel_round(3, X), block()] if reviews is None else reviews, **kw)
+
+    def test_the_scope_is_anchored_on_the_panel_round_not_the_card(self):
+        # The card says Y (an axes-only re-check moved it); the panel saw X.
+        seen = []
+
+        def cmp(repo, base, head):
+            seen.append(base)
+            return cmp_data(["docs/guide.md"])
+        fake = self.fake(card=red_card(sha=Y), reviews=[panel_round(3, X), block(sha=Y)], head=Z)
+        with mock.patch.object(AA, "compare", cmp):
+            self.run_stage(fake, "check", head=Z, paths="docs/**")
+        self.assertEqual(seen, [X])
+
+    def test_no_readable_panel_round_falls_through(self):
+        self.assertEqual(self.run_stage(self.fake(reviews=[block()]), "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_a_docs_only_push_is_re_checked(self):
+        fake = self.fake()
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/** **/*.md",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "true")
+        self.assertEqual(self.run_stage(fake, "start", paths="docs/** **/*.md",
+                                        compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["go"], "true")
+
+    def test_a_mixed_push_falls_through_to_a_full_round(self):
+        fake = self.fake()
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md", "lib/core.py"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.assertEqual(fake.patches, [], "a push out of scope announces nothing on the card")
+
+    def test_a_force_pushed_head_falls_through(self):
+        self.assertEqual(self.run_stage(self.fake(), "start", paths="docs/**",
+                                        compare=cmp_data(["docs/guide.md"], status="diverged", behind=4)), 0)
+        self.assertEqual(self.outputs()["go"], "false")
+
+    def test_an_empty_scope_keeps_todays_behaviour_without_a_compare(self):
+        # No compare stub: if the empty-scope path read the compare API, the
+        # FakeGitHub would raise on the unexpected call.
+        fake = self.fake()
+        self.assertEqual(self.run_stage(fake, "check", paths=""), 0)
+        self.assertEqual(self.outputs()["eligible"], "true")
 
 
 if __name__ == "__main__":
