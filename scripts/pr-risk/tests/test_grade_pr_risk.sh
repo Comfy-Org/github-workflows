@@ -128,7 +128,7 @@ cat > "$SANDBOX/fixture.json" <<'FIX'
 {"data":{"repository":{"pullRequest":{
   "number":42,"title":"docs: tweak readme","state":"OPEN","isDraft":false,
   "createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:10:00Z","closedAt":null,"mergedAt":null,
-  "author":{"login":"dev"},"authorAssociation":"MEMBER","baseRefName":"main","headRefName":"docs-tweak",
+  "author":{"login":"dev"},"authorAssociation":"MEMBER","baseRefName":"main","baseRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"docs-tweak",
   "isCrossRepository":false,"additions":3,"deletions":1,"changedFiles":1,
   "labels":{"pageInfo":{"hasNextPage":false},"nodes":[]},
   "commits":{"nodes":[{"commit":{"oid":"c0ffee1234567890abcdef1234567890abcdef12","statusCheckRollup":{"state":"PENDING","contexts":{
@@ -170,6 +170,14 @@ eq "self-excluded rollup reads SUCCESS (by name)" SUCCESS "$(jq -r '.checks_stat
 # this commit's tier to a different commit as an immutable Check Run.
 eq "the record carries the graded head sha" \
    "c0ffee1234567890abcdef1234567890abcdef12" "$(jq -r '.head_sha' <<<"$out")"
+eq "the live record has the additive base-observation schema" 5 "$(jq -r '.schema_version' <<<"$out")"
+eq "the record carries the observed PR base sha" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$(jq -r '.observed_base_sha' <<<"$out")"
+# Missing base evidence stays null; it must not be inferred from the branch name.
+cp "$SANDBOX/fixture.json" "$SANDBOX/fixture-base.json"
+jq 'del(.data.repository.pullRequest.baseRefOid)' "$SANDBOX/fixture-base.json" > "$SANDBOX/fixture.json"
+missing_base="$(graded_pr --self-context 'CI - PR Risk Grade')"
+eq "a missing observed base stays null" null "$(jq -r '.observed_base_sha' <<<"$missing_base")"
+cp "$SANDBOX/fixture-base.json" "$SANDBOX/fixture.json"
 eq "nothing else pending" false "$(jq -r '.checks_pending_excl_self' <<<"$out")"
 eq "live docs PR grades R1" R1 "$(jq -r '.risk.tier' <<<"$out")"
 # --self-run-id is the EXACT selector: same result, but keyed on github.run_id, so a
