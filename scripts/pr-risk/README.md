@@ -11,11 +11,20 @@ event is graded into a tier and gets ONE label:
 | R3 | `risk:R3` | elevated — auth, billing, migrations, IaC, CI, deps, secrets | owner + e2e |
 | — | `risk:ungraded` | an input could not be read; deliberately NOT a tier | human review |
 
-**The label is the entire product.** Nothing is gated, blocked, routed, commented
-on, or merged. `risk-dispute:low` through `risk-dispute:xhigh` override the
+**The label is the default product.** Nothing is gated, blocked, routed, commented
+on, or merged. Report-only mode retains records without changing the label. `risk-dispute:low` through `risk-dispute:xhigh` override the
 visible risk label while leaving the computed tier in the grade record. Removing
 the dispute restores the computed label; if multiple overrides exist, the highest
 risk wins.
+
+## Report-only mode
+
+Set `report_only: true` on the reusable workflow to retain grade records and per-target
+results as a 30-day Actions artifact. It skips risk labels, sticky comments and the
+optional risk Check Run, even if their options are enabled. The workflow itself still
+creates GitHub Actions run/check records and retains its declared token permissions.
+An ungraded result is unknown, never a low-risk verdict. Separate GitHub reads can
+race with changes to the base or head; the artifact is not readiness evidence.
 
 ## How a grade is computed
 

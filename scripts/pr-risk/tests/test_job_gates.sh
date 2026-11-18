@@ -164,7 +164,7 @@ eq "the grade gate is exactly what it should be" \
    "needs.gate.outputs.enabled == 'true' || github.event_name == 'workflow_dispatch'" \
    "$GRADE_IF"
 eq "the publish-check gate is exactly what it should be" \
-   "needs.grade.result != 'skipped' && inputs.check_run && !cancelled()" \
+   "needs.grade.result != 'skipped' && inputs.check_run && !inputs.report_only && !cancelled()" \
    "$PUBLISH_IF"
 
 # --- grade: `enabled` OR a manual dispatch ----------------------------------------------------
@@ -182,6 +182,7 @@ needs_has "grade waits on gate" "$(job_needs grade)" "gate"
 needs_has "publish-check waits on grade" "$(job_needs 'publish-check')" "grade"
 has "publish-check is gated on grade having run"   "$PUBLISH_IF" "needs.grade.result != 'skipped'"
 has "publish-check still honours the opt-in input" "$PUBLISH_IF" "inputs.check_run"
+has "report-only forbids the optional Check Run" "$PUBLISH_IF" "!inputs.report_only"
 no  "publish-check does not INVERT the opt-in"     "$PUBLISH_IF" "!inputs.check_run"
 has "publish-check still runs on a failed grade"   "$PUBLISH_IF" '!cancelled()'
 has "publish-check joins its terms with AND"       "$PUBLISH_IF" "&&"
@@ -205,6 +206,10 @@ if printf '%s\n' "$PUBLISH_IF" | grep -qE -- '!?(cancelled|always|success|failur
 else
   ok "publish-check never pairs a status function with no needs.grade.result test"
 fi
+
+has "grade passes report-only mode to the script" "$(job_body grade)" "REPORT_ONLY: \${{ inputs.report_only && '1' || '0' }}"
+has "report-only retains the results" "$(job_body grade)" "pr-risk-results.jsonl"
+has "report-only retains the grade records" "$(job_body grade)" "record-*.json"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

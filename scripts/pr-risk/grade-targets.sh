@@ -38,7 +38,8 @@
 #   LABEL_MAP             passed through to apply-risk-label.sh
 #   MAX_TARGETS           refuse a list longer than this (default 50)
 #   RESULTS               per-target JSONL outcome file (default pr-risk-results.jsonl)
-#   DRY_RUN               1 = grade and report, write no label
+#   DRY_RUN               1 = simulate label/comment writes
+#   REPORT_ONLY           1 = retain records only; ignore publication options
 #   GH_TOKEN              token for gh
 #   GITHUB_OUTPUT         when set, tier / waited / targets / graded / ungraded / failed /
 #                         skipped are appended
@@ -101,6 +102,7 @@ SURFACES_BUDGET_BYTES="${SURFACES_BUDGET_BYTES:-100000}"
 SURFACES_BYTES=0
 SURFACES_DROPPED=0
 DRY_RUN="${DRY_RUN:-0}"
+REPORT_ONLY="${REPORT_ONLY:-0}"
 # The retry/backoff constants are env-overridable ONLY so the suite can exercise the
 # unreadable-PR and settle-repeat branches without sleeping through the production backoff. CI
 # passes none of them, so the values below are what runs in production. (READ_RETRY_TRIES and
@@ -196,7 +198,11 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
             read_delay=$(( read_delay * 2 )); [ "$read_delay" -le 60 ] || read_delay=60
             continue
           fi
-          log "PR unreadable via the API after ${unreadable_tries} attempt(s) — labeling ungraded"
+          if [ "$REPORT_ONLY" = 1 ]; then
+            log "PR unreadable via the API after ${unreadable_tries} attempt(s) — recording ungraded"
+          else
+            log "PR unreadable via the API after ${unreadable_tries} attempt(s) — labeling ungraded"
+          fi
           printf '{}' > "$record"
           break ;;
       *)  log "grader failed for ${REPO}#${num} (rc=$rc)"; G_TIER=""; return 1 ;;  # setup/usage bug
@@ -295,6 +301,18 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
   }
   log "${REPO}#${num}: graded tier ${G_TIER} (waited ${G_WAITED}s for the rollup, base ${base})"
 
+  # Report-only runs must not call any publisher, even when conflicting options are set.
+  # A null label says no label was applied; unknown remains distinct from a low-risk grade.
+  if [ "$REPORT_ONLY" = 1 ]; then
+    case "$G_TIER" in
+      ""|unknown|null)
+        record_result "$num" ungraded unknown "" "$record" "$G_WAITED" "$base" "risk evidence unavailable; no label was written" ;;
+      *)
+        record_result "$num" graded "$G_TIER" "" "$record" "$G_WAITED" "$base" "report only; no label was written" ;;
+    esac
+    return 0
+  fi
+
   # The labeler prints the applied label on stdout and its own log on stderr; the rc has to be
   # read from the command itself, not from a pipeline, so its output goes to a file first.
   label_rc=0
@@ -389,6 +407,7 @@ main() {
   # it first costs nothing and closes that window.
   trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
   init_scratch
+  case "$REPORT_ONLY" in 0|1) ;; *) die "REPORT_ONLY must be 0 or 1" ;; esac
   [ -n "$REPO" ] || die "REPO is required"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad REPO '$REPO' (want owner/name)"
   [ -f "$GRADER" ]  || die "grader not found at $GRADER (set TOOL_DIR)"
