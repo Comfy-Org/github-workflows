@@ -51,7 +51,7 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   multi-model panel + judge). `catalog-drift.py` reads the model pins *out of*
   `cursor-review.yml` — never duplicate that model list.
 - `.github/cursor-approve/` — the five axis prompts + `aggregate.py`, the pure
-  verdict aggregator behind the planned `cursor-approve.yml`; it never writes to GitHub.
+  verdict aggregator behind `cursor-approve.yml`; it never writes to GitHub.
   `context-proxy.py` is the read-only Linear/Notion/Slack MCP proxy the axes
   query: it holds the tokens, and ONE guard function owns every network call.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
