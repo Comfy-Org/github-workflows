@@ -473,8 +473,11 @@ on:
           compare never sees the base, so a retarget since the round — base A to
           base B — could otherwise let a docs-only compare approve a diff against
           B that no panel read; a retarget, or a round from before the base was
-          recorded, takes the full-round path. The base branch merely advancing
-          on the SAME ref is not a retarget and does not drop the lane. Any
+          recorded, takes the full-round path. So does a base rewritten under
+          the same name (the round's recorded merge base no longer an ancestor
+          of the live base tip, e.g. a stacked PR's lower branch rebased). The
+          base branch merely fast-forwarding on the SAME ref does not drop the
+          lane. Any
           non-matching file, a diverged or force-pushed
           head, a push that changed too many files to scope, or an unreadable
           compare or file list means no axes-only re-check, never an unscoped
@@ -6456,8 +6459,11 @@ jobs:
           # The base BRANCH this round reviewed against, recorded (hex-encoded) in the
           # sentinel beside BASE_SHA. `approve-only` reads it to drop the axes-only lane
           # on a retarget: BASE_SHA alone cannot tell a retarget from the base branch
-          # merely advancing (both move the SHA), and only the former changes the PR's
-          # own diff — so the name is what the retarget check compares.
+          # merely advancing (both move the SHA). The name catches a retarget; a base
+          # rewritten under the SAME name (a stacked PR's lower branch rebased, a base
+          # reset or recreated) also changes the PR's own diff, and `approve-only`
+          # catches that from MERGE_BASE_SHA, which must still be an ancestor of the
+          # live base tip.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           TRIGGERED_BY: ${{ steps.meta.outputs.triggered_by }}
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}

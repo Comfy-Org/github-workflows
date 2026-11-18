@@ -4013,6 +4013,14 @@ def panel_round_base_ref(reviews: list, poster_login: str) -> str:
     return round_base_ref(_latest_panel_round(reviews, poster_login) or {})
 
 
+def panel_round_merge_base(reviews: list, poster_login: str) -> str:
+    """The merge base the latest panel round diffed against, from its round
+    sentinel; "" when none can be read (see `_latest_panel_round`). The base
+    check's second half: a base branch rewritten under the same name moves the
+    PR's merge base off it, which the name alone cannot see."""
+    return round_merge_base_sha(_latest_panel_round(reviews, poster_login) or {})
+
+
 def _printable_base(ref: str) -> str:
     """A base ref safe to echo into the log and job summary, backticked, or a
     placeholder when it is not. A ref is the PR author's text; echoing it raw
@@ -4127,15 +4135,27 @@ def cmd_approve_only(args) -> int:
     globs = (getattr(args, "approve_only_paths", "") or "").split()
     if globs:
         poster = getattr(args, "poster_login", "") or ""
+        reviewed = panel_round_head(reviews, poster)
+        if not reviewed:
+            return skip("no panel round records the commit it reviewed, so there is nothing to scope the push "
+                        "against")
         # The scope compares the push head-to-head against the panel's commit and
-        # never looks at the PR's base. A retarget since that round (base A → base
-        # B) moves the base out from under a compare that still reads docs-only, so
-        # the axes alone would approve a diff against B that no panel round read.
-        # Require the live base to be the one the panel reviewed; a missing or
+        # never looks at the PR's base. Two base moves change the PR's own diff
+        # under a compare that still reads docs-only, so the axes alone would
+        # approve a diff no panel round read: a retarget (base A → base B), and
+        # the SAME base branch rewritten under its name (a stacked PR's lower
+        # branch rebased or force-pushed, a base reset or recreated), which moves
+        # the merge base off the one the round diffed against. Require both the
+        # live base ref to be the one the panel reviewed AND the round's merge base
+        # to still be an ancestor of (or equal to) the live base tip; a missing or
         # unreadable record refuses too (a round from before the base was recorded
-        # cannot prove it was not retargeted since). A same-ref advance (main moving
-        # on) keeps the same ref and is deliberately NOT a mismatch.
+        # cannot prove the base did not move since). A same-ref fast-forward (main
+        # moving on) keeps both and is deliberately NOT a mismatch.
         _, live_base = pr_head_base(pr)
+        live_base_sha = _str_field(pr, "base", "sha").lower()
+        if not live_base or not SHA_HEX_RE.fullmatch(live_base_sha):
+            return skip("the PR's live base could not be read, so a base move since the panel round cannot be "
+                        "ruled out; the push needs a full round")
         reviewed_base = panel_round_base_ref(reviews, poster)
         if not reviewed_base:
             return skip("the panel round recorded no base branch, so a retarget since it reviewed cannot be "
@@ -4143,7 +4163,20 @@ def cmd_approve_only(args) -> int:
         if reviewed_base != live_base:
             return skip(f"the PR's base is now {_printable_base(live_base)} but the panel reviewed against "
                         f"{_printable_base(reviewed_base)} (a retarget), so the push needs a full round")
-        reason, summary = approve_only_paths_scope(args.repo, panel_round_head(reviews, poster), head, globs)
+        merge_base = panel_round_merge_base(reviews, poster)
+        if not merge_base:
+            return skip("the panel round recorded no merge base, so a rewrite of the base branch since it "
+                        "reviewed cannot be ruled out; the push needs a full round")
+        if merge_base != live_base_sha:
+            data = compare(args.repo, merge_base, live_base_sha)
+            if data is None:
+                return skip(f"the compare of the panel round's merge base `{merge_base[:7]}` to the live base "
+                            f"`{live_base_sha[:7]}` could not be read, so the push needs a full round")
+            if not is_ancestor_compare(data):
+                return skip(f"the panel round's merge base `{merge_base[:7]}` is no longer an ancestor of the "
+                            f"live base `{live_base_sha[:7]}` (the base branch was rewritten), so the push "
+                            "needs a full round")
+        reason, summary = approve_only_paths_scope(args.repo, reviewed, head, globs)
         if reason:
             return skip(reason)
         emit(f"📁 **Approver-only path scope** — {summary}.")
@@ -4292,6 +4325,17 @@ def round_head(panel: dict) -> str:
     except (ValueError, AttributeError, RecursionError):
         return ""
     return head if isinstance(head, str) and SHA_HEX_RE.fullmatch(head) else ""
+
+
+def round_merge_base_sha(panel: dict) -> str:
+    """The merge base a consolidated review's round sentinel recorded; "" when
+    the body carries none, or it is not a full lowercase hex SHA."""
+    match = ROUND_SENTINEL_RE.search(_lf(panel.get("body")))
+    try:
+        merge_base = json.loads(match.group(1)).get("merge_base") if match else ""
+    except (ValueError, AttributeError, RecursionError):
+        return ""
+    return merge_base if isinstance(merge_base, str) and SHA_HEX_RE.fullmatch(merge_base) else ""
 
 
 def round_base_ref(panel: dict) -> str:

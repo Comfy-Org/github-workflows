@@ -2055,7 +2055,10 @@ def render_round_sentinel(head: str, base: str, merge_base: str, base_ref: str =
     payload = json.dumps(
         {
             "base": field(base),
-            "base_ref": (base_ref or "").strip().encode("utf-8").hex(),
+            # Encoded exactly, never stripped: `str.strip()` also eats Unicode
+            # whitespace a branch name may carry, and the reader compares the
+            # decoded value byte-for-byte against the live `base.ref`.
+            "base_ref": (base_ref or "").encode("utf-8").hex(),
             "head": field(head),
             "merge_base": field(merge_base),
         },

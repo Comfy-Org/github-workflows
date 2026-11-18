@@ -5403,6 +5403,13 @@ class RoundSentinelTest(PostHarness, unittest.TestCase):
         self.assertEqual(bytes.fromhex(encoded).decode("utf-8"), "release/1.2")
         self.assertNotIn("/", encoded, "the ref is hex, not raw")
 
+    def test_the_base_ref_is_encoded_exactly_never_stripped(self):
+        # U+00A0 is legal in a branch name; stripping it would record `main` and
+        # the byte-exact reader would then match a different branch.
+        rendered = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40, "main\u00a0")
+        encoded = json.loads(rendered.split(" ", 3)[3].rsplit(" ", 1)[0])["base_ref"]
+        self.assertEqual(bytes.fromhex(encoded).decode("utf-8"), "main\u00a0")
+
     def test_an_unknown_base_ref_is_recorded_empty(self):
         payload = self.run_main(
             [finding("app.py", 11)],

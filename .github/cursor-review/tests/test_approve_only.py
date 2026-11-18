@@ -70,6 +70,7 @@ class Base(unittest.TestCase):
         self.out = tempfile.NamedTemporaryFile("w+", delete=False)
         self.addCleanup(os.unlink, self.out.name)
         self.printed = []
+        self.emitted = []
 
     def outputs(self):
         with open(self.out.name, encoding="utf-8") as f:
@@ -93,7 +94,7 @@ class Base(unittest.TestCase):
                 mock.patch.object(AA, "_load_card", lambda: CARD), \
                 mock.patch.object(AA, "open_thread_severities", reader), \
                 mock.patch.object(AA, "card_foreign_editors", history), \
-                mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.object(AA, "emit", lambda *a: self.emitted.extend(a)), \
                 compare_cm, \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
@@ -340,7 +341,7 @@ class DismissalTextTest(Base):
             auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false", carry_forward="false",
             event_name="pull_request_target", approve_only="true", approve_only_delay_minutes="10")
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
-                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: self.emitted.extend(a)), \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             AA.cmd_dismiss_stale(args)
@@ -365,7 +366,7 @@ class DismissalTextTest(Base):
             auto_rereview_delay_minutes="10", can_relabel="true", run_without_label="false", carry_forward="false",
             event_name="pull_request_target", approve_only="true", approve_only_delay_minutes="10")
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
-                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: self.emitted.extend(a)), \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             AA.cmd_dismiss_stale(args)
@@ -427,7 +428,7 @@ class PanelBlockedRereviewTest(Base):
             can_relabel=can_relabel, run_without_label=run_without_label, carry_forward="false",
             event_name="pull_request_target", approve_only=approve_only, approve_only_delay_minutes="10")
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
-                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: self.emitted.extend(a)), \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             return AA.cmd_dismiss_stale(args)
@@ -436,7 +437,7 @@ class PanelBlockedRereviewTest(Base):
         args = argparse.Namespace(repo="o/r", pr_number="1", head_sha=head, approver_login=LOGIN,
                                   poster_login=POSTER, review_label="cursor-review", max_rounds="5")
         with mock.patch.object(AA, "gh", fake), mock.patch.object(CARD, "gh", fake), \
-                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: None), \
+                mock.patch.object(AA, "_load_card", lambda: CARD), mock.patch.object(AA, "emit", lambda *a: self.emitted.extend(a)), \
                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": self.out.name}), \
                 mock.patch("builtins.print", lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
             return AA.cmd_auto_rereview(args)
@@ -591,16 +592,17 @@ def cmp_data(filenames, status="ahead", behind=0, files=None):
     return {"status": status, "ahead_by": len(listed), "behind_by": behind, "total_commits": 1, "files": listed}
 
 
-def panel_round(rid, sha=X, login=POSTER, base_ref="main", **extra):
+def panel_round(rid, sha=X, login=POSTER, base_ref="main", merge_base=Z, **extra):
     """A consolidated review carrying post-review.py's round sentinel for `sha`.
 
     `base_ref` is the base branch the round reviewed against, hex-encoded as
     post-review.py writes it; "main" matches FakeGitHub's PR base, and "" models
-    a round from before the base was recorded."""
+    a round from before the base was recorded. `merge_base` defaults to Z, the
+    live base SHA PathScopeEligibilityTest's fake PR carries."""
     marker = AA._load_post_review().CONSOLIDATED_MARKER
     encoded = base_ref.encode("utf-8").hex() if base_ref else ""
     sentinel = (f'<!-- cursor-review:round v1 '
-                f'{{"base":"{Z}","base_ref":"{encoded}","head":"{sha}","merge_base":"{Z}"}} -->')
+                f'{{"base":"{Z}","base_ref":"{encoded}","head":"{sha}","merge_base":"{merge_base}"}} -->')
     return {"id": rid, "user": {"login": login}, "state": "COMMENTED", "commit_id": sha,
             "body": f"{marker}\n\n{sentinel}\n\nfindings", "submitted_at": "2026-10-12T07:00:00Z", **extra}
 
@@ -746,8 +748,11 @@ class PathScopeEligibilityTest(Base):
     push out of scope leaves `eligible`/`go` false and a full round runs."""
 
     def fake(self, card=None, reviews=None, **kw):
-        # The panel round on X the scope is anchored on, then its decision.
-        return super().fake(card=card, reviews=[panel_round(3, X), block()] if reviews is None else reviews, **kw)
+        # The panel round on X the scope is anchored on, then its decision. The
+        # live base tip is the round's merge base (Z): the base has not moved.
+        fake = super().fake(card=card, reviews=[panel_round(3, X), block()] if reviews is None else reviews, **kw)
+        fake.pr["base"]["sha"] = Z
+        return fake
 
     def test_the_scope_is_anchored_on_the_panel_round_not_the_card(self):
         # The card says Y (an axes-only re-check moved it); the panel saw X.
@@ -809,6 +814,56 @@ class PathScopeEligibilityTest(Base):
         self.assertEqual(self.run_stage(self.fake(), "check", paths="docs/**",
                                         compare=cmp_data(["docs/guide.md"])), 0)
         self.assertEqual(self.outputs()["eligible"], "true")
+
+    def test_the_same_base_fast_forwarded_still_goes(self):
+        # main moved on: the round's merge base Z is an ancestor of the new tip Y.
+        seen = []
+
+        def cmp(repo, base, head):
+            seen.append((base, head))
+            return cmp_data(["docs/guide.md"])
+        fake = self.fake()
+        fake.pr["base"]["sha"] = Y
+        with mock.patch.object(AA, "compare", cmp):
+            self.assertEqual(self.run_stage(fake, "check", head=Y, paths="docs/**"), 0)
+        self.assertEqual(self.outputs()["eligible"], "true")
+        self.assertIn((Z, Y), seen, "the merge base is checked against the live base tip")
+
+    def test_a_base_rewritten_under_the_same_name_falls_through(self):
+        # A stacked PR's lower branch rebased: same ref, but the round's merge base
+        # is no longer on it, so the PR's own diff grew by commits no round read.
+        def cmp(repo, base, head):
+            if base == Z:
+                return cmp_data([], status="diverged", behind=3)
+            return cmp_data(["docs/guide.md"])
+        fake = self.fake()
+        fake.pr["base"]["sha"] = "d" * 40
+        with mock.patch.object(AA, "compare", cmp):
+            self.assertEqual(self.run_stage(fake, "check", paths="docs/**"), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.assertTrue(any("base branch was rewritten" in line for line in self.emitted), self.emitted)
+
+    def test_an_unreadable_merge_base_compare_falls_through(self):
+        fake = self.fake()
+        fake.pr["base"]["sha"] = "d" * 40
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**", compare=None), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_a_round_without_a_merge_base_falls_through(self):
+        fake = self.fake(reviews=[panel_round(3, X, merge_base=""), block()])
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**", compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+
+    def test_an_unreadable_live_base_falls_through_and_says_so(self):
+        fake = self.fake()
+        del fake.pr["base"]["sha"]
+        self.assertEqual(self.run_stage(fake, "check", paths="docs/**", compare=cmp_data(["docs/guide.md"])), 0)
+        self.assertEqual(self.outputs()["eligible"], "false")
+        self.assertTrue(any("live base could not be read" in line for line in self.emitted), self.emitted)
+
+    def test_no_panel_round_is_named_as_such_not_as_a_missing_base(self):
+        self.run_stage(self.fake(reviews=[block()]), "check", paths="docs/**", compare=cmp_data(["docs/guide.md"]))
+        self.assertTrue(any("no panel round records the commit" in line for line in self.emitted), self.emitted)
 
     def test_an_unprintable_live_base_still_falls_through_without_crashing(self):
         # The base is the PR author's text; a mismatch on a ref carrying a newline
