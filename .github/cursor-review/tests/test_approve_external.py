@@ -36,6 +36,10 @@ class FakeGitHub:
             return json.dumps({"id": 555}) if self.post_reply is None else self.post_reply
         if args[:3] == ["api", "-X", "PUT"]:
             self.dismissed.append(args[3].split("/")[-2])
+            # As GitHub: a dismissed review no longer reads back as APPROVED.
+            for r in self.reviews:
+                if str(r.get("id")) == self.dismissed[-1]:
+                    r["state"] = "DISMISSED"
             self.dismiss_messages.append((payload or {}).get("message"))
             return "{}"
         if args[:2] == ["api", "graphql"]:
@@ -442,6 +446,135 @@ class ApproveExternal(unittest.TestCase):
         self.assertEqual((rc, outcome), (0, "retargeted"))
         self.assertEqual(fake.dismissed, ["555"])
         self.assertEqual([p["event"] for p in fake.posted], ["APPROVE", "REQUEST_CHANGES"])
+
+    # A base branch rewritten under the SAME name between the approve-only start
+    # gate and the POST: the ref-name checks cannot see it, the merge base can.
+    PANEL = "cr-bot[bot]"
+    MERGE_BASE = "e" * 40
+    GREEN = {"correctness": "green", "conformance": "green"}
+
+    def panel_round(self, merge_base=MERGE_BASE, poster=PANEL):
+        marker = aa._load_post_review().CONSOLIDATED_MARKER
+        sentinel = (f'<!-- cursor-review:round v1 {{"base":"{merge_base or "f" * 40}","base_ref":"",'
+                    f'"head":"{SHA}","merge_base":"{merge_base}"}} -->')
+        return {"id": 300, "state": "COMMENTED", "user": {"login": poster},
+                "body": f"{marker}\n\n{sentinel}\n\nfindings"}
+
+    def pr(self, base_sha):
+        return {"head": {"sha": SHA}, "base": {"ref": "main", "sha": base_sha}, "labels": []}
+
+    def run_rewrite(self, fake, compare_data, poster=PANEL):
+        cmp = mock.Mock(return_value=compare_data)
+        with mock.patch.object(aa, "compare", cmp):
+            rc, outcome = self.run_cmd(fake, self.GREEN, poster=poster)
+        return rc, outcome, cmp
+
+    def test_a_base_rewritten_before_the_post_is_retargeted_and_posts_no_approval(self):
+        fake = FakeGitHub(reviews=[self.panel_round(), prior_approval(SHA)], pr_override=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3, "ahead_by": 1})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        cmp.assert_any_call("o/r", self.MERGE_BASE, "1" * 40)
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+        # The earlier approval of this very head was signed against the old base.
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_an_unreadable_base_compare_refuses_never_open(self):
+        fake = FakeGitHub(reviews=[self.panel_round()], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, None)
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+
+    def test_an_unreadable_live_base_sha_refuses(self):
+        fake = FakeGitHub(reviews=[self.panel_round()], pr_override=self.pr(""))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+
+    def test_a_fast_forwarded_base_still_approves(self):
+        fake = FakeGitHub(reviews=[self.panel_round()], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0, "ahead_by": 2})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE"])
+
+    def test_a_round_with_no_recorded_merge_base_checks_nothing(self):
+        fake = FakeGitHub(reviews=[self.panel_round(merge_base="")], pr_override=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertNotIn(mock.call("o/r", "", "1" * 40), cmp.call_args_list)
+
+    def test_a_base_rewritten_during_the_post_withdraws_the_approval(self):
+        # Approval 42 of this same head was signed against the old base too: it
+        # is withdrawn with the new one, and so cannot stand in for the block.
+        fake = FakeGitHub(reviews=[self.panel_round(), prior_approval(SHA)], pr_override=self.pr(self.MERGE_BASE),
+                          pr_after=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3, "ahead_by": 1})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        cmp.assert_any_call("o/r", self.MERGE_BASE, "1" * 40)
+        self.assertEqual(fake.dismissed, ["555", "42"])
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE", "REQUEST_CHANGES"])
+
+    def test_a_base_fast_forwarded_during_the_post_keeps_the_approval(self):
+        fake = FakeGitHub(reviews=[self.panel_round(), prior_approval(SHA)], pr_override=self.pr(self.MERGE_BASE),
+                          pr_after=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0, "ahead_by": 1})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(fake.dismissed, [])
+
+    def test_a_panel_round_edited_after_the_start_gate_refuses_on_a_rewritten_base(self):
+        # The start gate validated round 300; someone then edits it (or posts and
+        # edits a newer review as the poster) and rewrites the base under the
+        # same name. The round reads as None, but the approval must not stand.
+        edited = dict(self.panel_round(), lastEditedAt="2026-01-01T00:00:00Z")
+        fake = FakeGitHub(reviews=[edited, prior_approval(SHA)], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3, "ahead_by": 1})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+        self.assertEqual(fake.dismissed, ["42"])
+
+    def test_a_newer_edited_poster_review_hides_the_round_and_refuses(self):
+        newer = {"id": 301, "state": "COMMENTED", "user": {"login": self.PANEL}, "body": "x",
+                 "lastEditedAt": "2026-01-01T00:00:00Z"}
+        fake = FakeGitHub(reviews=[self.panel_round(), newer], pr_override=self.pr(self.MERGE_BASE))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0})
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+
+    def test_an_older_edited_poster_review_does_not_hide_the_round(self):
+        older = {"id": 299, "state": "COMMENTED", "user": {"login": self.PANEL}, "body": "x",
+                 "lastEditedAt": "2026-01-01T00:00:00Z"}
+        fake = FakeGitHub(reviews=[older, self.panel_round()], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0, "ahead_by": 2})
+        self.assertEqual((rc, outcome), (0, "approved"))
+
+    def test_no_panel_round_at_all_still_approves(self):
+        # Standalone cursor-approve with no panel round: the record stays optional.
+        fake = FakeGitHub(pr_override=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3})
+        self.assertEqual((rc, outcome), (0, "approved"))
+        cmp.assert_not_called()
+
+    # With no bot App the panel posts as `github-actions[bot]`, and the
+    # approve-only start gate reads that round: so does the rewrite check.
+    ACTIONS = "github-actions[bot]"
+
+    def test_a_base_rewritten_before_the_post_is_caught_for_a_github_actions_panel(self):
+        fake = FakeGitHub(reviews=[self.panel_round(poster=self.ACTIONS)], pr_override=self.pr("1" * 40))
+        rc, outcome, cmp = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3}, poster=self.ACTIONS)
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        cmp.assert_any_call("o/r", self.MERGE_BASE, "1" * 40)
+        self.assertNotIn("APPROVE", [p["event"] for p in fake.posted])
+
+    def test_a_base_rewritten_during_the_post_is_caught_for_a_github_actions_panel(self):
+        fake = FakeGitHub(reviews=[self.panel_round(poster=self.ACTIONS)], pr_override=self.pr(self.MERGE_BASE),
+                          pr_after=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "diverged", "behind_by": 3}, poster=self.ACTIONS)
+        self.assertEqual((rc, outcome), (0, "retargeted"))
+        self.assertEqual(fake.dismissed, ["555"])
+        self.assertEqual([p["event"] for p in fake.posted], ["APPROVE", "REQUEST_CHANGES"])
+
+    def test_a_github_actions_panel_on_a_fast_forwarded_base_still_approves(self):
+        fake = FakeGitHub(reviews=[self.panel_round(poster=self.ACTIONS)], pr_override=self.pr("1" * 40))
+        rc, outcome, _ = self.run_rewrite(fake, {"status": "ahead", "behind_by": 0}, poster=self.ACTIONS)
+        self.assertEqual((rc, outcome), (0, "approved"))
 
     def test_approval_records_the_axes_base(self):
         fake = FakeGitHub()

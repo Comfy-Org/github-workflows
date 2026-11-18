@@ -3958,22 +3958,25 @@ def _approve_only_cap(args) -> int:
     return min(int(match.group(1)), _load_card().RECHECK_HEADS_KEPT) if match else 0
 
 
-def panel_round_head(reviews: list, poster_login: str) -> str:
-    """The commit the latest panel round reviewed, from its round sentinel; ""
-    when none can be read.
+def _latest_panel_round(reviews: list, poster_login: str):
+    """The latest panel round `poster_login` posted, as its review dict, or None.
 
     The newest consolidated review `poster_login` — the identity the panel
     posts as, round-cap's — left that reviewed something (no NON_ROUND_BANNERS).
     Any other bot is ignored, since the marker is a public constant: its review
     must not move the anchor past changes the panel never saw. An axes-only
-    re-check posts no consolidated review, so this stays on the panel's commit
+    re-check posts no consolidated review, so this stays on the panel's round
     across re-checks — unlike the card's "Reviewed commit". No poster, an
-    edited review newer than it, or a sentinel-less one, reads as "" (fail
-    closed). `github-actions[bot]` is accepted when it IS the poster: with no
-    bot App the panel posts as it."""
+    edited review newer than it, or none at all, reads as None (fail closed).
+    `github-actions[bot]` is accepted when it IS the poster: with no bot App the
+    panel posts as it.
+
+    `panel_round_head` and `panel_round_base_ref` both read from this ONE
+    review, so the commit a push is scoped against and the base that commit was
+    reviewed against can never come from two different rounds."""
     poster = (poster_login or "").strip().lower()
     if not poster:
-        return ""
+        return None
     marker = _load_post_review().CONSOLIDATED_MARKER
     latest, edited = None, []
     for r in reviews:
@@ -3992,8 +3995,51 @@ def panel_round_head(reviews: list, poster_login: str) -> str:
         if latest is None or _review_id(r) > _review_id(latest):
             latest = r
     if latest is None or any(rid > _review_id(latest) for rid in edited):
-        return ""
-    return round_head(latest)
+        return None
+    return latest
+
+
+def panel_round_hidden_by_edit(reviews: list, poster_login: str) -> bool:
+    """True when an edited review by `poster_login` is what makes
+    `_latest_panel_round` read None: it is newer than the latest readable round,
+    or there is no readable round at all. Then a round existed that can no
+    longer be read — unlike a PR the panel never posted a round on."""
+    poster = (poster_login or "").strip().lower()
+    if not poster or _latest_panel_round(reviews, poster) is not None:
+        return False
+    return any(isinstance(r, dict) and _review_id(r) is not None and r.get("edited")
+               and ((r.get("user") or {}).get("login") or "").lower() == poster
+               for r in reviews)
+
+
+def panel_round_head(reviews: list, poster_login: str) -> str:
+    """The commit the latest panel round reviewed, from its round sentinel; ""
+    when none can be read (see `_latest_panel_round`)."""
+    return round_head(_latest_panel_round(reviews, poster_login) or {})
+
+
+def panel_round_base_ref(reviews: list, poster_login: str) -> str:
+    """The base branch the latest panel round reviewed against, from its round
+    sentinel; "" when no round, no sentinel, or no recorded base ref can be read
+    (see `_latest_panel_round` and `round_base_ref`). "" fails closed: the
+    approve-only base check refuses the axes-only lane on an unreadable base."""
+    return round_base_ref(_latest_panel_round(reviews, poster_login) or {})
+
+
+def panel_round_merge_base(reviews: list, poster_login: str) -> str:
+    """The merge base the latest panel round diffed against, from its round
+    sentinel; "" when none can be read (see `_latest_panel_round`). The base
+    check's second half: a base branch rewritten under the same name moves the
+    PR's merge base off it, which the name alone cannot see."""
+    return round_merge_base_sha(_latest_panel_round(reviews, poster_login) or {})
+
+
+def _printable_base(ref: str) -> str:
+    """A base ref safe to echo into the log and job summary, backticked, or a
+    placeholder when it is not. A ref is the PR author's text; echoing it raw
+    would let one carrying a newline or `::` smuggle a workflow command, the same
+    reason `approve_only_paths_scope` screens an out-of-scope path name."""
+    return f"`{ref}`" if REGENERATED_PATH_RE.fullmatch(ref or "") else "a base with an unprintable name"
 
 
 def approve_only_paths_scope(repo: str, reviewed: str, head: str, globs: list):
@@ -4101,8 +4147,49 @@ def cmd_approve_only(args) -> int:
     # other — never fail open.
     globs = (getattr(args, "approve_only_paths", "") or "").split()
     if globs:
-        reason, summary = approve_only_paths_scope(
-            args.repo, panel_round_head(reviews, getattr(args, "poster_login", "") or ""), head, globs)
+        poster = getattr(args, "poster_login", "") or ""
+        reviewed = panel_round_head(reviews, poster)
+        if not reviewed:
+            return skip("no panel round records the commit it reviewed, so there is nothing to scope the push "
+                        "against")
+        # The scope compares the push head-to-head against the panel's commit and
+        # never looks at the PR's base. Two base moves change the PR's own diff
+        # under a compare that still reads docs-only, so the axes alone would
+        # approve a diff no panel round read: a retarget (base A → base B), and
+        # the SAME base branch rewritten under its name (a stacked PR's lower
+        # branch rebased or force-pushed, a base reset or recreated), which moves
+        # the merge base off the one the round diffed against. Require both the
+        # live base ref to be the one the panel reviewed AND the round's merge base
+        # to still be an ancestor of (or equal to) the live base tip; a missing or
+        # unreadable record refuses too (a round from before the base was recorded
+        # cannot prove the base did not move since). A same-ref fast-forward (main
+        # moving on) keeps both and is deliberately NOT a mismatch.
+        _, live_base = pr_head_base(pr)
+        live_base_sha = _str_field(pr, "base", "sha").lower()
+        if not live_base or not SHA_HEX_RE.fullmatch(live_base_sha):
+            return skip("the PR's live base could not be read, so a base move since the panel round cannot be "
+                        "ruled out; the push needs a full round")
+        reviewed_base = panel_round_base_ref(reviews, poster)
+        if not reviewed_base:
+            return skip("the panel round recorded no base branch, so a retarget since it reviewed cannot be "
+                        "ruled out; the push needs a full round")
+        if reviewed_base != live_base:
+            return skip(f"the PR's base is now {_printable_base(live_base)} but the panel reviewed against "
+                        f"{_printable_base(reviewed_base)} (a retarget), so the push needs a full round")
+        merge_base = panel_round_merge_base(reviews, poster)
+        if not merge_base:
+            return skip("the panel round recorded no merge base, so a rewrite of the base branch since it "
+                        "reviewed cannot be ruled out; the push needs a full round")
+        if merge_base != live_base_sha:
+            data = compare(args.repo, merge_base, live_base_sha)
+            if data is None:
+                return skip(f"the compare of the panel round's merge base `{merge_base[:7]}` to the live base "
+                            f"`{live_base_sha[:7]}` could not be read, so the push needs a full round")
+            if not is_ancestor_compare(data):
+                return skip(f"the panel round's merge base `{merge_base[:7]}` is no longer an ancestor of the "
+                            f"live base `{live_base_sha[:7]}` (the base branch was rewritten), so the push "
+                            "needs a full round")
+        reason, summary = approve_only_paths_scope(args.repo, reviewed, head, globs)
         if reason:
             return skip(reason)
         emit(f"📁 **Approver-only path scope** — {summary}.")
@@ -4251,6 +4338,36 @@ def round_head(panel: dict) -> str:
     except (ValueError, AttributeError, RecursionError):
         return ""
     return head if isinstance(head, str) and SHA_HEX_RE.fullmatch(head) else ""
+
+
+def round_merge_base_sha(panel: dict) -> str:
+    """The merge base a consolidated review's round sentinel recorded; "" when
+    the body carries none, or it is not a full lowercase hex SHA."""
+    match = ROUND_SENTINEL_RE.search(_lf(panel.get("body")))
+    try:
+        merge_base = json.loads(match.group(1)).get("merge_base") if match else ""
+    except (ValueError, AttributeError, RecursionError):
+        return ""
+    return merge_base if isinstance(merge_base, str) and SHA_HEX_RE.fullmatch(merge_base) else ""
+
+
+def round_base_ref(panel: dict) -> str:
+    """The base branch a consolidated review's round sentinel recorded, decoded
+    from the hex post-review.py wrote; "" when the body carries no sentinel, the
+    sentinel records no `base_ref` (a round from before this field existed), or
+    the record is garbled. Fails closed: a reader treats "" as "base unknown"
+    and refuses the axes-only lane on it."""
+    match = ROUND_SENTINEL_RE.search(_lf(panel.get("body")))
+    try:
+        encoded = json.loads(match.group(1)).get("base_ref") if match else ""
+    except (ValueError, AttributeError, RecursionError):
+        return ""
+    if not isinstance(encoded, str) or not encoded:
+        return ""
+    try:
+        return bytes.fromhex(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
 
 
 def _review_id(r: dict):
@@ -4667,6 +4784,61 @@ def external_block(args, outcome: str, decision, why: str, live_head: str = "") 
     return rc
 
 
+def external_base_rewrite(args, pr, merge_base: str) -> str:
+    """Why the live base no longer holds the panel round's merge base, or "".
+
+    cmd_approve_only's start gate checks the round's merge base against the
+    live base tip, but the axes then run for minutes, and a base branch
+    rewritten under the SAME name in that window (a stacked PR's lower branch
+    force-pushed) passes the ref-name checks around the POST. So the approval
+    repeats the ancestry half right before it posts, and again after it when
+    the base tip moved meanwhile. No recorded merge base ("") checks nothing,
+    as before: a round from before the sentinel recorded one is the start
+    gate's to refuse. An unreadable live base or compare refuses (never fail
+    open); a fast-forward of the same base keeps the merge base an ancestor."""
+    if not merge_base:
+        return ""
+    live_base_sha = _str_field(pr, "base", "sha").lower() if isinstance(pr, dict) else ""
+    if not SHA_HEX_RE.fullmatch(live_base_sha):
+        return "the PR's live base commit could not be read to rule out a rewrite of the base branch"
+    if live_base_sha == merge_base:
+        return ""
+    data = compare(args.repo, merge_base, live_base_sha)
+    if data is None:
+        return (f"the compare of the panel round's merge base {merge_base[:7]} to the live base "
+                f"{live_base_sha[:7]} could not be read")
+    if not is_ancestor_compare(data):
+        return (f"the panel round's merge base {merge_base[:7]} is no longer an ancestor of the live base "
+                f"{live_base_sha[:7]} (the base branch was rewritten)")
+    return ""
+
+
+def external_panel_merge_base(args) -> tuple:
+    """(the latest panel round's recorded merge base or "", why it is unknown or "").
+
+    The round is `_latest_panel_round`'s — the same one the approve-only start
+    gate read — so `github-actions[bot]` counts when it IS the poster (no bot
+    App). Unlike approval_merge_base, which RECORDS what it reads, this record
+    can only refuse an approval, never grant one, so an identity any workflow
+    can post as is still worth reading here. No poster means no round to read;
+    an unreadable review list is a reason to refuse, not an absent record. So
+    is a round an EDIT hid (panel_round_hidden_by_edit): the approve-only start
+    gate may have validated that very round's merge base, and a body edited
+    during the axes (repo write access suffices) must not turn the check off."""
+    poster = (getattr(args, "poster_login", "") or "").strip()
+    if not poster:
+        return "", ""
+    try:
+        reviews = list_reviews(args.repo, args.pr_number)
+    except (RuntimeError, ValueError) as e:
+        return "", (f"the panel round's merge base could not be read to rule out a rewrite of the base branch "
+                    f"({annotation_cause(e, 'unknown error')})")
+    if panel_round_hidden_by_edit(reviews, poster):
+        return "", ("the latest panel round was edited, so its merge base can no longer be read to rule out a "
+                    "rewrite of the base branch")
+    return panel_round_merge_base(reviews, poster), ""
+
+
 def cmd_approve_external(args) -> int:
     set_output("outcome", "error")
     axes = [a.strip().lower() for a in (args.axes or "").split(",") if a.strip()]
@@ -4718,10 +4890,23 @@ def cmd_approve_external(args) -> int:
         outcome, why = "not_approved", "the axes did not approve"
     else:
         outcome, why = "approved", ""
+    panel_merge_base, rewritten = "", False
+    if outcome == "approved":
+        # Same ref name, rewritten branch: the axes' verdicts hold for a diff
+        # the panel never read (external_base_rewrite), so it is a retarget too.
+        panel_merge_base, why = external_panel_merge_base(args)
+        why = why or external_base_rewrite(args, pr, panel_merge_base)
+        if why:
+            outcome, rewritten = "retargeted", True
     if outcome != "approved":
         set_output("outcome", outcome)
         emit(f"ℹ️ **cursor-approve: no approval** — {why}.")
-        if outcome in SUPERSEDED_OUTCOMES and live_head:
+        if rewritten:
+            # Every approval of this head was signed against the old base
+            # branch, and no run reading this panel round can pass this check
+            # now, so none of them is current.
+            rc = withdraw_own_approvals(args, STALE_MESSAGE)
+        elif outcome in SUPERSEDED_OUTCOMES and live_head:
             # A newer head or base is a newer run's to judge: withdraw only what
             # is stale against the LIVE head and base, so a decide that finishes
             # late cannot dismiss an approval that run already posted.
@@ -4769,9 +4954,14 @@ def cmd_approve_external(args) -> int:
         labels_unreadable = not live_labels_readable(pr_now)
         vetoed_now = has_label(pr_now, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError):
-        head_now = base_now = None
+        head_now = base_now = pr_now = None
         labelled_now = vetoed_now = labels_unreadable = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
+    if not moved and panel_merge_base and (_str_field(pr_now, "base", "sha").lower()
+                                           != _str_field(pr, "base", "sha").lower()):
+        # The base tip moved during the POST: re-check it still holds the panel
+        # round's merge base, so a same-name rewrite withdraws the approval.
+        moved = rewritten = bool(external_base_rewrite(args, pr_now, panel_merge_base))
     if moved or labelled_now or vetoed_now or labels_unreadable:
         # Veto, then hand-off, first, as before the POST.
         if vetoed_now:
@@ -4792,10 +4982,13 @@ def cmd_approve_external(args) -> int:
         except RuntimeError as e:
             print(f"::error::The PR changed while the approval was posted, and withdrawing it failed: {e}. {DISMISS_PERMISSION_HINT}")
             return 1
-        if outcome in ("vetoed", "error"):
+        if outcome in ("vetoed", "error") or rewritten:
             # Not only the review just posted: any other standing approval by
             # this identity (an earlier run's, or one posted concurrently) would
             # still count toward branch protection on a PR that cannot be cleared.
+            # A rewritten base likewise voids every approval of this head, as
+            # before the POST — and one left standing would also let
+            # external_block's own_approval_on skip the block below.
             if withdraw_own_approvals(args, message):
                 return 1
         # The withdrawn approval leaves the PR unblocked unless this does.
