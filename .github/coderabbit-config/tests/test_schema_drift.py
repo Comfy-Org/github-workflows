@@ -214,8 +214,11 @@ class VendoredSchemaTest(unittest.TestCase):
         # arrived with #288's refresh and is pinned so the 15th cap is checked
         # rather than merely counted.
         self.assertEqual(caps["chat.integrations.jira.issue_template"], 3000)
+        # The 16th and 17th arrived together with #467's refresh.
+        self.assertEqual(caps["reviews.merge_risk_instructions"], 3000)
+        self.assertEqual(caps["reviews.security_risk_instructions"], 3000)
         # README.md documents this count and the 50 -> 20,000 span; both move together.
-        self.assertEqual(len(caps), 15)
+        self.assertEqual(len(caps), 17)
         self.assertEqual((min(caps.values()), max(caps.values())), (50, 20000))
 
 
