@@ -534,7 +534,7 @@ jobs:
         # normal (first round, or the read failed): no block, never an error.
         if: inputs.prior_rounds > 0
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: prior-axes
           path: ${{ runner.temp }}/prior
@@ -544,7 +544,7 @@ jobs:
         # normal (no panel threads yet, or the read failed): no block, never an error.
         if: inputs.panel_threads_context
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: panel-threads
           path: ${{ runner.temp }}/panel
@@ -784,7 +784,7 @@ jobs:
       - name: Upload the transcript
         # Its own artifact, never named axis-*: only the verdict JSON flows on.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: transcript-axis-${{ inputs.axis }}
           path: ${{ runner.temp }}/axis-transcript/
@@ -802,7 +802,7 @@ jobs:
           cat "$RUNNER_TEMP/axis-out/$AXIS.json"
 
       - name: Upload the verdict
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: axis-${{ inputs.axis }}
           path: ${{ runner.temp }}/axis-out/${{ inputs.axis }}.json
@@ -910,7 +910,7 @@ jobs:
       - name: Download the prior verdicts
         if: inputs.prior_rounds > 0
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: prior-axes
           path: ${{ runner.temp }}/prior
@@ -918,7 +918,7 @@ jobs:
       - name: Download the panel threads
         if: inputs.panel_threads_context
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: panel-threads
           path: ${{ runner.temp }}/panel
@@ -1147,7 +1147,7 @@ jobs:
       - name: Upload the transcript
         # Its own artifact, never named axis-*: only the verdict JSON flows on.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: transcript-axis-${{ inputs.axis }}
           path: ${{ runner.temp }}/axis-transcript/
@@ -1179,7 +1179,7 @@ jobs:
           cat "$RUNNER_TEMP/axis-out/$AXIS.json"
 
       - name: Upload the verdict
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: axis-${{ inputs.axis }}
           path: ${{ runner.temp }}/axis-out/${{ inputs.axis }}.json
@@ -1279,7 +1279,7 @@ jobs:
         if: always() && steps.axis_direct.outcome != 'skipped'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: usage-direct-axis-${{ inputs.axis }}-${{ inputs.axis_direct_model }}
           path: /tmp/usage-out/usage.json
