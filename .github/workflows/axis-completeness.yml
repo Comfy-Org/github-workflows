@@ -8,7 +8,8 @@ name: Cursor axis (completeness)
 # Runs only on same-repo PRs in a PRIVATE repo; otherwise it skips with a
 # notice. See docs/callers/cursor-approve.md for the caller and accepted risk.
 #
-# Inputs (passed through): commit_sha, model, runs_on, prior_rounds.
+# Inputs (passed through): commit_sha, model, runs_on, prior_rounds,
+# panel_threads_context.
 # Secrets: CURSOR_API_KEY, LINEAR_KEY.
 
 on:
@@ -26,6 +27,9 @@ on:
       prior_rounds:
         type: number
         default: 0
+      panel_threads_context:
+        type: boolean
+        default: false
     secrets:
       CURSOR_API_KEY:
         required: true
@@ -58,6 +62,7 @@ jobs:
       model: ${{ inputs.model }}
       runs_on: ${{ inputs.runs_on }}
       prior_rounds: ${{ inputs.prior_rounds }}
+      panel_threads_context: ${{ inputs.panel_threads_context }}
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       LINEAR_KEY: ${{ secrets.LINEAR_KEY }}

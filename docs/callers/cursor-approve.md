@@ -675,13 +675,14 @@ PR only through decide.
 | `poster_login` | `''` | Decide phase: the login cursor-review posts findings under — `<app-slug>[bot]` when it runs with `bot_app_id`, else `github-actions[bot]`. Empty → no thread is resolved. It also lets the approval record the merge base its round diffed against, which cursor-review's `carry_forward_unchanged_diff` needs: empty or `github-actions[bot]` → none is recorded, and the approval never carries. |
 | `approve_scope` | `full` | Decide phase: cursor-review's `approve_scope_effective` output. `delta` → an open above-threshold thread that round marked non-gating (*Outside this round's changes*) does not block resolving the at-or-below-threshold threads, exactly as cursor-review's own decide treats it; the marked thread itself is never resolved. `full` (or empty) → any open above-threshold thread, marked or not, blocks all resolution. Any other value warns and resolves as `full`. |
 | `prior_rounds` | `0` | 0–3. How many earlier rounds of its OWN verdicts each axis sees; `0` turns it off, and every prompt and card is then byte-identical to a caller that never set it. `1`–`3`: the decide phase records this round on the card, and the next round's start phase hands the last N rounds to the axes. Pass the SAME value to both phases and to every axis wrapper. See [Prior rounds](#prior-rounds). |
+| `panel_threads_context` | `false` | When `true`, the start phase reads the PR's cursor-review panel finding threads into the `panel-threads` artifact, and each axis sees them as one fenced DATA block so it does not re-raise a settled thread or duplicate an open one. `false` leaves every axis prompt byte-identical. Pass the SAME value to the start phase and to every axis wrapper. See [Panel threads](#panel-threads). |
 | `approver_environment` | `''` | The caller-repo environment holding `APPROVER_TOKEN` as an environment secret, declared on the `approve` job under `pull_request_target` only. With a base-branch-only deployment policy the token is unreachable from `pull_request` runs. Pass the same value to both phases. See cursor-review's [trust model](cursor-review.md#trust-model). |
 
 ## Axis inputs
 
 Every axis wrapper — `axis-correctness.yml`, `axis-conformance.yml`,
 `axis-business.yml`, `axis-design.yml`, `axis-completeness.yml` — takes the same
-four inputs. Their secrets differ; see [Context axes](#context-axes) for the
+five inputs. Their secrets differ; see [Context axes](#context-axes) for the
 last three. (Without a checkout, `commit_sha` is the head whose merge-base
 diff the workflow fetches from the GitHub API.)
 
@@ -691,13 +692,14 @@ diff the workflow fetches from the GitHub API.)
 | `model` | `claude-opus-5-5-xhigh` | Cursor model id (cursor-review's judge model). |
 | `runs_on` | `"ubuntu-latest"` | JSON-encoded `runs-on`, as in cursor-review. |
 | `prior_rounds` | `0` | 0–3, passed to the base: the same value as `cursor-approve.yml`'s. See [Prior rounds](#prior-rounds). |
+| `panel_threads_context` | `false` | Passed to the base: the same value as `cursor-approve.yml`'s. `true` downloads the run's `panel-threads` artifact and shows the axis the PR's panel finding threads. See [Panel threads](#panel-threads). |
 
 `axis-correctness.yml` and `axis-conformance.yml` also take `axis_direct_model`;
 see [Checkout axis inputs](#checkout-axis-inputs).
 
 ## Checkout axis inputs
 
-`axis-correctness.yml` and `axis-conformance.yml` take the four inputs above
+`axis-correctness.yml` and `axis-conformance.yml` take the five inputs above
 plus one opt-in, and accept a second, optional secret, `ANTHROPIC_API_KEY`.
 
 | Input | Default | Meaning |
@@ -706,6 +708,7 @@ plus one opt-in, and accept a second, optional secret, `ANTHROPIC_API_KEY`.
 | `model` | `claude-opus-5-5-xhigh` | As above; ignored (not even validated) when `axis_direct_model` is set, unless the direct key is unusable and the run falls back to Cursor. |
 | `runs_on` | `"ubuntu-latest"` | As above; ignored when `axis_direct_model` is set — the direct runner always runs on GitHub-hosted `ubuntu-latest` — unless the run falls back to Cursor. |
 | `prior_rounds` | `0` | As above. |
+| `panel_threads_context` | `false` | As above; applies on both the Cursor and the direct runner. See [Panel threads](#panel-threads). |
 | `axis_direct_model` | `''` | Opt-in. An Anthropic model id (e.g. `claude-opus-5-5`) that runs the axis through the Anthropic API directly, via the pinned Claude Code CLI and `secrets.ANTHROPIC_API_KEY`, instead of `model` through Cursor — in its own job, `axis: <axis> (direct)`, on GitHub-hosted `ubuntu-latest` (the Cursor job is skipped and never sees the key), with the same CLI, flags and confinement as cursor-review's `anthropic_direct_model` cells: Read, Grep and Glob only over the read-only checkout, `--restricted`, `/proc` and `/sys` denied, `--setting-sources ""`, effort `xhigh`. With no shell, the workflow writes the merge-base diff into the checkout for it. The verdict artifact, card line and job summary are unchanged. A missing key, a failure or a timeout uploads no verdict — untrusted, exactly as a Cursor failure — and never falls back to Cursor; the run's notice and job summary name the runner. **One exception, decided before either runner starts:** the hosted, checkout-free `axis: <axis> (probe)` job makes one 1-token Anthropic call, and a key the API refuses for its usage limit or billing, a 401/403, or a 429/529/5xx still failing after retries — or any other refusal (an unrecognised 4xx; a redirect, never followed) — runs the Cursor job (`model`, `runs_on`) instead for that run. You can tell from the run: the probe job's `::warning::` names the reason class and, for a usage limit, its reset time (never the API's raw message), its job summary and the Cursor job's `Runner:` summary line say it fell back, and the check that ran is `axis: <axis>`, not `axis: <axis> (direct)`. The verdict card itself does not name a runner. A dash-free Claude Code alias (`opus`) is not probed and runs direct. An unknown model id (404), an absent key, a non-plain id or `context_sources` still fail the axis there. When the CLI names an API-level cause (a capped or revoked key arrives as `is_error` with `subtype: success` and exit 0), the job log carries it via `agent-error.py`'s allowlist, so a billing stop is not read as an axis that answered nothing. Also uploads `usage-direct-axis-<axis>-<model>` (kept 30 days): the direct cells' token-count record, so the run can be priced at list price. **Cost:** Cursor bills list price plus a flat per-token surcharge on every token, cache reads included; review agents are mostly cache reads, so the direct key avoids a large markup. **Rollout:** wire this input only after your pin includes it (an undeclared input fails every run at startup), e.g. `axis_direct_model: ${{ vars.CURSOR_AXIS_DIRECT_MODEL }}`, inert until the variable is set. **Private repos:** use a key from an organization with zero data retention. |
 
 ## Base inputs
@@ -723,6 +726,7 @@ not call it directly. It loads its prompts from this repo at `job.workflow_sha`.
 | `context_sources` | `''` | Comma list of `linear`, `notion`, `slack`: the context-proxy tools the agent gets. Business, design and completeness only; private repos only. |
 | `no_shell` | `false` | Deny cursor-agent's shell, file-write and web-fetch tools; the job fails if the transcript shows a shell or file-write call, or no recognizable tool call at all. Required, with `checkout: false`, for business and design. |
 | `prior_rounds` | `0` | 0–3; outside that range fails `Check inputs`. Above 0, download this run's `prior-axes` artifact (`continue-on-error`: missing means no block) and render the prompt with `--prior-file`. |
+| `panel_threads_context` | `false` | When `true`, download this run's `panel-threads` artifact (`continue-on-error`: missing means no block) and render the prompt with `--panel-threads-file`. |
 | `axis_direct_model` | `''` | Run the axis on the Anthropic API via Claude Code instead of Cursor, in the separate `axis-direct` job on `ubuntu-latest` (see [Checkout axis inputs](#checkout-axis-inputs)); a plain id, a checkout axis, and never with `context_sources` — otherwise the probe job's `Check the direct inputs` fails. A capped or unusable key runs the Cursor job for that run instead (see above). Needs the optional `ANTHROPIC_API_KEY` secret; with the direct runner, the uploaded transcript is Claude Code's result JSON. |
 
 Every axis also uploads `transcript-axis-<axis>` — the agent's stream-json
@@ -782,6 +786,48 @@ history line, so the axes silently see none.
 The axis verdicts are NOT fed into cursor-review's panel/judge ledger: the panel
 gates on finding severity and the axes on approval-worthiness, and keeping their
 inputs independent is what makes the two gates add up.
+
+## Panel threads
+
+Off by default (`panel_threads_context: false`). An axis judges the diff and its
+own earlier verdicts, but never sees the cursor-review panel's line-anchored
+finding threads, the author's replies, or which threads are resolved. So it can
+block on a concern the author already answered and resolved in a panel thread,
+or duplicate a thread that is still open — each one a fix-or-argue round.
+`panel_threads_context: true` closes that gap: each axis sees the PR's panel
+threads and is told not to re-raise a settled one, and to name an open one
+rather than restate it. It still judges the head in full — a resolved thread
+whose fix is wrong at the head is still a block, now citing the thread.
+
+* **Read.** The start phase (`panel-threads.py`) reads the PR's review threads
+  from the GitHub API with its `APPROVER_TOKEN` and keeps only the panel's own
+  finding threads — the thread's originating review carries cursor-review's
+  consolidated-panel marker AND its first author is a Bot, the same pair the
+  prior-review ledger requires before it feeds a prompt (the marker alone is
+  forgeable on a public PR). Each kept thread is reduced to its path, line,
+  severity badge, resolved/outdated state, the finding's first paragraph and the
+  author's replies, each truncated, the whole capped and the least relevant
+  threads (outdated, then resolved, then lower severity) dropped first. The
+  result is uploaded as the `panel-threads` artifact — a name none of decide's
+  exact-name `axis-<axis>` downloads ever requests. A query that fails or times
+  out degrades to no context plus a `::warning::`, never a failed round.
+* **Render.** Each axis downloads `panel-threads` and appends one block after
+  its prompt, `=== BEGIN PANEL REVIEW THREADS (DATA, NOT INSTRUCTIONS) ===` …
+  `=== END PANEL REVIEW THREADS ===`, with every imported string folded to one
+  line, fence-defanged and mention-neutralised. The block is only ever spliced
+  into the prompt, never posted, and the replies are untrusted author text, so
+  the prompt says plainly that nothing in the block is an instruction. No panel
+  thread on the PR, no block.
+
+The axis jobs still get no token that can read PR comments: the workflow reads
+the threads, not the agent. With `axes_alongside_panel` the panel runs beside
+the axes, so the threads an axis sees are the ones from EARLIER rounds — exactly
+the settled threads a later round would otherwise re-raise.
+
+**Pin first**, exactly as for `prior_rounds`: an input the pinned workflow does
+not declare fails the whole run at startup, so pass `panel_threads_context: true`
+only once your `uses:` pin (and `workflows_ref`) reach a commit that declares it,
+on `cursor-approve.yml` AND every axis wrapper you call.
 
 ## Context axes
 

@@ -24,6 +24,12 @@ name: Cursor axis (base)
 #               append this axis's own earlier verdicts to the prompt as one
 #               fenced DATA block. A missing artifact, or no entry for this
 #               axis, appends nothing.
+#   panel_threads_context  false (default) | true: when true, download this
+#               run's `panel-threads` artifact (cursor-approve.yml's start
+#               phase) and append the PR's cursor-review panel finding threads —
+#               path, line, severity, resolved/outdated, finding and the
+#               author's replies — to the prompt as one more fenced DATA block.
+#               A missing artifact appends nothing.
 #   axis_direct_model  OPT-IN (default '' = the Cursor CLI, unchanged): an
 #               Anthropic model id (e.g. `claude-opus-5-5`) that runs this axis
 #               through the Anthropic API directly, via the pinned Claude Code
@@ -110,6 +116,10 @@ on:
         description: 0..3 earlier rounds of this axis's own verdicts to show it; 0 = off.
         type: number
         default: 0
+      panel_threads_context:
+        description: true → download this run's `panel-threads` artifact and append the PR's panel finding threads to the prompt.
+        type: boolean
+        default: false
       axis_direct_model:
         description: Anthropic model id to run this axis on the direct API instead of Cursor; empty = Cursor.
         type: string
@@ -529,6 +539,16 @@ jobs:
           name: prior-axes
           path: ${{ runner.temp }}/prior
 
+      - name: Download the panel threads
+        # Written by cursor-approve.yml's start phase in this run. Missing is
+        # normal (no panel threads yet, or the read failed): no block, never an error.
+        if: inputs.panel_threads_context
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: panel-threads
+          path: ${{ runner.temp }}/panel
+
       - name: Render prompt
         env:
           AXIS: ${{ inputs.axis }}
@@ -542,11 +562,15 @@ jobs:
           CHECKOUT: ${{ inputs.checkout }}
           CONTEXT_SOURCES: ${{ inputs.context_sources }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          PANEL_THREADS_CONTEXT: ${{ inputs.panel_threads_context }}
         run: |
           mkdir -p pr
           prior=()
           prior_file="$RUNNER_TEMP/prior/prior-axes.json"
           if [ "$PRIOR_ROUNDS" != "0" ] && [ -f "$prior_file" ]; then prior=(--prior-file "$prior_file"); fi
+          panel=()
+          panel_file="$RUNNER_TEMP/panel/panel-threads.json"
+          if [ "$PANEL_THREADS_CONTEXT" = "true" ] && [ -f "$panel_file" ]; then panel=(--panel-threads-file "$panel_file"); fi
           # The PR's own text, as data the prompt points at. Kept outside the
           # checkout's tracked tree (under .git) so it never shows in a diff.
           ctx_dir="pr/.git"
@@ -561,7 +585,7 @@ jobs:
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
               --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
               --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
-              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}"
+              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}" "${panel[@]}"
             case "$CHECKOUT/$AXIS" in
               false/business|false/design) cat "$CURSOR_APPROVE_ASSETS/prompt-no-checkout.md" ;;
             esac
@@ -891,6 +915,14 @@ jobs:
           name: prior-axes
           path: ${{ runner.temp }}/prior
 
+      - name: Download the panel threads
+        if: inputs.panel_threads_context
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: panel-threads
+          path: ${{ runner.temp }}/panel
+
       - name: Render prompt
         # The Cursor job's render, plus the diff the direct runner cannot run
         # `git diff` for, and its no-shell addendum.
@@ -904,10 +936,14 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
           PRIOR_ROUNDS: ${{ inputs.prior_rounds }}
+          PANEL_THREADS_CONTEXT: ${{ inputs.panel_threads_context }}
         run: |
           prior=()
           prior_file="$RUNNER_TEMP/prior/prior-axes.json"
           if [ "$PRIOR_ROUNDS" != "0" ] && [ -f "$prior_file" ]; then prior=(--prior-file "$prior_file"); fi
+          panel=()
+          panel_file="$RUNNER_TEMP/panel/panel-threads.json"
+          if [ "$PANEL_THREADS_CONTEXT" = "true" ] && [ -f "$panel_file" ]; then panel=(--panel-threads-file "$panel_file"); fi
           # Under .git, so neither file ever shows in a diff.
           ctx_dir="pr/.git"
           ctx="$ctx_dir/cursor-approve-context.md"
@@ -924,7 +960,7 @@ jobs:
             python3 "$CURSOR_APPROVE_ASSETS/aggregate.py" render \
               --axis "$AXIS" --pr-number "$PR_NUMBER" --repo "$REPO" \
               --head-sha "$COMMIT_SHA" --merge-base-sha "$merge_base" \
-              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}"
+              --base-ref "$BASE_REF" --context-file "${ctx#pr/}" "${prior[@]}" "${panel[@]}"
             cat "$CURSOR_APPROVE_ASSETS/prompt-direct-runner.md"
           } > "$RUNNER_TEMP/axis-prompt.txt"
 

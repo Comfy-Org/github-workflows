@@ -72,6 +72,13 @@ name: Cursor approve
 #                    (`card.py prior`) into the `prior-axes` artifact the axis
 #                    workflows take with the same input. Pass it to BOTH phases
 #                    and to every axis. 0 leaves every prompt and card unchanged.
+#   panel_threads_context  false (default) | true. When true, the start phase
+#                    reads the PR's cursor-review panel finding threads
+#                    (`panel-threads.py`) into the `panel-threads` artifact the
+#                    axis workflows take with the same input, so each axis sees
+#                    the threads it might otherwise re-raise or duplicate. Pass
+#                    it to the start phase and to every axis. false leaves every
+#                    axis prompt byte-identical.
 # Secrets:
 #   APPROVER_TOKEN   token of the approving identity. Empty → warn and exit 0;
 #                    there is deliberately no fallback to an App or GITHUB_TOKEN.
@@ -120,6 +127,9 @@ on:
       prior_rounds:
         type: number
         default: 0
+      panel_threads_context:
+        type: boolean
+        default: false
       approver_environment:
         description: >-
           The caller-repo environment that holds APPROVER_TOKEN. With a
@@ -391,6 +401,37 @@ jobs:
         with:
           name: prior-axes
           path: ${{ runner.temp }}/prior/prior-axes.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+      - name: Read the panel threads
+        # The workflow, not the agent, reads the PR's panel finding threads: the
+        # axis jobs hold `contents: read` and no token that can read them. No
+        # login is needed — panel-threads.py selects threads by the consolidated
+        # marker plus a Bot author, not by this identity. continue-on-error: the
+        # panel context is an aid, so a failed read is no context, never a failed
+        # start phase (which would skip the axes).
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.panel_threads_context }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/panel"
+          python3 "$CURSOR_APPROVE_ASSETS/panel-threads.py" build --repo "$REPO" \
+            --pr-number "$PR_NUMBER" --out "$RUNNER_TEMP/panel/panel-threads.json"
+
+      - name: Upload the panel threads
+        # NOT axis-*: decide downloads `axis-*`, and this must never be read as a
+        # verdict (a test pins the name).
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' && inputs.phase == 'start' && inputs.panel_threads_context }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: panel-threads
+          path: ${{ runner.temp }}/panel/panel-threads.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: 7

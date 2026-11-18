@@ -8,8 +8,8 @@ name: Cursor axis (correctness)
 # docs/callers/cursor-approve.md for the caller.
 #
 # Inputs (passed through): commit_sha, model, runs_on, prior_rounds,
-# axis_direct_model (opt-in: run on the Anthropic API directly instead of
-# Cursor; see cursor-axis-base.yml).
+# panel_threads_context, axis_direct_model (opt-in: run on the Anthropic API
+# directly instead of Cursor; see cursor-axis-base.yml).
 # Secrets: CURSOR_API_KEY; ANTHROPIC_API_KEY, needed only with axis_direct_model.
 
 on:
@@ -27,6 +27,9 @@ on:
       prior_rounds:
         type: number
         default: 0
+      panel_threads_context:
+        type: boolean
+        default: false
       axis_direct_model:
         type: string
         default: ''
@@ -51,6 +54,7 @@ jobs:
       model: ${{ inputs.model }}
       runs_on: ${{ inputs.runs_on }}
       prior_rounds: ${{ inputs.prior_rounds }}
+      panel_threads_context: ${{ inputs.panel_threads_context }}
       axis_direct_model: ${{ inputs.axis_direct_model }}
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
