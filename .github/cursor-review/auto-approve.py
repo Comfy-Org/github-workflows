@@ -3958,22 +3958,29 @@ def _approve_only_cap(args) -> int:
     return min(int(match.group(1)), _load_card().RECHECK_HEADS_KEPT) if match else 0
 
 
-def panel_round_head(reviews: list) -> str:
+def panel_round_head(reviews: list, poster_login: str) -> str:
     """The commit the latest panel round reviewed, from its round sentinel; ""
     when none can be read.
 
-    The newest consolidated review a bot posted (`head_already_reviewed`'s
-    author test) that reviewed something (no NON_ROUND_BANNERS). An axes-only
+    The newest consolidated review `poster_login` — the identity the panel
+    posts as, round-cap's — left that reviewed something (no NON_ROUND_BANNERS).
+    Any other bot is ignored, since the marker is a public constant: its review
+    must not move the anchor past changes the panel never saw. An axes-only
     re-check posts no consolidated review, so this stays on the panel's commit
-    across re-checks — unlike the card's "Reviewed commit". An edited review
-    newer than it, or a sentinel-less one, reads as "" (fail closed)."""
+    across re-checks — unlike the card's "Reviewed commit". No poster, an
+    edited review newer than it, or a sentinel-less one, reads as "" (fail
+    closed). `github-actions[bot]` is accepted when it IS the poster: with no
+    bot App the panel posts as it."""
+    poster = (poster_login or "").strip().lower()
+    if not poster:
+        return ""
     marker = _load_post_review().CONSOLIDATED_MARKER
     latest = None
     for r in reviews:
         if not isinstance(r, dict) or _review_id(r) is None:
             continue
         body = _lf(r.get("body"))
-        if not (((r.get("user") or {}).get("login") or "").endswith("[bot]") and body.startswith(marker)):
+        if not (((r.get("user") or {}).get("login") or "").lower() == poster and body.startswith(marker)):
             continue
         if any(b in body for b in NON_ROUND_BANNERS):
             continue
@@ -4089,7 +4096,8 @@ def cmd_approve_only(args) -> int:
     # other — never fail open.
     globs = (getattr(args, "approve_only_paths", "") or "").split()
     if globs:
-        reason, summary = approve_only_paths_scope(args.repo, panel_round_head(reviews), head, globs)
+        reason, summary = approve_only_paths_scope(
+            args.repo, panel_round_head(reviews, getattr(args, "poster_login", "") or ""), head, globs)
         if reason:
             return skip(reason)
         emit(f"📁 **Approver-only path scope** — {summary}.")
@@ -4994,6 +5002,8 @@ def main() -> int:
     # `approve_only_paths`: when non-empty, the axes re-check a push only when
     # every file it changed since the reviewed commit matches a glob.
     o.add_argument("--approve-only-paths", default="")
+    # The panel's posting identity: only its rounds anchor that scope.
+    o.add_argument("--poster-login", default="")
     r = sub.add_parser("auto-retry")
     r.add_argument("--repo", required=True)
     r.add_argument("--pr-number", required=True)

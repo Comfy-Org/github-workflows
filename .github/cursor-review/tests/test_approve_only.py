@@ -80,7 +80,7 @@ class Base(unittest.TestCase):
         args = argparse.Namespace(stage=stage, repo="o/r", pr_number="1", head_sha=head, approver_login=LOGIN,
                                   review_label="", threshold=threshold, approve_authors=authors,
                                   max_runs=max_runs, max_rounds=max_rounds, delay_minutes="10",
-                                  approve_only_paths=paths)
+                                  approve_only_paths=paths, poster_login=POSTER)
         reader = (mock.Mock(side_effect=RuntimeError("graphql 502")) if threads is None
                   else mock.Mock(return_value=list(threads)))
         history = (mock.Mock(side_effect=RuntimeError("graphql 502")) if editors is None
@@ -572,6 +572,10 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertEqual(self.job.count('--approve-only-paths "$APPROVE_ONLY_PATHS"'), 2)
         self.assertEqual(self.job.count("APPROVE_ONLY_PATHS: ${{ inputs.approve_only_paths }}"), 2)
         self.assertEqual(self.job.count("FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}"), 2)
+        # The scope's anchor is read only from the panel poster's rounds.
+        self.assertEqual(self.job.count('--poster-login "$POSTER_LOGIN"'), 2)
+        self.assertEqual(self.job.count("POSTER_LOGIN: ${{ needs.dismiss-stale-approval.outputs.poster_login }}"), 2)
+        self.assertIn("poster_login: ${{ steps.dismiss.outputs.poster_login }}", self.text)
 
     def test_approve_only_paths_defaults_empty(self):
         block = self.text[self.text.index("      approve_only_paths:\n"):]
@@ -599,18 +603,29 @@ class PanelRoundHeadTest(unittest.TestCase):
     """The scope's anchor: the last panel round's commit, never the card's."""
 
     def test_the_newest_bot_round_names_its_commit(self):
-        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z), block()]), Z)
-        self.assertEqual(AA.panel_round_head([panel_round(5, Z), panel_round(3, X)]), Z, "order is by id")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z), block()], POSTER), Z)
+        self.assertEqual(AA.panel_round_head([panel_round(5, Z), panel_round(3, X)], POSTER), Z, "order is by id")
 
     def test_no_round_a_human_forgery_or_an_edited_newest_round_reads_empty(self):
-        self.assertEqual(AA.panel_round_head([block()]), "")
-        self.assertEqual(AA.panel_round_head([panel_round(3, X, login="dev")]), "")
-        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z, edited=True)]), "")
+        self.assertEqual(AA.panel_round_head([block()], POSTER), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X, login="dev")], POSTER), "")
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z, edited=True)], POSTER), "")
+
+    def test_only_the_configured_poster_anchors_it(self):
+        # The marker is public: another bot's newer round must not move the
+        # anchor past changes the panel never reviewed.
+        reviews = [panel_round(3, X), panel_round(5, Z, login="other-app[bot]")]
+        self.assertEqual(AA.panel_round_head(reviews, POSTER), X)
+        self.assertEqual(AA.panel_round_head(reviews, POSTER.upper()), X, "logins compare case-insensitively")
+        self.assertEqual(AA.panel_round_head(reviews, ""), "", "no poster: fail closed")
+        # No bot App: the panel posts as github-actions[bot], which then counts.
+        gha = [panel_round(3, X, login="github-actions[bot]"), panel_round(5, Z, login=POSTER)]
+        self.assertEqual(AA.panel_round_head(gha, "github-actions[bot]"), X)
 
     def test_an_axes_only_recheck_does_not_move_it(self):
         # The card's "Reviewed commit" moves to each re-checked head; the panel's does not.
         reviews = [panel_round(3, X), block(rid=9, sha=Y), REREVIEW.approval(10, Y)]
-        self.assertEqual(AA.panel_round_head(reviews), X)
+        self.assertEqual(AA.panel_round_head(reviews, POSTER), X)
 
 
 class PathScopeUnitTest(unittest.TestCase):
