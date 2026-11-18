@@ -3167,6 +3167,9 @@ class ApproveExternalResolveScopeTest(unittest.TestCase):
         fake_graphql = graphql_fake(self.mutations, threads)
 
         def fake_gh(args, payload=None):
+            if args[:2] == ["api", "graphql"] and not any(a.startswith("threadId=") for a in args):
+                # list_reviews (the base-rewrite check's panel round): none posted.
+                return graphql_reviews([])
             if args[:2] == ["api", "graphql"]:
                 return fake_graphql(args)
             if args[:3] == ["api", "-X", "POST"]:
@@ -4916,6 +4919,10 @@ class ApprovalMergeBaseTest(unittest.TestCase):
             if isinstance(self.reviews, Exception):
                 raise self.reviews
             return graphql_reviews(self.reviews)
+        if args[1:2] == [f"repos/o/r/compare/{self.MERGE_BASE}...{self.BASE_SHA}"]:
+            # approve-external's base-rewrite check: the base fast-forwarded past
+            # the round's merge base, which is what `behind_by: 2` below means.
+            return json.dumps({"status": "ahead", "behind_by": 0, "ahead_by": 2})
         if len(args) == 2 and args[1].startswith("repos/o/r/compare/"):
             self.compares.append(args[1])
             if isinstance(self.compare_answer, Exception):

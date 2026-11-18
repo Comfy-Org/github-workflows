@@ -4771,6 +4771,50 @@ def external_block(args, outcome: str, decision, why: str, live_head: str = "") 
     return rc
 
 
+def external_base_rewrite(args, pr, merge_base: str) -> str:
+    """Why the live base no longer holds the panel round's merge base, or "".
+
+    cmd_approve_only's start gate checks the round's merge base against the
+    live base tip, but the axes then run for minutes, and a base branch
+    rewritten under the SAME name in that window (a stacked PR's lower branch
+    force-pushed) passes the ref-name checks around the POST. So the approval
+    repeats the ancestry half right before it posts, and again after it when
+    the base tip moved meanwhile. No recorded merge base ("") checks nothing,
+    as before: a round from before the sentinel recorded one is the start
+    gate's to refuse. An unreadable live base or compare refuses (never fail
+    open); a fast-forward of the same base keeps the merge base an ancestor."""
+    if not merge_base:
+        return ""
+    live_base_sha = _str_field(pr, "base", "sha").lower() if isinstance(pr, dict) else ""
+    if not SHA_HEX_RE.fullmatch(live_base_sha):
+        return "the PR's live base commit could not be read to rule out a rewrite of the base branch"
+    if live_base_sha == merge_base:
+        return ""
+    data = compare(args.repo, merge_base, live_base_sha)
+    if data is None:
+        return (f"the compare of the panel round's merge base {merge_base[:7]} to the live base "
+                f"{live_base_sha[:7]} could not be read")
+    if not is_ancestor_compare(data):
+        return (f"the panel round's merge base {merge_base[:7]} is no longer an ancestor of the live base "
+                f"{live_base_sha[:7]} (the base branch was rewritten)")
+    return ""
+
+
+def external_panel_merge_base(args) -> tuple:
+    """(the latest panel round's recorded merge base or "", why it is unknown or "").
+
+    No trusted poster means no panel round to read, as approval_merge_base;
+    an unreadable review list is a reason to refuse, not an absent record."""
+    poster = (getattr(args, "poster_login", "") or "").strip()
+    if not poster or poster.lower() in UNTRUSTED_POSTERS:
+        return "", ""
+    try:
+        return panel_round_merge_base(list_reviews(args.repo, args.pr_number), poster), ""
+    except (RuntimeError, ValueError) as e:
+        return "", (f"the panel round's merge base could not be read to rule out a rewrite of the base branch "
+                    f"({annotation_cause(e, 'unknown error')})")
+
+
 def cmd_approve_external(args) -> int:
     set_output("outcome", "error")
     axes = [a.strip().lower() for a in (args.axes or "").split(",") if a.strip()]
@@ -4822,10 +4866,23 @@ def cmd_approve_external(args) -> int:
         outcome, why = "not_approved", "the axes did not approve"
     else:
         outcome, why = "approved", ""
+    panel_merge_base, rewritten = "", False
+    if outcome == "approved":
+        # Same ref name, rewritten branch: the axes' verdicts hold for a diff
+        # the panel never read (external_base_rewrite), so it is a retarget too.
+        panel_merge_base, why = external_panel_merge_base(args)
+        why = why or external_base_rewrite(args, pr, panel_merge_base)
+        if why:
+            outcome, rewritten = "retargeted", True
     if outcome != "approved":
         set_output("outcome", outcome)
         emit(f"ℹ️ **cursor-approve: no approval** — {why}.")
-        if outcome in SUPERSEDED_OUTCOMES and live_head:
+        if rewritten:
+            # Every approval of this head was signed against the old base
+            # branch, and no run reading this panel round can pass this check
+            # now, so none of them is current.
+            rc = withdraw_own_approvals(args, STALE_MESSAGE)
+        elif outcome in SUPERSEDED_OUTCOMES and live_head:
             # A newer head or base is a newer run's to judge: withdraw only what
             # is stale against the LIVE head and base, so a decide that finishes
             # late cannot dismiss an approval that run already posted.
@@ -4873,9 +4930,14 @@ def cmd_approve_external(args) -> int:
         labels_unreadable = not live_labels_readable(pr_now)
         vetoed_now = has_label(pr_now, SKIP_REVIEW_LABEL)
     except (RuntimeError, ValueError):
-        head_now = base_now = None
+        head_now = base_now = pr_now = None
         labelled_now = vetoed_now = labels_unreadable = False
     moved = head_now != args.commit_sha or base_now != args.base_ref
+    if not moved and panel_merge_base and (_str_field(pr_now, "base", "sha").lower()
+                                           != _str_field(pr, "base", "sha").lower()):
+        # The base tip moved during the POST: re-check it still holds the panel
+        # round's merge base, so a same-name rewrite withdraws the approval.
+        moved = bool(external_base_rewrite(args, pr_now, panel_merge_base))
     if moved or labelled_now or vetoed_now or labels_unreadable:
         # Veto, then hand-off, first, as before the POST.
         if vetoed_now:

@@ -165,7 +165,9 @@ The decide phase maps its outcome onto the same contract: `approved` →
 `pass`/`none`; `not_approved` (an axis was red, missing, had no headline, too
 many were yellow, or every one was `n/a`) →
 `changes_requested`/`relabel`; `superseded` (the head moved) → `no_decision`/`relabel`;
-`retargeted` (the base alone changed) and `error` → `no_decision`/`push_then_relabel`;
+`retargeted` (the base alone changed — retargeted, or rewritten under the same
+name so the panel round's merge base is no longer an ancestor of its tip, read
+right before the approval posts and again after it) and `error` → `no_decision`/`push_then_relabel`;
 `needs_human` → `capped`/`human`; `vetoed` (`skip-cursor-review`) and `own_pr` →
 `no_decision`/`human`. Every card also shows the reviewed commit SHA.
 
