@@ -3975,18 +3975,23 @@ def panel_round_head(reviews: list, poster_login: str) -> str:
     if not poster:
         return ""
     marker = _load_post_review().CONSOLIDATED_MARKER
-    latest = None
+    latest, edited = None, []
     for r in reviews:
         if not isinstance(r, dict) or _review_id(r) is None:
             continue
-        body = _lf(r.get("body"))
-        if not (((r.get("user") or {}).get("login") or "").lower() == poster and body.startswith(marker)):
+        if ((r.get("user") or {}).get("login") or "").lower() != poster:
             continue
-        if any(b in body for b in NON_ROUND_BANNERS):
+        # As round_merge_base: an edited body may have lost its marker, so it
+        # counts before the body filter — it rules out every older round.
+        if r.get("edited"):
+            edited.append(_review_id(r))
+            continue
+        body = _lf(r.get("body"))
+        if not body.startswith(marker) or any(b in body for b in NON_ROUND_BANNERS):
             continue
         if latest is None or _review_id(r) > _review_id(latest):
             latest = r
-    if latest is None or latest.get("edited"):
+    if latest is None or any(rid > _review_id(latest) for rid in edited):
         return ""
     return round_head(latest)
 

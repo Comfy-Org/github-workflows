@@ -610,6 +610,12 @@ class PanelRoundHeadTest(unittest.TestCase):
         self.assertEqual(AA.panel_round_head([block()], POSTER), "")
         self.assertEqual(AA.panel_round_head([panel_round(3, X, login="dev")], POSTER), "")
         self.assertEqual(AA.panel_round_head([panel_round(3, X), panel_round(5, Z, edited=True)], POSTER), "")
+        # An edited newer review that lost its marker still rules out the older round.
+        stripped = {"id": 5, "user": {"login": POSTER}, "state": "COMMENTED", "body": "gone", "edited": True}
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), stripped], POSTER), "")
+        # An edited OLDER review, or another login's edit, does not.
+        self.assertEqual(AA.panel_round_head([dict(stripped, id=1), panel_round(3, X)], POSTER), X)
+        self.assertEqual(AA.panel_round_head([panel_round(3, X), dict(stripped, user={"login": "dev"})], POSTER), X)
 
     def test_only_the_configured_poster_anchors_it(self):
         # The marker is public: another bot's newer round must not move the
