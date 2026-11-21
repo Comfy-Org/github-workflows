@@ -47,9 +47,14 @@ class AddedLinesTests(unittest.TestCase):
         lines = lib.added_lines(self.PATCH)
         self.assertEqual(lines, ["added line one", "added line two"])
 
-    def test_file_header_not_treated_as_added(self):
-        patch = "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n+real_added_line\n"
-        self.assertEqual(lib.added_lines(patch), ["real_added_line"])
+    def test_content_line_starting_with_plus_plus_is_added(self):
+        # GitHub's per-file `patch` fragments start at the first `@@` and never carry the
+        # `+++`/`---` file-header lines a full multi-file diff would have before it. A real
+        # added line whose own content starts with `++` (e.g. `++i, posthog.capture(...)`) is
+        # rendered as `+++i, ...` and must still be scanned, not excluded as if it were a
+        # file header.
+        patch = "@@ -1 +1 @@\n+++i, posthog.capture('x')\n"
+        self.assertEqual(lib.added_lines(patch), ["++i, posthog.capture('x')"])
 
     def test_empty_patch(self):
         self.assertEqual(lib.added_lines(""), [])
@@ -249,6 +254,22 @@ class FailureOutcomeTests(unittest.TestCase):
         for category in ("missing_cost_impact", "changed_files_unavailable"):
             self.assertTrue(lib.failure_guidance(category))
             lib.failure_outcome(category, enforce=True, soft_fail=True)
+
+    def test_guidance_names_the_configured_exempt_label(self):
+        guidance = lib.failure_guidance("missing_cost_impact", "my-exempt")
+        self.assertIn("`my-exempt` label", guidance)
+        self.assertNotIn("cost-exempt", guidance)
+
+    def test_guidance_omits_waiver_sentence_when_exemption_disabled(self):
+        guidance = lib.failure_guidance("missing_cost_impact", "")
+        self.assertNotIn("label instead", guidance)
+        self.assertNotIn("cost-exempt", guidance)
+
+    def test_guidance_without_exemption_unaffected_for_other_categories(self):
+        self.assertEqual(
+            lib.failure_guidance("changed_files_unavailable"),
+            lib.failure_guidance("changed_files_unavailable", "some-label"),
+        )
 
     def test_descriptions_pairwise_distinct(self):
         descriptions = {

@@ -30,9 +30,13 @@ MARKER = "<!-- telemetry-cost-contract-check -->"
 # a rename silently retires a required check) — check every caller's ruleset before renaming.
 CONTEXT = "Telemetry cost contract"
 
-# A unified diff's hunk lines: '+' or '-' prefixed content lines, vs. the '+++'/'---' file
-# headers and '@@' hunk headers, which must never be mistaken for added content.
-_ADDED_LINE_RE = re.compile(r"^\+(?!\+\+)(.*)$", re.MULTILINE)
+# A unified diff's hunk lines: '+' or '-' prefixed content lines. GitHub's per-file `patch`
+# fragments start at the first `@@` hunk header and never carry the `+++`/`---` file-header
+# lines a full multi-file diff would have before it, so there is nothing here to exclude by
+# content shape. A `(?!\+\+)` lookahead would look like it is guarding against those headers
+# but actually drops real added lines whose content itself starts with `++` (e.g.
+# `++i, posthog.capture(...)`), which the diff renders as `+++i, ...`.
+_ADDED_LINE_RE = re.compile(r"^\+(.*)$", re.MULTILINE)
 
 _COST_IMPACT_HEADING_RE = re.compile(
     r"^#{1,6}[ \t]+cost impact\b.*$", re.IGNORECASE | re.MULTILINE)
@@ -176,8 +180,7 @@ _GUIDANCE = {
         "Per the observability program's TDD section 7.1, add one naming: the priced unit "
         "(events, sessions, custom-metric series, …), a baseline/scale forecast (current "
         "cloud MAU, opted-in Desktop cohort, the local-MAU ceiling), and the protected signal "
-        "this change must not regress. If this change adds no new billable volume, apply the "
-        "`cost-exempt` label instead."
+        "this change must not regress.{exemption}"
     ),
     "changed_files_unavailable": (
         "This check could not be completed because the PR's changed-file list (with diff "
@@ -188,9 +191,20 @@ _GUIDANCE = {
 }
 
 
-def failure_guidance(category: str) -> str:
-    """The fixed, category-specific paragraph for the PR comment and job summary."""
-    return _GUIDANCE[category]
+def failure_guidance(category: str, exempt_label: str = "") -> str:
+    """The fixed, category-specific paragraph for the PR comment and job summary.
+
+    ``exempt_label`` only shapes the ``missing_cost_impact`` text: a caller that set
+    ``EXEMPT_LABEL=''`` disabled the exemption entirely, so the guidance must not name a
+    label that can never waive the check — see validate.py's identical footer rule."""
+    text = _GUIDANCE[category]
+    if category == "missing_cost_impact":
+        exemption = (
+            f" If this change adds no new billable volume, apply the `{exempt_label}` "
+            "label instead." if exempt_label else ""
+        )
+        text = text.format(exemption=exemption)
+    return text
 
 
 _STATUS_HEADLINE = {

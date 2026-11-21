@@ -287,7 +287,7 @@ class Validator:
         return 1
 
     def finish_fail(self, category: str, detail: str) -> int:
-        guidance = lib.failure_guidance(category)
+        guidance = lib.failure_guidance(category, self.exempt_label)
         outcome = lib.failure_outcome(category, self.enforce, self.soft_fail)
 
         body_lines = [
@@ -299,13 +299,12 @@ class Validator:
             body_lines += ["", detail]
         if outcome.advisory:
             body_lines += ["", lib.advisory_note(category)]
-        body_lines += [
-            "", "---",
-            (f"After updating the PR body, re-run this check from the "
-             f"[workflow run]({self.run_url}) or edit the PR to trigger a fresh run. A "
-             f"repository maintainer can waive the requirement by applying the "
-             f"`{self.exempt_label or 'cost-exempt'}` label."),
-        ]
+        footer = (f"After updating the PR body, re-run this check from the "
+                  f"[workflow run]({self.run_url}) or edit the PR to trigger a fresh run.")
+        if self.exempt_label:
+            footer += (f" A repository maintainer can waive the requirement by applying "
+                       f"the `{self.exempt_label}` label.")
+        body_lines += ["", "---", footer]
 
         if not self._guard_supersession():
             return outcome.exit_code
