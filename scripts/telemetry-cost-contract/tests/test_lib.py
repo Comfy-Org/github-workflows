@@ -88,6 +88,47 @@ class FirstMatchTests(unittest.TestCase):
     def test_empty_files_list(self):
         self.assertIsNone(lib.first_match([], self.patterns))
 
+    def test_anchored_pattern_matches_a_later_added_line(self):
+        # Regression: added lines are joined into one blob with "\n". Without re.MULTILINE on
+        # the caller's compiled pattern, `^` only binds to the blob's start, so an anchored
+        # pattern would see line one and miss every added line after it.
+        anchored = lib.parse_patterns(r"^\s*statsd\.Gauge\(")
+        files = [{"filename": "a.go", "patch": (
+            "+fmt.Println(1)\n"
+            "+    statsd.Gauge(\"x\", 1)\n"
+        )}]
+        match = lib.first_match(files, anchored)
+        self.assertEqual(match, ("a.go", r"^\s*statsd\.Gauge\("))
+
+
+class UnscannableFilesTests(unittest.TestCase):
+    def test_missing_patch_with_additions_is_unscannable(self):
+        files = [{"filename": "huge.go", "additions": 500, "status": "modified"}]
+        self.assertEqual(lib.unscannable_files(files), ["huge.go"])
+
+    def test_missing_patch_but_removed_is_not_unscannable(self):
+        files = [{"filename": "gone.go", "additions": 0, "status": "removed"}]
+        self.assertEqual(lib.unscannable_files(files), [])
+
+    def test_missing_patch_with_zero_additions_is_not_unscannable(self):
+        files = [{"filename": "binary.png", "additions": 0, "status": "modified"}]
+        self.assertEqual(lib.unscannable_files(files), [])
+
+    def test_file_with_patch_is_not_unscannable(self):
+        files = [{"filename": "a.go", "patch": "+x\n", "additions": 1, "status": "modified"}]
+        self.assertEqual(lib.unscannable_files(files), [])
+
+    def test_multiple_unscannable_files_in_order(self):
+        files = [
+            {"filename": "a.go", "additions": 10, "status": "modified"},
+            {"filename": "b.go", "patch": "+x\n", "additions": 1, "status": "modified"},
+            {"filename": "c.go", "additions": 20, "status": "added"},
+        ]
+        self.assertEqual(lib.unscannable_files(files), ["a.go", "c.go"])
+
+    def test_empty_files_list(self):
+        self.assertEqual(lib.unscannable_files([]), [])
+
 
 class CostImpactSectionTests(unittest.TestCase):
     def test_present_with_content(self):

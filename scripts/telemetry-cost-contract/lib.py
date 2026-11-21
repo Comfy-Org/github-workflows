@@ -58,7 +58,12 @@ def parse_patterns(raw: str) -> list[re.Pattern]:
         if not text or text.startswith("#"):
             continue
         try:
-            patterns.append(re.compile(text))
+            # MULTILINE: a matched file's added lines are joined into one blob (see
+            # first_match) so one pattern.search() covers the whole file, but an anchored
+            # caller pattern like `^\s*statsd\.` must still match at the start of ANY added
+            # line, not only the first — without this flag `^`/`$` bind to the blob's start
+            # and end only, so every added line past the first is invisible to anchors.
+            patterns.append(re.compile(text, re.MULTILINE))
         except re.error as exc:
             raise ValueError(f"invalid pattern {text!r}: {exc}") from exc
     if not patterns:
@@ -84,9 +89,9 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
 
     A file with no ``patch`` key (binary, or a diff too large for GitHub to render — GitHub
     omits `patch` past its ~1MB-per-file render ceiling and does not flag the omission)
-    contributes no lines and is silently skipped, matching the diff-added-lines-only scope:
-    this check is a code-review nudge, not a security boundary, so a binary/huge-diff file
-    simply cannot trip it either way.
+    contributes no lines and is silently skipped here. Call ``unscannable_files`` first and
+    fail closed on anything it returns — a large/padded file missing its patch must not get a
+    free pass just because this function cannot see its content.
     """
     for entry in files or []:
         patch = entry.get("patch") if isinstance(entry, dict) else None
@@ -100,6 +105,28 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
             if pattern.search(blob):
                 return entry.get("filename") or "<unknown file>", pattern.pattern
     return None
+
+
+def unscannable_files(files: list[dict]) -> list[str]:
+    """Filenames whose diff content this check could not see at all.
+
+    GitHub omits ``patch`` both for genuinely binary files and for text diffs too large to
+    render, and the two look identical on the wire. A removed file or one with zero added
+    lines can only ever shrink cost, so it is excluded; anything else missing its patch with
+    ``additions > 0`` must be treated as unscannable rather than silently passed as "no
+    match" — a padded or oversized new telemetry module is exactly the case this gate exists
+    to catch, and ``first_match`` alone cannot distinguish it from a harmless binary asset.
+    """
+    names = []
+    for entry in files or []:
+        if not isinstance(entry, dict) or entry.get("patch"):
+            continue
+        if entry.get("status") == "removed":
+            continue
+        if (entry.get("additions") or 0) <= 0:
+            continue
+        names.append(entry.get("filename") or "<unknown file>")
+    return names
 
 
 def has_cost_impact_section(body: str) -> bool:

@@ -329,6 +329,16 @@ class Validator:
                   "Failing closed.")
             return self.finish_fail("changed_files_unavailable", f"Changed-file lookup: {exc}.")
 
+        unscannable = lib.unscannable_files(files)
+        if unscannable:
+            error(f"{len(unscannable)} changed file(s) have added content but no renderable "
+                  "diff patch (GitHub omits `patch` past its render ceiling); cannot rule "
+                  "out a cost-sensitive call site. Failing closed.")
+            return self.finish_fail(
+                "changed_files_unavailable",
+                f"Unscannable file(s): {', '.join(f'`{n}`' for n in unscannable[:10])}"
+                + ("…" if len(unscannable) > 10 else "") + ".")
+
         match = lib.first_match(files, self.patterns)
         if match is None:
             log(f"No cost-sensitive pattern matched across {len(files)} changed file(s) — pass.")
@@ -337,7 +347,7 @@ class Validator:
                 "No new cost-sensitive telemetry call site detected")
 
         filename, pattern_text = match
-        log(f"Cost-sensitive pattern matched in {filename} (pattern: {pattern_text!r})")
+        log(f"Cost-sensitive pattern matched in {filename!r} (pattern: {pattern_text!r})")
         if lib.has_cost_impact_section(body):
             return self.finish_pass(
                 f"A new telemetry call site was detected (matched `{pattern_text}` in "
