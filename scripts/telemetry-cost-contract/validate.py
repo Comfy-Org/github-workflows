@@ -182,12 +182,22 @@ class GitHub:
             entries.append(entry)
         return entries
 
-    def current_pr_target(self, pr: int) -> tuple[str | None, str | None]:
+    def current_pr_target(self, pr: int) -> tuple[str, str, str, frozenset[str]] | None:
+        """The PR's live head/base/body/labels, or ``None`` if the refetch failed or came
+        back without a head or base. Every field the supersession guard compares must be
+        refetched together: the body and labels decide this gate's verdict just as much as
+        the SHA does, so a stale read of either lets a newer run's result be overwritten."""
         data = self.get(f"/repos/{self.repo}/pulls/{pr}")
-        return (
-            (data or {}).get("head", {}).get("sha"),
-            (data or {}).get("base", {}).get("ref"),
-        )
+        if not isinstance(data, dict):
+            return None
+        sha = data.get("head", {}).get("sha")
+        base = data.get("base", {}).get("ref")
+        if not sha or not base:
+            return None
+        body = data.get("body") or ""
+        labels = frozenset(
+            lbl.get("name") for lbl in (data.get("labels") or []) if lbl.get("name"))
+        return (sha, base, body, labels)
 
     def branch_is_protected(self, branch: str) -> bool | None:
         encoded = urllib.parse.quote(branch, safe="")
@@ -209,28 +219,49 @@ class Validator:
         self.pr_number: int | None = None
         self.validated_sha: str | None = None
         self.validated_base_branch: str | None = None
+        self.validated_body: str | None = None
+        self.validated_labels: frozenset[str] = frozenset()
 
     def _guard_supersession(self) -> bool:
-        now_sha, now_base = self.gh.current_pr_target(self.pr_number)
-        if now_sha and now_sha != self.validated_sha:
+        """Whether this run is still the latest word on the PR. Everything this gate's
+        verdict can depend on — head SHA, base, body (the ``## Cost impact`` section) and
+        labels (the exempt label) — is refetched and compared; a mismatch on any of them, or
+        a failed refetch, means a newer run already has (or will) read fresher state, so this
+        run fails closed and skips the terminal write rather than risk overwriting it."""
+        current = self.gh.current_pr_target(self.pr_number)
+        if current is None:
+            log("Could not refetch the PR to confirm this run is still current; failing "
+                "closed and not writing a terminal status.")
+            return False
+        now_sha, now_base, now_body, now_labels = current
+        if now_sha != self.validated_sha:
             log(f"PR head moved {self.validated_sha} -> {now_sha}; a newer run supersedes "
                 "this one. Not writing a terminal status.")
             return False
-        if now_base and now_base != self.validated_base_branch:
+        if now_base != self.validated_base_branch:
             log(f"PR base moved {self.validated_base_branch} -> {now_base}; a newer run "
                 "supersedes this one. Not writing a terminal status.")
+            return False
+        if now_body != self.validated_body:
+            log("PR body changed since this run started; a newer run supersedes this one. "
+                "Not writing a terminal status.")
+            return False
+        if now_labels != self.validated_labels:
+            log("PR labels changed since this run started; a newer run supersedes this one. "
+                "Not writing a terminal status.")
             return False
         return True
 
     def finish_pass(self, reason: str, status_desc: str) -> int:
+        if not self._guard_supersession():
+            return 0
         summary("## telemetry-cost-contract: ✅ pass")
         summary("")
         summary(reason)
         self.gh.delete_marker_comment(self.pr_number)
-        if self._guard_supersession():
-            if not self.gh.publish_status(self.validated_sha, "success", status_desc,
-                                          self.run_url, critical=True):
-                return 1
+        if not self.gh.publish_status(self.validated_sha, "success", status_desc,
+                                      self.run_url, critical=True):
+            return 1
         return 0
 
     def finish_not_required(self, base_branch: str) -> int:
@@ -241,6 +272,19 @@ class Validator:
         summary(f"PR targets the unprotected `{base_branch}` branch.")
         self.gh.delete_marker_comment(self.pr_number)
         return 0
+
+    def _fail_closed_pre_pr(self, sha: str, message: str, *, log_message: bool = True) -> int:
+        """Fail closed before ``self.validated_sha`` exists: PR resolution, PR fetch, or the
+        base-branch checks failed. ``sha`` is the triggering commit from the workflow_run
+        event, known from the very first line of ``run``, so the status can still be keyed
+        correctly. Without this write, a transient failure here on a PR whose SHA already
+        carries an earlier run's `success` (because the body or labels — not the SHA —
+        changed since, e.g. a cost-impact section was removed) would leave that stale
+        `success` as the terminal status."""
+        if log_message:
+            error(message)
+        self.gh.publish_status(sha, "failure", message[:140], self.run_url, critical=True)
+        return 1
 
     def finish_fail(self, category: str, detail: str) -> int:
         guidance = lib.failure_guidance(category)
@@ -288,41 +332,47 @@ class Validator:
 
         wr_event = wr.get("event") or ""
         if wr_event != "pull_request":
-            error(f"Triggering workflow_run event was '{wr_event}', not 'pull_request'. The "
-                  "signal workflow must run on pull_request; refusing to validate.")
-            return 1
+            return self._fail_closed_pre_pr(
+                head_sha,
+                f"Triggering workflow_run event was '{wr_event}', not 'pull_request'. The "
+                "signal workflow must run on pull_request; refusing to validate.")
 
         self.pr_number = self._resolve_pr(event, head_sha)
         if self.pr_number is None:
-            return 1
+            return self._fail_closed_pre_pr(
+                head_sha, "Could not resolve exactly one open PR for this commit; refusing "
+                "to publish an ambiguous result.", log_message=False)
 
         pr = self.gh.get(f"/repos/{self.gh.repo}/pulls/{self.pr_number}")
         if not pr:
-            error(f"Could not fetch PR #{self.pr_number}")
-            return 1
+            return self._fail_closed_pre_pr(
+                head_sha, f"Could not fetch PR #{self.pr_number}")
         self.validated_sha = pr.get("head", {}).get("sha")
         base_branch = pr.get("base", {}).get("ref") or ""
         self.validated_base_branch = base_branch
-        body = pr.get("body") or ""
-        labels = [lbl.get("name") for lbl in (pr.get("labels") or [])]
+        self.validated_body = pr.get("body") or ""
+        self.validated_labels = frozenset(
+            lbl.get("name") for lbl in (pr.get("labels") or []) if lbl.get("name"))
 
         log(f"Validating PR #{self.pr_number} at head {self.validated_sha}")
         if not base_branch:
-            error(f"PR #{self.pr_number} has no base branch; refusing to validate.")
-            return 1
+            return self._fail_closed_pre_pr(
+                head_sha, f"PR #{self.pr_number} has no base branch; refusing to validate.")
         protected = self.gh.branch_is_protected(base_branch)
         if protected is None:
-            error(f"Could not determine whether base branch '{base_branch}' is protected; "
-                  "failing closed.")
-            return 1
+            return self._fail_closed_pre_pr(
+                head_sha, f"Could not determine whether base branch '{base_branch}' is "
+                "protected; failing closed.")
         if not protected:
             log(f"PR targets unprotected branch '{base_branch}' — contract not required.")
             return self.finish_not_required(base_branch)
 
-        self.gh.publish_status(self.validated_sha, "pending",
-                               "Scanning diff for cost-sensitive call sites…", self.run_url)
+        if not self.gh.publish_status(self.validated_sha, "pending",
+                                      "Scanning diff for cost-sensitive call sites…",
+                                      self.run_url, critical=True):
+            return 1
 
-        if self.exempt_label and self.exempt_label in labels:
+        if self.exempt_label and self.exempt_label in self.validated_labels:
             log(f"PR carries the '{self.exempt_label}' label — exempt.")
             return self.finish_pass(
                 f"PR carries the `{self.exempt_label}` label — the cost-contract requirement "
@@ -355,7 +405,7 @@ class Validator:
 
         filename, pattern_text = match
         log(f"Cost-sensitive pattern matched in {filename!r} (pattern: {pattern_text!r})")
-        if lib.has_cost_impact_section(body):
+        if lib.has_cost_impact_section(self.validated_body):
             return self.finish_pass(
                 f"A new telemetry call site was detected (matched `{pattern_text}` in "
                 f"{md_code(filename)}), and the PR body carries a `## Cost impact` section.",
