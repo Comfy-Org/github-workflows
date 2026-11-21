@@ -22,6 +22,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `stale.yml` | [stale.md](stale.md) | `SLACK_BOT_TOKEN` (optional) |
 | `detect-unreviewed-merge.yml` | [detect-unreviewed-merge.md](detect-unreviewed-merge.md) | `UNREVIEWED_MERGES_TOKEN` |
 | `linear-ticket.yml` | [linear-ticket.md](linear-ticket.md) | `LINEAR_API_TOKEN` + a two-workflow caller |
+| `telemetry-cost-contract.yml` | [telemetry-cost-contract.md](telemetry-cost-contract.md) | `patterns` input + a two-workflow caller |
 
 Everything below applies to all of them. Read it once.
 

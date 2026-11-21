@@ -19,7 +19,7 @@ whatever you touched.
 ```bash
 # Python suites — agents-md-integrity, coderabbit-config, cursor-approve,
 # cursor-review, groom, linear-ticket, public-repo-hygiene, refresh-reviewers,
-# workflow-pins:
+# telemetry-cost-contract, workflow-pins:
 python3 -m unittest discover -s <dir>/tests -p 'test_*.py' -v
 # coderabbit-config first: pip install --require-hashes --only-binary=:all: -r <its requirements.txt>
 
@@ -79,7 +79,7 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   v0 grades deterministically — **no LLM in the grading path; keep it that way**.
   v1 plans a split on `/derisk`, the ONLY place a model runs, and every floor it
   shows comes from v0's grader. A pr-derisk caller executes BOTH trees.
-- `scripts/{area-label,linear-ticket,check-pr-size}/` — logic behind those reusables.
+- `scripts/{area-label,linear-ticket,telemetry-cost-contract,check-pr-size}/` — logic behind those reusables.
 - `README.md` (public catalog) + `docs/callers/` (per-reusable setup guides) —
   keep both in sync when you add a workflow.
 
