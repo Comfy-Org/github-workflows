@@ -62,6 +62,13 @@ def warning(msg: str) -> None:
     print(f"::warning::{msg}", file=sys.stderr, flush=True)
 
 
+def md_code(text: str) -> str:
+    """Render ``text`` as a Markdown inline code span, safe even if it contains a backtick or
+    newline — either would otherwise let PR-controlled data (a filename) break out of the
+    span into arbitrary Markdown, links or @-mentions in the marker comment / job summary."""
+    return "`" + text.replace("`", "'").replace("\n", " ").replace("\r", " ") + "`"
+
+
 def summary(msg: str) -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -336,7 +343,7 @@ class Validator:
                   "out a cost-sensitive call site. Failing closed.")
             return self.finish_fail(
                 "changed_files_unavailable",
-                f"Unscannable file(s): {', '.join(f'`{n}`' for n in unscannable[:10])}"
+                f"Unscannable file(s): {', '.join(md_code(n) for n in unscannable[:10])}"
                 + ("…" if len(unscannable) > 10 else "") + ".")
 
         match = lib.first_match(files, self.patterns)
@@ -351,12 +358,12 @@ class Validator:
         if lib.has_cost_impact_section(body):
             return self.finish_pass(
                 f"A new telemetry call site was detected (matched `{pattern_text}` in "
-                f"`{filename}`), and the PR body carries a `## Cost impact` section.",
+                f"{md_code(filename)}), and the PR body carries a `## Cost impact` section.",
                 "Cost impact section present")
 
         return self.finish_fail(
             "missing_cost_impact",
-            f"Matched pattern `{pattern_text}` against an added line in `{filename}`.")
+            f"Matched pattern `{pattern_text}` against an added line in {md_code(filename)}.")
 
     def _resolve_pr(self, event: dict, head_sha: str) -> int | None:
         """Exactly one open PR. Same-repo runs carry workflow_run.pull_requests; fork runs do
