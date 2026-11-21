@@ -58,12 +58,7 @@ def parse_patterns(raw: str) -> list[re.Pattern]:
         if not text or text.startswith("#"):
             continue
         try:
-            # MULTILINE: a matched file's added lines are joined into one blob (see
-            # first_match) so one pattern.search() covers the whole file, but an anchored
-            # caller pattern like `^\s*statsd\.` must still match at the start of ANY added
-            # line, not only the first — without this flag `^`/`$` bind to the blob's start
-            # and end only, so every added line past the first is invisible to anchors.
-            patterns.append(re.compile(text, re.MULTILINE))
+            patterns.append(re.compile(text))
         except re.error as exc:
             raise ValueError(f"invalid pattern {text!r}: {exc}") from exc
     if not patterns:
@@ -87,6 +82,15 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
     """The first (filename, pattern-text) whose pattern matches an added line in some file's
     patch, in file order then pattern order; None if nothing matches.
 
+    Each added line is matched on its own (``any(p.search(line) for line in lines)``), never
+    joined into one multi-line blob: joining would make an anchored pattern like
+    `^\\s*statsd\\.` see only the file's first added line (`^`/`$` bind to the whole blob, not
+    each line, without `re.MULTILINE`), AND would let a pattern containing `\\s`, a negated
+    character class, or `.` with `re.DOTALL` span two unrelated added lines — or even two
+    different hunks — and match content nobody actually wrote. Per-line matching has neither
+    failure mode: a single line has no embedded newline for an anchor to miss or a
+    cross-line pattern to exploit.
+
     A file with no ``patch`` key (binary, or a diff too large for GitHub to render — GitHub
     omits `patch` past its ~1MB-per-file render ceiling and does not flag the omission)
     contributes no lines and is silently skipped here. Call ``unscannable_files`` first and
@@ -98,11 +102,8 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
         if not patch:
             continue
         lines = added_lines(patch)
-        if not lines:
-            continue
-        blob = "\n".join(lines)
         for pattern in patterns:
-            if pattern.search(blob):
+            if any(pattern.search(line) for line in lines):
                 return entry.get("filename") or "<unknown file>", pattern.pattern
     return None
 

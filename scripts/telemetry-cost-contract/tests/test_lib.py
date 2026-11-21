@@ -89,9 +89,9 @@ class FirstMatchTests(unittest.TestCase):
         self.assertIsNone(lib.first_match([], self.patterns))
 
     def test_anchored_pattern_matches_a_later_added_line(self):
-        # Regression: added lines are joined into one blob with "\n". Without re.MULTILINE on
-        # the caller's compiled pattern, `^` only binds to the blob's start, so an anchored
-        # pattern would see line one and miss every added line after it.
+        # Regression: each added line is matched on its own. If lines were joined into one
+        # blob, `^` would only bind to the blob's start (without re.MULTILINE), so an
+        # anchored pattern would see line one and miss every added line after it.
         anchored = lib.parse_patterns(r"^\s*statsd\.Gauge\(")
         files = [{"filename": "a.go", "patch": (
             "+fmt.Println(1)\n"
@@ -99,6 +99,17 @@ class FirstMatchTests(unittest.TestCase):
         )}]
         match = lib.first_match(files, anchored)
         self.assertEqual(match, ("a.go", r"^\s*statsd\.Gauge\("))
+
+    def test_pattern_does_not_false_match_across_two_added_lines(self):
+        # Regression: joining added lines into one blob would let a pattern containing `\s`
+        # (which matches a literal newline) span two unrelated added lines and match content
+        # nobody actually wrote on one line.
+        spanning = lib.parse_patterns(r"foo\s+bar")
+        files = [{"filename": "a.go", "patch": (
+            "+some_call(foo)\n"
+            "+bar_other_call()\n"
+        )}]
+        self.assertIsNone(lib.first_match(files, spanning))
 
 
 class UnscannableFilesTests(unittest.TestCase):
