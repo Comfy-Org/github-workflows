@@ -87,7 +87,7 @@ jobs:
         statsd\.(Gauge|Count|Histogram|Distribution)\(
         sentrygo\.CaptureException\(
       # exempt-label: cost-exempt    # default; empty disables exemption
-      enforce: false                 # WARN-ONLY during rollout; flip to true when ready
+      # enforce: false               # default; WARN-ONLY during rollout, flip to true when ready
       # soft-fail: true              # default; warn-only still shows a RED (non-blocking) check
 ```
 
@@ -124,7 +124,7 @@ short grant fails the whole run with no job-level detail.
 | `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. Validated to be a full 40-hex lowercase SHA **and an ancestor of this repo's main** before checkout. |
 | `patterns` | — (**required**) | Newline-separated regexes (Python `re`). A match against an added diff line marks the PR cost-sensitive. Blank/`#`-comment lines are skipped. At least one must survive and every one must compile, or the run fails as a caller misconfiguration. |
 | `exempt-label` | `cost-exempt` | Single label that waives the requirement. Empty disables exemption. |
-| `enforce` | `true` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported. |
+| `enforce` | `false` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported. `true` fails closed and exits the job nonzero. |
 | `soft-fail` | `true` | Warn-only only. `true` publishes a red `failure` status (loud, non-blocking while the context is not required). `false` restores the silent variant (always-green warn-only). |
 
 ## Rollout (warn-only first)

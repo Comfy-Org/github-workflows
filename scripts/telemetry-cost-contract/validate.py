@@ -413,7 +413,7 @@ def main() -> int:
     with open(event_path, encoding="utf-8") as handle:
         event = json.load(handle)
 
-    enforce = os.environ.get("ENFORCE", "true") != "false"
+    enforce = lib.enforce_enabled(os.environ.get("ENFORCE"))
     soft_fail = lib.soft_fail_enabled(os.environ.get("SOFT_FAIL"))
     run_url = os.environ.get("RUN_URL", "")
     exempt_label = os.environ.get("EXEMPT_LABEL", "")

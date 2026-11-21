@@ -207,6 +207,21 @@ class SoftFailEnabledTests(unittest.TestCase):
         self.assertFalse(lib.soft_fail_enabled("false"))
 
 
+class EnforceEnabledTests(unittest.TestCase):
+    def test_true_string(self):
+        self.assertTrue(lib.enforce_enabled("true"))
+        self.assertTrue(lib.enforce_enabled("TRUE"))
+
+    def test_absent_is_false(self):
+        """An omitted `enforce` input is the documented warn-only pilot default, not a
+        silent fail-closed gate."""
+        self.assertFalse(lib.enforce_enabled(None))
+        self.assertFalse(lib.enforce_enabled(""))
+
+    def test_false_string(self):
+        self.assertFalse(lib.enforce_enabled("false"))
+
+
 class FailureOutcomeTests(unittest.TestCase):
     def test_enforce_fails_closed(self):
         outcome = lib.failure_outcome("missing_cost_impact", enforce=True, soft_fail=True)

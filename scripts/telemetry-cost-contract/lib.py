@@ -162,6 +162,13 @@ def soft_fail_enabled(raw: str | None) -> bool:
     return (raw or "").strip().lower() == "true"
 
 
+def enforce_enabled(raw: str | None) -> bool:
+    """Parse the ``ENFORCE`` env var. An ABSENT value means the documented default: warn-only
+    (false) — same shape and rationale as ``soft_fail_enabled``. A caller that omits `enforce`
+    gets the pilot rung the docs promise, never an accidental fail-closed gate."""
+    return (raw or "").strip().lower() == "true"
+
+
 _GUIDANCE = {
     "missing_cost_impact": (
         "This PR adds a new billable telemetry call site matching this repository's "

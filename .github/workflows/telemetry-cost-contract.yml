@@ -68,14 +68,15 @@ on:
         default: 'cost-exempt'
       enforce:
         description: >-
-          true (default) fails closed on a missing Cost-impact section or infrastructure
-          error, and the job itself exits nonzero. false is warn-only: a failing VERDICT
-          never exits the job nonzero, `soft-fail` decides how loudly it is reported. Warn-only
-          is not a promise the job always exits 0 — a broken run still does (a failed terminal
-          status write, a missing repo, malformed `patterns`, a non-`pull_request` trigger).
+          false (default) is warn-only: a failing VERDICT never exits the job nonzero,
+          `soft-fail` decides how loudly it is reported. true fails closed on a missing
+          Cost-impact section or infrastructure error, and the job itself exits nonzero.
+          Warn-only is not a promise the job always exits 0 — a broken run still does (a
+          failed terminal status write, a missing repo, malformed `patterns`, a
+          non-`pull_request` trigger).
         type: boolean
         required: false
-        default: true
+        default: false
       soft-fail:
         description: >-
           Warn-only only (ignored when `enforce: true`). true (default) publishes a red
