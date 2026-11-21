@@ -198,6 +198,32 @@ class CostImpactSectionTests(unittest.TestCase):
     def test_heading_requires_space_not_just_any_whitespace(self):
         self.assertFalse(lib.has_cost_impact_section("##\ncost impact\nsome text\n"))
 
+    def test_deeper_subheadings_stay_inside_the_section(self):
+        body = "## Cost impact\n### Priced unit\nevents\n### Baseline\n10k/day\n"
+        self.assertTrue(lib.has_cost_impact_section(body))
+
+    def test_shallower_heading_still_ends_a_deep_section(self):
+        body = "### Cost impact\nsome text\n## Testing\nstuff"
+        self.assertTrue(lib.has_cost_impact_section(body))
+        self.assertFalse(lib.has_cost_impact_section(
+            "### Cost impact\n## Testing\nstuff"))
+
+    def test_tilde_fenced_example_does_not_count(self):
+        body = "## Cost impact\n~~~\nExample only\n~~~\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_four_backtick_fenced_example_does_not_count(self):
+        body = "## Cost impact\n````\nExample only\n````\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_heading_inside_fenced_example_is_not_the_real_heading(self):
+        body = "```\n## Cost impact\nExample only\n```\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_unclosed_fence_does_not_leak_trailing_real_section(self):
+        body = "## Cost impact\n```\nunclosed fence\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
 
 class SoftFailEnabledTests(unittest.TestCase):
     def test_true_string(self):

@@ -39,10 +39,40 @@ CONTEXT = "Telemetry cost contract"
 _ADDED_LINE_RE = re.compile(r"^\+(.*)$", re.MULTILINE)
 
 _COST_IMPACT_HEADING_RE = re.compile(
-    r"^#{1,6}[ \t]+cost impact\b.*$", re.IGNORECASE | re.MULTILINE)
-_ANY_HEADING_RE = re.compile(r"^#{1,6}[ \t]", re.MULTILINE)
+    r"^(#{1,6})[ \t]+cost impact\b.*$", re.IGNORECASE | re.MULTILINE)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-_FENCED_BLOCK_RE = re.compile(r"^```.*?^```", re.DOTALL | re.MULTILINE)
+_FENCE_MARKER_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Remove CommonMark-fenced code blocks (both ``` and ~~~ families, any length >= 3).
+
+    A single ``^```.*?^```'' regex only recognizes the triple-backtick family and accepts any
+    line starting with ``` as a closing fence regardless of length — so a 4-backtick opening
+    (` ```` `) is "closed" by the first stray triple-backtick line, and a ~~~ fence isn't
+    recognized as a fence at all, leaving its content eligible to count as real section text.
+    This instead tracks the actual opening marker (character and length) and only closes on a
+    line that is itself only that same character, at least that many times — the CommonMark
+    rule — so content inside any valid fence is dropped regardless of marker family or length.
+    """
+    out_lines = []
+    fence_char = None
+    fence_len = 0
+    for line in text.split("\n"):
+        if fence_char is None:
+            match = _FENCE_MARKER_RE.match(line)
+            if match:
+                fence_char = match.group(1)[0]
+                fence_len = len(match.group(1))
+                continue
+            out_lines.append(line)
+            continue
+        stripped = line.strip()
+        if (stripped and set(stripped) == {fence_char}
+                and len(stripped) >= fence_len):
+            fence_char = None
+            fence_len = 0
+    return "\n".join(out_lines)
 
 
 def parse_patterns(raw: str) -> list[re.Pattern]:
@@ -136,25 +166,29 @@ def unscannable_files(files: list[dict]) -> list[str]:
 
 def has_cost_impact_section(body: str) -> bool:
     """True iff ``body`` has a ``## Cost impact`` (any heading depth, case-insensitive)
-    heading followed by at least one non-blank, non-placeholder line before the next heading
-    or EOF.
+    heading followed by at least one non-blank, non-placeholder line before the next
+    same-or-shallower heading or EOF.
 
     A bare heading with nothing under it (copy-pasted template, never filled in) does not
     count — TDD section 7.1 requires actual content (priced unit, baseline, protected signal),
     not just the section's existence. The heading match consumes the whole heading line (so
-    trailing text like ``: TBD`` or ``(required)`` is never mistaken for section content), and
-    the section body has HTML comments and fenced code blocks stripped before the
-    content check, so an untouched PR-template placeholder (``<!-- priced unit, ... -->`` or an
-    example inside a ``` fence) does not count either.
+    trailing text like ``: TBD`` or ``(required)`` is never mistaken for section content).
+    Fenced code blocks are stripped from the *whole* body before the heading search even
+    starts — not just from the text after a match — so an example in the PR template (a
+    fenced block that itself contains a ``## Cost impact`` line) can never be mistaken for the
+    real heading. The section ends only at a heading of the same or shallower depth: a
+    ``## Cost impact`` section legitimately contains deeper ``###`` sub-headings (priced unit,
+    baseline, protected signal) without those ending the section early. HTML comments are
+    stripped from the remaining section body before the content check, so an untouched
+    PR-template placeholder (``<!-- priced unit, ... -->``) does not count either.
     """
-    match = _COST_IMPACT_HEADING_RE.search(body or "")
+    text = _strip_fenced_blocks(body or "")
+    match = _COST_IMPACT_HEADING_RE.search(text)
     if not match:
         return False
-    # Strip fenced blocks before looking for the next heading: a heading-shaped line quoted
-    # inside a fence (e.g. an example of the template itself) must not be mistaken for the
-    # section boundary.
-    rest = _FENCED_BLOCK_RE.sub("", (body or "")[match.end():])
-    next_heading = _ANY_HEADING_RE.search(rest)
+    level = len(match.group(1))
+    rest = text[match.end():]
+    next_heading = re.compile(rf"^#{{1,{level}}}[ \t]", re.MULTILINE).search(rest)
     section_body = rest[:next_heading.start()] if next_heading else rest
     section_body = _HTML_COMMENT_RE.sub("", section_body)
     return any(line.strip() for line in section_body.splitlines())
