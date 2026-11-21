@@ -34,8 +34,11 @@ CONTEXT = "Telemetry cost contract"
 # headers and '@@' hunk headers, which must never be mistaken for added content.
 _ADDED_LINE_RE = re.compile(r"^\+(?!\+\+)(.*)$", re.MULTILINE)
 
-_COST_IMPACT_HEADING_RE = re.compile(r"^#{1,6}\s*cost impact\b", re.IGNORECASE | re.MULTILINE)
-_ANY_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
+_COST_IMPACT_HEADING_RE = re.compile(
+    r"^#{1,6}[ \t]+cost impact\b.*$", re.IGNORECASE | re.MULTILINE)
+_ANY_HEADING_RE = re.compile(r"^#{1,6}[ \t]", re.MULTILINE)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_FENCED_BLOCK_RE = re.compile(r"^```.*?^```", re.DOTALL | re.MULTILINE)
 
 
 def parse_patterns(raw: str) -> list[re.Pattern]:
@@ -101,18 +104,27 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
 
 def has_cost_impact_section(body: str) -> bool:
     """True iff ``body`` has a ``## Cost impact`` (any heading depth, case-insensitive)
-    heading followed by at least one non-blank line before the next heading or EOF.
+    heading followed by at least one non-blank, non-placeholder line before the next heading
+    or EOF.
 
     A bare heading with nothing under it (copy-pasted template, never filled in) does not
     count — TDD section 7.1 requires actual content (priced unit, baseline, protected signal),
-    not just the section's existence.
+    not just the section's existence. The heading match consumes the whole heading line (so
+    trailing text like ``: TBD`` or ``(required)`` is never mistaken for section content), and
+    the section body has HTML comments and fenced code blocks stripped before the
+    content check, so an untouched PR-template placeholder (``<!-- priced unit, ... -->`` or an
+    example inside a ``` fence) does not count either.
     """
     match = _COST_IMPACT_HEADING_RE.search(body or "")
     if not match:
         return False
-    rest = (body or "")[match.end():]
+    # Strip fenced blocks before looking for the next heading: a heading-shaped line quoted
+    # inside a fence (e.g. an example of the template itself) must not be mistaken for the
+    # section boundary.
+    rest = _FENCED_BLOCK_RE.sub("", (body or "")[match.end():])
     next_heading = _ANY_HEADING_RE.search(rest)
     section_body = rest[:next_heading.start()] if next_heading else rest
+    section_body = _HTML_COMMENT_RE.sub("", section_body)
     return any(line.strip() for line in section_body.splitlines())
 
 

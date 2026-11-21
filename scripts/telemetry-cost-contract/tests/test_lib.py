@@ -116,6 +116,31 @@ class CostImpactSectionTests(unittest.TestCase):
         self.assertFalse(lib.has_cost_impact_section(""))
         self.assertFalse(lib.has_cost_impact_section(None))
 
+    def test_unfilled_html_comment_placeholder_does_not_count(self):
+        body = "## Cost impact\n\n<!-- priced unit, baseline, protected signal -->\n\n## Testing\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_multiline_html_comment_placeholder_does_not_count(self):
+        body = "## Cost impact\n\n<!--\npriced unit\nbaseline\n-->\n\n## Testing\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_text_on_heading_line_does_not_count_as_content(self):
+        self.assertFalse(lib.has_cost_impact_section("## Cost impact: TBD\n\n## Testing\n"))
+        self.assertFalse(lib.has_cost_impact_section("## Cost impact (required)\n\n## Testing\n"))
+        self.assertFalse(lib.has_cost_impact_section("## Cost impact ##\n\n## Testing\n"))
+
+    def test_example_inside_fenced_block_does_not_count(self):
+        body = "## Cost impact\n\n```\n## Cost impact\nBills $X/month.\n```\n\n## Testing\n"
+        self.assertFalse(lib.has_cost_impact_section(body))
+
+    def test_real_content_after_placeholder_comment_still_counts(self):
+        body = ("## Cost impact\n\n<!-- priced unit, baseline, protected signal -->\n"
+                "Bills per event; forecast 1k/day.\n\n## Testing\n")
+        self.assertTrue(lib.has_cost_impact_section(body))
+
+    def test_heading_requires_space_not_just_any_whitespace(self):
+        self.assertFalse(lib.has_cost_impact_section("##\ncost impact\nsome text\n"))
+
 
 class SoftFailEnabledTests(unittest.TestCase):
     def test_true_string(self):
