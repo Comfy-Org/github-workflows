@@ -1472,10 +1472,24 @@ class CancelledRunTest(unittest.TestCase):
     RUN_HEAD = "a" * 40
     NEW_HEAD = "b" * 40
 
+    # Every job `panel-integrity` needs. A `cancelled` result on ANY of them is
+    # a run this step has to wake up for, so the trigger is pinned against the
+    # `needs:` list rather than against the two names that happened to come
+    # back cancelled in the measured runs.
+    PANEL_NEEDS = (
+        "gate", "round-cap", "diff-size", "preflight", "ledger",
+        "review", "consolidate", "post-review",
+    )
+
     def setUp(self):
         self.panel = split_jobs(read_workflow())[PANEL_JOB]
         self.step = step_named(self.panel, CANCEL_STEP)
         self.assertIsNotNone(self.step, f"`{PANEL_JOB}` lost its `{CANCEL_STEP}` step")
+        self.step_if = None
+        for line in code_lines(self.step):
+            if line.strip().startswith("if:"):
+                self.step_if = line.strip()[len("if:"):].strip()
+        self.assertIsNotNone(self.step_if, f"`{CANCEL_STEP}` lost its `if:`")
         self.workdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.workdir)
 
@@ -1483,12 +1497,76 @@ class CancelledRunTest(unittest.TestCase):
         order = step_order(self.panel)
         self.assertEqual(order[0], CANCEL_STEP)
         lines = [line.strip() for line in code_lines(self.step)]
-        self.assertIn("if: ${{ cancelled() }}", lines)
         self.assertIn("id: cancel", lines)
         self.assertFalse(any("continue-on-error" in line for line in lines))
         for name in (UNDECIDED_STEP, REPORT_STEP):
             body = "\n".join(code_lines(step_named(self.panel, name)))
             self.assertIn("steps.cancel.outputs.superseded != 'true'", body, name)
+        # Still ONLY on a cancel. A run where every job finished must not reach
+        # the head check at all, or a whole green panel would stand down
+        # instead of being reported.
+        clean = {job: {"result": "success"} for job in self.PANEL_NEEDS}
+        self.assertFalse(evaluate_if(self.step_if, clean))
+
+    def test_it_wakes_on_a_run_level_cancel(self):
+        clean = {job: {"result": "success"} for job in self.PANEL_NEEDS}
+        self.assertTrue(evaluate_if(self.step_if, clean, workflow_cancelled=True))
+
+    def test_it_wakes_on_a_concurrency_supersede_that_cancelled_only_the_jobs(self):
+        # The measured production case, and the reason this step existed
+        # without ever running: `cancelled()` FALSE, run conclusion
+        # `cancelled`, and the jobs that had not finished come back
+        # `cancelled`. With `cancelled()` as the sole trigger the step skipped,
+        # the fail-closed guard below it ran instead, and every supersede
+        # published a red `Panel integrity` — 26 of 40 measured cancelled runs,
+        # with this step skipped in 5 of 5 that carried it.
+        measured = {job: {"result": "success"} for job in self.PANEL_NEEDS}
+        measured["diff-size"] = {"result": "cancelled"}
+        measured["preflight"] = {"result": "cancelled"}
+        self.assertTrue(
+            evaluate_if(self.step_if, measured, workflow_cancelled=False),
+            "`%s` must wake on a supersede that `cancelled()` does not report" % CANCEL_STEP,
+        )
+        # And having woken, it must be the step that owns the outcome: the
+        # fail-closed guard stands down once it reports a supersede.
+        guard_if = None
+        for line in code_lines(step_named(self.panel, UNDECIDED_STEP)):
+            if line.strip().startswith("if:"):
+                guard_if = line.strip()[len("if:"):].strip()
+        self.assertIsNotNone(guard_if)
+        self.assertFalse(evaluate_if(
+            guard_if, measured, steps={"cancel": {"superseded": "true"}}))
+
+    def test_it_wakes_on_a_cancelled_result_from_any_job_the_panel_needs(self):
+        # Pinned as a relationship, not a name list: a job added to the panel's
+        # `needs:` without being added to this trigger re-opens the skip-through
+        # silently, which is how the step slept through every supersede.
+        needs_list = job_scalar(self.panel, "needs")
+        self.assertIsNotNone(needs_list)
+        declared = [
+            name.strip() for name in needs_list.strip("[]").split(",") if name.strip()
+        ]
+        self.assertEqual(sorted(declared), sorted(self.PANEL_NEEDS), needs_list)
+        for job in declared:
+            one = {other: {"result": "success"} for other in declared}
+            one[job] = {"result": "cancelled"}
+            self.assertTrue(
+                evaluate_if(self.step_if, one, workflow_cancelled=False),
+                "a cancelled `%s` must wake `%s`" % (job, CANCEL_STEP),
+            )
+
+    def test_it_asks_for_no_permission_the_caller_does_not_grant(self):
+        # The same-SHA supersede is knowingly left red because proving it needs
+        # a workflow-runs read, and this job holds `pull-requests: read` while
+        # the documented caller grants only `contents: read` +
+        # `pull-requests: write`. A called workflow requesting MORE than the
+        # caller granted fails at startup with zero jobs, across every caller
+        # at once — and this repo auto-bumps caller pins. So the step must not
+        # reach the Actions API, and the job must not grow a scope.
+        body = "\n".join(code_lines(self.step))
+        self.assertNotIn("/actions/", body)
+        permissions = block_mapping(self.panel, "    permissions:", 6)
+        self.assertEqual(permissions, {"pull-requests": "read"}, permissions)
 
     def run_cancel(self, live_head, pr_number="7", run_head=RUN_HEAD, gh_fails=False):
         bindir = os.path.join(self.workdir, "bin")
@@ -1525,12 +1603,23 @@ class CancelledRunTest(unittest.TestCase):
             self.assertIn("repos/o/r/pulls/7", f.read())
 
     def test_an_unmoved_head_fails(self):
-        # A manual cancel, or a same-SHA supersede: nothing is known to report
-        # on this head, so the check stays red.
+        # A manual cancel, or a same-SHA supersede: nothing readable here
+        # reports on this head, so the check stays red.
         done, output = self.run_cancel(self.RUN_HEAD)
         self.assertEqual(done.returncode, 1)
         self.assertIn("::error::", done.stdout)
         self.assertNotIn("superseded", output)
+
+    def test_the_unmoved_head_message_does_not_advise_re_applying_the_label(self):
+        # The review label is one-shot for callers that gate on it, and a
+        # DUPLICATE application is what produces the same-SHA cancel this
+        # message is printed over — so "re-apply the review label" told the
+        # reader to repeat the cause, using up an allowance they may not have.
+        done, _ = self.run_cancel(self.RUN_HEAD)
+        self.assertEqual(done.returncode, 1)
+        self.assertNotIn("re-apply the review label", done.stdout.lower())
+        # It must still say what to do instead.
+        self.assertIn("new commit", done.stdout.lower())
 
     def test_an_unreadable_head_fails(self):
         for kwargs in ({"gh_fails": True}, {"live_head": ""}):
