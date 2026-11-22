@@ -235,6 +235,14 @@ ROWS = (
         sentinel="workflows_ref",
         expect_header_with=False,
     ),
+    # Same shape as linear-ticket: the header comment documents the two caller
+    # FILES in prose (see "Caller pattern:") and leaves the `with:` fences to
+    # the guide.
+    Row(
+        workflow="telemetry-cost-contract",
+        sentinel="workflows_ref",
+        expect_header_with=False,
+    ),
     Row(
         workflow="pr-area-label",
         sentinel="workflows_ref",

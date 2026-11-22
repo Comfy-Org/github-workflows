@@ -1,0 +1,180 @@
+name: Telemetry Cost Contract (reusable)
+
+# Reusable gate requiring a PR that adds a new billable telemetry call site (per the
+# caller's `patterns`) to explain the cost impact in its own body under a `## Cost impact`
+# heading, or carry the `cost-exempt` label. Backs cost-governance lane C3
+# (comfy-observability program, D315): C2 found ten zero-consumer custom Datadog metrics
+# that no PR-time check caught, only a manual inventory months after merge.
+#
+# TWO-STAGE, FORK-SAFE EXECUTION — same shape as linear-ticket.yml, same reason: this
+# privileged validator is invoked by a caller that runs on `workflow_run: completed` of an
+# unprivileged, no-op signal workflow in the consumer repo, so GitHub grants THIS run a
+# write token even for a fork or Dependabot PR. Constraints (identical to linear-ticket.yml):
+#   * the signal workflow checks out nothing, runs no PR content, emits no artifact/cache;
+#   * this validator never downloads that run's artifacts/caches and never checks out the PR
+#     branch or merge commit — detection reads ONLY the `patch` fragments
+#     `GET .../pulls/{n}/files` returns (GitHub-owned metadata, not a checkout);
+#   * every PR-derived value (branch, title, body, labels, diff patch text) is untrusted
+#     DATA, passed through env, never shell-interpolated.
+# The job runs on the DEFAULT branch, so its job-level check must NOT be the required merge
+# check. validate.py publishes the `Telemetry cost contract` commit status on the refetched
+# PR head SHA instead; branch protection requires THAT context.
+#
+# REPORTING MODES (identical semantics to linear-ticket.yml):
+#   enforce: true                     red status, job exits nonzero. Gating (once required).
+#   enforce: false, soft-fail: true   red status, job stays green on a failing VERDICT. Loud
+#     (the default)                   pilot rung: shows on the PR like enforce does but blocks
+#                                     nothing while the context is not required.
+#   enforce: false, soft-fail: false  green status; only the job summary and marker comment
+#                                     carry the verdict. The silent variant.
+#
+# PERMISSIONS the caller must grant (validated by GitHub at STARTUP, before any `if:`):
+#   actions: read           # read the triggering workflow_run
+#   contents: read          # checkout THIS repo's scripts (no PR code is ever checked out)
+#   pull-requests: write    # read changed-file patches; the one marker diagnostic comment
+#   statuses: write         # publish the `Telemetry cost contract` commit status
+#
+# No secret is required — detection and the Cost-impact-section check both read only
+# GitHub-owned PR data.
+#
+# Caller pattern: docs/callers/telemetry-cost-contract.md.
+
+on:
+  workflow_call:
+    inputs:
+      workflows_ref:
+        description: >-
+          Full 40-hex commit SHA of THIS repo to load the validator scripts from. Pin to the
+          SAME SHA as the caller's `uses:` line. Required; validated to be a full lowercase
+          SHA and an ancestor of this repo's main before checkout.
+        type: string
+        required: true
+      patterns:
+        description: >-
+          Required. Newline-separated regexes (Python `re`); a match against an ADDED diff
+          line in any changed file marks the PR cost-sensitive. Newline-separated, not comma:
+          a regex alternation commonly contains a comma. Blank lines and `#`-comment lines
+          are skipped. At least one pattern must survive, and every surviving line must
+          compile, or the run fails as a caller misconfiguration (an empty pattern set would
+          silently disable the gate on every PR).
+        type: string
+        required: true
+      exempt-label:
+        description: >-
+          Single label that waives the requirement (recommended `cost-exempt`). Empty
+          disables exemption.
+        type: string
+        required: false
+        default: 'cost-exempt'
+      enforce:
+        description: >-
+          false (default) is warn-only: a failing VERDICT never exits the job nonzero,
+          `soft-fail` decides how loudly it is reported. true fails closed on a missing
+          Cost-impact section or infrastructure error, and the job itself exits nonzero.
+          Warn-only is not a promise the job always exits 0 — a broken run still does (a
+          failed terminal status write, a missing repo, malformed `patterns`, a
+          non-`pull_request` trigger).
+        type: boolean
+        required: false
+        default: false
+      soft-fail:
+        description: >-
+          Warn-only only (ignored when `enforce: true`). true (default) publishes a red
+          `failure` commit status so the PR's check list shows the check failing — loud, but
+          non-blocking for as long as `Telemetry cost contract` is not a required status.
+          false restores the silent variant: warn-only publishes `success` and only the job
+          summary and comment carry the verdict. An ABSENT value (pin skew between `uses:` and
+          `workflows_ref`) is treated as false, so skew alone can never flip a caller to red.
+        type: boolean
+        required: false
+        default: true
+    secrets: {}
+
+permissions: {}
+
+concurrency:
+  group: telemetry-cost-contract-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Require a pinned workflows_ref
+        # Identical trust-boundary check to linear-ticket.yml's step of the same name: SHAPE
+        # (full 40-hex lowercase SHA) proves the value is immutable; ANCESTRY (reachable from
+        # this repo's upstream main) proves it names a MERGED commit, not a fork-authored SHA
+        # that happens to be well-shaped. See linear-ticket.yml's step for the full rationale.
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see the caller doc)"
+            exit 1
+          fi
+          safe_ref=$(printf '%s' "$REF" | tr -c 'A-Za-z0-9._/-' '?'); safe_ref=${safe_ref:0:64}
+          if [ "${#REF}" -ne 40 ] || [ -n "${REF//[0-9a-f]/}" ]; then
+            echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Branches, tags and PR-head refs are mutable and are rejected before checkout."
+            exit 1
+          fi
+          scratch=$(mktemp -d) || { echo "::error::ancestry check for workflows_ref (${safe_ref}) could not allocate scratch space; failing closed."; exit 1; }
+          trap 'rm -rf "$scratch"' EXIT
+          git init -q "$scratch" || { echo "::error::ancestry check for workflows_ref (${safe_ref}) could not init a scratch repo; failing closed."; exit 1; }
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                   fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts; failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown merged upstream; failing closed."
+            exit 1
+          fi
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::the ancestry test for workflows_ref (${safe_ref}) could not COMPLETE (git error, not a verdict); failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be fork-authored; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run."
+            exit 1
+          fi
+      - name: Checkout validator scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: .telemetry-cost-contract-tools
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Validate the telemetry cost contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PATTERNS: ${{ inputs.patterns }}
+          EXEMPT_LABEL: ${{ inputs.exempt-label }}
+          ENFORCE: ${{ inputs.enforce }}
+          SOFT_FAIL: ${{ inputs.soft-fail }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .telemetry-cost-contract-tools/scripts/telemetry-cost-contract/validate.py
