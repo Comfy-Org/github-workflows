@@ -7,14 +7,24 @@ Read [the shared caller contract](README.md) first.
 For a PR targeting a **protected base branch**, scans every changed file's diff for an
 **added** line matching one of this caller's `patterns` regexes (a new Datadog metrics-client
 call, a new Sentry capture, a new PostHog `.capture(`, a new RUM custom action — whatever the
-repo's `patterns` input names). When a match is found, the PR body must carry a `## Cost
-impact` section with real content (priced unit, baseline/scale forecast, protected signal —
-the observability program's TDD section 7.1 contract), or the PR must carry the `cost-exempt`
-label. A PR with no matching added line passes trivially; a PR targeting an unprotected branch
-skips without scanning at all.
+repo's `patterns` input names). When a match is found, the PR body must carry a non-empty
+`## Cost impact` section, or the PR must carry the `cost-exempt` label. A PR with no matching
+added line passes trivially; a PR targeting an unprotected branch skips without scanning at
+all.
+
+The validator only checks that the section is non-empty — it does not verify the content is
+substantive. Reviewers must still confirm the section actually names a priced unit, a
+baseline/scale forecast, and the protected signal (the observability program's TDD section
+7.1 contract); a section that just says `N/A` passes the automated check but has not met the
+contract.
 
 Detection reads only the `patch` fragments GitHub's changed-files API returns — never a
-checkout of the PR branch — so it is safe to run on fork and Dependabot PRs.
+checkout of the PR branch — so it is safe to run on fork and Dependabot PRs. If GitHub omits
+the `patch` for a changed file (large diffs are rendered as "too large," `renamed`/`removed`
+files never carry one), that file cannot be scanned for a pattern match. Rather than silently
+skip it, such a file with added content fails the check closed (`changed_files_unavailable`)
+so a human reviews it manually instead of the gate passing trivially on a file it couldn't
+read.
 
 ### Why two workflows
 

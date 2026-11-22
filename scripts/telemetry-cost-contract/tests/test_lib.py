@@ -111,8 +111,8 @@ class FirstMatchTests(unittest.TestCase):
         # nobody actually wrote on one line.
         spanning = lib.parse_patterns(r"foo\s+bar")
         files = [{"filename": "a.go", "patch": (
-            "+some_call(foo)\n"
-            "+bar_other_call()\n"
+            "+foo\n"
+            "+bar\n"
         )}]
         self.assertIsNone(lib.first_match(files, spanning))
 

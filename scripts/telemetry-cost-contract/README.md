@@ -15,10 +15,17 @@ matching this repo's convention.
 
 ## The invariant
 
-A PR only turns red when an **added** diff line matches a caller-configured pattern AND the
-PR body has no non-empty `## Cost impact` section AND the PR carries no exemption label.
-Detection reads only the `patch` fragments GitHub's changed-files API already returns —
-nothing here checks out the PR branch or executes PR content, which is what makes it safe to
-run in the privileged `workflow_run` validator job on a fork or Dependabot PR. See
+A PR turns red for a cost-impact verdict when an **added** diff line matches a
+caller-configured pattern AND the PR body has no non-empty `## Cost impact` section AND the PR
+carries no exemption label. Detection reads only the `patch` fragments GitHub's changed-files
+API already returns — nothing here checks out the PR branch or executes PR content, which is
+what makes it safe to run in the privileged `workflow_run` validator job on a fork or
+Dependabot PR.
+
+Separately, the validator also fails closed — publishing red with no cost-impact verdict at
+all — on infrastructure failure: the changed-file lookup erroring, or a changed file with
+added content but no renderable `patch` (`changed_files_unavailable`). This can block a
+required check in enforce mode even though no matching line was ever found; it is a
+"couldn't verify" signal, not a cost-impact finding. See
 [`docs/callers/telemetry-cost-contract.md`](../../docs/callers/telemetry-cost-contract.md) for
 the caller setup and rollout.
