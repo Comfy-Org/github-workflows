@@ -41,10 +41,11 @@ belongs.
 
 The unknown-key check fires wherever a schema object accepts only the property
 names it lists. Upstream says that two ways and both are checked: **explicitly**,
-with `additionalProperties: false` (five objects, including the document root),
-and **by omission** — a `properties` block and nothing said about anything else
-(103 objects, including `reviews`, `chat`, `knowledge_base`, `code_generation` and
-every individual tool config). So a key in the wrong PLACE is caught, and so is a
+with `additionalProperties: false` — which the vendored schema now does for every
+object, including the document root, `reviews`, `chat`, `knowledge_base`,
+`code_generation` and every individual tool config — and **by omission**, a
+`properties` block and nothing said about anything else (no objects today, but
+still checked in case a schema refresh brings them back). So a key in the wrong PLACE is caught, and so is a
 typo *inside* an object (`reviews.profil`, `golangci-lint.enabld`) and a key
 upstream has since removed.
 
@@ -86,8 +87,7 @@ The window is a property of the vendored schema being older than upstream, **not
 of which half detects the key, so neither half is exempt: a key upstream adds at
 the document root (or under `knowledge_base.mcp`) is missing from the vendored
 `properties` list, and the vendored `additionalProperties: false` rejects it just
-the same. The by-omission half is only the *larger* surface — 103 objects against
-5 — not the only one.
+the same. Today every nested object is closed that way too.
 
 That is the trade `strict_unknown_keys` makes, not a bug: the same freshness that
 lets the checker catch a key upstream REMOVED is what makes it briefly wrong about

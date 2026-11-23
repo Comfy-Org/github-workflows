@@ -28,9 +28,9 @@ class of problem rather than what a schema library calls "invalid":
     failure for a repo that has cleaned up and wants to stay clean.
 
 An unknown key is reported wherever the schema object it sits in accepts only the
-names it lists — whether it says so with `additionalProperties: false` (seven
-objects, which jsonschema reports) or simply by naming `properties` and nothing
-else (105 more, which `_walk_unknown_keys` reports). A node that opts OUT of that
+names it lists — whether it says so with `additionalProperties: false` (all 112
+such objects in the vendored schema, which jsonschema reports) or simply by naming
+`properties` and nothing else (none today, which `_walk_unknown_keys` would report). A node that opts OUT of that
 — any of `_OPENER_KEYWORDS` — is left alone in both halves.
 
 A repo with no `.coderabbit.yaml` passes, and says so in the log — not every
@@ -110,11 +110,10 @@ _RANK_REJECTING = 2   # CodeRabbit discards the WHOLE file over this one
 STRIPPED_KEYWORDS = frozenset({"additionalProperties", "unevaluatedProperties"})
 
 # Keywords that leave a schema object OPEN to keys its own `properties` block does
-# not name. Upstream's schema closes only seven objects with an explicit
-# `additionalProperties: false` (the document root, `reviews.auto_approvals` and
-# its `overrides[]` items, the `htmlhint` and `stylelint` tool objects,
-# `knowledge_base.mcp`, and `knowledge_base.linked_repositories[]`), while 105
-# more declare `properties` and say nothing at all about the rest. A
+# not name. Upstream's schema used to close only seven objects with an explicit
+# `additionalProperties: false`, while 105 more declared `properties` and said
+# nothing at all about the rest; since #467's refresh it closes all 112
+# explicitly, but the walk stays for a refresh that reverts that. A
 # typo inside one of those — `reviews.profil`, `golangci-lint.enabld` — is stripped
 # by CodeRabbit exactly like a root-level one, but jsonschema has nothing to
 # complain about, so `iter_errors` alone reports it nowhere. `_walk_unknown_keys`
@@ -277,8 +276,9 @@ def _suggest_home(key, schema_index, offending_path):
     """A one-line 'did you mean' for an unknown key, or '' when there is none.
 
     Written for the root-level `tools:` case: a name specific enough that the one
-    other place the schema uses it is almost certainly where it belonged. Keys
-    found by the closed-by-omission walk break that assumption, because nested
+    other place the schema uses it is almost certainly where it belonged. NESTED
+    unknown keys (jsonschema's since #467 closed every object, the
+    closed-by-omission walk's before) break that assumption, because nested
     unknown keys are dominated by GENERIC names — `enabled` sits at ~72 places in
     this schema, plus `scope`, `path`, `instructions` — and for one of those the
     three alphabetically-first paths are three homes that are all probably wrong
@@ -655,8 +655,9 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
     """Unknown keys inside objects the schema closes BY OMISSION.
 
     jsonschema reports an unknown key only where the schema says `additionalProperties`
-    / `unevaluatedProperties` — seven objects in upstream's schema. This walks the
-    parsed document alongside the schema and reports the other 105: a node that
+    / `unevaluatedProperties` — all 112 objects in the vendored schema since
+    #467 (seven before). This walks the parsed document alongside the schema and
+    reports the rest (105 before #467, none now): a node that
     declares a dict-valued `properties` and NONE of `_OPENER_KEYWORDS` accepts
     exactly the names it lists, so any other key in the document is stripped.
 
@@ -932,8 +933,8 @@ def validate(text, schema, strict_unknown_keys=False):
             )
         )
 
-    # The other 105 objects: closed by OMISSION, so jsonschema said nothing about
-    # them. Appended after the jsonschema findings rather than merged into their
+    # Objects closed by OMISSION (none in the vendored schema since #467), so
+    # jsonschema said nothing about them. Appended after the jsonschema findings rather than merged into their
     # sort, which keeps both halves in document order within themselves and the
     # whole list stable run to run. One past `remaining` so an overflow is
     # detectable; `remaining` can be 0, in which case a single walk finding is
