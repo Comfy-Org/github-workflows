@@ -50,6 +50,16 @@ class ChangedFilesUnavailable(Exception):
     to be complete. Always fails the check closed (``changed_files_unavailable``)."""
 
 
+class _AlreadyMerged:
+    """Sentinel type for _resolve_pr: the commit's only associated PR merged in the window
+    between the signal workflow uploading and this workflow_run executing. The verdict is
+    moot post-merge (nothing left to publish a status against that could still block
+    anything), so this is distinct from genuine ambiguity, which still fails closed."""
+
+
+_ALREADY_MERGED = _AlreadyMerged()
+
+
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -336,11 +346,16 @@ class Validator:
                 f"Triggering workflow_run event was '{wr_event}', not 'pull_request'. The "
                 "signal workflow must run on pull_request; refusing to validate.")
 
-        self.pr_number = self._resolve_pr(event, head_sha)
-        if self.pr_number is None:
+        resolved = self._resolve_pr(event, head_sha)
+        if isinstance(resolved, _AlreadyMerged):
+            log(f"The PR for {head_sha} merged before this validate run could execute; the "
+                "verdict is moot post-merge. Skipping without publishing a status.")
+            return 0
+        if resolved is None:
             return self._fail_closed_pre_pr(
                 head_sha, "Could not resolve exactly one open PR for this commit; refusing "
                 "to publish an ambiguous result.", log_message=False)
+        self.pr_number = resolved
 
         pr = self.gh.get(f"/repos/{self.gh.repo}/pulls/{self.pr_number}")
         if not pr:
@@ -414,31 +429,44 @@ class Validator:
             "missing_cost_impact",
             f"Matched pattern `{pattern_text}` against an added line in {md_code(filename)}.")
 
-    def _resolve_pr(self, event: dict, head_sha: str) -> int | None:
-        """Exactly one open PR. Same-repo runs carry workflow_run.pull_requests; fork runs do
-        not, so fall back to the commit->PR association (GitHub-owned data either way)."""
+    def _resolve_pr(self, event: dict, head_sha: str) -> int | _AlreadyMerged | None:
+        """Exactly one open PR, ``_ALREADY_MERGED`` if the commit's one associated PR merged
+        before this run could execute, or ``None`` if genuinely ambiguous (zero or multiple
+        candidates with none merged). Same-repo runs carry workflow_run.pull_requests; fork
+        runs do not, so fall back to the commit->PR association (GitHub-owned data either
+        way)."""
         wr = event.get("workflow_run") or {}
         candidates = [pr.get("number") for pr in (wr.get("pull_requests") or []) if pr.get("number")]
         if not candidates:
             assoc = self.gh.get(f"/repos/{self.gh.repo}/commits/{head_sha}/pulls") or []
             candidates = [
                 pr.get("number") for pr in assoc
-                if pr.get("state") == "open"
-                and (pr.get("base") or {}).get("repo", {}).get("full_name") == self.gh.repo
+                if (pr.get("base") or {}).get("repo", {}).get("full_name") == self.gh.repo
             ]
 
         open_prs: list[int] = []
+        merged_prs: list[int] = []
         for number in dict.fromkeys(candidates):
             data = self.gh.get(f"/repos/{self.gh.repo}/pulls/{number}")
-            if data and data.get("state") == "open":
+            if not data:
+                continue
+            if data.get("state") == "open":
                 open_prs.append(number)
+            elif data.get("merged_at"):
+                merged_prs.append(number)
 
-        if len(open_prs) != 1:
-            error(f"Expected exactly one open PR associated with {head_sha}, found "
-                  f"{len(open_prs)} (event={wr.get('event')}). Refusing to publish an "
-                  "ambiguous result.")
-            return None
-        return open_prs[0]
+        if len(open_prs) == 1:
+            return open_prs[0]
+
+        if not open_prs and len(merged_prs) == 1:
+            log(f"PR #{merged_prs[0]} associated with {head_sha} already merged before this "
+                "validate run executed.")
+            return _ALREADY_MERGED
+
+        error(f"Expected exactly one open PR associated with {head_sha}, found "
+              f"{len(open_prs)} (event={wr.get('event')}). Refusing to publish an "
+              "ambiguous result.")
+        return None
 
 
 def main() -> int:

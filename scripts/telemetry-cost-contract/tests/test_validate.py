@@ -162,6 +162,70 @@ class FailClosedStatusPublishing(unittest.TestCase):
         self.assertEqual(github.statuses, [("abc123", "failure", github.statuses[0][2], True)])
 
 
+class MergeRaceBeforeValidate(unittest.TestCase):
+    """Regression for the merge-queue race: the signal workflow runs on a PR that merges
+    (closing it) before this workflow_run executes, so the open-PR lookup finds zero — not
+    because the result is ambiguous, but because it is moot. Observed live on
+    ComfyUI_frontend's 2026-11-24 merge of PR #24114: run 45391308799 hard-failed with
+    'Expected exactly one open PR ... found 0' even though SOFT_FAIL=true."""
+
+    def test_already_merged_pr_skips_cleanly_without_publishing_a_status(self):
+        github = FakeGitHub()
+        github.pr["state"] = "closed"
+        github.pr["merged_at"] = "2026-11-24T09:06:53Z"
+
+        self.assertEqual(validator(github).run(event()), 0)
+        self.assertEqual(github.statuses, [])
+        self.assertEqual(github.upserted_comments, [])
+        self.assertEqual(github.deleted_comments, [])
+
+    def test_already_merged_pr_via_fork_fallback_also_skips_cleanly(self):
+        github = FakeGitHub()
+        github.pr["state"] = "closed"
+        github.pr["merged_at"] = "2026-11-24T09:06:53Z"
+
+        def get(path, *, paginate=False):
+            if path.endswith("/commits/abc123/pulls"):
+                return [{"number": 17, "base": {"repo": {"full_name": github.repo}}}]
+            if path.endswith("/pulls/17"):
+                return dict(github.pr)
+            raise AssertionError(f"unexpected GitHub request: {path}")
+
+        github.get = get
+        fork_event = {"workflow_run": {"event": "pull_request", "head_sha": "abc123",
+                                        "pull_requests": []}}
+
+        self.assertEqual(validator(github).run(fork_event), 0)
+        self.assertEqual(github.statuses, [])
+
+    def test_closed_without_merging_still_fails_closed(self):
+        # A closed-but-not-merged PR is genuine ambiguity (abandoned PR, not a merge race):
+        # there is no "the result is moot, it already merged" justification to skip silently.
+        github = FakeGitHub()
+        github.pr["state"] = "closed"
+        github.pr["merged_at"] = None
+
+        self.assertEqual(validator(github).run(event()), 1)
+        self.assertEqual([s[1] for s in github.statuses], ["failure"])
+
+    def test_two_merged_candidates_is_still_ambiguous_and_fails_closed(self):
+        github = FakeGitHub()
+        github.pr["state"] = "closed"
+        github.pr["merged_at"] = "2026-11-24T09:06:53Z"
+
+        def get(path, *, paginate=False):
+            if path.endswith("/pulls/17") or path.endswith("/pulls/18"):
+                return dict(github.pr)
+            raise AssertionError(f"unexpected GitHub request: {path}")
+
+        github.get = get
+        two_candidates = event()
+        two_candidates["workflow_run"]["pull_requests"] = [{"number": 17}, {"number": 18}]
+
+        self.assertEqual(validator(github).run(two_candidates), 1)
+        self.assertEqual([s[1] for s in github.statuses], ["failure"])
+
+
 class PendingStatusWriteFailure(unittest.TestCase):
     def test_failed_pending_write_is_treated_as_critical_and_short_circuits(self):
         github = FakeGitHub(pending_publish_ok=False)
