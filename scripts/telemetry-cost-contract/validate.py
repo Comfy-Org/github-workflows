@@ -446,9 +446,11 @@ class Validator:
 
         open_prs: list[int] = []
         merged_prs: list[int] = []
+        lookup_failed = False
         for number in dict.fromkeys(candidates):
             data = self.gh.get(f"/repos/{self.gh.repo}/pulls/{number}")
             if not data:
+                lookup_failed = True
                 continue
             if data.get("state") == "open":
                 open_prs.append(number)
@@ -458,7 +460,7 @@ class Validator:
         if len(open_prs) == 1:
             return open_prs[0]
 
-        if not open_prs and len(merged_prs) == 1:
+        if not lookup_failed and not open_prs and len(merged_prs) == 1:
             log(f"PR #{merged_prs[0]} associated with {head_sha} already merged before this "
                 "validate run executed.")
             return _ALREADY_MERGED

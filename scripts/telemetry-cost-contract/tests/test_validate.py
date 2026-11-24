@@ -225,6 +225,25 @@ class MergeRaceBeforeValidate(unittest.TestCase):
         self.assertEqual(validator(github).run(two_candidates), 1)
         self.assertEqual([s[1] for s in github.statuses], ["failure"])
 
+    def test_merged_candidate_with_failed_lookup_still_fails_closed(self):
+        github = FakeGitHub()
+        github.pr["state"] = "closed"
+        github.pr["merged_at"] = "2026-11-24T09:06:53Z"
+
+        def get(path, *, paginate=False):
+            if path.endswith("/pulls/17"):
+                return dict(github.pr)
+            if path.endswith("/pulls/18"):
+                return None
+            raise AssertionError(f"unexpected GitHub request: {path}")
+
+        github.get = get
+        two_candidates = event()
+        two_candidates["workflow_run"]["pull_requests"] = [{"number": 17}, {"number": 18}]
+
+        self.assertEqual(validator(github).run(two_candidates), 1)
+        self.assertEqual([s[1] for s in github.statuses], ["failure"])
+
 
 class PendingStatusWriteFailure(unittest.TestCase):
     def test_failed_pending_write_is_treated_as_critical_and_short_circuits(self):
