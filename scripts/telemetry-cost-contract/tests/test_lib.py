@@ -489,5 +489,85 @@ class SplitUnifiedDiffTests(unittest.TestCase):
                 self.assertEqual(lib.split_unified_diff(text), {})
 
 
+class PathKeyIntegrityTests(unittest.TestCase):
+    """Review-panel findings on the path parsing. Each is a way for recovery to key a
+    fragment under the wrong name and then report a clean scan of a file it never read."""
+
+    def test_trailing_space_in_a_filename_is_preserved(self):
+        # A trailing space is a legal filename character and git does NOT quote for it, so
+        # `strip()` collapsed `foo.js` and `foo.js ` onto one key with last-wins assignment:
+        # an oversized `foo.js` carrying a billable call plus a small benign `foo.js ` would
+        # mark the real file recovered-and-clean from the WRONG file's hunks.
+        diff = ("diff --git a/svc/foo.js b/svc/foo.js\n"
+                "--- a/svc/foo.js\n"
+                "+++ b/svc/foo.js\n"
+                "@@ -1,1 +1,2 @@\n"
+                "+posthog.capture('billable')\n"
+                "diff --git a/svc/foo.js  b/svc/foo.js \n"
+                "--- a/svc/foo.js \n"
+                "+++ b/svc/foo.js \n"
+                "@@ -1,1 +1,2 @@\n"
+                "+harmless\n")
+        fragments = lib.split_unified_diff(diff)
+        self.assertEqual(sorted(fragments), ["svc/foo.js", "svc/foo.js "])
+        self.assertIn("posthog.capture", fragments["svc/foo.js"])
+        self.assertIn("harmless", fragments["svc/foo.js "])
+
+    def test_single_trailing_tab_separator_is_removed(self):
+        # git appends a TAB after an unquoted name in the ---/+++ header. That one TAB must
+        # go (or the key never matches the API filename), and nothing else may.
+        diff = ("diff --git a/svc/a b.go b/svc/a b.go\n"
+                "--- a/svc/a b.go\t\n"
+                "+++ b/svc/a b.go\t\n"
+                "@@ -1,1 +1,2 @@\n"
+                "+ok\n")
+        self.assertEqual(sorted(lib.split_unified_diff(diff)), ["svc/a b.go"])
+
+    def test_octal_escaped_non_ascii_path_decodes_as_utf8(self):
+        # Flagged by 6 of 6 reviewers. Under the default core.quotePath git renders a
+        # non-ASCII path as octal-escaped UTF-8 BYTES; decoding the escapes straight to text
+        # yields `cafÃ©.go`, which never matches the API's `café.go`, so recovery silently
+        # never worked for a non-ASCII filename.
+        diff = ('diff --git "a/svc/caf\\303\\251.go" "b/svc/caf\\303\\251.go"\n'
+                '--- "a/svc/caf\\303\\251.go"\n'
+                '+++ "b/svc/caf\\303\\251.go"\n'
+                "@@ -1,1 +1,2 @@\n"
+                "+ok\n")
+        self.assertEqual(sorted(lib.split_unified_diff(diff)), ["svc/café.go"])
+
+    def test_quoted_path_keeps_standard_c_escapes(self):
+        diff = ('diff --git "a/svc/a\\tb\\\\c.go" "b/svc/a\\tb\\\\c.go"\n'
+                '--- "a/svc/a\\tb\\\\c.go"\n'
+                '+++ "b/svc/a\\tb\\\\c.go"\n'
+                "@@ -1,1 +1,2 @@\n"
+                "+ok\n")
+        self.assertEqual(sorted(lib.split_unified_diff(diff)), ["svc/a\tb\\c.go"])
+
+    def test_duplicate_path_fails_closed_rather_than_last_wins(self):
+        # Two sections cannot legitimately claim one new path. A duplicate means a quoting
+        # edge read wrong or file content that forged a section header, and the honest answer
+        # is that the file was not read — so it yields NO fragment and stays unscannable.
+        diff = ("diff --git a/svc/x.go b/svc/x.go\n"
+                "--- a/svc/x.go\n"
+                "+++ b/svc/x.go\n"
+                "@@ -1,1 +1,2 @@\n"
+                "+posthog.capture('real')\n"
+                "diff --git a/svc/x.go b/svc/x.go\n"
+                "--- a/svc/x.go\n"
+                "+++ b/svc/x.go\n"
+                "@@ -1,1 +1,2 @@\n"
+                "+benign\n")
+        self.assertEqual(lib.split_unified_diff(diff), {})
+        # ...so the entry it would have repaired is still reported unscannable.
+        files = [{"filename": "svc/x.go", "additions": 1, "status": "modified"}]
+        self.assertEqual(lib.unscannable_files(files), ["svc/x.go"])
+
+    def test_a_non_duplicate_neighbour_survives_a_duplicate(self):
+        diff = ("diff --git a/svc/dup.go b/svc/dup.go\n+++ b/svc/dup.go\n@@ -1 +1 @@\n+a\n"
+                "diff --git a/svc/dup.go b/svc/dup.go\n+++ b/svc/dup.go\n@@ -1 +1 @@\n+b\n"
+                "diff --git a/svc/ok.go b/svc/ok.go\n+++ b/svc/ok.go\n@@ -1 +1 @@\n+c\n")
+        self.assertEqual(sorted(lib.split_unified_diff(diff)), ["svc/ok.go"])
+
+
 if __name__ == "__main__":
     unittest.main()

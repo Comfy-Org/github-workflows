@@ -135,14 +135,20 @@ class SupersessionGuard(unittest.TestCase):
 
 
 class FailClosedStatusPublishing(unittest.TestCase):
-    def test_unreadable_branch_protection_publishes_failure_on_head_sha(self):
+    """These four publish `error`, not `failure`, since the honesty fix: each is this gate
+    unable to reach a verdict (PR fetch failed, PR resolution ambiguous, branch protection
+    unreadable, wrong triggering event), never a finding about the PR's cost impact. Leaving
+    them as `failure` contradicted the contract the module docstring states. The exit code is
+    unchanged at 1, so fail-closed behaviour is identical."""
+
+    def test_unreadable_branch_protection_publishes_error_on_head_sha(self):
         github = FakeGitHub(protected=None)
 
         self.assertEqual(validator(github).run(event()), 1)
-        self.assertEqual(github.statuses, [("abc123", "failure",
+        self.assertEqual(github.statuses, [("abc123", "error",
                                             github.statuses[0][2], True)])
 
-    def test_pr_fetch_failure_publishes_failure_on_head_sha(self):
+    def test_pr_fetch_failure_publishes_error_on_head_sha(self):
         github = FakeGitHub()
         github.pr = None  # type: ignore[assignment]
 
@@ -152,17 +158,17 @@ class FailClosedStatusPublishing(unittest.TestCase):
         github.get = get
 
         self.assertEqual(validator(github).run(event()), 1)
-        self.assertEqual([s[1] for s in github.statuses], ["failure"])
+        self.assertEqual([s[1] for s in github.statuses], ["error"])
         self.assertEqual(github.statuses[0][0], "abc123")
 
-    def test_missing_base_branch_publishes_failure_on_head_sha(self):
+    def test_missing_base_branch_publishes_error_on_head_sha(self):
         github = FakeGitHub()
         github.pr["base"] = {"ref": ""}
 
         self.assertEqual(validator(github).run(event()), 1)
-        self.assertEqual([s[1] for s in github.statuses], ["failure"])
+        self.assertEqual([s[1] for s in github.statuses], ["error"])
 
-    def test_non_pull_request_workflow_run_publishes_failure_before_any_pr_lookup(self):
+    def test_non_pull_request_workflow_run_publishes_error_before_any_pr_lookup(self):
         github = FakeGitHub()
 
         def get(path, *, paginate=False):
@@ -173,7 +179,7 @@ class FailClosedStatusPublishing(unittest.TestCase):
         bad_event["workflow_run"]["event"] = "push"
 
         self.assertEqual(validator(github).run(bad_event), 1)
-        self.assertEqual(github.statuses, [("abc123", "failure", github.statuses[0][2], True)])
+        self.assertEqual(github.statuses, [("abc123", "error", github.statuses[0][2], True)])
 
 
 class PendingStatusWriteFailure(unittest.TestCase):
@@ -225,7 +231,7 @@ class OmittedPatchRecovery(unittest.TestCase):
             {"filename": "svc/handler.go", "additions": 1, "status": "modified",
              "patch": "@@ -1,2 +1,3 @@\n package svc\n+// nothing cost-sensitive here\n"},
             # additions > 0 and NO `patch` key — the live omission.
-            {"filename": "svc/ingest.gen.go", "additions": 1531, "status": "modified"},
+            {"filename": "svc/ingest.gen.go", "additions": 1, "status": "modified"},
         ]
 
     def test_omitted_patch_is_recovered_and_the_check_reaches_a_real_verdict(self):
@@ -282,6 +288,112 @@ class OmittedPatchRecovery(unittest.TestCase):
 
         self.assertEqual(validator(github).run(event()), 0)
         self.assertEqual(github.diff_requests, [])
+
+
+class RecoveredFragmentCoverage(unittest.TestCase):
+    """A recovered fragment is only a complete scan if it accounts for every added line the
+    changed-files API independently reported. Otherwise a truncated or mis-split section
+    would be scanned as if whole — the exact free pass `unscannable_files` exists to deny."""
+
+    DIFF = ("diff --git a/svc/big.go b/svc/big.go\n"
+            "--- a/svc/big.go\n"
+            "+++ b/svc/big.go\n"
+            "@@ -1,1 +1,2 @@\n"
+            " package svc\n"
+            "+// only one added line here\n")
+
+    def test_short_fragment_leaves_the_file_unscannable(self):
+        # API says 900 additions; the recovered section shows 1. Something is truncated, so
+        # the honest result is `error`, not a clean scan of a tenth of the file.
+        github = FakeGitHub(
+            changed_files=[{"filename": "svc/big.go", "additions": 900, "status": "modified"}],
+            diff=self.DIFF)
+
+        self.assertEqual(validator(github).run(event()), 1)
+        self.assertEqual([s[1] for s in github.statuses], ["pending", "error"])
+        self.assertIn("big.go", github.upserted_comments[0][1])
+
+    def test_exact_coverage_is_accepted(self):
+        github = FakeGitHub(
+            changed_files=[{"filename": "svc/big.go", "additions": 1, "status": "modified"}],
+            diff=self.DIFF)
+
+        self.assertEqual(validator(github).run(event()), 0)
+        self.assertEqual([s[1] for s in github.statuses], ["pending", "success"])
+
+
+class LogInjectionSafety(unittest.TestCase):
+    """Filenames are PR-controlled and reach `::warning::` output in a privileged,
+    fork-triggerable workflow_run job. git permits a newline in a path, so an unescaped name
+    can open a new runner command — forging annotations, registering a mask, or suppressing
+    the `::error::` that carries the real verdict."""
+
+    HOSTILE = "x\n::stop-commands::tok"
+
+    def test_log_safe_neutralises_newlines_and_percent(self):
+        rendered = validate.log_safe(self.HOSTILE)
+        self.assertNotIn("\n", rendered)
+        self.assertNotIn("\r", rendered)
+        self.assertNotIn("::stop-commands::tok", rendered.split("\\n")[0])
+        self.assertNotIn("%0A", validate.log_safe("a%0Ab"))
+
+    def test_hostile_filename_never_reaches_a_raw_log_line(self):
+        import io
+        import contextlib
+
+        github = FakeGitHub(
+            changed_files=[{"filename": self.HOSTILE, "additions": 3, "status": "added"}],
+            diff=None)
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            self.assertEqual(validator(github).run(event()), 1)
+
+        for line in buffer.getvalue().split("\n"):
+            self.assertFalse(line.startswith("::stop-commands::"),
+                             f"forged workflow command: {line!r}")
+        self.assertEqual([s[1] for s in github.statuses], ["pending", "error"])
+
+
+class WholePrDiffDecoding(unittest.TestCase):
+    """`pull_request_diff` reads repository bytes, not JSON. Text-mode subprocess decoding
+    would crash on a non-UTF-8 fixture and would rewrite a lone \\r into a real newline."""
+
+    class FakeProc:
+        def __init__(self, stdout, returncode=0, stderr=b""):
+            self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
+
+    def _github(self, payload, returncode=0):
+        github = validate.GitHub("Comfy-Org/example")
+        github._run_bytes = lambda args: self.FakeProc(payload, returncode)
+        github._run = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the diff must be read as bytes, never through text-mode _run"))
+        return github
+
+    def test_non_utf8_bytes_do_not_raise(self):
+        # A Latin-1 fixture with no NUL is a text file to git. Strict decoding raised
+        # UnicodeDecodeError here, killing the validator AFTER the `pending` write and
+        # leaving that non-terminal status as the PR's last word.
+        payload = ("diff --git a/svc/x.go b/svc/x.go\n+++ b/svc/x.go\n@@ -1 +1 @@\n+caf"
+                   ).encode("utf-8") + b"\xe9\n"
+        text = self._github(payload).pull_request_diff(17)
+        self.assertIsNotNone(text)
+        self.assertIn("svc/x.go", lib.split_unified_diff(text))
+
+    def test_lone_carriage_return_is_not_turned_into_a_newline(self):
+        # Universal-newline translation would split one added line in two and strip the
+        # second half's `+`, so `added_lines` drops it — a detection bypass.
+        payload = (b"diff --git a/svc/x.go b/svc/x.go\n+++ b/svc/x.go\n@@ -1 +1,2 @@\n"
+                   b"+foo();\rposthog.capture('billable')\n")
+        text = self._github(payload).pull_request_diff(17)
+        added = lib.added_lines(lib.split_unified_diff(text)["svc/x.go"])
+        self.assertEqual(len(added), 1, f"line was split: {added!r}")
+        self.assertIn("posthog.capture", added[0])
+
+    def test_unavailable_diff_returns_none(self):
+        self.assertIsNone(self._github(b"", returncode=1).pull_request_diff(17))
+
+    def test_empty_diff_returns_none(self):
+        self.assertIsNone(self._github(b"").pull_request_diff(17))
 
 
 if __name__ == "__main__":

@@ -39,12 +39,17 @@ coverage.
 ### Two non-success states, and the difference matters
 
 Separately, the validator fails closed — no cost-impact verdict at all — when it cannot read
-a changed file's content from **either** source, or when the changed-file lookup itself
-errors (`changed_files_unavailable`). That publishes the commit-status state **`error`**,
-never `failure`: `failure` is this gate's verdict that the contract was broken, `error` is
-this gate reporting it could not reach a verdict. Both are non-success, so a required context
-still blocks in enforce mode — distinguishable is not the same as permissive — but "I could
-not look" no longer emits the same signal as "you broke it", for a human or for a tool
-reading the status. See
+a changed file's content from **either** source, when a recovered fragment does not account
+for all of that file's reported `additions`, or when the changed-file lookup itself errors
+(`changed_files_unavailable`). In the two reporting modes that publish a red status that is
+the commit-status state **`error`**, never `failure`, and the same now goes for the
+pre-verdict infrastructure failures (PR fetch, ambiguous PR resolution, unreadable branch
+protection, a non-`pull_request` trigger).
+
+`failure` is this gate's verdict that the contract was broken; `error` is this gate reporting
+it could not reach a verdict. Both are non-success, so a required context still blocks in
+enforce mode and the exit code is unchanged — distinguishable is not the same as permissive —
+but "I could not look" no longer emits the same signal as "you broke it", for a human or for
+a tool reading the status. See
 [`docs/callers/telemetry-cost-contract.md`](../../docs/callers/telemetry-cost-contract.md) for
 the caller setup and rollout.

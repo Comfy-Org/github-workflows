@@ -66,6 +66,21 @@ def warning(msg: str) -> None:
     print(f"::warning::{msg}", file=sys.stderr, flush=True)
 
 
+def log_safe(text: str) -> str:
+    """Render PR-controlled text safe to pass to ``log``/``warning``/``error``.
+
+    A workflow command is newline-delimited, so a filename is a command-injection vector in
+    this privileged, fork-triggerable ``workflow_run`` job: git permits ``\\n`` in a path, and
+    a file named ``x\\n::stop-commands::tok`` embedded in a ``::warning::`` line starts a NEW
+    runner command — enough to forge annotations, register a mask, or suppress the later
+    ``::error::`` that reports the real verdict. ``repr`` escapes the newline (and any other
+    control character) while staying readable, and ``%`` is percent-encoded because the runner
+    decodes ``%0A``/``%0D`` in command data. The summary/comment path has always been safe via
+    ``md_code``; this is the equivalent for the log path.
+    """
+    return repr(text).replace("%", "%25")
+
+
 def md_code(text: str) -> str:
     """Render ``text`` as a Markdown inline code span, safe even if it contains a backtick or
     newline — either would otherwise let PR-controlled data (a filename) break out of the
@@ -90,6 +105,26 @@ class GitHub:
         return subprocess.run(
             ["gh", "api", *args], input=stdin, text=True, capture_output=True,
         )
+
+    def _run_bytes(self, args: list[str]) -> subprocess.CompletedProcess:
+        """``gh api`` with the payload captured as RAW BYTES.
+
+        ``text=True`` is wrong for a response that is repository content rather than JSON,
+        in two independent ways, and ``_run`` must keep it for every JSON call:
+
+        * **strict UTF-8 decode.** One non-UTF-8 text file anywhere in the PR (a Latin-1 or
+          CP-1252 fixture, no NUL so git treats it as text) makes the implicit decode raise
+          ``UnicodeDecodeError``. Nothing upstream catches it, so the validator would die
+          AFTER publishing `pending` and leave that non-terminal status as the PR's last
+          word — strictly worse than the bug this fix exists to remove.
+        * **universal-newline translation.** It rewrites a lone ``\\r`` inside file content
+          into a real ``\\n``. That silently splits one added line into two, and the second
+          half loses its ``+`` prefix so ``added_lines`` drops it — a detection bypass in
+          exactly the oversized file this recovery path exists to scan. It also lets file
+          content forge a line-start ``diff --git``/``+++``/``@@`` section (caught
+          independently by ``split_unified_diff``'s duplicate-key refusal).
+        """
+        return subprocess.run(["gh", "api", *args], capture_output=True)
 
     def get(self, path: str, *, paginate: bool = False):
         args = [path]
@@ -117,13 +152,21 @@ class GitHub:
 
         GitHub answers 406 when even this is too large to generate, which surfaces here as a
         nonzero ``gh`` exit and a ``None`` — the caller then reports a genuine cannot-verify.
+
+        Read as bytes and decoded here with ``errors="replace"`` and newline translation
+        OFF; see ``_run_bytes`` for why text mode would be a crash and a detection bypass.
+        A replacement character can only ever make a pattern fail to match, never match
+        something that is not there, and an undecodable file still cannot hide a call site:
+        the added-line coverage check in ``_recover_omitted_patches`` leaves any file whose
+        recovered fragment does not account for all its additions unscannable.
         """
-        result = self._run([f"/repos/{self.repo}/pulls/{pr}",
-                            "-H", "Accept: application/vnd.github.diff"])
+        result = self._run_bytes([f"/repos/{self.repo}/pulls/{pr}",
+                                  "-H", "Accept: application/vnd.github.diff"])
         if result.returncode != 0:
-            log(f"whole-PR diff for #{pr} is unavailable: {result.stderr.strip()}")
+            stderr = (result.stderr or b"").decode("utf-8", "replace").strip()
+            log(f"whole-PR diff for #{pr} is unavailable: {stderr}")
             return None
-        return result.stdout or None
+        return (result.stdout or b"").decode("utf-8", "replace") or None
 
     def publish_status(self, sha: str, state: str, description: str, target_url: str,
                        *, critical: bool = False) -> bool:
@@ -305,10 +348,17 @@ class Validator:
         correctly. Without this write, a transient failure here on a PR whose SHA already
         carries an earlier run's `success` (because the body or labels — not the SHA —
         changed since, e.g. a cost-impact section was removed) would leave that stale
-        `success` as the terminal status."""
+        `success` as the terminal status.
+
+        Published as `error`, not `failure`, for the same reason `changed_files_unavailable`
+        is: every condition reaching here — PR fetch failure, ambiguous PR resolution,
+        unreadable branch protection, a non-`pull_request` trigger — is this gate unable to
+        reach a verdict, never a finding about the PR's cost impact. Leaving these as
+        `failure` would have contradicted the contract this module's docstring states.
+        """
         if log_message:
             error(message)
-        self.gh.publish_status(sha, "failure", message[:140], self.run_url, critical=True)
+        self.gh.publish_status(sha, "error", message[:140], self.run_url, critical=True)
         return 1
 
     def finish_fail(self, category: str, detail: str) -> int:
@@ -365,6 +415,14 @@ class Validator:
         as a red check nobody read is how this defect survived, so a successful recovery logs
         a ``::warning::`` naming the files and the summary records it, and a partial recovery
         says which files are still unreadable rather than quietly scanning the rest.
+
+        A recovered fragment is accepted ONLY when its added-line count equals the entry's
+        ``additions``, which the changed-files API reported independently of the diff text.
+        That keeps this path inside the module's existing fail-closed invariant — the same
+        one behind ``CHANGED_FILES_CAP`` and the ``changed_files`` count comparison — so a
+        truncated section, a mis-split one, or a file mangled by an undecodable byte stays
+        unscannable instead of being treated as a complete scan. Verified against 404 real
+        file/source pairs: the two counts agree exactly whenever the fragment is intact.
         """
         wanted = set(unscannable)
         diff_text = self.gh.pull_request_diff(self.pr_number)
@@ -372,7 +430,7 @@ class Validator:
             warning(
                 f"{len(unscannable)} changed file(s) have no API diff patch and the whole-PR "
                 "unified diff could not be read either, so their content was never scanned: "
-                + ", ".join(sorted(wanted)))
+                + ", ".join(log_safe(n) for n in sorted(wanted)))
             return sorted(wanted)
 
         fragments = lib.split_unified_diff(diff_text)
@@ -384,6 +442,14 @@ class Validator:
             fragment = fragments.get(name)
             if not fragment:
                 continue
+            declared = entry.get("additions") or 0
+            found = len(lib.added_lines(fragment))
+            if found != declared:
+                warning(
+                    f"the whole-PR diff section for {log_safe(name)} accounts for {found} "
+                    f"added line(s) but the changed-files API reports {declared}; treating "
+                    "the file as unread rather than scanning a partial section.")
+                continue
             entry["patch"] = fragment
             recovered.append(name)
 
@@ -392,14 +458,15 @@ class Validator:
             warning(
                 f"{len(recovered)} changed file(s) had no diff patch from the changed-files "
                 "API (GitHub omits `patch` past its per-file render ceiling) and were scanned "
-                "from the whole-PR unified diff instead: " + ", ".join(sorted(recovered)))
+                "from the whole-PR unified diff instead: "
+                + ", ".join(log_safe(n) for n in sorted(recovered)))
             summary(
                 f"> ℹ️ Recovered the diff of {len(recovered)} file(s) from the whole-PR "
                 "unified diff after the changed-files API omitted their `patch`: "
                 + ", ".join(md_code(n) for n in sorted(recovered)) + ".")
         if still:
             warning(f"{len(still)} changed file(s) remain unreadable after the whole-PR diff "
-                    "fallback: " + ", ".join(still))
+                    "fallback: " + ", ".join(log_safe(n) for n in still))
         return still
 
     def run(self, event: dict) -> int:

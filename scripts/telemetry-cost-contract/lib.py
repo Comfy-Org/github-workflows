@@ -148,19 +148,70 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
 _DIFF_HEADER_RE = re.compile(r"^diff --git ", re.MULTILINE)
 
 
+_C_ESCAPE_BYTES = {
+    "a": 0x07, "b": 0x08, "f": 0x0C, "n": 0x0A, "r": 0x0D, "t": 0x09, "v": 0x0B,
+    "\\": 0x5C, '"': 0x22,
+}
+
+
+def _unquote_c_bytes(inner: str) -> bytes:
+    """Decode git's C-style quoting to the RAW BYTES it encodes.
+
+    Decoding to bytes is the whole point, and ``.decode("unicode_escape")`` is the trap:
+    under the default ``core.quotePath``, git renders a non-ASCII path as octal-escaped
+    **UTF-8 bytes** (``"b/caf\\303\\251.go"``). ``unicode_escape`` maps each of those bytes to
+    its own code point and yields ``cafÃ©.go``, which never matches the API's ``café.go`` — so
+    recovery silently never worked for a non-ASCII filename. Collect the bytes here and let
+    the caller decode them as UTF-8 once, which is what git actually wrote.
+    """
+    out = bytearray()
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if char != "\\":
+            out.extend(char.encode("utf-8", "surrogateescape"))
+            index += 1
+            continue
+        if index + 1 >= len(inner):          # trailing lone backslash: keep it literally
+            out.append(0x5C)
+            break
+        nxt = inner[index + 1]
+        if nxt in _C_ESCAPE_BYTES:
+            out.append(_C_ESCAPE_BYTES[nxt])
+            index += 2
+        elif nxt in "01234567":
+            digits = ""
+            cursor = index + 1
+            while cursor < len(inner) and len(digits) < 3 and inner[cursor] in "01234567":
+                digits += inner[cursor]
+                cursor += 1
+            out.append(int(digits, 8) & 0xFF)
+            index = cursor
+        else:                                 # unknown escape: keep the escaped character
+            out.extend(nxt.encode("utf-8", "surrogateescape"))
+            index += 2
+    return bytes(out)
+
+
 def _unquote_diff_path(raw: str) -> str:
     """The path out of a ``+++ b/...`` line, undoing git's C-style quoting when present.
 
-    git quotes a path containing a space, a quote or a non-ASCII byte (``+++ "b/a b.go"``)
-    unless ``core.quotePath=false``, so a naive ``line[6:]`` yields ``a b.go"`` for exactly
-    the large generated/fixture files this recovery path exists to read.
+    git quotes a path containing a space, a quote, a control character or a non-ASCII byte
+    (``+++ "b/a b.go"``) unless ``core.quotePath=false``, so a naive ``line[6:]`` yields
+    ``a b.go"`` for exactly the large generated/fixture files this recovery path exists to read.
+
+    Whitespace is stripped SURGICALLY — at most one trailing TAB, which is the separator git
+    appends after an unquoted name — and never with ``strip()``. A general strip silently
+    maps the distinct paths ``foo.js`` and ``foo.js `` (a trailing space is a legal filename
+    character that git does not quote) onto the same key, and ``split_unified_diff``'s
+    assignment is last-wins: an oversized ``foo.js`` carrying a billable call plus a small
+    benign ``foo.js `` would mark the real file recovered-and-clean from the WRONG file's
+    hunks. ``split_unified_diff`` additionally fails closed on any duplicate key, so the two
+    guards are independent.
     """
-    text = raw.strip()
-    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
-        try:
-            text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
-        except UnicodeDecodeError:
-            text = text[1:-1]
+    text = raw[:-1] if raw.endswith("\t") else raw
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        text = _unquote_c_bytes(text[1:-1]).decode("utf-8", "surrogateescape")
     return text[2:] if text.startswith("b/") else text
 
 
@@ -187,13 +238,19 @@ def split_unified_diff(diff_text: str) -> dict[str, str]:
     change, or a genuinely binary file (``Binary files a/x and b/y differ``). Returning
     nothing for those is correct and keeps ``unscannable_files`` failing closed on a real
     binary rather than passing it as recovered-and-clean.
+
+    A path that resolves TWICE yields no entry either, rather than last-wins. Two sections
+    cannot legitimately claim one new path in a single PR diff, so a duplicate means either
+    a quoting edge this parser read wrong or file content that forged a section header — and
+    in both cases the honest answer is that this file was not read. Dropping it leaves it
+    unscannable, which fails closed; keeping the last one would hand the gate a fragment
+    from the wrong source and call it a clean scan.
     """
-    fragments: dict[str, str] = {}
+    collected: list[tuple[str, str]] = []
     bounds = [m.start() for m in _DIFF_HEADER_RE.finditer(diff_text or "")]
     for index, start in enumerate(bounds):
         end = bounds[index + 1] if index + 1 < len(bounds) else len(diff_text)
-        section = diff_text[start:end]
-        lines = section.split("\n")
+        lines = diff_text[start:end].split("\n")
         name = None
         hunk_at = None
         for offset, line in enumerate(lines):
@@ -206,8 +263,9 @@ def split_unified_diff(diff_text: str) -> dict[str, str]:
                 break
         if not name or hunk_at is None:
             continue
-        fragments[name] = "\n".join(lines[hunk_at:]).rstrip("\n")
-    return fragments
+        collected.append((name, "\n".join(lines[hunk_at:]).rstrip("\n")))
+    seen = [name for name, _ in collected]
+    return {name: fragment for name, fragment in collected if seen.count(name) == 1}
 
 
 def unscannable_files(files: list[dict]) -> list[str]:
@@ -290,13 +348,15 @@ _GUIDANCE = {
         "this change must not regress.{exemption}"
     ),
     "changed_files_unavailable": (
-        "This check could not be completed because the PR's changed-file list (with diff "
-        "patches) could not be read completely, **and** the whole-PR unified diff could not "
-        "supply the missing content either. A partial list could miss the very file that "
+        "This check could not be completed because the PR's changed files could not be read "
+        "completely — either the changed-file list itself was unreadable, or a file's diff "
+        "content was missing from both the changed-files API and the whole-PR unified diff "
+        "(the specific cause is named below). A partial read could miss the very file that "
         "added a billable call site, so this fails closed instead of declaring a partial scan "
-        "clean. This is an infrastructure error, not a verdict on cost impact: it is reported "
-        "as the commit-status state `error`, never `failure`, so it is distinguishable from a "
-        "real contract violation both by eye and by any tool reading the status."
+        "clean. This is an infrastructure error, not a verdict on cost impact, and in the two "
+        "reporting modes that publish a red status it is the commit-status state `error` "
+        "rather than `failure`, so it is distinguishable from a real contract violation both "
+        "by eye and by any tool reading the status."
     ),
 }
 
