@@ -9,9 +9,12 @@ that cost-governance lane C3 (comfy-observability program, D315) asked for, so t
 zero-consumer custom metrics C2 found months after merge get caught at PR time instead.
 
 Detection reads ONLY GitHub-owned PR metadata — the `patch` fragments `GET
-.../pulls/{n}/files` returns for each changed file — never a checkout of the PR branch. That
-is what makes this safe to run on a fork PR's privileged `workflow_run` validator: the
-untrusted diff text is pattern-MATCHED, never executed or interpolated.
+.../pulls/{n}/files` returns for each changed file, plus the whole-PR unified diff from `GET
+.../pulls/{n}` under the `application/vnd.github.diff` media type when the former omits a
+file's `patch` — never a checkout of the PR branch. Both are the same trust class (rendered
+by GitHub, delivered as text) and neither is a checkout, which is what makes this safe to run
+on a fork PR's privileged `workflow_run` validator: the untrusted diff text is
+pattern-MATCHED, never executed or interpolated.
 
 Side-effecting orchestration (resolve the PR, read its files, publish the commit status,
 upsert the comment) lives in validate.py, which imports this. Standard library only, matching
@@ -142,6 +145,71 @@ def first_match(files: list[dict], patterns: list[re.Pattern]) -> tuple[str, str
     return None
 
 
+_DIFF_HEADER_RE = re.compile(r"^diff --git ", re.MULTILINE)
+
+
+def _unquote_diff_path(raw: str) -> str:
+    """The path out of a ``+++ b/...`` line, undoing git's C-style quoting when present.
+
+    git quotes a path containing a space, a quote or a non-ASCII byte (``+++ "b/a b.go"``)
+    unless ``core.quotePath=false``, so a naive ``line[6:]`` yields ``a b.go"`` for exactly
+    the large generated/fixture files this recovery path exists to read.
+    """
+    text = raw.strip()
+    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        try:
+            text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except UnicodeDecodeError:
+            text = text[1:-1]
+    return text[2:] if text.startswith("b/") else text
+
+
+def split_unified_diff(diff_text: str) -> dict[str, str]:
+    """Per-file, hunk-only diff fragments out of a WHOLE-PR unified diff, keyed by new path.
+
+    The recovery half of the unscannable-file problem. ``GET .../pulls/{n}/files`` omits a
+    file's ``patch`` past GitHub's per-file render ceiling, but ``GET .../pulls/{n}`` with the
+    ``application/vnd.github.diff`` media type still returns that file's hunks — same class of
+    GitHub-owned metadata, still no checkout of the PR branch, so the fork-safety contract is
+    unchanged. Measured against a live consumer repo on 2026-11-25: an 18.3 MB whole-PR diff
+    whose largest JSON fixture (+289,490 lines) carries no API `patch` is fully present here,
+    as is every generated-client file that had taken the gate out.
+
+    Each returned value is shaped EXACTLY like GitHub's ``patch`` field — it starts at the
+    first ``@@`` hunk header, with the ``diff --git``/``index``/``---``/``+++``/mode lines
+    dropped — so ``added_lines`` and ``first_match`` consume it unchanged. That shape is the
+    whole point and is not cosmetic: a full multi-file diff DOES carry ``+++ b/<path>`` header
+    lines, which ``_ADDED_LINE_RE`` would otherwise report as an added line with content
+    ``++ b/<path>``, inventing added content nobody wrote (and a caller pattern matching
+    ``+`` or a path fragment would fire on it).
+
+    A section with no ``@@`` at all contributes no entry: that is a pure rename, a mode
+    change, or a genuinely binary file (``Binary files a/x and b/y differ``). Returning
+    nothing for those is correct and keeps ``unscannable_files`` failing closed on a real
+    binary rather than passing it as recovered-and-clean.
+    """
+    fragments: dict[str, str] = {}
+    bounds = [m.start() for m in _DIFF_HEADER_RE.finditer(diff_text or "")]
+    for index, start in enumerate(bounds):
+        end = bounds[index + 1] if index + 1 < len(bounds) else len(diff_text)
+        section = diff_text[start:end]
+        lines = section.split("\n")
+        name = None
+        hunk_at = None
+        for offset, line in enumerate(lines):
+            if line.startswith("+++ "):
+                candidate = _unquote_diff_path(line[4:])
+                if candidate and candidate != "/dev/null":
+                    name = candidate
+            elif line.startswith("@@"):
+                hunk_at = offset
+                break
+        if not name or hunk_at is None:
+            continue
+        fragments[name] = "\n".join(lines[hunk_at:]).rstrip("\n")
+    return fragments
+
+
 def unscannable_files(files: list[dict]) -> list[str]:
     """Filenames whose diff content this check could not see at all.
 
@@ -151,6 +219,11 @@ def unscannable_files(files: list[dict]) -> list[str]:
     ``additions > 0`` must be treated as unscannable rather than silently passed as "no
     match" — a padded or oversized new telemetry module is exactly the case this gate exists
     to catch, and ``first_match`` alone cannot distinguish it from a harmless binary asset.
+
+    Call this AGAIN after splicing in whatever ``split_unified_diff`` recovered: the API's
+    per-file ``patch`` ceiling is far lower than the whole-PR diff endpoint's, so in practice
+    almost every file this returns on the first pass IS readable, and only a still-nonempty
+    list after recovery is a genuine cannot-verify (a real binary).
     """
     names = []
     for entry in files or []:
@@ -218,10 +291,27 @@ _GUIDANCE = {
     ),
     "changed_files_unavailable": (
         "This check could not be completed because the PR's changed-file list (with diff "
-        "patches) could not be read completely. A partial list could miss the very file that "
+        "patches) could not be read completely, **and** the whole-PR unified diff could not "
+        "supply the missing content either. A partial list could miss the very file that "
         "added a billable call site, so this fails closed instead of declaring a partial scan "
-        "clean. This is an infrastructure error, not a verdict on cost impact."
+        "clean. This is an infrastructure error, not a verdict on cost impact: it is reported "
+        "as the commit-status state `error`, never `failure`, so it is distinguishable from a "
+        "real contract violation both by eye and by any tool reading the status."
     ),
+}
+
+# The commit-status state each failing category publishes. These are deliberately DIFFERENT,
+# and that is the point: `failure` is this gate's verdict that the contract was broken, while
+# `error` is this gate reporting that it could not reach a verdict at all. Collapsing both to
+# `failure` is what made the gate lie in the direction that costs the most — a PR carrying a
+# red "could not verify" is indistinguishable at a glance from a real failing test, and it
+# pushes the PR to `mergeable_state: unstable` either way. Measured on a consumer repo three
+# days into the warn-only pilot (2026-11-25): 8 of the 10 red statuses across 339 open PRs
+# were this category, and all 8 were substantively clean. Both states are non-success, so
+# fail-closed behaviour under `enforce: true` is unchanged: a required context still blocks.
+_FAILING_STATE = {
+    "missing_cost_impact": "failure",
+    "changed_files_unavailable": "error",
 }
 
 
@@ -247,8 +337,8 @@ _STATUS_HEADLINE = {
 }
 
 _ADVISORY = (
-    "> ⚠️ **Advisory — this check is warn-only.** It is reported as failing so it shows up in "
-    "the PR's check list, but nothing this workflow does blocks a merge: what blocks is this "
+    "> ⚠️ **Advisory — this check is warn-only.** It is reported as not passing so it shows up "
+    "in the PR's check list, but nothing this workflow does blocks a merge: what blocks is this "
     "repository's ruleset requiring the `Telemetry cost contract` status context, and a "
     "warn-only pilot is meant to run *before* that context is required. If your merge button "
     "is actually blocked on `Telemetry cost contract`, the context is already required while "
@@ -279,10 +369,11 @@ def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOut
     if category not in _GUIDANCE:
         raise KeyError(category)
     headline = _STATUS_HEADLINE[category]
+    state = _FAILING_STATE[category]
     if enforce:
         return FailureOutcome(
             verdict=f"❌ fail ({category})",
-            state="failure",
+            state=state,
             description=headline,
             exit_code=1,
             advisory=False,
@@ -290,7 +381,7 @@ def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOut
     if soft_fail:
         return FailureOutcome(
             verdict=f"❌ fail ({category}) — warn-only",
-            state="failure",
+            state=state,
             description=f"Warn-only: {headline[0].lower()}{headline[1:]}",
             exit_code=0,
             advisory=True,

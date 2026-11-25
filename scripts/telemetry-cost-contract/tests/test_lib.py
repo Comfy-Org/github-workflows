@@ -305,5 +305,189 @@ class FailureOutcomeTests(unittest.TestCase):
         self.assertEqual(len(descriptions), 2)
 
 
+class FailingStateHonestyTests(unittest.TestCase):
+    """A warn-only check must not emit the same signal for "you broke the contract" and
+    "I could not look". Measured on a consumer repo three days into the warn-only pilot
+    (2026-11-25): 8 of 10 red `Telemetry cost contract` statuses across 339 open PRs were
+    the could-not-look case, and all 8 were substantively clean — indistinguishable at a
+    glance from a real failing test, and pushing every one of those PRs to
+    `mergeable_state: unstable`."""
+
+    def test_cannot_verify_reports_error_not_failure(self):
+        for enforce, soft_fail in ((True, True), (True, False), (False, True)):
+            with self.subTest(enforce=enforce, soft_fail=soft_fail):
+                self.assertEqual(
+                    lib.failure_outcome("changed_files_unavailable", enforce, soft_fail).state,
+                    "error")
+
+    def test_real_violation_still_reports_failure(self):
+        for enforce, soft_fail in ((True, True), (True, False), (False, True)):
+            with self.subTest(enforce=enforce, soft_fail=soft_fail):
+                self.assertEqual(
+                    lib.failure_outcome("missing_cost_impact", enforce, soft_fail).state,
+                    "failure")
+
+    def test_the_two_categories_never_share_a_state(self):
+        for enforce, soft_fail in ((True, True), (True, False), (False, True)):
+            with self.subTest(enforce=enforce, soft_fail=soft_fail):
+                self.assertNotEqual(
+                    lib.failure_outcome("missing_cost_impact", enforce, soft_fail).state,
+                    lib.failure_outcome("changed_files_unavailable", enforce, soft_fail).state)
+
+    def test_silent_variant_is_still_green_for_both(self):
+        # enforce:false + soft-fail:false is the documented SILENT rung; the honesty fix
+        # must not promote it to a red state it never had.
+        for category in ("missing_cost_impact", "changed_files_unavailable"):
+            with self.subTest(category=category):
+                self.assertEqual(
+                    lib.failure_outcome(category, enforce=False, soft_fail=False).state,
+                    "success")
+
+    def test_cannot_verify_still_fails_closed_under_enforce(self):
+        # `error` is non-success, so a required context still blocks. Distinguishable is
+        # not the same as permissive, and this is the line that proves it.
+        self.assertEqual(
+            lib.failure_outcome("changed_files_unavailable", enforce=True,
+                                soft_fail=True).exit_code, 1)
+
+
+class SplitUnifiedDiffTests(unittest.TestCase):
+    """Recovery of a file whose per-file `patch` GitHub omitted, from the whole-PR diff."""
+
+    TWO_FILE_DIFF = (
+        "diff --git a/svc/metrics.go b/svc/metrics.go\n"
+        "index f3c411d8fbab..b228a2350a75 100644\n"
+        "--- a/svc/metrics.go\n"
+        "+++ b/svc/metrics.go\n"
+        "@@ -10,3 +10,4 @@ func start() {\n"
+        " \tctx := context.Background()\n"
+        "+\tmetricsClient.Incr(\"auth.grant_ended\", nil)\n"
+        " \treturn nil\n"
+        "diff --git a/svc/ingest.gen.go b/svc/ingest.gen.go\n"
+        "index aaaaaaaaaaaa..bbbbbbbbbbbb 100644\n"
+        "--- a/svc/ingest.gen.go\n"
+        "+++ b/svc/ingest.gen.go\n"
+        "@@ -4874,2 +4874,3 @@ func (e Body) Valid() bool {\n"
+        " \tswitch e {\n"
+        "+\tcase \"agent_free_use\":\n"
+    )
+
+    def test_splits_into_one_hunks_only_fragment_per_file(self):
+        fragments = lib.split_unified_diff(self.TWO_FILE_DIFF)
+        self.assertEqual(sorted(fragments), ["svc/ingest.gen.go", "svc/metrics.go"])
+        for name, fragment in fragments.items():
+            self.assertTrue(fragment.startswith("@@"), f"{name}: {fragment[:40]!r}")
+
+    def test_fragment_shape_matches_the_api_patch_field(self):
+        # The `diff --git`, `index`, `---` and `+++` header lines must all be gone: a
+        # `+++ b/<path>` line survives `_ADDED_LINE_RE` as an added line whose content is
+        # `++ b/<path>`, inventing content nobody wrote.
+        for fragment in lib.split_unified_diff(self.TWO_FILE_DIFF).values():
+            self.assertNotIn("diff --git", fragment)
+            self.assertNotIn("+++ ", fragment)
+            self.assertNotIn("--- ", fragment)
+            self.assertNotIn("index ", fragment)
+
+    def test_recovered_fragment_feeds_first_match_unchanged(self):
+        # The whole point of the shape: detection code is untouched and consumes a
+        # recovered fragment by exactly the same path as an API-supplied one.
+        fragments = lib.split_unified_diff(self.TWO_FILE_DIFF)
+        files = [{"filename": "svc/metrics.go", "additions": 1,
+                  "patch": fragments["svc/metrics.go"]}]
+        patterns = lib.parse_patterns(
+            r"[A-Za-z_]*(?:[Dd]ata[Dd]og|[Mm]etrics?|[Ss]tats[Dd])[A-Za-z_]*"
+            r"\.(Gauge|Count|Histogram|Distribution|Incr|Decr)\(")
+        self.assertIsNotNone(lib.first_match(files, patterns))
+
+    def test_no_phantom_added_lines_from_file_headers(self):
+        for name, fragment in lib.split_unified_diff(self.TWO_FILE_DIFF).items():
+            for line in lib.added_lines(fragment):
+                self.assertFalse(line.startswith("+ b/"), f"{name}: phantom {line!r}")
+                self.assertFalse(line.startswith("++ b/"), f"{name}: phantom {line!r}")
+
+    def test_recovery_closes_the_unscannable_gap(self):
+        # The end-to-end shape of the live defect: 1 of N files has additions but no API
+        # patch, so the whole gate reported could-not-verify even though every other file
+        # in the PR was readable. After splicing the recovered fragment there is nothing
+        # unscannable left.
+        files = [
+            {"filename": "svc/metrics.go", "additions": 1, "status": "modified",
+             "patch": "@@ -1,1 +1,2 @@\n+ok\n"},
+            {"filename": "svc/ingest.gen.go", "additions": 1531, "status": "modified"},
+        ]
+        self.assertEqual(lib.unscannable_files(files), ["svc/ingest.gen.go"])
+        fragments = lib.split_unified_diff(self.TWO_FILE_DIFF)
+        files[1]["patch"] = fragments["svc/ingest.gen.go"]
+        self.assertEqual(lib.unscannable_files(files), [])
+
+    def test_binary_file_yields_no_fragment_so_it_stays_unscannable(self):
+        # git renders no hunk for a binary, so recovery must NOT manufacture one — a real
+        # binary has to keep failing closed.
+        binary = ("diff --git a/logo.png b/logo.png\n"
+                  "index aaaa..bbbb 100644\n"
+                  "Binary files a/logo.png and b/logo.png differ\n")
+        self.assertEqual(lib.split_unified_diff(binary), {})
+
+    def test_rename_without_content_change_yields_no_fragment(self):
+        rename = ("diff --git a/old.go b/new.go\n"
+                  "similarity index 100%\n"
+                  "rename from old.go\n"
+                  "rename to new.go\n")
+        self.assertEqual(lib.split_unified_diff(rename), {})
+
+    def test_added_file_is_keyed_by_its_new_path(self):
+        added = ("diff --git a/svc/new.go b/svc/new.go\n"
+                 "new file mode 100644\n"
+                 "index 000000000000..abcdef123456\n"
+                 "--- /dev/null\n"
+                 "+++ b/svc/new.go\n"
+                 "@@ -0,0 +1,1 @@\n"
+                 "+package svc\n")
+        self.assertEqual(sorted(lib.split_unified_diff(added)), ["svc/new.go"])
+
+    def test_deleted_file_yields_no_fragment(self):
+        deleted = ("diff --git a/svc/gone.go b/svc/gone.go\n"
+                   "deleted file mode 100644\n"
+                   "index abcdef123456..000000000000\n"
+                   "--- a/svc/gone.go\n"
+                   "+++ /dev/null\n"
+                   "@@ -1,1 +0,0 @@\n"
+                   "-package svc\n")
+        self.assertEqual(lib.split_unified_diff(deleted), {})
+
+    def test_quoted_path_is_unquoted_to_match_the_api_filename(self):
+        # git C-style-quotes a path with a space unless core.quotePath=false. The API
+        # reports the UNQUOTED name, so a naive line[6:] would key the fragment
+        # `a b.go"` and never match the entry it is meant to repair.
+        quoted = ('diff --git "a/svc/a b.go" "b/svc/a b.go"\n'
+                  "index aaaa..bbbb 100644\n"
+                  '--- "a/svc/a b.go"\n'
+                  '+++ "b/svc/a b.go"\n'
+                  "@@ -1,1 +1,2 @@\n"
+                  "+ok\n")
+        self.assertEqual(sorted(lib.split_unified_diff(quoted)), ["svc/a b.go"])
+
+    def test_content_line_resembling_a_diff_header_does_not_split(self):
+        # A fixture or doc whose CONTENT contains `diff --git` must not be read as a new
+        # file section, or the fragment after it is lost.
+        tricky = ("diff --git a/docs/x.md b/docs/x.md\n"
+                  "index aaaa..bbbb 100644\n"
+                  "--- a/docs/x.md\n"
+                  "+++ b/docs/x.md\n"
+                  "@@ -1,1 +1,3 @@\n"
+                  " intro\n"
+                  "+    diff --git a/fake b/fake\n"
+                  "+metricsClient.Incr(\"x\", nil)\n")
+        fragments = lib.split_unified_diff(tricky)
+        self.assertEqual(sorted(fragments), ["docs/x.md"])
+        self.assertIn('metricsClient.Incr("x", nil)',
+                      "\n".join(lib.added_lines(fragments["docs/x.md"])))
+
+    def test_empty_and_garbage_input_are_safe(self):
+        for text in ("", None, "not a diff at all\n", "@@ -1,1 +1,1 @@\n+orphan hunk\n"):
+            with self.subTest(text=text):
+                self.assertEqual(lib.split_unified_diff(text), {})
+
+
 if __name__ == "__main__":
     unittest.main()
