@@ -12,8 +12,10 @@ name: Telemetry Cost Contract (reusable)
 # write token even for a fork or Dependabot PR. Constraints (identical to linear-ticket.yml):
 #   * the signal workflow checks out nothing, runs no PR content, emits no artifact/cache;
 #   * this validator never downloads that run's artifacts/caches and never checks out the PR
-#     branch or merge commit — detection reads ONLY the `patch` fragments
-#     `GET .../pulls/{n}/files` returns (GitHub-owned metadata, not a checkout);
+#     branch or merge commit — detection reads ONLY GitHub-rendered diff text: the `patch`
+#     fragments `GET .../pulls/{n}/files` returns, plus the whole-PR unified diff from
+#     `GET .../pulls/{n}` (`application/vnd.github.diff`) for any file whose `patch` GitHub
+#     omitted past its per-file render ceiling. Same trust class, neither is a checkout;
 #   * every PR-derived value (branch, title, body, labels, diff patch text) is untrusted
 #     DATA, passed through env, never shell-interpolated.
 # The job runs on the DEFAULT branch, so its job-level check must NOT be the required merge
@@ -27,6 +29,15 @@ name: Telemetry Cost Contract (reusable)
 #                                     nothing while the context is not required.
 #   enforce: false, soft-fail: false  green status; only the job summary and marker comment
 #                                     carry the verdict. The silent variant.
+#
+# WHICH red, in the two non-green modes, is itself part of the contract:
+#   state `failure`  the contract was broken — a new billable call site with no Cost impact
+#                    section. This gate's actual verdict.
+#   state `error`    this gate could NOT reach a verdict (no readable diff content for a
+#                    changed file, even from the whole-PR diff). Never reported as `failure`:
+#                    "I could not look" must not emit the same signal as "you broke it", or
+#                    a silently-degraded gate reads as coverage. Both block under
+#                    `enforce: true`, so fail-closed is unaffected.
 #
 # PERMISSIONS the caller must grant (validated by GitHub at STARTUP, before any `if:`):
 #   actions: read           # read the triggering workflow_run
