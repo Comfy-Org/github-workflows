@@ -7138,24 +7138,36 @@ jobs:
     # capped by `max_rounds`, over the diff-size cap, panel skipped).
     #
     # `always()` rather than `!cancelled()` for `Blocking gate`'s reason: GitHub
-    # counts a SKIPPED required check as passing, and `cancelled()` is true for
-    # EVERY workflow cancel, not just a `cancel-in-progress` supersede. A manual
-    # cancel (UI, API, `gh run cancel`, which anyone with Actions write can do)
-    # has no replacement run at all, and a same-SHA replacement can itself
-    # decline to review (label removed, `skip-cursor-review`). A `!cancelled()`
-    # skip would hand that head SHA a green completeness gate over a panel that
-    # never finished.
+    # counts a SKIPPED required check as passing, and a cancel is not always a
+    # supersede. A manual cancel (UI, API, `gh run cancel`, which anyone with
+    # Actions write can do) has no replacement run at all, and a same-SHA
+    # replacement can itself decline to review (label removed,
+    # `skip-cursor-review`). A `!cancelled()` skip would hand that head SHA a
+    # green completeness gate over a panel that never finished.
+    #
+    # `always()` is also the only thing that gets this job to RUN on a
+    # concurrency supersede, and a sentence that used to stand here — that
+    # `cancelled()` is true for EVERY workflow cancel, not just a
+    # `cancel-in-progress` supersede — is measured FALSE. On 5 measured
+    # supersedes out of 5 the run's conclusion was `cancelled`, two `needs`
+    # results were `cancelled`, and `cancelled()` was false, because the
+    # supersede cancels the queued JOBS without raising a run-level
+    # cancellation. `Judge a cancelled run` therefore reads the `needs` results
+    # too; see its own comment for the measurement.
     #
     # The supersede case is still not red, though: `Judge a cancelled run`
-    # below runs only when the run was cancelled and re-reads the PR's LIVE
-    # head. If it moved past the SHA this run was reviewing, a newer push
-    # superseded it — this check sits on a head nobody can merge any more, the
-    # new head is judged by its own checks, and the job passes without judging. If the
-    # head did NOT move (or cannot be read), nothing is known to have replaced
-    # this run on this SHA, so the job fails closed exactly as before. A job
-    # that hit its own `timeout-minutes` lands on the same fail-closed path
-    # whichever way GitHub reports `cancelled()` for it: either the guard
-    # reads its `cancelled` result, or the head check finds the head unmoved.
+    # below runs only on a cancelled run and re-reads the PR's LIVE head. If it
+    # moved past the SHA this run was reviewing, a newer push superseded it —
+    # this check sits on a head nobody can merge any more, the new head is
+    # judged by its own checks, and the job passes without judging. If the head
+    # did NOT move (or cannot be read), nothing READABLE HERE has replaced this
+    # run on this SHA, so the job fails closed exactly as before. A same-SHA
+    # supersede is the known gap in that: proving one needs `actions: read`,
+    # which the documented caller does not grant, so it stays red — see that
+    # step. A job that hit its own `timeout-minutes` lands on the same
+    # fail-closed path whichever way GitHub reports `cancelled()` for it:
+    # either the guard reads its `cancelled` result, or the head check finds
+    # the head unmoved.
     #
     # That same "skipped counts as passing" rule is why those four conditions
     # cannot be read STRAIGHT off `gate`, `diff-size` and the matrix. Three of
@@ -7213,8 +7225,27 @@ jobs:
         # then sets `superseded` so the two steps below stand down. Every other
         # outcome — head unchanged, no PR head in the event, the read failing —
         # exits 1, which skips the steps below and leaves the check red.
+        #
+        # `cancelled()` ALONE does not detect a `cancel-in-progress` supersede,
+        # which is the cancel this workflow's own caller contract produces most
+        # often, so this step used to sleep through exactly the case it was
+        # written for. Measured on ComfyUI_frontend across the 40 most recent
+        # cancelled runs of its caller: 26 published a red `Panel integrity`,
+        # and in all 5 of those whose pinned ref carried this step it was
+        # SKIPPED — `cancelled()` false, while the RUN's conclusion was
+        # `cancelled` and `needs.diff-size.result` / `needs.preflight.result`
+        # were `cancelled`. A concurrency supersede cancels the queued JOBS; it
+        # does not raise the run-level cancellation `cancelled()` reads. So the
+        # `needs` results are read alongside it — they are the signal that
+        # actually appears — and the head check below, which was unreachable in
+        # production, finally runs.
+        #
+        # This widens only WHEN THE STEP WAKES, never what it accepts: waking
+        # on a job that merely tripped its own `timeout-minutes` on a live run
+        # is harmless, because such a run's head has not moved and the step
+        # exits 1 on the same fail-closed path as before.
         id: cancel
-        if: ${{ cancelled() }}
+        if: ${{ cancelled() || needs.gate.result == 'cancelled' || needs.round-cap.result == 'cancelled' || needs.diff-size.result == 'cancelled' || needs.preflight.result == 'cancelled' || needs.ledger.result == 'cancelled' || needs.review.result == 'cancelled' || needs.consolidate.result == 'cancelled' || needs.post-review.result == 'cancelled' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -7231,7 +7262,19 @@ jobs:
             exit 1
           fi
           if [ "$live_head" = "$RUN_HEAD" ]; then
-            echo "::error::Panel integrity: this run was cancelled before its panel finished, and the PR head is still ${RUN_HEAD} — nothing has superseded it. Re-run the workflow, or re-apply the review label."
+            # A same-SHA supersede lands here and stays red. That is a known
+            # gap, not the intended answer: a second `labeled` event for the
+            # review label on this same SHA cancels this run and is replaced by
+            # one that reviews the head properly, and proving that needs a read
+            # of this repo's workflow runs — `actions: read`, which this job
+            # does not hold and the documented caller does not grant. Closing
+            # it is a caller-permission change, so it is deliberately not done
+            # here. Until then the remediation is a new commit, as it already
+            # is for the `skipped`-supersedes-red shape in
+            # docs/callers/cursor-review.md. Do NOT advise re-applying the
+            # review label: callers that treat it as one-shot cannot, and on a
+            # duplicate-label cancel it is what caused this.
+            echo "::error::Panel integrity: this run was cancelled before its panel finished, and the PR head is still ${RUN_HEAD} — nothing readable here shows it was superseded. If a newer run of this workflow reviewed this same head, read that run's Panel integrity; otherwise push a new commit, or re-run the workflow."
             exit 1
           fi
           echo "::notice::Panel integrity: this run was cancelled after the PR head moved from ${RUN_HEAD} to ${live_head}. Required checks are read on the newer head; nothing is judged here."

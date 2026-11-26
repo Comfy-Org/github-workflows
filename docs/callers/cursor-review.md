@@ -679,13 +679,39 @@ The remaining shapes to expect before you require it:
   PR's live head. If a newer push moved it past the SHA this run was
   reviewing, the check passes without judging: it sits on a head nobody can
   merge, and required checks are read on the new head. If the head did **not** move, or
-  cannot be read, the check fails — re-run the workflow or re-apply the
-  review label. That includes a same-SHA re-trigger under `cancel-in-progress`
-  (re-applying the label while a panel is running): the cancelled run goes
-  red on that SHA, and the replacement run's later Panel integrity result is
-  the one to read. A decision job that **failed** or timed out on a run that
-  was not cancelled still fails the check through the guard. The Blocking gate
-  is separate and still goes red on cancellation.
+  cannot be read, the check fails. A decision job that **failed** or timed out
+  on a run that was not cancelled still fails the check through the guard. The
+  Blocking gate is separate and still goes red on cancellation.
+
+  **That head check did not run at all until recently, so expect older runs to
+  contradict this bullet.** A `cancel-in-progress` supersede cancels the queued
+  *jobs* without raising the run-level cancellation `cancelled()` reads, and
+  `cancelled()` was this step's only trigger — so on a supersede it skipped,
+  the fail-closed guard behind it ran instead, and the run published a red
+  `Panel integrity` saying the panel decision "did not complete". Measured on
+  one consumer repo over its 40 most recent cancelled runs: 26 published that
+  red, and the step was skipped in all 5 of those pinned to a ref that had it.
+  The trigger now reads the `needs` results alongside `cancelled()`, which is
+  the signal a supersede actually produces.
+
+  **A same-SHA supersede still goes red, and that is a known gap.** Two label
+  applications landing within a second of each other — which is one dispatcher
+  bug away, and was how this was found — mint two runs on one SHA under a
+  concurrency group keyed on PR + label; GitHub cancels the first and the
+  second reviews the head properly. The head never moved, so the cancelled run
+  stays red even though that SHA *was* fully reviewed. Proving the replacement
+  exists means reading this repo's workflow runs, which needs `actions: read` —
+  a scope the panel job does not hold and the [required
+  permissions](#required-permissions) above do not grant, and a called workflow
+  that requests more than its caller granted fails at startup with zero jobs.
+  Closing it is therefore a caller-permission change, not a workflow fix. Until
+  then: **read the newer run's `Panel integrity`, which is the one that judged
+  the head**, and clear the stale red with a new commit rather than by
+  re-applying the review label — callers that treat that label as one-shot
+  cannot, and on a duplicate-label cancel re-applying it repeats the cause.
+  Note also that branch protection reads the *latest* check run of a given
+  name, so where the replacement published its own `Panel integrity` the red is
+  already not the one being gated on; see the supersession bullet below.
 * **Do not require a leg check instead.** A panel cell's context name carries
   the model id (`edge-case (kimi-k3-max)`), so it changes whenever the panel
   list does — and a required check whose name no longer exists blocks every PR
