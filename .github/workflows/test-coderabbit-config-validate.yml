@@ -160,9 +160,9 @@ jobs:
 
       - name: Smoke test — a typo INSIDE an object warns, then fails under strict
         run: |
-          # The closed-by-omission half. `reviews.tools.github-checks` names only
-          # `enabled` and says nothing about the rest, so jsonschema has no
-          # keyword to fire on — `timeout_ms` is a key upstream removed that is
+          # A nested unknown key. `reviews.tools.github-checks` names only
+          # `enabled` — closed by omission until #467's refresh, explicitly
+          # since, so jsonschema reports it now — and `timeout_ms` is a key upstream removed that is
           # still live in several org repos, doing nothing. A regression that
           # loses this path is invisible from the default-mode exit code alone,
           # which is why the strict direction is asserted too.

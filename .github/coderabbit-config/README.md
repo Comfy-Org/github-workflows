@@ -28,7 +28,7 @@ a schema library calls "invalid":
 | Class | Severity | Because |
 |---|---|---|
 | YAML parse error | error | CodeRabbit cannot read the file at all. |
-| `maxLength` violation | error | File-rejecting. The schema carries **15** per-field caps, 50 → 20,000 chars. |
+| `maxLength` violation | error | File-rejecting. The schema carries **17** per-field caps, 50 → 20,000 chars. |
 | type / enum error | error | File-rejecting. |
 | unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. Reported wherever the schema object accepts only the names it lists — see below. |
 | config path that is not a regular file, or > 512 KiB | exit 2 | "I could not check" must never look like a pass. A path resolving outside the repo root (symlinks resolved) is refused the same way. |
@@ -40,17 +40,18 @@ cleaned up and wants to stay clean.
 only the property names it lists — which upstream expresses two different ways,
 and both are checked:
 
-* **explicitly**, with `additionalProperties: false`. Seven objects: the document
-  root, `reviews.auto_approvals` and its `overrides[]` items, `knowledge_base.mcp`,
-  `knowledge_base.linked_repositories[]`, and the `htmlhint` / `stylelint` tool
-  configs. jsonschema reports these.
+* **explicitly**, with `additionalProperties: false`. jsonschema reports these.
+  Since #467's refresh that is **every** object that declares `properties` — all
+  **112**, including `reviews`, `chat`, `knowledge_base`, `code_generation` and
+  every individual tool config (it was seven before). This is what catches a typo
+  *inside* an object — `reviews.profil`, `golangci-lint.enabld` — and a key
+  upstream has since REMOVED, such as `reviews.tools.github-checks.timeout_ms`.
 * **by omission** — a `properties` block and no statement at all about anything
-  else. **105** objects, including `reviews`, `chat`, `knowledge_base`,
-  `code_generation` and every individual tool config. jsonschema has no keyword to
-  fire on here, so a schema-walk in `_walk_unknown_keys` reports them. This is
-  what catches a typo *inside* an object — `reviews.profil`,
-  `golangci-lint.enabld` — and a key upstream has since REMOVED, such as
-  `reviews.tools.github-checks.timeout_ms`.
+  else. jsonschema has no keyword to fire on here, so a schema-walk in
+  `_walk_unknown_keys` reports them. The vendored schema has **zero** such
+  objects today (it had 105 before #467); the walk stays so that a refresh which
+  drops the keyword again does not silently stop the check reaching inside
+  objects.
 
 The rule the walk applies is conservative: a node is closed by omission only when
 it declares a `properties` block and NONE of `additionalProperties`,
@@ -82,7 +83,7 @@ pin moves. Warn-only mode absorbs that as a warning; a caller running
 freshness, opposite sign, as catching a key upstream removed. Neither half is
 exempt — a root-level addition is missing from the vendored `properties` list and
 the vendored `additionalProperties: false` rejects it just as the by-omission rule
-would; by-omission is merely the larger surface (105 objects against 7). See the
+would, and every nested object now says `additionalProperties: false` too. See the
 caller doc's rollout section.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
@@ -96,7 +97,7 @@ carried exactly that shape when this landed.
 ## Why file size is the wrong invariant
 
 The obvious cheap check — "fail if `.coderabbit.yaml` gets too big" — would gate
-nothing. There is no whole-document size cap in the schema, only the 15 per-field
+nothing. There is no whole-document size cap in the schema, only the 17 per-field
 ones, and size is uncorrelated with validity: the invalid config that started this
 was 2,198 bytes while a valid one next to it was 4,826. Across the org sweep there
 were **zero** `maxLength` violations and three misplaced-key repos, so a size check

@@ -38,6 +38,14 @@ SCHEMA_PATH = os.path.join(
 with open(SCHEMA_PATH, "r", encoding="utf-8") as _f:
     SCHEMA = json.load(_f)
 
+# The vendored schema with every `additionalProperties: false` dropped, so every
+# object declaring `properties` is closed BY OMISSION. Since #467's refresh the
+# vendored copy closes all of them explicitly, which leaves `_walk_unknown_keys`
+# nothing of its own to find there; the tests of the walk's OWN bounds run
+# against this instead, so it is still the walk that finds (or fails to reach)
+# the key — not jsonschema answering for it.
+OMISSION_SCHEMA = checker._without_stripping(SCHEMA)
+
 VALID = """\
 language: en-US
 tone_instructions: Be concise.
@@ -429,8 +437,11 @@ class MainTest(unittest.TestCase):
 class ClosedByOmissionTest(unittest.TestCase):
     """Unknown keys inside objects the schema closes by saying nothing.
 
-    Upstream declares `additionalProperties: false` on seven objects and leaves 105
-    more with a `properties` block and no statement about anything else. CodeRabbit
+    Upstream used to declare `additionalProperties: false` on seven objects and
+    leave 105 more with a `properties` block and no statement about anything else;
+    since #467's refresh it closes all 112 explicitly, so against the vendored
+    schema jsonschema reports every one of these, and the walk's own bounds are
+    tested against `OMISSION_SCHEMA`. CodeRabbit
     strips an unrecognized key in either kind, so both must be reported — and the
     two halves must stay disjoint, since one fires only where the keyword is
     present and the other only where it is absent.
@@ -594,7 +605,7 @@ class ClosedByOmissionTest(unittest.TestCase):
 
     def test_findings_count_toward_the_shared_cap_and_note_the_truncation(self):
         # The cap is over BOTH halves. Half the unknown keys here are root-level
-        # (jsonschema's) and half are nested (the walk's).
+        # and half are nested (the walk's before #467; jsonschema's since).
         root = "".join(f"unknown_root_{i}: 1\n" for i in range(60))
         nested = "reviews:\n" + "".join(f"  unknown_nested_{i}: 1\n" for i in range(60))
         findings, notes = checker.validate(root + nested, SCHEMA)
@@ -605,7 +616,7 @@ class ClosedByOmissionTest(unittest.TestCase):
         # A partial scan must never read like a completed one. Forced via the
         # budget rather than a megabyte fixture.
         with budget(keys=1):
-            findings, _notes = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+            findings, _notes = checker.validate(STALE_GITHUB_CHECKS, OMISSION_SCHEMA)
         self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
         severity, path, _line, message = findings[0]
         self.assertEqual(severity, "warning")
@@ -617,9 +628,9 @@ class ClosedByOmissionTest(unittest.TestCase):
         # to exit 0 even for a repo that asked for unknown keys to FAIL — a green
         # check over keys nothing looked at. Warn-only mode is unchanged.
         with budget(keys=1):
-            warn, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+            warn, _ = checker.validate(STALE_GITHUB_CHECKS, OMISSION_SCHEMA)
             strict, _ = checker.validate(
-                STALE_GITHUB_CHECKS, SCHEMA, strict_unknown_keys=True
+                STALE_GITHUB_CHECKS, OMISSION_SCHEMA, strict_unknown_keys=True
             )
         self.assertEqual(severities(warn), ["warning"])
         self.assertEqual(severities(strict), ["error"])
@@ -627,7 +638,7 @@ class ClosedByOmissionTest(unittest.TestCase):
     def test_a_depth_cutoff_is_reported_like_an_exhausted_budget(self):
         # Both are "I did not see the whole document"; only one used to be said.
         with budget(depth=0):
-            findings, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+            findings, _ = checker.validate(STALE_GITHUB_CHECKS, OMISSION_SCHEMA)
         self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
         self.assertIn("were NOT checked", findings[0][3])
 
@@ -637,9 +648,9 @@ class ClosedByOmissionTest(unittest.TestCase):
         # is complete, and saying otherwise cries wolf on every exact fit.
         text = "reviews:\n  profil: chill\n"
         with budget(keys=4):  # two node visits + two keys
-            exact, _ = checker.validate(text, SCHEMA)
+            exact, _ = checker.validate(text, OMISSION_SCHEMA)
         with budget(keys=3):
-            short, _ = checker.validate(text, SCHEMA)
+            short, _ = checker.validate(text, OMISSION_SCHEMA)
         self.assertEqual([f[1] for f in exact], ["reviews.profil"])
         self.assertEqual([f[1] for f in short], ["(document root)"])
 
@@ -1040,7 +1051,7 @@ class CapAndBudgetTest(unittest.TestCase):
         # The budget is charged per node visit as well as per key, so a
         # list-heavy document exhausts it after far fewer than MAX_WALK_KEYS keys.
         with budget(keys=1):
-            findings, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+            findings, _ = checker.validate(STALE_GITHUB_CHECKS, OMISSION_SCHEMA)
         self.assertIn("keys and nodes", findings[0][3])
 
 
@@ -1100,12 +1111,15 @@ class OpennessTest(unittest.TestCase):
         # with `additionalProperties: false` (asserted below), so growth there
         # means more explicitly closed objects, never a new way to open one. It went
         # 5 -> 7 when upstream added `reviews.auto_approvals` and its
-        # `overrides[]` items, both closed that way. Bump these deliberately,
+        # `overrides[]` items, both closed that way. #467's refresh then closed
+        # EVERY object explicitly -- 7 -> 112, 105 -> 0 -- so the walk has no
+        # by-omission surface left against this schema; it stays as the guard
+        # for a refresh that drops the keyword again. Bump these deliberately,
         # never to go green.
-        self.assertEqual(len(explicit), 7)
+        self.assertEqual(len(explicit), 112)
         for one in explicit:
             self.assertIs(one.get("additionalProperties"), False, msg=f"{list(one)}")
-        self.assertEqual(len(omitted), 105)
+        self.assertEqual(len(omitted), 0)
 
     def test_every_explicitly_open_object_uses_additional_properties(self):
         # The audit behind `_OPENER_KEYWORDS`: the schema uses one opener today,
@@ -1202,8 +1216,20 @@ class OpennessTest(unittest.TestCase):
         #    walks a node's keywords in schema key order, so that error is emitted
         #    ahead of the element errors it would otherwise be buried under.
         #    Except the arrays listed here, which declare no `maxItems` at all and
-        #    are what the checker's rejecting-only second pass exists for.
-        uncapped = {"$.properties.reviews.properties.auto_approvals.properties.overrides"}
+        #    are what the checker's rejecting-only second pass exists for. The
+        #    set went 1 -> 9 with #467's refresh, which closed the item objects
+        #    of eight more uncapped arrays.
+        uncapped = {
+            "$.properties.reviews.properties.auto_approvals.properties.overrides",
+            "$.properties.reviews.properties.path_instructions",
+            "$.properties.reviews.properties.labeling_instructions",
+            "$.properties.reviews.properties.suggested_reviewers_instructions",
+            "$.properties.reviews.properties.suggested_reviewers_instructions.items.properties.reviewers",
+            "$.properties.code_generation.properties.docstrings.properties.path_instructions",
+            "$.properties.code_generation.properties.unit_tests.properties.path_instructions",
+            "$.properties.issue_enrichment.properties.labeling.properties.labeling_instructions",
+            "$.properties.knowledge_base.properties.code_guidelines.properties.filePatterns",
+        }
         arrays = [x for x in arrays_over_closed if isinstance(x, tuple)]
         self.assertEqual(
             {path for path, array in arrays if "maxItems" not in array}, uncapped
