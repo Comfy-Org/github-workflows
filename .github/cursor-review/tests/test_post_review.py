@@ -2958,11 +2958,18 @@ class PostTimeoutTest(unittest.TestCase):
     def test_a_timeout_becomes_an_undecided_result_not_an_exception(self):
         """Reported as a nonzero CompletedProcess, exactly as the list read's timeout
         is, so the caller reads it through the ordinary failure classifiers instead of
-        dying on a TimeoutExpired the recovery path does not catch."""
+        dying on a TimeoutExpired the recovery path does not catch.
+
+        `time.sleep` is mocked because this run exhausts `gh_post_review`'s own
+        bounded retry (oploop1144-5): every attempt times out the same way, so every
+        retry's own `confirm_landed` read also times out (the same `subprocess.run`
+        stub serves it) and answers unconfirmed, which is exactly what should drive
+        a retry here — this test is about the FINAL result shape, not the backoff.
+        """
         with mock.patch.object(
             PR.subprocess, "run",
             side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=60),
-        ):
+        ), mock.patch.object(PR.time, "sleep"):
             result = PR.gh_post_review("o/r", "1", "{}")
         self.assertIsInstance(result, subprocess.CompletedProcess)
         self.assertNotEqual(result.returncode, 0)
@@ -2977,10 +2984,13 @@ class PostTimeoutTest(unittest.TestCase):
         — losing the findings on the very path built to preserve them.
         """
         partial = b"HTTP/2.0 403 Forbidden\r\nRetry-After: 60\r\n\r\n"
+        # `time.sleep` mocked: this run exhausts `gh_post_review`'s own bounded retry
+        # (oploop1144-5) — see the docstring on
+        # `test_a_timeout_becomes_an_undecided_result_not_an_exception` above.
         with mock.patch.object(
             PR.subprocess, "run",
             side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=60, output=partial),
-        ):
+        ), mock.patch.object(PR.time, "sleep"):
             result = PR.gh_post_review("o/r", "1", "{}")
         self.assertIsInstance(result.stdout, str, "decoded at the source, once")
         self.assertEqual(PR.gh_status_line(result), "HTTP/2.0 403 Forbidden")
@@ -2993,23 +3003,31 @@ class PostTimeoutTest(unittest.TestCase):
     def test_a_severed_multibyte_capture_degrades_rather_than_raising(self):
         """A kill can land mid-character. A diagnostic must never be the thing that
         raises, so the decode replaces rather than strict-errors."""
+        # `time.sleep` mocked: this run exhausts `gh_post_review`'s own bounded retry
+        # (oploop1144-5) — see the docstring on
+        # `test_a_timeout_becomes_an_undecided_result_not_an_exception` above.
         with mock.patch.object(
             PR.subprocess, "run",
             side_effect=subprocess.TimeoutExpired(
                 cmd=["gh"], timeout=60, output=b"HTTP/2.0 502 Bad Gateway\r\n\r\n\xe2\x82",
             ),
-        ):
+        ), mock.patch.object(PR.time, "sleep"):
             result = PR.gh_post_review("o/r", "1", "{}")
         self.assertIsInstance(result.stdout, str)
         self.assertIn("502", PR.format_post_failure("Review", result))
 
     def test_a_timed_out_post_takes_the_undecided_path(self):
         """It carries no HTTP status, so it is neither a throttle nor a read-only
-        token — it is genuinely undecided, and the PR gets asked."""
+        token — it is genuinely undecided, and the PR gets asked.
+
+        `time.sleep` mocked: this run exhausts `gh_post_review`'s own bounded retry
+        (oploop1144-5) — see the docstring on
+        `test_a_timeout_becomes_an_undecided_result_not_an_exception` above.
+        """
         with mock.patch.object(
             PR.subprocess, "run",
             side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=60),
-        ):
+        ), mock.patch.object(PR.time, "sleep"):
             result = PR.gh_post_review("o/r", "1", "{}")
         self.assertIsNone(
             PR.gh_http_status(result),
@@ -3022,6 +3040,162 @@ class PostTimeoutTest(unittest.TestCase):
             "the request may have been served — ask the PR rather than guess",
         )
         self.assertEqual(PR.throttle_delay_seconds(result), PR.THROTTLE_DELAY_DEFAULT_SECONDS)
+
+
+class PostReviewRetryTest(unittest.TestCase):
+    """`gh_post_review` retries a 5xx / transport failure (oploop1144-5).
+
+    THE FAILURE THIS PINS. FE #22315's `cursor-review` round ran all six reviewer
+    jobs and `Consolidate panel` to `SUCCESS` with zero findings, then lost the
+    whole result to one transient `HTTP 502` on the no-findings POST: `gh api`
+    returned nonzero, `post_or_degrade` had no retry, and the round's only artifact
+    was two red checks and nothing on the PR — a human had to notice and re-run
+    the job by hand (run 41813305200, job 126519108973).
+
+    Retrying blindly would risk a duplicate review if the failed response actually
+    carried a write GitHub's API had already committed (the same gateway-timeout
+    shape `post_may_have_landed`'s docstring names), so each retry asks the PR
+    first via the same `confirm_landed` every other failure path already uses.
+    """
+
+    def _fake_run(self, post_results, list_result, post_calls, list_calls):
+        """A `subprocess.run` stub that tells the review POST apart from the
+        reviews-list GET by argv shape, the same discriminator `gh_post_review`
+        and `gh_list_reviews` build their argv with."""
+
+        def fake_run(argv, **kwargs):
+            if "--method" in argv:
+                post_calls.append(argv)
+                result = post_results[min(len(post_calls) - 1, len(post_results) - 1)]
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=result[0], stdout=result[1], stderr=result[2]
+                )
+            list_calls.append(argv)
+            return subprocess.CompletedProcess(
+                args=argv, returncode=list_result[0], stdout=list_result[1], stderr=list_result[2]
+            )
+
+        return fake_run
+
+    def test_a_5xx_retries_and_succeeds_on_the_second_attempt(self):
+        post_calls, list_calls = [], []
+        fake_run = self._fake_run(
+            post_results=[
+                (1, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "gh: Server Error (HTTP 502)"),
+                (0, "HTTP/2.0 200 OK\r\n\r\n{}", ""),
+            ],
+            list_result=(0, "[[]]", ""),
+            post_calls=post_calls,
+            list_calls=list_calls,
+        )
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(PR.time, "sleep") as sleep_mock:
+            result = PR.gh_post_review(
+                "o/r", "1", json.dumps({"commit_id": "deadbee", "body": "b"})
+            )
+        self.assertEqual(result.returncode, 0, "the retried attempt is what is returned")
+        self.assertEqual(len(post_calls), 2, "one retry, not three")
+        self.assertEqual(len(list_calls), 1, "asked once, between the two POSTs")
+        sleep_mock.assert_called_once_with(5)
+
+    def test_a_persistent_5xx_exhausts_retries_and_reports_the_last_status(self):
+        post_calls, list_calls = [], []
+        fake_run = self._fake_run(
+            post_results=[(1, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "gh: Server Error (HTTP 502)")],
+            list_result=(0, "[[]]", ""),
+            post_calls=post_calls,
+            list_calls=list_calls,
+        )
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(PR.time, "sleep") as sleep_mock:
+            result = PR.gh_post_review(
+                "o/r", "1", json.dumps({"commit_id": "deadbee", "body": "b"})
+            )
+        self.assertNotEqual(result.returncode, 0, "still a failure — exhausted, not swallowed")
+        self.assertEqual(PR.gh_http_status(result), 502)
+        self.assertEqual(
+            len(post_calls), PR.POST_REVIEW_MAX_ATTEMPTS, "every attempt spent, no more"
+        )
+        self.assertEqual(len(list_calls), PR.POST_REVIEW_MAX_ATTEMPTS - 1, "one ask per retry")
+        self.assertEqual(
+            sleep_mock.call_args_list,
+            [mock.call(s) for s in PR.POST_REVIEW_RETRY_DELAYS_SECONDS],
+        )
+
+    def test_a_4xx_is_never_retried(self):
+        """A 422 is GitHub validating and refusing before writing anything — the
+        exact case AGENTS.md rule 9 means by 'do not swallow a genuine 4xx': it
+        must stay red on the first attempt, with no extra read spent asking."""
+        post_calls, list_calls = [], []
+        fake_run = self._fake_run(
+            post_results=[(1, "", "gh: Unprocessable Entity (HTTP 422)")],
+            list_result=(0, "[[]]", ""),
+            post_calls=post_calls,
+            list_calls=list_calls,
+        )
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(PR.time, "sleep") as sleep_mock:
+            result = PR.gh_post_review("o/r", "1", json.dumps({"commit_id": "c", "body": "b"}))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(post_calls), 1, "no retry on a validation rejection")
+        self.assertEqual(len(list_calls), 0, "a 4xx needs no read, same as post_or_degrade's")
+        sleep_mock.assert_not_called()
+
+    def test_a_throttled_403_is_not_retried_by_this_layer(self):
+        """The existing backoff-then-read for a throttle (403/408/425/429) lives in
+        the CALLER, which asks once after a single attempt — this layer must not
+        duplicate or race that by also retrying the write itself."""
+        post_calls, list_calls = [], []
+        fake_run = self._fake_run(
+            post_results=[
+                (
+                    1, "HTTP/2.0 403 Forbidden\r\nRetry-After: 30\r\n\r\n",
+                    "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+                )
+            ],
+            list_result=(0, "[[]]", ""),
+            post_calls=post_calls,
+            list_calls=list_calls,
+        )
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(PR.time, "sleep") as sleep_mock:
+            result = PR.gh_post_review("o/r", "1", json.dumps({"commit_id": "c", "body": "b"}))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(post_calls), 1, "one attempt — the caller owns the throttle wait")
+        self.assertEqual(len(list_calls), 0, "no read happens inside this layer for a throttle")
+        sleep_mock.assert_not_called()
+
+    def test_a_retry_that_finds_the_write_already_landed_does_not_resend(self):
+        """A 502 can be raised on a write GitHub's API committed before the
+        response failed. Resending in that case would duplicate the review, so a
+        confirmed-landed read between attempts must stop the retry — the caller's
+        own post_may_have_landed/confirm_landed call resolves the (still-failed)
+        result this returns into a delivered review, exactly as it already does
+        for a throttled 403 that turns out to have landed."""
+        post_calls, list_calls = [], []
+        landed_review = json.dumps([[{
+            "state": "COMMENTED",
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "commit_id": "deadbee",
+            "body": f"{PR.CONSOLIDATED_MARKER}\n\nFound **0** finding(s).",
+        }]])
+        fake_run = self._fake_run(
+            post_results=[(1, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "gh: Server Error (HTTP 502)")],
+            list_result=(0, landed_review, ""),
+            post_calls=post_calls,
+            list_calls=list_calls,
+        )
+        payload = json.dumps({
+            "commit_id": "deadbee",
+            "body": f"{PR.CONSOLIDATED_MARKER}\n\nFound **0** finding(s).",
+        })
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(PR.time, "sleep") as sleep_mock:
+            result = PR.gh_post_review("o/r", "1", payload)
+        self.assertEqual(result.returncode, 1, "the failed attempt, unchanged — caller resolves it")
+        self.assertEqual(len(post_calls), 1, "confirmed landed — never resent")
+        self.assertEqual(len(list_calls), 1)
+        sleep_mock.assert_not_called()
 
 
 class ThrottleBackoffTest(unittest.TestCase):
